@@ -1,0 +1,40 @@
+{
+  "name": "@driller/desktop",
+  "productName": "driller",
+  "private": true,
+  "version": "0.1.0",
+  "description": "driller — a browsable, honestly-indexed Code Map for local codebases",
+  "main": ".vite/build/main.js",
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "publish": "electron-forge publish",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p renderer/tsconfig.json"
+  },
+  "dependencies": {
+    "@driller/ipc-contracts": "*",
+    "electron-squirrel-startup": "^1.0.1",
+    "electron-store": "11.0.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "7.11.2",
+    "@electron-forge/maker-deb": "7.11.2",
+    "@electron-forge/maker-rpm": "7.11.2",
+    "@electron-forge/maker-squirrel": "7.11.2",
+    "@electron-forge/maker-zip": "7.11.2",
+    "@electron-forge/plugin-auto-unpack-natives": "7.11.2",
+    "@electron-forge/plugin-fuses": "7.11.2",
+    "@electron-forge/plugin-vite": "7.11.2",
+    "@electron/fuses": "^1.8.0",
+    "@types/electron-squirrel-startup": "^1.0.2",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "4.7.0",
+    "electron": "43.6.0",
+    "typescript": "5.9.3",
+    "vite": "5.4.21"
+  }
+}

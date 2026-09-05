@@ -1,0 +1,16 @@
+{
+  "name": "@driller/graph-service",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@driller/ipc-contracts": "*"
+  },
+  "devDependencies": {
+    "electron": "43.6.0",
+    "typescript": "5.9.3"
+  }
+}

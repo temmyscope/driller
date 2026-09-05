@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "noEmit": true,
+    "paths": {
+      "@driller/ipc-contracts": ["../../packages/ipc-contracts/src/index.ts"]
+    }
+  },
+  "include": [
+    "main/**/*.ts",
+    "preload/**/*.ts",
+    "forge.config.ts",
+    "forge.env.d.ts",
+    "vite.main.config.ts",
+    "vite.preload.config.ts",
+    "vite.graph-service.config.ts",
+    "vite.renderer.config.ts"
+  ]
+}

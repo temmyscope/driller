@@ -1,0 +1,191 @@
+/*
+ * Minimal styling for the open-folder / Recent Projects screen only.
+ * Dark-first per EXPERIENCE.md — a full design-token pass is explicitly
+ * deferred (ARCHITECTURE-SPINE.md Deferred: "DESIGN.md visual-token
+ * synthesis"). This is not the shadcn/ui chrome the architecture stack
+ * calls for eventually — see the story's report for that scope note.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #14161a;
+  --surface: #1c1f26;
+  --border: #2a2e37;
+  --text: #e6e8eb;
+  --text-muted: #9aa0ab;
+  --accent: #5b8def;
+  --warning: #d9a441;
+  --error: #e05d5d;
+  --ok: #4caf7d;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+code,
+.recent-projects__path code {
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+}
+
+.app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 4rem 1.5rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+  min-height: 100%;
+}
+
+.app__title {
+  margin: 0;
+  font-size: 1.75rem;
+}
+
+.app__subtitle {
+  margin: 0.25rem 0 0;
+  color: var(--text-muted);
+}
+
+.open-folder {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.open-folder__button {
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #0b0d10;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.open-folder__button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.notice {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.notice--warning {
+  background: color-mix(in srgb, var(--warning) 15%, transparent);
+  color: var(--warning);
+  border: 1px solid var(--warning);
+}
+
+.notice--error {
+  background: color-mix(in srgb, var(--error) 15%, transparent);
+  color: var(--error);
+  border: 1px solid var(--error);
+}
+
+.recent-projects__heading {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.recent-projects__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.recent-projects__open {
+  width: 100%;
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.recent-projects__open:hover {
+  border-color: var(--accent);
+}
+
+.recent-projects__name {
+  font-weight: 600;
+}
+
+.recent-projects__path {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.graph-service-status {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.badge {
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.badge--pending {
+  color: var(--text-muted);
+}
+
+.badge--ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.badge--muted {
+  color: var(--text-muted);
+}
+
+.badge--error {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.graph-service-status__retry {
+  padding: 0.25rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}

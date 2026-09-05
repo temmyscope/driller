@@ -1,0 +1,31 @@
+{
+  "name": "driller",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "driller — a browsable, honestly-indexed Code Map for local codebases",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "start": "npm run start --workspace=@driller/desktop",
+    "package": "npm run package --workspace=@driller/desktop",
+    "make": "npm run make --workspace=@driller/desktop",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/node": "^24.9.0",
+    "eslint": "9.39.5",
+    "globals": "^15.15.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.69.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
