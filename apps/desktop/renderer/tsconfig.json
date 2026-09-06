@@ -3,7 +3,7 @@
   "compilerOptions": {
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
-    "types": [],
+    "types": ["vite/client"],
     "noEmit": true,
     "paths": {
       "@driller/ipc-contracts": ["../../../packages/ipc-contracts/src/index.ts"]

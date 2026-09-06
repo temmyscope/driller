@@ -283,6 +283,18 @@ code,
   border-color: var(--accent);
 }
 
+/* Both `.code-map__node` and `.code-map__cluster` are keyboard-activatable
+   (`tabIndex`, `role="button"`, Enter/Space) but had no visible focus state
+   at all (review finding) — the accessibility floor requires a keyboard
+   path, and a keyboard path with no visible focus indicator isn't usable.
+   `:focus-visible` (not plain `:focus`) so this only shows for keyboard
+   navigation, not every mouse click. */
+.code-map__node:focus-visible,
+.code-map__cluster:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .code-map__node-kind {
   font-size: 0.7rem;
   text-transform: uppercase;
@@ -300,6 +312,58 @@ code,
 
 .code-map__edge {
   stroke: var(--text-muted);
+}
+
+/* LOD cluster card (Story 1.3 Phase 2, AD-2): a lightweight aggregate
+   representation, deliberately less detailed than `.code-map__node` — it
+   stands in for real Nodes, not for a Node of its own. */
+.code-map__cluster {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 999px;
+  border: 1px dashed var(--border);
+  background: var(--surface);
+  min-width: 72px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.code-map__cluster:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.code-map__cluster-count {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.code-map__cluster-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* A cluster over CLUSTER_EXPAND_MAX zooms in on click instead of expanding
+   (CodeMap.tsx's `expandCluster`) — solid border + accent color distinguish
+   it from a normal (dashed, muted) cluster (review finding: otherwise a
+   click just moves the camera with no indication why this one behaved
+   differently). Never color-only (Accessibility Floor): the label itself
+   also reads "zoom in" instead of "nodes" — see `CodeMapClusterCard`. */
+.code-map__cluster--zoom {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.code-map__cluster .react-flow__handle {
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* No editing surface (Non-Goal): each Node card's Handles exist only for

@@ -3,7 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'" />
+    <!--
+      style-src needs 'unsafe-inline' on top of the base `default-src 'self'`
+      lockdown: Vite's dev server injects component CSS (including
+      `@xyflow/react`'s own bundled stylesheet) as inline `<style>` tags for
+      HMR, which a bare `default-src 'self'` silently blocks — found via
+      Story 1.3 Phase 2's live CDP verification (`document.styleSheets`
+      stayed empty despite real CSS content sitting in the DOM, collapsing
+      the whole layout to near-zero height and hiding every rendered Node).
+      A production build is unaffected either way: Vite extracts CSS into a
+      real same-origin `<link rel="stylesheet">` file there, already allowed
+      by `default-src 'self'` alone. `script-src` is untouched — this only
+      widens the much lower-risk style-injection surface, not script
+      execution.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'" />
     <title>driller</title>
   </head>
   <body>
