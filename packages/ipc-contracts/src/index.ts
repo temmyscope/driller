@@ -94,6 +94,67 @@ export type GraphServiceState =
   | 'exited'
   | 'error';
 
+// ---------------------------------------------------------------------------
+// Phase 2: coverage/scale transparency (FR2, NFR1, AD-15).
+//
+// Sourced entirely from the real backend's own `index_repository`/
+// `index_status` reporting — driller never re-derives or infers coverage
+// locally. `parse_partial`/`skipped` files are the only genuine coverage
+// gaps; `not_indexed` (gitignore/skip-list exclusions) is by-design and MUST
+// NOT be surfaced here. The follow-up `index_status` call that supplies
+// `gapPaths` is best-effort: if it fails, `coverage` is omitted from the
+// `indexed` message entirely rather than posting a partial summary.
+//
+// `expectedNodes`/`expectedEdges` are optional enrichment, not a gate:
+// live testing found the backend's MCP `index_repository` response
+// intermittently omits them even on an otherwise-healthy call, while
+// `skippedCount`/`parsePartialCount` (the fields that actually determine a
+// genuine gap) are always present. Requiring the expected-count fields
+// before building `coverage` at all made the summary vanish on healthy
+// runs — see mcp-client.ts's `fetchCoverage` and this spec's Design Notes.
+// ---------------------------------------------------------------------------
+
+/**
+ * One coverage-gap file from the `index_status` follow-up call, tagged with
+ * which kind of gap it is. `skipped` (not indexed at all) and `parse_partial`
+ * (indexed, but tree-sitter's error recovery may have missed some constructs)
+ * are meaningfully different severities — Story 1.3's per-Node rendering is
+ * expected to show them differently, so this story preserves the distinction
+ * through the wire rather than flattening it into an undifferentiated
+ * `string[]`.
+ */
+export interface GapFile {
+  /** Absolute path of the gap file, as reported by `index_status`. */
+  path: string;
+  /** Which kind of coverage gap this file is. */
+  kind: 'skipped' | 'parse_partial';
+}
+
+export interface IndexCoverageSummary {
+  /**
+   * Node count the backend expected to produce for a fully-covered index.
+   * Optional enrichment — present only when the backend's response happens
+   * to include it; never required to produce a `coverage` object at all.
+   */
+  expectedNodes?: number;
+  /**
+   * Edge count the backend expected to produce for a fully-covered index.
+   * Optional enrichment — same caveat as `expectedNodes`.
+   */
+  expectedEdges?: number;
+  /** Count of files the backend skipped outright (a genuine coverage gap). */
+  skippedCount: number;
+  /** Count of files the backend could only partially parse (a genuine coverage gap). */
+  parsePartialCount: number;
+  /**
+   * The `parse_partial`/`skipped` gap files from the `index_status`
+   * follow-up call, each tagged with its `kind`. Wired through for Story
+   * 1.3's Code Map to render per-Node — this story does not render them
+   * itself.
+   */
+  gapPaths: GapFile[];
+}
+
 export type GraphServiceStatusMessage =
   | { state: 'starting'; pid?: number; at: string }
   | { state: 'alive'; pid?: number; at: string }
@@ -114,6 +175,19 @@ export type GraphServiceStatusMessage =
       nodes: number;
       /** Raw edge count from the backend — no coverage-gap interpretation. */
       edges: number;
+      /**
+       * Wall-clock time the index attempt took, in milliseconds. Always
+       * present and honest (NFR1, AD-15) — never hidden regardless of
+       * hardware speed or repo size.
+       */
+      elapsedMs: number;
+      /**
+       * Coverage summary sourced directly from the backend's own reporting
+       * (FR2). Omitted when the best-effort `index_status` follow-up call
+       * fails — that failure never turns this successful `index_repository`
+       * result into an `error` status.
+       */
+      coverage?: IndexCoverageSummary;
     }
   | {
       state: 'exited';
@@ -136,6 +210,13 @@ export type GraphServiceStatusMessage =
        * unexpected exit) that aren't about any particular in-flight index.
        */
       path?: string;
+      /**
+       * Elapsed time of the failed index attempt, in milliseconds. Present
+       * whenever this error came from an in-flight index attempt (mirrors
+       * `path`'s presence) — never hidden (NFR1, AD-15). Absent for
+       * subprocess-level errors unrelated to any particular index attempt.
+       */
+      elapsedMs?: number;
     };
 
 /** Message main sends to ask the Graph Service subprocess to shut down cleanly. */

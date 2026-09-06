@@ -176,6 +176,17 @@ code,
   color: var(--text-muted);
 }
 
+/*
+ * Partial-coverage indexed state (Phase 2, FR2/UX-DR11): visually distinct
+ * from both the clean `badge--ok` indexed state and the `badge--error`
+ * failure state — a coverage gap is neither success nor failure. Never
+ * color-only: the badge text itself always names the gap counts.
+ */
+.badge--warning {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
 .badge--error {
   color: var(--error);
   border-color: var(--error);

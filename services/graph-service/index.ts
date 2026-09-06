@@ -21,6 +21,12 @@
  * project while one is still in flight makes the new one authoritative —
  * the old attempt's eventual result (MCP tool calls aren't cleanly
  * cancelable mid-flight) is discarded rather than posted once superseded.
+ *
+ * Story 1.2 (Phase 2) adds coverage/scale transparency on top of that same
+ * handshake: `elapsedMs` (timed here, around the whole `indexRepository`
+ * call) on both `indexed` and index-attempt `error` posts, and an optional
+ * `coverage` summary (sourced entirely from `mcp-client.ts`'s parsing of the
+ * backend's own responses) on `indexed`.
  */
 
 import path from 'node:path';
@@ -113,25 +119,41 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
   // Visible within ~5s of folder selection (NFR1, AD-15): posted immediately,
   // before the potentially long-running backend call below.
   postStatus({ state: 'indexing', pid: process.pid, at: now(), path: projectPath });
+  // Times the whole indexRepository call (Phase 2, NFR1, AD-15): elapsedMs is
+  // always present and honest on both the eventual `indexed` and `error`
+  // posts below — never hidden regardless of hardware speed or repo size.
+  const startedAt = Date.now();
   try {
-    const { nodes, edges } = await indexRepository(projectPath);
+    const { nodes, edges, coverage } = await indexRepository(projectPath);
     if (activeIndexPath !== projectPath) {
       // A request for a different project superseded this one while it was
       // in flight — this result is stale, discard rather than apply.
       return;
     }
-    postStatus({ state: 'indexed', pid: process.pid, at: now(), path: projectPath, nodes, edges });
+    postStatus({
+      state: 'indexed',
+      pid: process.pid,
+      at: now(),
+      path: projectPath,
+      nodes,
+      edges,
+      elapsedMs: Date.now() - startedAt,
+      ...(coverage ? { coverage } : {}),
+    });
   } catch (error) {
     if (activeIndexPath !== projectPath) {
       return;
     }
     // Backend-unavailable (spawn fails, or the MCP call errors/rejects/times
     // out) reuses Story 1.1's error status path — no separate failure UI.
+    // This error came from an in-flight index attempt, so elapsedMs (like
+    // path) is included per the Always constraint.
     postStatus({
       state: 'error',
       pid: process.pid,
       at: now(),
       path: projectPath,
+      elapsedMs: Date.now() - startedAt,
       message: error instanceof Error ? error.message : String(error),
     });
   }
