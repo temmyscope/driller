@@ -27,7 +27,14 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import type { GapFile, IndexCoverageSummary } from '@driller/ipc-contracts';
+import type {
+  CodeMapEdge,
+  CodeMapEdgeKind,
+  CodeMapNode,
+  CodeMapNodeKind,
+  GapFile,
+  IndexCoverageSummary,
+} from '@driller/ipc-contracts';
 
 export interface IndexRepositoryResult {
   nodes: number;
@@ -39,6 +46,20 @@ export interface IndexRepositoryResult {
    * inferred locally (Always: FR2).
    */
   coverage?: IndexCoverageSummary;
+  /**
+   * The backend's own project identifier for this repo (the same value
+   * `fetchCoverage` uses to call `index_status`), needed by Story 1.3's
+   * `fetchCodeMap` to run its `query_graph` calls against the right project.
+   * Undefined under the same conditions `fetchCoverage`'s `project` gate
+   * is — an older/degraded backend response that didn't report it.
+   */
+  project?: string;
+}
+
+/** Result of `fetchCodeMap`'s two `query_graph` calls. */
+export interface CodeMapFetchResult {
+  nodes: CodeMapNode[];
+  edges: CodeMapEdge[];
 }
 
 const CLIENT_INFO = { name: 'driller-graph-service', version: '0.1.0' };
@@ -176,7 +197,423 @@ async function runIndex(
 
   const fields = parseIndexResult(result);
   const coverage = await fetchCoverage(client, fields);
-  return { nodes: fields.nodes, edges: fields.edges, coverage };
+  return { nodes: fields.nodes, edges: fields.edges, coverage, project: fields.project };
+}
+
+// ---------------------------------------------------------------------------
+// Story 1.3 (Phase 1): Code Map data fetch (AD-3, FR3/FR4).
+//
+// Same per-call MCP connection pattern as `indexRepository` above: a fresh
+// client+transport spun up for this call and always torn down before
+// returning, never a lingering connection reused across renders. Both
+// `query_graph` calls (nodes, then edges) run over the one connection before
+// it's closed, mirroring `runIndex`'s two-calls-one-connection shape.
+//
+// Node/edge selection here is a judgment call (Design Notes): Function /
+// Interface / Type / Module labels only (EXPERIENCE.md's "function/method/
+// module name" atomic map unit) — never Variable/Section (too granular) or
+// File/Folder/Project/Branch (scaffolding). CALLS/IMPORTS/USAGE edges only —
+// never DEFINES/CONTAINS_* containment edges (FR4 is call/dependency edges).
+// ---------------------------------------------------------------------------
+
+const CODE_MAP_NODE_KINDS: readonly CodeMapNodeKind[] = [
+  'Function',
+  'Interface',
+  'Type',
+  'Module',
+];
+
+const CODE_MAP_EDGE_KINDS: readonly CodeMapEdgeKind[] = ['CALLS', 'IMPORTS', 'USAGE'];
+
+// Live-verified against a real codebase-memory-mcp instance (this story's
+// verification pass) — the Code Map's Design Notes explicitly pre-authorize
+// "a one-line query change if this reads wrong once real maps are seen."
+// The spec's original text (`any(l IN labels(n) WHERE l IN [...])` /
+// `type(r) IN [...]` in WHERE) reliably errors on the tested build:
+// `unsupported function 'any'/'type' in WHERE (supported: coalesce,
+// substring, replace, left, right)` — this engine's WHERE evaluator only
+// supports that fixed function allowlist, distinct from its RETURN
+// expression evaluator (`type(r)` works fine in RETURN, confirmed below).
+//
+// Also live-verified: `labels(n)[0] AS kind` (list-indexing a function
+// result) silently breaks alias assignment on this engine — the response
+// column comes back named `labels(n)` (not `kind`) holding the whole
+// JSON-array-as-string value (`"[\"Module\"]"`), not the first element.
+// Replaced with an explicit `CASE WHEN n:Function THEN 'Function' ... END AS
+// kind`, which returns a plain, unquoted, already-exactly-one-of-our-four-
+// literals string — simpler than double-JSON-decoding an array string, and
+// confirmed working.
+//
+// Label filtering itself uses `(x:A|B|C|D)` pattern-position label
+// alternation exclusively, on every node variable in both queries — NOT a
+// `WHERE x:A OR x:B ...` boolean disjunction. A second live-verification
+// round (review finding #7's fix) found this engine's WHERE-clause label
+// test only works for a pattern's first/anchor variable: `WHERE a:Function
+// OR ...` behaved correctly, but the exact same construct on the *second*
+// pattern variable (`WHERE b:Function OR ...`) silently matched nothing —
+// `rows: 0`, even for edges independently confirmed to exist via a direct
+// query. `(b:Function|Interface|Type|Module)` written directly in the
+// pattern, by contrast, worked correctly in both positions — confirmed by
+// re-running the edges query below and getting the expected row count back
+// (184, matching a manual cross-check of valid edges). The nodes query was
+// also switched to this same pattern-based form for consistency, even
+// though its single-variable WHERE form already worked — so neither query
+// depends on the WHERE-based label test's positional limitation.
+const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind`;
+
+// Both endpoints are filtered to the same Function/Interface/Type/Module
+// label set as the nodes query (review finding #7): without this, the
+// query happily returns edges to/from Variable/File/etc. entities that
+// were never going to be in the fetched node set anyway. Live testing
+// confirmed React Flow silently drops such dangling edges (harmless), but
+// fetching and parsing rows only to discard them is wasteful and was
+// inconsistent with the nodes query's own filtering — this makes the two
+// consistent. See the comment above `CODE_MAP_NODES_QUERY` for why both
+// `a` and `b` use pattern-position `(x:A|B|C|D)` label alternation rather
+// than a `WHERE` boolean disjunction.
+const CODE_MAP_EDGES_QUERY = `MATCH (a:Function|Interface|Type|Module)-[r:CALLS|IMPORTS|USAGE]->(b:Function|Interface|Type|Module) WHERE a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL RETURN a.qualified_name AS source, b.qualified_name AS target, type(r) AS kind`;
+
+/**
+ * Connects to `codebase-memory-mcp` over stdio and runs the Code Map's two
+ * `query_graph` Cypher calls against `project` (the backend's own project
+ * identifier — see `IndexRepositoryResult.project`'s doc comment, this is
+ * NOT the filesystem repo path). Ephemeral connection, same lifecycle as
+ * `indexRepository`: always torn down (success, failure, or timeout) before
+ * this function returns, never leaking a dangling backend process.
+ *
+ * Throws on any failure (backend fails to spawn, the MCP handshake fails,
+ * either `query_graph` call rejects or reports `isError`, or the combined
+ * call exceeds `timeoutMs`) — the caller (`index.ts`) surfaces that as an
+ * explicit error state (matrix: "Map data fetch fails"), never a blank/
+ * crashed map. A malformed *individual row* is dropped rather than failing
+ * the whole fetch (see `parseCodeMapNodeRow`/`parseCodeMapEdgeRow`) — one
+ * bad row shouldn't blank the entire map when the rest parsed fine.
+ */
+export async function fetchCodeMap(
+  project: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<CodeMapFetchResult> {
+  const { command, args } = resolveBackendCommand();
+  const transport = new StdioClientTransport({ command, args });
+  const client = new Client(CLIENT_INFO);
+
+  try {
+    return await withTimeout(
+      runFetchCodeMap(client, transport, project),
+      timeoutMs,
+      `query_graph (${project})`,
+    );
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+async function runFetchCodeMap(
+  client: Client,
+  transport: StdioClientTransport,
+  project: string,
+): Promise<CodeMapFetchResult> {
+  await client.connect(transport);
+
+  const nodesResult = await client.callTool({
+    name: 'query_graph',
+    arguments: { project, query: CODE_MAP_NODES_QUERY },
+  });
+  if (nodesResult.isError) {
+    throw new Error(`query_graph (Code Map nodes) reported an error: ${extractErrorText(nodesResult)}`);
+  }
+  const nodes = parseCodeMapRows(nodesResult, parseCodeMapNodeRow, 'Code Map nodes');
+
+  const edgesResult = await client.callTool({
+    name: 'query_graph',
+    arguments: { project, query: CODE_MAP_EDGES_QUERY },
+  });
+  if (edgesResult.isError) {
+    throw new Error(`query_graph (Code Map edges) reported an error: ${extractErrorText(edgesResult)}`);
+  }
+  const edges = parseCodeMapRows(edgesResult, parseCodeMapEdgeRow, 'Code Map edges');
+
+  return { nodes, edges };
+}
+
+/**
+ * Extracts `query_graph`'s rows from a `CallToolResult` and hands each one
+ * (as a `{columnName: string}` record) to `parseRow`. Live-verified against
+ * a real codebase-memory-mcp instance (this story's verification pass):
+ * `query_graph` carries NO `structuredContent` and NO JSON at all — its only
+ * payload is a plain-text table in the first `content` text block:
+ *
+ *   rows: N  (cols: col1 col2 ...)
+ *     <row 1 tokens, space-separated>
+ *     ...
+ *     <row N tokens>
+ *   total: N
+ *   hint: "..."            (only ever seen when N is 0)
+ *
+ * This is a genuinely different shape from `index_repository`/`index_status`
+ * (both real JSON, handled above by `extractFromCallResult`) — a distinct
+ * tool with a human-readable-table response convention, not an
+ * inconsistency in this file's parsing. `parseQueryGraphRows` is the primary
+ * path; `extractFromCallResult`'s JSON-based extraction is kept as a
+ * fallback purely in case a future backend build ever does emit structured
+ * JSON for this tool, but every real response seen returns to
+ * `parseQueryGraphRows` below.
+ *
+ * Throws only when the header itself can't be found/parsed — an empty
+ * `rows: 0 (...)` result is a legitimate "no map-eligible nodes/edges"
+ * result (matrix: "Indexed project has zero map-eligible nodes"), not a
+ * parse failure. A malformed *individual row* (wrong token count, or one
+ * `parseRow` rejects) is dropped with a warning rather than failing the
+ * whole fetch.
+ */
+function parseCodeMapRows<T>(
+  result: unknown,
+  parseRow: (row: Record<string, string>) => T | undefined,
+  label: string,
+): T[] {
+  const text = extractQueryGraphText(result);
+  const rawRows =
+    text !== undefined
+      ? parseQueryGraphRows(text, label)
+      : extractFromCallResult(result, extractJsonRowList)?.map(coerceToStringRecord);
+  if (rawRows === undefined) {
+    throw new Error(`query_graph (${label}) did not return a recognizable row list.`);
+  }
+
+  const parsed: T[] = [];
+  for (const row of rawRows) {
+    const item = parseRow(row);
+    if (item === undefined) {
+      console.warn(
+        `[graph-service] ${label}: dropped a row with an unrecognized shape: ${JSON.stringify(row)}`,
+      );
+      continue;
+    }
+    parsed.push(item);
+  }
+  return parsed;
+}
+
+/** Returns the first text content block's raw text, if any. */
+function extractQueryGraphText(result: unknown): string | undefined {
+  const content = (result as { content?: unknown } | null | undefined)?.content;
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const textBlock = content.find(
+    (block) =>
+      block &&
+      typeof block === 'object' &&
+      (block as { type?: unknown }).type === 'text' &&
+      typeof (block as { text?: unknown }).text === 'string',
+  ) as { text: string } | undefined;
+  return textBlock?.text;
+}
+
+/**
+ * Parses `query_graph`'s real plain-text table format (see
+ * `parseCodeMapRows`'s doc comment) into `{columnName: string}` records —
+ * every value is still a string at this point (numeric columns come back
+ * quoted, e.g. `"94"`; `parseCodeMapNodeRow`/`parseCodeMapEdgeRow` are what
+ * convert/validate per-field). Reads exactly the `rows: N` header's `N`
+ * lines that follow it, rather than trying to distinguish data rows from
+ * the trailing `total:`/`hint:` lines by shape — those lines are simply
+ * never reached when `N` data lines have already been consumed.
+ */
+function parseQueryGraphRows(text: string, label: string): Record<string, string>[] {
+  const lines = text.split(/\r\n|\r|\n/);
+  const headerIndex = lines.findIndex((line) => /^rows:\s*\d+\s*\(cols:/.test(line));
+  const headerLine = headerIndex >= 0 ? lines[headerIndex] : undefined;
+  const headerMatch = headerLine !== undefined ? /^rows:\s*(\d+)\s*\(cols:\s*([^)]*)\)/.exec(headerLine) : null;
+  const rowCountText = headerMatch?.[1];
+  const colsText = headerMatch?.[2];
+  if (rowCountText === undefined || colsText === undefined) {
+    throw new Error(
+      `query_graph (${label}) response did not match the expected "rows: N (cols: ...)" header: ${JSON.stringify(text)}`,
+    );
+  }
+
+  const rowCount = Number(rowCountText);
+  const columns = colsText.trim().length > 0 ? colsText.trim().split(/\s+/) : [];
+
+  const rows: Record<string, string>[] = [];
+  for (let i = 0; i < rowCount; i++) {
+    const line = lines[headerIndex + 1 + i];
+    if (line === undefined) {
+      console.warn(
+        `[graph-service] ${label}: header claimed ${rowCount} rows but only ${i} line(s) followed.`,
+      );
+      break;
+    }
+    const tokens = tokenizeQueryGraphRowLine(line.trim());
+    if (tokens.length !== columns.length) {
+      console.warn(
+        `[graph-service] ${label}: dropped a row with ${tokens.length} token(s), expected ${columns.length}: ${JSON.stringify(line)}`,
+      );
+      continue;
+    }
+    const row: Record<string, string> = {};
+    columns.forEach((col, idx) => {
+      // `tokens.length === columns.length` was just checked above, so this
+      // index is always in range.
+      row[col] = tokens[idx] as string;
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * Splits one already-trimmed row line into its space-separated column
+ * values. A `"..."` run is a JSON-string-literal-quoted value — decoded via
+ * `JSON.parse` on just that run, which is how numeric (`"94"`) and
+ * array-shaped values round-trip through this text format; anything else is
+ * a bare run of non-space characters used as-is (identifiers/paths/edge
+ * kinds never contain internal spaces in this graph's data model). A plain
+ * `line.split(/\s+/)` would break if a quoted value ever contained an
+ * internal space — this doesn't assume it can't.
+ */
+function tokenizeQueryGraphRowLine(line: string): string[] {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < line.length) {
+    while (i < line.length && line.charAt(i) === ' ') {
+      i++;
+    }
+    if (i >= line.length) {
+      break;
+    }
+    if (line.charAt(i) === '"') {
+      let j = i + 1;
+      while (j < line.length) {
+        if (line.charAt(j) === '\\' && j + 1 < line.length) {
+          j += 2;
+          continue;
+        }
+        if (line.charAt(j) === '"') {
+          j++;
+          break;
+        }
+        j++;
+      }
+      const raw = line.slice(i, j);
+      try {
+        const decoded: unknown = JSON.parse(raw);
+        tokens.push(typeof decoded === 'string' ? decoded : raw);
+      } catch {
+        tokens.push(raw);
+      }
+      i = j;
+    } else {
+      let j = i;
+      while (j < line.length && line.charAt(j) !== ' ') {
+        j++;
+      }
+      tokens.push(line.slice(i, j));
+      i = j;
+    }
+  }
+  return tokens;
+}
+
+/** Fallback-path helper: coerces a JSON row object's values to strings, matching `parseQueryGraphRows`'s output shape. */
+function coerceToStringRecord(row: unknown): Record<string, string> {
+  if (!row || typeof row !== 'object') {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(row as Record<string, unknown>)) {
+    if (typeof value === 'string') {
+      out[key] = value;
+    } else if (typeof value === 'number' || typeof value === 'boolean') {
+      out[key] = String(value);
+    }
+  }
+  return out;
+}
+
+/**
+ * Fallback-only JSON row-list extractor (see `parseCodeMapRows`'s doc
+ * comment) — never observed live, kept only in case a future backend build
+ * emits structured JSON for `query_graph` the way it already does for
+ * `index_repository`/`index_status`.
+ */
+function extractJsonRowList(value: unknown): unknown[] | undefined {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const v = value as Record<string, unknown>;
+  for (const key of ['rows', 'results', 'records', 'data']) {
+    if (Array.isArray(v[key])) {
+      return v[key] as unknown[];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Live-verified: the backend's `query_graph` returns `start_line`/
+ * `end_line` (here aliased `startLine`/`endLine`) as numeric-looking
+ * strings, not numbers — this parses either shape. Anything else (missing,
+ * non-numeric, non-finite) fails the row.
+ *
+ * Line numbers are 1-indexed, so `0` is rejected here too, not just
+ * negatives (review finding): `0` used to pass the shared
+ * `isFiniteNonNegative` helper's `>= 0` check, parsing fine at this layer
+ * while `handleReadSourceRange`'s own `startLine < 1` guard rejected it
+ * downstream — a Node that parsed successfully here but could never open
+ * its source, failing later with a generic, unhelpful error instead of
+ * being dropped now like any other malformed row.
+ */
+function toLineNumber(value: unknown): number | undefined {
+  let parsed: number | undefined;
+  if (typeof value === 'number') {
+    parsed = value;
+  } else if (typeof value === 'string' && value.trim().length > 0) {
+    parsed = Number(value);
+  }
+  return parsed !== undefined && isFiniteNonNegative(parsed) && parsed >= 1 ? parsed : undefined;
+}
+
+function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNode | undefined {
+  const { id, name, file, kind } = row;
+  const startLine = toLineNumber(row.startLine);
+  const endLine = toLineNumber(row.endLine);
+
+  if (
+    typeof id !== 'string' ||
+    id.length === 0 ||
+    typeof name !== 'string' ||
+    typeof file !== 'string' ||
+    startLine === undefined ||
+    endLine === undefined ||
+    typeof kind !== 'string' ||
+    !CODE_MAP_NODE_KINDS.includes(kind as CodeMapNodeKind)
+  ) {
+    return undefined;
+  }
+
+  return { id, name, file, startLine, endLine, kind: kind as CodeMapNodeKind };
+}
+
+function parseCodeMapEdgeRow(row: Record<string, string>): CodeMapEdge | undefined {
+  const { source, target, kind } = row;
+
+  if (
+    typeof source !== 'string' ||
+    source.length === 0 ||
+    typeof target !== 'string' ||
+    target.length === 0 ||
+    typeof kind !== 'string' ||
+    !CODE_MAP_EDGE_KINDS.includes(kind as CodeMapEdgeKind)
+  ) {
+    return undefined;
+  }
+
+  return { source, target, kind: kind as CodeMapEdgeKind };
 }
 
 /**

@@ -12,6 +12,7 @@
  * preload API.
  */
 
+import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import {
   app,
@@ -24,10 +25,14 @@ import {
 import started from 'electron-squirrel-startup';
 import {
   IpcChannels,
+  type CodeMapResult,
   type GitDetectionResult,
+  type GraphServiceCodeMapMessage,
+  type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
   type GraphServiceStatusMessage,
   type ProjectOpenResult,
+  type ReadSourceRangeResult,
 } from '@driller/ipc-contracts';
 import { detectGitRepo } from './git-detect';
 import { listRecentProjects, recordProjectOpened } from './settings';
@@ -48,6 +53,29 @@ let isGraphServiceShuttingDown = false;
 // error) can re-send the index request without requiring the user to
 // re-pick the folder.
 let currentProjectPath: string | null = null;
+// Resolver + shared Promise for an in-flight `codeMap:get` renderer request
+// (Story 1.3): `requestCodeMap` posts a fire-and-forget `graphService:
+// getCodeMap` message to the subprocess (there is no invoke-style round
+// trip over `utilityProcess.postMessage`); `pendingCodeMapResolve` is what
+// turns the subprocess's eventual `graphService:codeMap`/
+// `graphService:codeMapError` reply back into the `ipcMain.handle` Promise
+// the renderer is awaiting. `pendingCodeMapPromise` is handed to a second
+// overlapping caller (e.g. a fast double-click on Retry) so it shares the
+// one in-flight result instead of getting an immediate, spurious "already
+// in progress" failure (review finding).
+let pendingCodeMapResolve: ((result: CodeMapResult) => void) | null = null;
+let pendingCodeMapPromise: Promise<CodeMapResult> | null = null;
+
+// A pure backstop, slightly exceeding `fetchCodeMap`'s own internal timeout
+// (mcp-client.ts's `DEFAULT_TIMEOUT_MS`, 30 minutes) — for a hang that
+// occurs BEFORE `fetchCodeMap` even starts (a lost `postMessage`, or a bug
+// in the Graph Service's own message routing), which that internal timeout
+// can never catch since it only wraps the MCP call itself. Not expected to
+// fire under normal operation (review finding: without this, such a hang
+// left the renderer's `getCodeMap()` promise unsettled forever, contradicting
+// `requestCodeMap`'s own doc comment that it "rejects nothing... never
+// hanging").
+const CODE_MAP_REQUEST_TIMEOUT_MS = 30 * 60 * 1000 + 10_000;
 
 // ---------------------------------------------------------------------------
 // Graph Service subprocess (AD-1): spawned via `utilityProcess.fork`, never
@@ -62,6 +90,37 @@ function sendGraphServiceStatus(status: GraphServiceStatusMessage): void {
   if (mainWindow && !mainWindow.webContents.isDestroyed()) {
     mainWindow.webContents.send(IpcChannels.graphServiceStatus, status);
   }
+}
+
+/**
+ * True for a `graphService:codeMap`/`graphService:codeMapError` reply —
+ * distinguished from a `GraphServiceStatusMessage` by `type` rather than
+ * `state`, per `ipc-contracts`'s doc comment on `GraphServiceCodeMapMessage`.
+ */
+function isCodeMapMessage(message: unknown): message is GraphServiceCodeMapMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  const type = (message as { type?: unknown }).type;
+  return type === 'graphService:codeMap' || type === 'graphService:codeMapError';
+}
+
+/**
+ * Settles the currently pending `codeMap:get` request (if any) with an
+ * explicit error result — used both when the subprocess itself reports
+ * `graphService:codeMapError` and when it exits/crashes with a request
+ * still outstanding. Without the latter, a Graph Service crash mid-fetch
+ * would leave the renderer's `getCodeMap()` promise hanging forever instead
+ * of surfacing the matrix's required "explicit error/retry state."
+ */
+function settlePendingCodeMapRequest(result: CodeMapResult): void {
+  const resolve = pendingCodeMapResolve;
+  if (!resolve) {
+    return;
+  }
+  pendingCodeMapResolve = null;
+  pendingCodeMapPromise = null;
+  resolve(result);
 }
 
 function spawnGraphService(): void {
@@ -86,12 +145,28 @@ function spawnGraphService(): void {
     return;
   }
 
-  graphService.on('message', (message: GraphServiceStatusMessage) => {
+  graphService.on('message', (message: GraphServiceStatusMessage | GraphServiceCodeMapMessage) => {
+    if (isCodeMapMessage(message)) {
+      settlePendingCodeMapRequest(
+        message.type === 'graphService:codeMap'
+          ? { status: 'ok', nodes: message.nodes, edges: message.edges }
+          : { status: 'error', message: message.message },
+      );
+      return;
+    }
     sendGraphServiceStatus(message);
   });
 
   graphService.on('exit', (code: number) => {
     graphService = null;
+    // A request still outstanding when the subprocess exits will never get
+    // its reply now — settle it as an explicit failure rather than leaving
+    // the renderer's `getCodeMap()` promise hanging (matrix: "Map data
+    // fetch fails").
+    settlePendingCodeMapRequest({
+      status: 'error',
+      message: 'Graph Service exited before the Code Map could be fetched.',
+    });
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -122,6 +197,182 @@ function sendIndexRequest(projectPath: string): void {
     type: 'graphService:index',
     path: projectPath,
   } satisfies GraphServiceIndexRequest);
+}
+
+/**
+ * Relays a Code Map fetch to the Graph Service subprocess (Story 1.3) and
+ * resolves once it replies. `utilityProcess.postMessage` has no built-in
+ * request/response correlation, so `pendingCodeMapResolve` is what bridges
+ * the fire-and-forget subprocess message to this Promise — settled by
+ * whichever comes first: the 'message' handler above (a genuine reply),
+ * the 'exit' handler (the subprocess died first), or `CODE_MAP_REQUEST_
+ * TIMEOUT_MS` firing (a hang with no reply and no exit).
+ *
+ * Rejects nothing: every failure path (no subprocess running, the
+ * subprocess's own error reply, it exiting mid-fetch, `postMessage` itself
+ * throwing, or the request timing out) resolves to `{status: 'error', ...}`
+ * — the matrix's "explicit error state... never blank/crash" applies here
+ * exactly like the index flow.
+ *
+ * An overlapping call (e.g. a fast double-click on Retry) shares the one
+ * in-flight `pendingCodeMapPromise` rather than getting an immediate,
+ * spurious "already in progress" failure — both callers see the same
+ * eventual result.
+ */
+function requestCodeMap(): Promise<CodeMapResult> {
+  if (pendingCodeMapPromise) {
+    return pendingCodeMapPromise;
+  }
+  if (!graphService) {
+    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+  }
+  const service = graphService;
+
+  const promise = new Promise<CodeMapResult>((resolve) => {
+    pendingCodeMapResolve = resolve;
+  });
+  // Assigned before the postMessage attempt below (and before the timeout
+  // is armed) so a synchronous settle from either one can safely null this
+  // back out without a subsequent assignment resurrecting an
+  // already-resolved stale promise.
+  pendingCodeMapPromise = promise;
+
+  const timeoutTimer = setTimeout(() => {
+    settlePendingCodeMapRequest({
+      status: 'error',
+      message: 'Timed out waiting for the Graph Service to respond with the Code Map.',
+    });
+  }, CODE_MAP_REQUEST_TIMEOUT_MS);
+  void promise.finally(() => clearTimeout(timeoutTimer));
+
+  try {
+    service.postMessage({
+      type: 'graphService:getCodeMap',
+    } satisfies GraphServiceGetCodeMapRequest);
+  } catch (error) {
+    // A synchronous throw here would otherwise leave pendingCodeMapResolve
+    // set with nothing left to ever call it, leaking the request forever.
+    settlePendingCodeMapRequest({
+      status: 'error',
+      message: `Failed to send the Code Map request to the Graph Service: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
+// One-click-to-source (FR3/FR17 groundwork): a local file read off the
+// user's own disk, resolved under the open project's root — never an MCP
+// call (the Graph Service/backend only ever produced the {file, startLine,
+// endLine} coordinates; reading the bytes back is main's own job).
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves a Node's POSIX-relative `file` (AD-19) to an absolute, OS-native
+ * path under `projectRoot`, and reads back the `[startLine, endLine]` line
+ * range (1-indexed, inclusive) as read-only raw source (Non-Goal: no editing
+ * surface). Line endings are normalized to `\n` for display (see the
+ * `readFile` block below) — this returns the requested lines' *content*
+ * verbatim, not necessarily the source file's original bytes, so a CRLF/CR
+ * file's line terminators are not reproduced byte-for-byte.
+ *
+ * Rejects a path that would resolve outside `projectRoot` — the Graph
+ * Service backend is trusted for graph *content*, but a `file` value
+ * reaching this handler still crosses the same untrusted IPC boundary as
+ * any other renderer-supplied input (main/index.ts's existing
+ * `projectOpenPath` validation is the precedent), so it's checked here
+ * rather than assumed safe. Checked twice: once lexically (cheap, catches
+ * an obvious `../`-escape even for a path that doesn't exist on disk), and
+ * once against the `realpath`-resolved path (review finding: a symlink
+ * *inside* `projectRoot` pointing outside it passes the lexical check alone
+ * — `path.resolve()` never follows symlinks — and `readFile` would then
+ * happily follow it). `projectRoot` itself is resolved the same way before
+ * the second comparison, since a legitimate project root can itself sit
+ * behind a symlinked ancestor (e.g. macOS's `/tmp` -> `/private/tmp`) —
+ * otherwise a perfectly legitimate file would fail containment because only
+ * one side of the comparison got de-symlinked.
+ */
+async function handleReadSourceRange(
+  projectRoot: string,
+  file: string,
+  startLine: number,
+  endLine: number,
+): Promise<ReadSourceRangeResult> {
+  if (
+    typeof file !== 'string' ||
+    file.length === 0 ||
+    !Number.isFinite(startLine) ||
+    !Number.isFinite(endLine) ||
+    startLine < 1 ||
+    endLine < startLine
+  ) {
+    return { status: 'error', message: 'Invalid source range request.' };
+  }
+
+  const absolutePath = path.resolve(projectRoot, file);
+  const rootWithSep = projectRoot.endsWith(path.sep) ? projectRoot : projectRoot + path.sep;
+  if (absolutePath !== projectRoot && !absolutePath.startsWith(rootWithSep)) {
+    return { status: 'error', message: 'Resolved path is outside the project root.' };
+  }
+
+  let realAbsolutePath: string;
+  let realRoot: string;
+  try {
+    [realAbsolutePath, realRoot] = await Promise.all([
+      resolveRealPathIfExists(absolutePath),
+      resolveRealPathIfExists(projectRoot),
+    ]);
+  } catch (error) {
+    // An unexpected realpath failure (e.g. a permission error on an
+    // intermediate directory) — reject explicitly rather than falling
+    // through to a containment check against an unresolved path.
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+  const realRootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+  if (realAbsolutePath !== realRoot && !realAbsolutePath.startsWith(realRootWithSep)) {
+    return { status: 'error', message: 'Resolved path is outside the project root.' };
+  }
+
+  try {
+    const raw = await readFile(realAbsolutePath, 'utf8');
+    const lines = raw.split(/\r\n|\r|\n/);
+    if (lines.length < endLine) {
+      // The file is shorter than the Node's indexed range — it likely
+      // shrank since the last index. Silently clamping and returning
+      // whatever's left would look confident but be wrong (review finding
+      // — the same honesty principle behind Story 1.2's coverage-gap
+      // reporting), so this says so explicitly instead of guessing.
+      return {
+        status: 'error',
+        message: `The file now has only ${lines.length} line(s), fewer than the requested range (${startLine}-${endLine}). It may have changed since the last index — try re-indexing.`,
+      };
+    }
+    const content = lines.slice(startLine - 1, endLine).join('\n');
+    return { status: 'ok', content };
+  } catch (error) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * `fs.promises.realpath`, tolerant of a not-yet-existing path: `readFile`
+ * (the actual consumer, right after the containment check this feeds) will
+ * itself fail with its own clear ENOENT-based error, so there's nothing
+ * useful to resolve here — `candidate` is returned as-is rather than
+ * treating "doesn't exist" as the same kind of failure as a genuine
+ * realpath error (e.g. a permission error on an intermediate directory),
+ * which the caller does still want to know about.
+ */
+async function resolveRealPathIfExists(candidate: string): Promise<string> {
+  try {
+    return await realpath(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return candidate;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -219,6 +470,25 @@ function registerIpcHandlers(): void {
     }
     return { ok: graphService !== null };
   });
+
+  ipcMain.handle(IpcChannels.codeMapGet, (): Promise<CodeMapResult> => requestCodeMap());
+
+  ipcMain.handle(
+    IpcChannels.sourceReadRange,
+    (_event, file: unknown, startLine: unknown, endLine: unknown): Promise<ReadSourceRangeResult> => {
+      // Renderer-supplied values cross the contextBridge boundary untyped at
+      // runtime (same precedent as `projectOpenPath` above) — validated here
+      // before touching the filesystem, and again inside
+      // `handleReadSourceRange` for the numeric range itself.
+      if (!currentProjectPath) {
+        return Promise.resolve({ status: 'error', message: 'No project is open.' });
+      }
+      if (typeof file !== 'string' || typeof startLine !== 'number' || typeof endLine !== 'number') {
+        return Promise.resolve({ status: 'error', message: 'Invalid source range request.' });
+      }
+      return handleReadSourceRange(currentProjectPath, file, startLine, endLine);
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------

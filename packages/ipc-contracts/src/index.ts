@@ -237,6 +237,91 @@ export interface GraphServiceIndexRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Story 1.3 (Phase 1): the Code Map (FR3/FR4).
+//
+// A map "Node" is a Function/Interface/Type/Module-labeled graph entity only
+// (EXPERIENCE.md's "function/method/module name" atomic map unit) — never a
+// raw Variable/Section/File/Folder/Project scaffolding entity. Edges are
+// CALLS/IMPORTS/USAGE call/dependency edges only — never DEFINES/CONTAINS_*
+// containment edges. See mcp-client.ts's `fetchCodeMap` for the exact Cypher
+// this is sourced from.
+//
+// `file`/`startLine`/`endLine` follow AD-19: `file` is POSIX-relative to the
+// project root, never absolute/OS-native. `startLine`/`endLine` are always
+// `number` here even though the live backend's `query_graph` returns them as
+// numeric-looking strings — `mcp-client.ts` parses them before this shape is
+// ever constructed, so nothing downstream (this contract included) ever
+// re-does that parsing or forgets it.
+// ---------------------------------------------------------------------------
+
+/** The map-eligible Node labels (Design Notes — a judgment call, not fixed by the backend's schema). */
+export type CodeMapNodeKind = 'Function' | 'Interface' | 'Type' | 'Module';
+
+/** The call/dependency edge kinds rendered on the Code Map (FR4) — never a containment edge. */
+export type CodeMapEdgeKind = 'CALLS' | 'IMPORTS' | 'USAGE';
+
+export interface CodeMapNode {
+  /** `qualified_name` — stable node identity, shown verbatim/monospace (Always: no summary content yet). */
+  id: string;
+  /** `name` — the bare identifier, verbatim from source. */
+  name: string;
+  /** POSIX-relative path to the file this Node is defined in (AD-19). */
+  file: string;
+  startLine: number;
+  endLine: number;
+  kind: CodeMapNodeKind;
+}
+
+export interface CodeMapEdge {
+  /** Source Node's `id` (`qualified_name`). */
+  source: string;
+  /** Target Node's `id` (`qualified_name`). */
+  target: string;
+  kind: CodeMapEdgeKind;
+}
+
+/**
+ * Result of fetching the Code Map — an explicit result state (AD-13's
+ * broader pattern), never null/undefined standing in for "fetch failed."
+ * The empty-map case (zero map-eligible nodes) is still `status: 'ok'` with
+ * an empty `nodes` array; the renderer is what turns that into the explicit
+ * empty-map state (Always: never a blank canvas) — it isn't a distinct wire
+ * state, since the backend genuinely has nothing more to say.
+ */
+export type CodeMapResult =
+  | { status: 'ok'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
+  | { status: 'error'; message: string };
+
+/**
+ * Result of reading a Node's raw source range off disk (FR3/FR17
+ * groundwork) — read-only, no editing surface (Non-Goal).
+ */
+export type ReadSourceRangeResult =
+  | { status: 'ok'; content: string }
+  | { status: 'error'; message: string };
+
+/**
+ * Message main sends to ask the Graph Service subprocess for the Code Map
+ * of the most recently `indexed` project. Carries no path/params — the
+ * Graph Service already knows which project it most recently finished
+ * indexing (mirrors `graphService:index`'s per-project correlation without
+ * repeating the path over this channel).
+ */
+export interface GraphServiceGetCodeMapRequest {
+  type: 'graphService:getCodeMap';
+}
+
+/**
+ * Message the Graph Service subprocess posts back in response to a
+ * `GraphServiceGetCodeMapRequest`, over the same `parentPort` channel as
+ * `GraphServiceStatusMessage` — distinguished from those by `type` rather
+ * than `state` so main can route the two without ambiguity.
+ */
+export type GraphServiceCodeMapMessage =
+  | { type: 'graphService:codeMap'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
+  | { type: 'graphService:codeMapError'; message: string };
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -246,6 +331,8 @@ export const IpcChannels = {
   projectListRecent: 'project:listRecent',
   graphServiceStatus: 'graphService:status',
   graphServiceRestart: 'graphService:restart',
+  codeMapGet: 'codeMap:get',
+  sourceReadRange: 'source:readRange',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -268,4 +355,20 @@ export interface DrillerApi {
   onGraphServiceStatus: (
     callback: (status: GraphServiceStatusMessage) => void,
   ) => () => void;
+  /**
+   * Fetches the Code Map (Nodes + call/dependency edges) for the most
+   * recently `indexed` project. Called once per successful `indexed` state
+   * — never re-fetched on every render.
+   */
+  getCodeMap: () => Promise<CodeMapResult>;
+  /**
+   * Reads a Node's exact source line range off disk, read-only (FR3/FR17
+   * groundwork) — `file` is the Node's POSIX-relative path (AD-19),
+   * `startLine`/`endLine` are 1-indexed and inclusive.
+   */
+  readSourceRange: (
+    file: string,
+    startLine: number,
+    endLine: number,
+  ) => Promise<ReadSourceRangeResult>;
 }

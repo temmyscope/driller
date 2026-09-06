@@ -10,9 +10,11 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import {
   IpcChannels,
+  type CodeMapResult,
   type DrillerApi,
   type GraphServiceStatusMessage,
   type ProjectOpenResult,
+  type ReadSourceRangeResult,
   type RecentProject,
 } from '@driller/ipc-contracts';
 
@@ -37,6 +39,11 @@ const drillerApi: DrillerApi = {
       ipcRenderer.removeListener(IpcChannels.graphServiceStatus, listener);
     };
   },
+
+  getCodeMap: (): Promise<CodeMapResult> => ipcRenderer.invoke(IpcChannels.codeMapGet),
+
+  readSourceRange: (file: string, startLine: number, endLine: number): Promise<ReadSourceRangeResult> =>
+    ipcRenderer.invoke(IpcChannels.sourceReadRange, file, startLine, endLine),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

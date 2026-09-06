@@ -5,6 +5,7 @@ import type {
   ProjectOpenResult,
   RecentProject,
 } from '@driller/ipc-contracts';
+import { CodeMap } from './CodeMap';
 
 type Notice =
   | { kind: 'not-a-git-repo'; path: string }
@@ -143,54 +144,71 @@ export function App() {
 
   const isLoadingRecents = recentProjects === null;
   const hasRecentProjects = (recentProjects?.length ?? 0) > 0;
+  // Once `indexed`, the Code Map replaces the open-folder/Recent Projects
+  // screen as the only landing view (FR3) — never a file-tree/editor-first
+  // view. The status badge stays visible, just demoted to a small
+  // persistent footer rather than the main content (Code Map task list).
+  const isIndexed = graphServiceStatus?.state === 'indexed';
 
   return (
-    <main className="app">
+    <main className={`app${isIndexed ? ' app--map' : ''}`}>
       <header className="app__header">
         <h1 className="app__title">driller</h1>
-        <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
+        {!isIndexed && (
+          <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
+        )}
       </header>
 
-      <section className="open-folder" aria-label="Open a project folder">
-        <button
-          type="button"
-          className="open-folder__button"
-          onClick={handleOpenFolder}
-          disabled={isOpening}
-        >
-          {isOpening ? 'Opening…' : 'Open a folder'}
-        </button>
+      {!isIndexed && (
+        <>
+          <section className="open-folder" aria-label="Open a project folder">
+            <button
+              type="button"
+              className="open-folder__button"
+              onClick={handleOpenFolder}
+              disabled={isOpening}
+            >
+              {isOpening ? 'Opening…' : 'Open a folder'}
+            </button>
 
-        {notice?.kind === 'not-a-git-repo' && (
-          <p className="notice notice--warning" role="status">
-            <code>{notice.path}</code> is not a git repository. Choose another folder.
-          </p>
-        )}
-        {notice?.kind === 'error' && (
-          <p className="notice notice--error" role="alert">
-            {notice.message}
-          </p>
-        )}
-      </section>
+            {notice?.kind === 'not-a-git-repo' && (
+              <p className="notice notice--warning" role="status">
+                <code>{notice.path}</code> is not a git repository. Choose another folder.
+              </p>
+            )}
+            {notice?.kind === 'error' && (
+              <p className="notice notice--error" role="alert">
+                {notice.message}
+              </p>
+            )}
+          </section>
 
-      {!isLoadingRecents && hasRecentProjects && (
-        <section className="recent-projects" aria-label="Recent projects">
-          <h2 className="recent-projects__heading">Recent Projects</h2>
-          <ul className="recent-projects__list">
-            {recentProjects!.map((project) => (
-              <li key={project.path} className="recent-projects__item">
-                <button
-                  type="button"
-                  className="recent-projects__open"
-                  onClick={() => handleOpenRecent(project.path)}
-                  disabled={isOpening}
-                >
-                  <span className="recent-projects__name">{project.name}</span>
-                  <span className="recent-projects__path"><code>{project.path}</code></span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          {!isLoadingRecents && hasRecentProjects && (
+            <section className="recent-projects" aria-label="Recent projects">
+              <h2 className="recent-projects__heading">Recent Projects</h2>
+              <ul className="recent-projects__list">
+                {recentProjects!.map((project) => (
+                  <li key={project.path} className="recent-projects__item">
+                    <button
+                      type="button"
+                      className="recent-projects__open"
+                      onClick={() => handleOpenRecent(project.path)}
+                      disabled={isOpening}
+                    >
+                      <span className="recent-projects__name">{project.name}</span>
+                      <span className="recent-projects__path"><code>{project.path}</code></span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </>
+      )}
+
+      {isIndexed && (
+        <section className="app__map" aria-label="Code Map">
+          <CodeMap />
         </section>
       )}
 

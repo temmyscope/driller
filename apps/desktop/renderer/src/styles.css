@@ -200,3 +200,163 @@ code,
   color: var(--text);
   cursor: pointer;
 }
+
+/*
+ * Story 1.3 (Phase 1): once indexed, the Code Map is the only landing view
+ * (FR3) — the shell drops its narrow centered-column layout in favor of a
+ * full-bleed map, with the status badge demoted to a slim persistent footer
+ * rather than the main content.
+ */
+.app--map {
+  max-width: none;
+  padding: 0;
+  gap: 0;
+}
+
+.app--map .app__header {
+  padding: 0.5rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.app--map .app__title {
+  font-size: 1rem;
+}
+
+.app--map .graph-service-status {
+  margin-top: 0;
+  padding: 0.5rem 1.5rem;
+}
+
+.app__map {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.code-map {
+  position: absolute;
+  inset: 0;
+}
+
+.code-map__notice {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.code-map__notice--error {
+  color: var(--error);
+}
+
+.code-map__notice button {
+  padding: 0.4rem 1rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+/* Every Node shows only its identifier, verbatim and monospace — no
+   summary/signal-strip content yet (Always: this phase's Node is
+   intentionally minimal). */
+.code-map__node {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  min-width: 160px;
+  cursor: pointer;
+}
+
+.code-map__node:hover {
+  border-color: var(--accent);
+}
+
+.code-map__node-kind {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.code-map__node-id {
+  font-size: 0.85rem;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.code-map__edge {
+  stroke: var(--text-muted);
+}
+
+/* No editing surface (Non-Goal): each Node card's Handles exist only for
+   React Flow's own edge-anchoring math (see CodeMap.tsx's doc comment on
+   CodeMapNodeCard) — hidden and non-interactive so they never look or
+   behave like a live, draggable connection point. */
+.code-map__node .react-flow__handle {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.code-map__source-overlay {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, black 50%, transparent);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 10;
+}
+
+.code-map__source-panel {
+  width: min(640px, 90vw);
+  height: 100%;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.code-map__source-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.code-map__source-header button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.code-map__source-error {
+  padding: 1rem;
+  color: var(--error);
+}
+
+.code-map__source-content {
+  margin: 0;
+  padding: 1rem;
+  overflow: auto;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}

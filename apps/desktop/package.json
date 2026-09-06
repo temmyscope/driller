@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@driller/ipc-contracts": "*",
+    "@xyflow/react": "12.11.6",
     "electron-squirrel-startup": "^1.0.1",
     "electron-store": "11.0.2",
     "react": "19.2.8",

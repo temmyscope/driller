@@ -27,10 +27,22 @@
  * call) on both `indexed` and index-attempt `error` posts, and an optional
  * `coverage` summary (sourced entirely from `mcp-client.ts`'s parsing of the
  * backend's own responses) on `indexed`.
+ *
+ * Story 1.3 (Phase 1) adds the Code Map data fetch: on a
+ * `graphService:getCodeMap` request, this module drives `mcp-client.ts`'s
+ * `fetchCodeMap` against the project this Graph Service most recently
+ * finished indexing (`activeProject`, captured off the same `indexed`
+ * result Phase 2 already parses `coverage` from — see `handleIndexRequest`),
+ * and posts back a `graphService:codeMap`/`graphService:codeMapError`
+ * message on the same `parentPort` channel. Fetched once per successful
+ * `indexed` (main calls this after receiving `indexed`, not on every
+ * render) — this module itself does not cache/re-fetch on a timer.
  */
 
 import path from 'node:path';
 import type {
+  GraphServiceCodeMapMessage,
+  GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
   GraphServiceShutdownRequest,
   GraphServiceStatusMessage,
@@ -39,7 +51,7 @@ import type {
 // augmentation (real, present only when forked via `utilityProcess.fork`)
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
-import { indexRepository } from './mcp-client';
+import { fetchCodeMap, indexRepository } from './mcp-client';
 
 // Stays comfortably under main's 2s forced-kill fallback for the Graph
 // Service subprocess (apps/desktop/main/index.ts's teardownGraphService) —
@@ -60,6 +72,18 @@ let activeIndexPath: string | null = null;
 let activeIndexRequest: Promise<void> | null = null;
 let isShuttingDown = false;
 
+// The backend's own project identifier for the most recently *successfully*
+// `indexed` project (Story 1.3) — set only once `handleIndexRequest`'s
+// `indexRepository` call resolves, never speculatively. `fetchCodeMap`
+// (mcp-client.ts) needs this exact identifier, not `activeIndexPath`'s
+// filesystem path — see `IndexRepositoryResult.project`'s doc comment.
+// Deliberately not cleared on a superseded/failed re-index of a different
+// project: a `getCodeMap` request racing a fresh `graphService:index` for
+// project B still resolves against the last project that actually finished
+// (project A) rather than erroring outright, since main only ever calls
+// `getCodeMap` after its own `indexed` status for the project on screen.
+let activeProject: string | undefined;
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -70,11 +94,23 @@ function postStatus(status: GraphServiceStatusMessage): void {
   process.parentPort?.postMessage(status);
 }
 
+function postCodeMapMessage(message: GraphServiceCodeMapMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
 function isShutdownRequest(data: unknown): data is GraphServiceShutdownRequest {
   return (
     typeof data === 'object' &&
     data !== null &&
     (data as { type?: unknown }).type === 'graphService:shutdown'
+  );
+}
+
+function isGetCodeMapRequest(data: unknown): data is GraphServiceGetCodeMapRequest {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (data as { type?: unknown }).type === 'graphService:getCodeMap'
   );
 }
 
@@ -124,12 +160,17 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
   // posts below — never hidden regardless of hardware speed or repo size.
   const startedAt = Date.now();
   try {
-    const { nodes, edges, coverage } = await indexRepository(projectPath);
+    const { nodes, edges, coverage, project } = await indexRepository(projectPath);
     if (activeIndexPath !== projectPath) {
       // A request for a different project superseded this one while it was
       // in flight — this result is stale, discard rather than apply.
       return;
     }
+    // Story 1.3: captured only on a genuinely successful index, so a
+    // superseded/failed attempt (the early return above, and the catch
+    // branch below) never overwrites the last project that actually
+    // finished with `undefined` or a not-yet-indexed path.
+    activeProject = project;
     postStatus({
       state: 'indexed',
       pid: process.pid,
@@ -159,9 +200,42 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
   }
 }
 
+/**
+ * Handles a `graphService:getCodeMap` request (Story 1.3): fetches the Code
+ * Map for `activeProject` (the project this Graph Service most recently
+ * finished indexing) and posts back exactly one `graphService:codeMap` or
+ * `graphService:codeMapError` message. Never throws — every failure path
+ * (no successful index yet, or `fetchCodeMap` itself failing) is reported
+ * as `graphService:codeMapError` so main's pending request always settles
+ * (matrix: "Map data fetch fails" — an explicit error/retry state, never a
+ * hung request).
+ */
+async function handleGetCodeMapRequest(): Promise<void> {
+  if (activeProject === undefined) {
+    postCodeMapMessage({
+      type: 'graphService:codeMapError',
+      message: 'No project has finished indexing yet.',
+    });
+    return;
+  }
+  try {
+    const { nodes, edges } = await fetchCodeMap(activeProject);
+    postCodeMapMessage({ type: 'graphService:codeMap', nodes, edges });
+  } catch (error) {
+    postCodeMapMessage({
+      type: 'graphService:codeMapError',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 process.parentPort?.on('message', (event) => {
   if (isShutdownRequest(event.data)) {
     shutdown();
+    return;
+  }
+  if (!isShuttingDown && isGetCodeMapRequest(event.data)) {
+    void handleGetCodeMapRequest();
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {
