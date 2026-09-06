@@ -25,6 +25,7 @@ import started from 'electron-squirrel-startup';
 import {
   IpcChannels,
   type GitDetectionResult,
+  type GraphServiceIndexRequest,
   type GraphServiceStatusMessage,
   type ProjectOpenResult,
 } from '@driller/ipc-contracts';
@@ -42,6 +43,11 @@ let graphService: UtilityProcess | null = null;
 // (app quit, or a future explicit stop) so its 'exit' handler can tell a
 // requested shutdown apart from a real crash.
 let isGraphServiceShuttingDown = false;
+// The most recently confirmed-opened project's path, so a manual Graph
+// Service restart (e.g. after a "codebase-memory-mcp failed to start"
+// error) can re-send the index request without requiring the user to
+// re-pick the folder.
+let currentProjectPath: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Graph Service subprocess (AD-1): spawned via `utilityProcess.fork`, never
@@ -107,6 +113,18 @@ function spawnGraphService(): void {
 }
 
 /**
+ * Sends an index-start request to a running Graph Service subprocess
+ * (Story 1.2, Phase 1). A no-op if the subprocess isn't up — callers only
+ * invoke this once `spawnGraphService()` has run.
+ */
+function sendIndexRequest(projectPath: string): void {
+  graphService?.postMessage({
+    type: 'graphService:index',
+    path: projectPath,
+  } satisfies GraphServiceIndexRequest);
+}
+
+/**
  * Stops the Graph Service subprocess. `onTornDown`, when given, fires once
  * the subprocess has actually exited (either on its own after the shutdown
  * message, or via the 2s fallback kill) — callers that must not proceed
@@ -150,7 +168,9 @@ function resolveOpenedFolder(folderPath: string): ProjectOpenResult {
   }
 
   const project = recordProjectOpened(folderPath);
+  currentProjectPath = project.path;
   spawnGraphService();
+  sendIndexRequest(project.path);
 
   return { status: 'opened', project, git };
 }
@@ -190,6 +210,13 @@ function registerIpcHandlers(): void {
     spawnGraphService();
     // spawnGraphService's fork() + catch above run synchronously, so
     // `graphService` already reflects whether the spawn actually succeeded.
+    if (graphService && currentProjectPath) {
+      // Covers both a fresh respawn (the subprocess itself died) and a
+      // still-alive subprocess whose indexing MCP call errored (spawn's own
+      // guard no-ops in that case) — either way, Retry re-attempts indexing
+      // rather than leaving the project un-indexed with no further signal.
+      sendIndexRequest(currentProjectPath);
+    }
     return { ok: graphService !== null };
   });
 }

@@ -65,26 +65,94 @@ export type ProjectOpenResult =
 // ---------------------------------------------------------------------------
 // Graph Service alive/status handshake (AD-1)
 //
-// This story establishes only the process boundary and this handshake — no
-// indexing messages exist yet (Story 1.2).
+// Story 1.1 established only the process boundary and the alive/exited/error
+// handshake. Story 1.2 (Phase 1) adds 'indexing'/'indexed': the Graph Service
+// connects to the real codebase-memory-mcp backend as an MCP client and
+// reports structural-indexing progress as a status distinct from plain
+// 'alive'. 'indexed' carries raw node/edge counts only — no coverage-gap
+// interpretation (that's Phase 2, and 'indexed' is deliberately a distinct
+// state so a future summary-generation status has room to sit alongside it,
+// per AD-8).
+//
+// This is a proper discriminated union keyed on `state`, not a flat shape
+// with optional fields: a flat shape let a real bug (review round 1) go
+// unnoticed by the type system — 'indexed' could be constructed without
+// `nodes`/`edges`, and nothing correlated a status to the project it was
+// about. `path` on the indexing-attempt states lets a consumer (the Graph
+// Service itself, and the renderer) tell a status about the currently-open
+// project apart from a stale/superseded one for a project the user has
+// since navigated away from — MCP tool calls aren't cleanly cancelable
+// mid-flight, so an overtaken attempt's eventual result must be identified
+// and discarded rather than silently applied.
 // ---------------------------------------------------------------------------
 
-export type GraphServiceState = 'starting' | 'alive' | 'exited' | 'error';
+export type GraphServiceState =
+  | 'starting'
+  | 'alive'
+  | 'indexing'
+  | 'indexed'
+  | 'exited'
+  | 'error';
 
-export interface GraphServiceStatusMessage {
-  state: GraphServiceState;
-  pid?: number;
-  /** ISO-8601 timestamp of when this status was produced. */
-  at: string;
-  /** Present when state is 'error', or 'exited' with a non-zero code. */
-  message?: string;
-  /** Process exit code, present when state is 'exited'. */
-  code?: number | null;
-}
+export type GraphServiceStatusMessage =
+  | { state: 'starting'; pid?: number; at: string }
+  | { state: 'alive'; pid?: number; at: string }
+  | {
+      state: 'indexing';
+      pid?: number;
+      at: string;
+      /** Absolute path of the project this indexing attempt is for. */
+      path: string;
+    }
+  | {
+      state: 'indexed';
+      pid?: number;
+      at: string;
+      /** Absolute path of the project that finished indexing. */
+      path: string;
+      /** Raw node count from the backend — no coverage-gap interpretation. */
+      nodes: number;
+      /** Raw edge count from the backend — no coverage-gap interpretation. */
+      edges: number;
+    }
+  | {
+      state: 'exited';
+      pid?: number;
+      at: string;
+      /** Process exit code. */
+      code: number | null;
+    }
+  | {
+      state: 'error';
+      pid?: number;
+      at: string;
+      message: string;
+      /** Process exit code, present when this error came from an unexpected exit. */
+      code?: number | null;
+      /**
+       * Absolute path of the project this error is about, present when the
+       * error came from a specific index attempt (an MCP-call failure or
+       * timeout). Absent for subprocess-level errors (spawn failure,
+       * unexpected exit) that aren't about any particular in-flight index.
+       */
+      path?: string;
+    };
 
 /** Message main sends to ask the Graph Service subprocess to shut down cleanly. */
 export interface GraphServiceShutdownRequest {
   type: 'graphService:shutdown';
+}
+
+/**
+ * Message main sends to ask the Graph Service subprocess to index a project.
+ * Sent after `spawnGraphService()` on a confirmed git-repo folder open (and,
+ * to retry a failed index without needing a full folder re-pick, on a manual
+ * Graph Service restart while a project is open).
+ */
+export interface GraphServiceIndexRequest {
+  type: 'graphService:index';
+  /** Absolute, OS-native path to the project root to index. */
+  path: string;
 }
 
 // ---------------------------------------------------------------------------

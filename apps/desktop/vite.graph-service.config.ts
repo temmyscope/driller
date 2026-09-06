@@ -15,4 +15,13 @@ export default defineConfig({
       ),
     },
   },
+  build: {
+    rollupOptions: {
+      // mcp-client.ts resolves codebase-memory-mcp's own installed `bin`
+      // entry at runtime via Node's module resolution (require.resolve) to
+      // spawn it directly — that needs the real package on disk, not an
+      // inlined copy of its (large, native-binary-downloading) code.
+      external: ['codebase-memory-mcp'],
+    },
+  },
 });

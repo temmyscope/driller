@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   GraphServiceStatusMessage,
   ProjectOpenResult,
@@ -15,6 +15,16 @@ export function App() {
   const [isOpening, setIsOpening] = useState(false);
   const [graphServiceStatus, setGraphServiceStatus] =
     useState<GraphServiceStatusMessage | null>(null);
+  // The currently-open project's path, so a status correlated to a
+  // different (superseded) project can be told apart from one about the
+  // project actually on screen. Mirrored into a ref because the status
+  // subscription below is registered once (empty deps) and would otherwise
+  // close over a stale value.
+  const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
+  const currentProjectPathRef = useRef<string | null>(null);
+  useEffect(() => {
+    currentProjectPathRef.current = currentProjectPath;
+  }, [currentProjectPath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -36,7 +46,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = window.driller.onGraphServiceStatus(setGraphServiceStatus);
+    const unsubscribe = window.driller.onGraphServiceStatus((status) => {
+      // A status correlated to a project (indexing/indexed/an index-attempt
+      // error) that isn't the one currently open is stale — e.g. a prior
+      // project's attempt resolving after the user has already moved on to
+      // another one. Discard it rather than showing project B's screen
+      // with project A's counts or error (review round 1's concurrency bug).
+      if ('path' in status && status.path !== currentProjectPathRef.current) {
+        return;
+      }
+      setGraphServiceStatus(status);
+    });
     return unsubscribe;
   }, []);
 
@@ -44,6 +64,12 @@ export function App() {
     switch (result.status) {
       case 'opened':
         setNotice(null);
+        // Synchronous, not just via the ref-sync effect below: a status
+        // push for this project (main sends the index-start request as
+        // part of producing this very result) could in principle reach
+        // this window before React has re-rendered and run that effect.
+        currentProjectPathRef.current = result.project.path;
+        setCurrentProjectPath(result.project.path);
         setRecentProjects((current) => {
           const withoutDuplicate = (current ?? []).filter(
             (p) => p.path !== result.project.path,
@@ -89,6 +115,15 @@ export function App() {
   const handleOpenRecent = useCallback(
     async (path: string) => {
       setIsOpening(true);
+      // Set optimistically, synchronously, and before the IPC round-trip:
+      // main sends the graph service its index-start request as part of
+      // handling this same call, and that subprocess's first 'indexing'
+      // push could in principle reach this window before this function's
+      // own `await` resolves. Setting the ref immediately (the known
+      // target path, not just on the eventual 'opened' result) keeps the
+      // status-correlation filter above from discarding that legitimate,
+      // freshly-arrived status as if it belonged to a stale/previous project.
+      currentProjectPathRef.current = path;
       try {
         const result = await window.driller.openRecentProject(path);
         applyOpenResult(result);
@@ -178,12 +213,20 @@ function GraphServiceStatusBadge({ status }: { status: GraphServiceStatusMessage
       return <span className="badge badge--pending">Graph Service starting…</span>;
     case 'alive':
       return <span className="badge badge--ok">Graph Service running</span>;
+    case 'indexing':
+      return <span className="badge badge--pending">Indexing…</span>;
+    case 'indexed':
+      return (
+        <span className="badge badge--ok">
+          Indexed — {status.nodes} nodes, {status.edges} edges
+        </span>
+      );
     case 'exited':
       return <span className="badge badge--muted">Graph Service exited</span>;
     case 'error':
       return (
         <span className="badge badge--error">
-          Graph Service unavailable{status.message ? `: ${status.message}` : ''}
+          Graph Service unavailable: {status.message}
         </span>
       );
   }

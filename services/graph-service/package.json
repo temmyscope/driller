@@ -7,7 +7,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@driller/ipc-contracts": "*"
+    "@driller/ipc-contracts": "*",
+    "@modelcontextprotocol/client": "2.0.0",
+    "codebase-memory-mcp": "^0.10.8"
   },
   "devDependencies": {
     "electron": "43.6.0",
