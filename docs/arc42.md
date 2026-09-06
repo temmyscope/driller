@@ -117,7 +117,7 @@ driller/
 | FR13 Whole-Repo Audit View | `apps/desktop/renderer` | AD-2, AD-14 |
 | FR14/15 Agent Query + Parity | `services/graph-service` (Agent-Facing Query Surface) | AD-10, AD-13 |
 | FR16 Staleness Indicator | `services/graph-service` (computation), `apps/desktop/renderer` (display) | AD-7 |
-| FR17 Source One-Click-Away | `apps/desktop/renderer`, via `apps/desktop/preload` | AD-11, source-location convention (§8) |
+| FR17 Source One-Click-Away | `apps/desktop/renderer`, via `apps/desktop/preload` | AD-11, AD-23, source-location convention (§8) |
 
 *All Code Map interactions (FR3, FR4, FR12, FR13) are additionally governed by AD-14's performance budget.*
 
@@ -153,6 +153,8 @@ Single-machine, single-process-tree deployment: one Electron app packaged and di
 **Explicit result states, everywhere.** Every Graph Service operation (Node lookup, Path Trace, Blast Radius, diff-scoped Node-set, coverage-check) returns an explicit enumerated result-state field — `null`/`undefined`/empty-array must never stand in implicitly for "nothing here" (AD-13). This is what lets `backend-degraded`, `no-path-found`, `not-a-git-repo`, etc. be rendered honestly instead of as ambiguous empty states, on both the human UI and the agent-facing surface (NFR4).
 
 **Security baseline (AD-11).** Every `BrowserWindow` sets `contextIsolation: true` and `nodeIntegration: false`, no exceptions, with the sandbox enabled wherever compatible with required native functionality. Renderer code reaches main/Graph Service exclusively through a typed `contextBridge` preload API.
+
+**External editor hand-off (AD-23).** `[Added 2026-09-06]` A Node's source-location data can additionally launch the Supervising Engineer's own editor at the exact line, alongside FR17's existing in-app view. Invoked from main only via a new typed IPC channel — renderer never calls `shell.openExternal` directly, the same AD-11 boundary applied to a new case. Main resolves the stored POSIX-relative, project-root-relative path to an absolute, OS-native path and validates/escapes it before it reaches a URI or subprocess argument. The editor preference is a required, always-populated Settings field defaulting to `system-default`; only a named editor (`vscode`, `jetbrains`) deep-links to the exact line via its own registered URI scheme, since a generic OS file-open cannot. An unresolvable handler surfaces as an explicit failure state, never a silent no-op.
 
 **Agent-Facing Query Surface hardening (AD-10).** Beyond binding to `127.0.0.1` and validating `Origin`, the server also validates the `Host` header on every request as an independent second layer — Origin-only validation alone is vulnerable to DNS-rebinding (the CVE-2025-49596 threat class), so the two checks are defense-in-depth, not redundant.
 
@@ -196,6 +198,7 @@ Full rationale, "prevents" framing, and binding scope for each decision lives in
 | AD-20 | Node record is additive/merge-write per signal family; structural re-index never clears summary/LLM-judgment/ingested fields. |
 | AD-21 | No crash reporting or telemetry in v1; diagnostic logging is local-only. |
 | AD-22 | Releases via `@electron-forge/publisher-github` + `update-electron-app`; macOS/Windows code-signed; no Linux auto-update path. |
+| AD-23 | `[Added 2026-09-06]` External editor hand-off (FR17/Story 1.10): invoked from main only via a new IPC channel, resolved/escaped path, editor preference defaults to `system-default` (no line-jump), named editors (`vscode`/`jetbrains`) deep-link to the exact line. |
 
 ### Stack
 

@@ -92,7 +92,7 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 
 ### 4.9 Trust indicators
 - **FR16 — Staleness Indicator.** Flags an AI-generated summary stale when the underlying source has changed since generation. Checked on every index refresh; visually distinct in the UI and flagged in the agent-facing response; regeneration is user-triggered, never automatic.
-- **FR17 — Source One-Click-Away.** Every summary and every Risk Overlay signal links directly to the exact source range it describes, opening in-app in one action.
+- **FR17 — Source One-Click-Away.** Every summary and every Risk Overlay signal links directly to the exact source range it describes, opening in-app in one action. From that in-app view, the Supervising Engineer can additionally open the same range in their configured external editor (Story 1.10, [arc42.md AD-23](arc42.md#9-architecture-decisions)) — a hand-off to an external tool, never in-app editing.
 
 ## 5. Non-Functional Requirements
 

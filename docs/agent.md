@@ -22,6 +22,7 @@ These are architecture decisions (AD-N in [arc42.md §9](arc42.md#9-architecture
 - **Every Node/signal source-location field is `{file, startLine, endLine}` with `file` POSIX-separator and project-root-relative.** Never an absolute path, never an OS-native separator. Normalize at the producer, not at the point of use.
 - **The full Node set never renders as live rich DOM simultaneously.** Use the shared LOD/virtualization module (`apps/desktop/renderer/map/lod/`) rather than a per-mode reimplementation; a cluster/aggregate ID is renderer-local and must never flow into a Graph Service call. (AD-2)
 - **The Agent-Facing Query Surface binds to `127.0.0.1` only and validates both `Origin` and `Host` on every request.** Never `0.0.0.0`; the two header checks are independent defense-in-depth (Origin-only validation alone is vulnerable to DNS-rebinding), not redundant — don't drop one because the other passed. (AD-10)
+- **Never launch an external editor or OS-level URI handler from the renderer.** Route it through a typed IPC call to main, which resolves the Node's source-location path to absolute/OS-native and validates/escapes it before building any URI or subprocess argument. (AD-23)
 
 ## Repo layout quick reference
 
@@ -47,7 +48,7 @@ Full rationale for this layout: [arc42.md §5](arc42.md#5-building-block-view). 
 
 ## Current build status
 
-driller is early: Epic 1 ("Open a Project and Explore Its Code Map") is in progress; only Story 1.1 (scaffold + open-a-local-project) exists in code so far. Don't assume any FR beyond what Story 1.1 covers (FR1's folder-open/git-detection/recent-projects flow) is implemented yet — check `_bmad-output/implementation-artifacts/sprint-status.yaml` for the current story-by-story status before assuming a feature exists, and `_bmad-output/implementation-artifacts/` for the per-story spec driving in-flight work.
+driller is early: Epic 1 ("Open a Project and Explore Its Code Map") is in progress. Story-by-story status moves independently of this file — always check `_bmad-output/implementation-artifacts/sprint-status.yaml` for what's actually `done`/`review`/`in-progress`/`backlog` before assuming a feature exists, rather than trusting a specific story number written here. `_bmad-output/implementation-artifacts/` holds the per-story spec driving whatever is currently in flight.
 
 `packages/graph-contracts` and the Graph Service's real query surface are intentionally unimplemented placeholders right now (see the package's own source comment) — that's expected, not a gap to silently fill in ahead of its story.
 
