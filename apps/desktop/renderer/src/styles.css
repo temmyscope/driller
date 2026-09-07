@@ -202,6 +202,31 @@ code,
 }
 
 /*
+ * Story 1.5 (Phase 1): the local-model download/verify status (AD-18) — a
+ * small, persistent indicator separate from `.graph-service-status`, since
+ * the two run in parallel and either can fail independently of the other.
+ * Deliberately mirrors `.graph-service-status`'s layout rather than sharing
+ * its class, so the two footers stack as two distinct rows instead of one
+ * merged line that would conflate indexing and model-readiness at a glance.
+ */
+.model-status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.model-status__retry {
+  padding: 0.25rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+/*
  * Story 1.3 (Phase 1): once indexed, the Code Map is the only landing view
  * (FR3) — the shell drops its narrow centered-column layout in favor of a
  * full-bleed map, with the status badge demoted to a slim persistent footer
@@ -225,6 +250,10 @@ code,
 .app--map .graph-service-status {
   margin-top: 0;
   padding: 0.5rem 1.5rem;
+}
+
+.app--map .model-status {
+  padding: 0 1.5rem 0.5rem;
 }
 
 .app__map {

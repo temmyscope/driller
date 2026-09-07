@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   GraphServiceStatusMessage,
   IndexCoverageSummary,
+  ModelStatusMessage,
   ProjectOpenResult,
   RecentProject,
 } from '@driller/ipc-contracts';
@@ -17,6 +18,12 @@ export function App() {
   const [isOpening, setIsOpening] = useState(false);
   const [graphServiceStatus, setGraphServiceStatus] =
     useState<GraphServiceStatusMessage | null>(null);
+  // The local-model download/verify status (Story 1.5 Phase 1, AD-18) — a
+  // separate stream from graphServiceStatus (the two run in parallel and
+  // either can fail independently), so it isn't project-path-correlated the
+  // way graphServiceStatus is: there's exactly one local model per
+  // installation, not one per project.
+  const [modelStatus, setModelStatus] = useState<ModelStatusMessage | null>(null);
   // The currently-open project's path, so a status correlated to a
   // different (superseded) project can be told apart from one about the
   // project actually on screen. Mirrored into a ref because the status
@@ -58,6 +65,13 @@ export function App() {
         return;
       }
       setGraphServiceStatus(status);
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = window.driller.onModelStatus((status) => {
+      setModelStatus(status);
     });
     return unsubscribe;
   }, []);
@@ -222,6 +236,24 @@ export function App() {
           )}
         </footer>
       )}
+
+      {modelStatus && (
+        <footer className="model-status" role="status">
+          <ModelStatusBadge status={modelStatus} />
+          {modelStatus.state === 'error' && (
+            // Reuses the Graph Service's own restart flow rather than a
+            // bespoke retry channel (Code Map — this story adds no new IPC
+            // request beyond onModelStatus): restarting respawns the Graph
+            // Service subprocess and re-sends graphService:index for the
+            // current project, which re-triggers ensureLocalModel() in the
+            // fresh process (a failed attempt is never silently
+            // auto-retried within the same process — see model-manager.ts).
+            <button type="button" className="model-status__retry" onClick={handleRetryGraphService}>
+              Retry
+            </button>
+          )}
+        </footer>
+      )}
     </main>
   );
 }
@@ -368,5 +400,74 @@ function GraphServiceStatusBadge({ status }: { status: GraphServiceStatusMessage
           {status.elapsedMs !== undefined && <> (after {formatElapsedMs(status.elapsedMs)})</>}
         </span>
       );
+  }
+}
+
+/**
+ * "512 B" / "512.0 MB" / "1.2 GB" — bytes formatted for the model-download
+ * progress text. Renders raw bytes below the 1KB threshold (review finding:
+ * a sub-1KB value — plausible right as a download connection opens, before
+ * any real progress has landed — used to render as a misleading "0 KB"
+ * rather than something that reads sensibly at that size).
+ */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return '—';
+  }
+  if (bytes < 1024) {
+    return `${Math.round(bytes)} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(0)} KB`;
+  }
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/**
+ * Story 1.5 Phase 1's small, persistent local-model status indicator
+ * (Design Notes / Code Map: text only, no Node-card rendering yet — this
+ * phase's model-ready signal has no consumer beyond this badge). Mirrors
+ * `GraphServiceStatusBadge`'s shape but is otherwise fully independent —
+ * the two statuses run in parallel and are never conflated.
+ *
+ * Accessibility balance (review finding, matching `GraphServiceStatusBadge`'s
+ * ticking elapsed-time indicator): the meaningful state transitions
+ * (downloading → verifying → ready/error) are plain text, direct children of
+ * this badge — never wrapped in `aria-live="off"` — so they're announced by
+ * the enclosing `<footer role="status">` (an implicit `aria-live="polite"`
+ * region) exactly once per transition, the same as any other status text.
+ * Only the fast-changing byte-counter detail is suppressed, and is nested in
+ * its *own* `aria-live="off"` span (with `aria-atomic="false"` alongside it,
+ * belt-and-suspenders against a `role="status"` ancestor's implicit
+ * `aria-atomic="true"` otherwise re-reading this nested span's every tick as
+ * part of the ancestor's own atomic announcement) — never suppressing the
+ * badge's own state-transition text itself.
+ */
+function ModelStatusBadge({ status }: { status: ModelStatusMessage }) {
+  switch (status.state) {
+    case 'downloading': {
+      const percent =
+        status.totalBytes > 0
+          ? Math.min(100, Math.round((status.downloadedBytes / status.totalBytes) * 100))
+          : undefined;
+      return (
+        <span className="badge badge--pending">
+          Downloading model…{' '}
+          <span aria-live="off" aria-atomic="false">
+            ({formatBytes(status.downloadedBytes)} / {formatBytes(status.totalBytes)}
+            {percent !== undefined && <> · {percent}%</>})
+          </span>
+        </span>
+      );
+    }
+    case 'verifying':
+      return <span className="badge badge--pending">Verifying model…</span>;
+    case 'ready':
+      return <span className="badge badge--ok">Model ready</span>;
+    case 'error':
+      return <span className="badge badge--error">Model unavailable: {status.message}</span>;
   }
 }

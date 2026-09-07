@@ -13,6 +13,7 @@ import {
   type CodeMapResult,
   type DrillerApi,
   type GraphServiceStatusMessage,
+  type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
@@ -37,6 +38,14 @@ const drillerApi: DrillerApi = {
     ipcRenderer.on(IpcChannels.graphServiceStatus, listener);
     return () => {
       ipcRenderer.removeListener(IpcChannels.graphServiceStatus, listener);
+    };
+  },
+
+  onModelStatus: (callback: (status: ModelStatusMessage) => void) => {
+    const listener = (_event: IpcRendererEvent, status: ModelStatusMessage) => callback(status);
+    ipcRenderer.on(IpcChannels.modelStatus, listener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.modelStatus, listener);
     };
   },
 

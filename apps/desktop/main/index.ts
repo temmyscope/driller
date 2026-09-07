@@ -31,6 +31,7 @@ import {
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
   type GraphServiceStatusMessage,
+  type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
 } from '@driller/ipc-contracts';
@@ -93,6 +94,19 @@ function sendGraphServiceStatus(status: GraphServiceStatusMessage): void {
 }
 
 /**
+ * Relays a local-model download/verify status (Story 1.5 Phase 1, AD-18) to
+ * the renderer — same destroyed-webContents guard as
+ * `sendGraphServiceStatus`, and deliberately a separate channel/stream from
+ * it (see `ModelStatusMessage`'s doc comment) since the two run in parallel
+ * and either can fail independently of the other.
+ */
+function sendModelStatus(status: ModelStatusMessage): void {
+  if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(IpcChannels.modelStatus, status);
+  }
+}
+
+/**
  * True for a `graphService:codeMap`/`graphService:codeMapError` reply —
  * distinguished from a `GraphServiceStatusMessage` by `type` rather than
  * `state`, per `ipc-contracts`'s doc comment on `GraphServiceCodeMapMessage`.
@@ -103,6 +117,18 @@ function isCodeMapMessage(message: unknown): message is GraphServiceCodeMapMessa
   }
   const type = (message as { type?: unknown }).type;
   return type === 'graphService:codeMap' || type === 'graphService:codeMapError';
+}
+
+/**
+ * True for a `graphService:modelStatus` post — distinguished from a
+ * `GraphServiceStatusMessage` by `type` the same way `isCodeMapMessage` is,
+ * since both status unions use overlapping `state` values (e.g. `'error'`).
+ */
+function isModelStatusMessage(message: unknown): message is ModelStatusMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:modelStatus';
 }
 
 /**
@@ -132,7 +158,16 @@ function spawnGraphService(): void {
   const modulePath = path.join(__dirname, 'graph-service.js');
 
   try {
-    graphService = utilityProcess.fork(modulePath, [], {
+    // The Graph Service subprocess has no runtime access to Electron's
+    // `app` module (only `process.parentPort` is real inside a
+    // `utilityProcess.fork`ed script) — `app.getPath('userData')` is
+    // resolved here, on the main-process side, and passed as the
+    // subprocess's first fork argument (`process.argv[2]`, mirroring
+    // `child_process.fork`'s own argv convention) so the Node record store
+    // and the local-model download/verify machinery (Story 1.5 Phase 1,
+    // AD-18/AD-19/AD-20) can persist under the same userData root main
+    // itself uses.
+    graphService = utilityProcess.fork(modulePath, [app.getPath('userData')], {
       serviceName: 'driller-graph-service',
     });
   } catch (error) {
@@ -145,17 +180,24 @@ function spawnGraphService(): void {
     return;
   }
 
-  graphService.on('message', (message: GraphServiceStatusMessage | GraphServiceCodeMapMessage) => {
-    if (isCodeMapMessage(message)) {
-      settlePendingCodeMapRequest(
-        message.type === 'graphService:codeMap'
-          ? { status: 'ok', nodes: message.nodes, edges: message.edges }
-          : { status: 'error', message: message.message },
-      );
-      return;
-    }
-    sendGraphServiceStatus(message);
-  });
+  graphService.on(
+    'message',
+    (message: GraphServiceStatusMessage | GraphServiceCodeMapMessage | ModelStatusMessage) => {
+      if (isCodeMapMessage(message)) {
+        settlePendingCodeMapRequest(
+          message.type === 'graphService:codeMap'
+            ? { status: 'ok', nodes: message.nodes, edges: message.edges }
+            : { status: 'error', message: message.message },
+        );
+        return;
+      }
+      if (isModelStatusMessage(message)) {
+        sendModelStatus(message);
+        return;
+      }
+      sendGraphServiceStatus(message);
+    },
+  );
 
   graphService.on('exit', (code: number) => {
     graphService = null;

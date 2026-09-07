@@ -322,6 +322,64 @@ export type GraphServiceCodeMapMessage =
   | { type: 'graphService:codeMapError'; message: string };
 
 // ---------------------------------------------------------------------------
+// Story 1.5 (Phase 1): local-model download/verify status (AD-18).
+//
+// A message stream distinct from `GraphServiceStatusMessage` even though
+// `error` appears in both unions — the two are disambiguated by `type`
+// (`'graphService:modelStatus'` here), the same convention
+// `GraphServiceCodeMapMessage` already established, rather than by `state`
+// alone (which collides). Posted by the Graph Service subprocess starting
+// alongside `graphService:index` (kicked off in parallel with
+// `indexRepository`, never sequentially after it — the pre-mortem finding
+// this story's Intent calls out), independent of indexing's own status:
+// a model failure never blocks/derails an indexing result, and vice versa.
+//
+// This phase's model-ready signal has no consumer yet beyond a small status
+// indicator (Never: no summary generation, no Node-card rendering) — Story
+// 1.5 Phase 2 is what actually consumes a `ready` state to start generating.
+// ---------------------------------------------------------------------------
+
+export type ModelStatusMessage =
+  | {
+      type: 'graphService:modelStatus';
+      state: 'downloading';
+      at: string;
+      /** Bytes downloaded so far, per `node-llama-cpp`'s downloader progress. */
+      downloadedBytes: number;
+      /** Total expected bytes for the model file being downloaded. */
+      totalBytes: number;
+    }
+  | {
+      type: 'graphService:modelStatus';
+      state: 'verifying';
+      at: string;
+    }
+  | {
+      type: 'graphService:modelStatus';
+      state: 'ready';
+      at: string;
+      /** The verified model's filename (e.g. the GGUF tier that was downloaded). */
+      model: string;
+    }
+  | {
+      type: 'graphService:modelStatus';
+      state: 'error';
+      at: string;
+      /**
+       * Explicit, actionable failure text (a metadata-fetch failure, a
+       * download failure, or a checksum mismatch) — never a silently
+       * partial model (AD-18). The renderer's retry affordance reuses the
+       * existing `restartGraphService` flow (same pattern as a
+       * `GraphServiceStatusMessage` error), which respawns the subprocess
+       * and re-sends `graphService:index` for the current project — that
+       * re-triggers `ensureLocalModel()` in a fresh process, since a failed
+       * attempt is not silently auto-retried within the same process
+       * (matrix: "Retry affordance", not automatic retry).
+       */
+      message: string;
+    };
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -333,6 +391,7 @@ export const IpcChannels = {
   graphServiceRestart: 'graphService:restart',
   codeMapGet: 'codeMap:get',
   sourceReadRange: 'source:readRange',
+  modelStatus: 'model:status',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -355,6 +414,13 @@ export interface DrillerApi {
   onGraphServiceStatus: (
     callback: (status: GraphServiceStatusMessage) => void,
   ) => () => void;
+  /**
+   * Subscribes to the local-model download/verify status stream (Story 1.5
+   * Phase 1, AD-18) — a separate signal from `onGraphServiceStatus`'s
+   * indexing status, since the two run in parallel and either can fail
+   * independently of the other. Returns an unsubscribe function.
+   */
+  onModelStatus: (callback: (status: ModelStatusMessage) => void) => () => void;
   /**
    * Fetches the Code Map (Nodes + call/dependency edges) for the most
    * recently `indexed` project. Called once per successful `indexed` state
