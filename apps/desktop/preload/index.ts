@@ -17,6 +17,7 @@ import {
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
+  type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 
 const drillerApi: DrillerApi = {
@@ -46,6 +47,14 @@ const drillerApi: DrillerApi = {
     ipcRenderer.on(IpcChannels.modelStatus, listener);
     return () => {
       ipcRenderer.removeListener(IpcChannels.modelStatus, listener);
+    };
+  },
+
+  onSummaryProgress: (callback: (message: SummaryProgressMessage) => void) => {
+    const listener = (_event: IpcRendererEvent, message: SummaryProgressMessage) => callback(message);
+    ipcRenderer.on(IpcChannels.summaryProgress, listener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.summaryProgress, listener);
     };
   },
 

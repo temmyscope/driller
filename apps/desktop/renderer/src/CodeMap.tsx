@@ -10,10 +10,20 @@
  * `onlyRenderVisibleElements` adds `@xyflow/react`'s own viewport culling.
  * A dev-only synthetic fixture (`devFixture.ts`, `?fixtureNodes=N`) is how
  * this was validated at 10,000-Node scale (epics AC) without a shipped
- * feature or new IPC surface. Every Node still shows only its identifier,
- * verbatim and monospace (Always) — no summary/signal-strip content
- * (Stories 1.5-1.9). Never a BI/analytics-dashboard treatment (UX-DR3): no
- * stat tiles, no data-viz divorced from the map's own structure.
+ * feature or new IPC surface. Every Node's identifier is always shown
+ * verbatim and monospace (Always) — never affected by summary state.
+ *
+ * Story 1.5 (Phase 2) adds the one-line summary itself: each Node card
+ * additionally renders its `summaryStatus` — a real generated summary when
+ * `'ready'`, a lightweight "Summary pending…" state while generation hasn't
+ * reached it yet, or a distinct coverage-gap indicator when the Node's file
+ * is in the current index's coverage gap set (FR5) — never a
+ * confident-looking placeholder standing in for a summary that doesn't
+ * exist. Batched `graphService:summaryProgress` events (AD-8) patch the
+ * already-rendered node set's `summaryStatus`/`summary` in place; they never
+ * trigger a full remap/refetch. Never a BI/analytics-dashboard treatment
+ * (UX-DR3): no stat tiles, no data-viz divorced from the map's own
+ * structure.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -358,9 +368,11 @@ function resolveEdgeClickTarget(edge: { source: string; target: string }, focuse
 }
 
 /**
- * The custom Node component: identifier verbatim, monospace — nothing else
- * (Always). `tabIndex`/`role="button"`/`onKeyDown` give one-click-to-source
- * a keyboard path (Enter/Space) alongside the mouse click `<ReactFlow>`'s
+ * The custom Node component: identifier verbatim, monospace (Always),
+ * plus its one-line summary/pending/coverage-gap state (Story 1.5 Phase 2 —
+ * see this file's module doc comment). `tabIndex`/`role="button"`/
+ * `onKeyDown` give one-click-to-source a keyboard path (Enter/Space)
+ * alongside the mouse click `<ReactFlow>`'s
  * own `onNodeClick` already handles — the product's stated Accessibility
  * Floor requires map traversal to have one, and this was mouse-only before
  * (review finding).
@@ -398,6 +410,27 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
       <Handle type="target" position={Position.Left} />
       <span className="code-map__node-kind">{node.kind}</span>
       <code className="code-map__node-id">{node.name}</code>
+      {/* Story 1.5 Phase 2: one-line summary / pending / coverage-gap — a
+          Node's file being in the current index's coverage gap set (FR5)
+          is a real, distinct signal from an ordinary "not generated yet"
+          state, so it gets its own icon+text indicator rather than looking
+          like a summary that just hasn't arrived (Boundaries &
+          Constraints: "never a confident-looking placeholder", and the
+          product's Accessibility Floor: "signal/trust states never
+          color-only"). */}
+      {node.summaryStatus === 'ready' && node.summary !== undefined && (
+        <p className="code-map__node-summary">{node.summary}</p>
+      )}
+      {node.summaryStatus === 'pending' && (
+        <p className="code-map__node-summary code-map__node-summary--pending" role="status">
+          Summary pending…
+        </p>
+      )}
+      {node.summaryStatus === 'coverage-gap' && (
+        <p className="code-map__node-summary code-map__node-summary--coverage-gap">
+          <span aria-hidden="true">⚠</span> Coverage gap — no summary
+        </p>
+      )}
       {/* Caller/callee affordances (Story 1.4): a lightweight alternative to
           precisely clicking a thin edge line — hidden/inert entirely (not
           just visually) when the count is 0, per this story's Code Map
@@ -548,7 +581,20 @@ function recordFrameDelta(perf: NonNullable<DrillerDevPerfWindow['__drillerPerf'
   perf.frameDeltaCount = Math.min(perf.frameDeltaCount + 1, MAX_RECORDED_FRAME_DELTAS);
 }
 
-export function CodeMap() {
+export interface CodeMapProps {
+  /**
+   * Absolute, OS-native path of the currently-open project (review finding,
+   * Medium) — used only to filter incoming `graphService:summaryProgress`
+   * messages by `message.path`, mirroring the `currentProjectPathRef`-style
+   * correlation pattern `App.tsx` already applies to
+   * `GraphServiceStatusMessage` (Story 1.2/1.4): a progress message for a
+   * project the user has since navigated away from is dropped rather than
+   * patching a Node id that may not even belong to the map on screen.
+   */
+  projectPath: string | null;
+}
+
+export function CodeMap({ projectPath }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
   // Correlates a `readSourceRange` response back to the click that started
@@ -684,6 +730,50 @@ export function CodeMap() {
   useEffect(() => {
     loadCodeMap();
   }, [loadCodeMap]);
+
+  // Story 1.5 Phase 2: incoming batched summary-generation progress patches
+  // the already-rendered node set in place — never a full remap/refetch
+  // (Code Map: "patch the already-rendered node set in place"), so the map
+  // stays exactly where the user left it (viewport, expanded clusters,
+  // selection) while summaries fill in around them. A `Map` lookup (built
+  // fresh per event, `updated` batches are small — see
+  // `PROGRESS_FLUSH_BATCH_SIZE` in summary-generator.ts) is cheap next to
+  // re-running `layoutNodes`/`computeLOD` on every batch.
+  useEffect(() => {
+    const unsubscribe = window.driller.onSummaryProgress((message) => {
+      // Structural correlation (review finding, Medium) — see `CodeMapProps.
+      // projectPath`'s doc comment. Previously relied entirely on the
+      // backend never sending a stale message; this is a defensive filter
+      // on the renderer side too.
+      if (message.path !== projectPath) {
+        return;
+      }
+      const updatesById = new Map(message.updated.map((update) => [update.id, update.summary]));
+      if (updatesById.size === 0) {
+        return;
+      }
+      setFetchState((previous) => {
+        if (previous.status !== 'ready') {
+          // The map isn't showing this fetch's Nodes (yet, or anymore) —
+          // nothing to patch. A same-session late arrival for a since-
+          // discarded map is simply dropped, matching the same
+          // stale-response handling `openSourceForNode` already applies.
+          return previous;
+        }
+        let changed = false;
+        const nodes = previous.nodes.map((node) => {
+          const summary = updatesById.get(node.id);
+          if (summary === undefined) {
+            return node;
+          }
+          changed = true;
+          return { ...node, summaryStatus: 'ready' as const, summary };
+        });
+        return changed ? { ...previous, nodes } : previous;
+      });
+    });
+    return unsubscribe;
+  }, [projectPath]);
 
   const openSourceForNode = useCallback((node: CodeMapNode) => {
     const requestId = ++sourceRequestIdRef.current;

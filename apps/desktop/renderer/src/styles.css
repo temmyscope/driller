@@ -339,6 +339,35 @@ code,
   text-overflow: ellipsis;
 }
 
+/* Story 1.5 (Phase 2): one-line summary / pending / coverage-gap. Plain
+   prose (not monospace) — distinguishes generated/derived text from the
+   verbatim-from-source identifier above it. Clamped to two lines so a long
+   summary doesn't blow out the card's compact layout at a glance. */
+.code-map__node-summary {
+  margin: 0.15rem 0 0;
+  font-size: 0.75rem;
+  line-height: 1.3;
+  color: var(--text-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.code-map__node-summary--pending {
+  font-style: italic;
+}
+
+/* Never color-only (Accessibility Floor): the "⚠" glyph and "Coverage gap"
+   text carry the signal on their own — the warning color is reinforcement,
+   not the only cue. Distinct from `.code-map__node-summary--pending`'s
+   plain muted italic so a coverage gap never reads as "just not generated
+   yet". */
+.code-map__node-summary--coverage-gap {
+  color: var(--warning);
+  font-style: normal;
+}
+
 .code-map__edge {
   stroke: var(--text-muted);
   cursor: pointer;

@@ -596,7 +596,14 @@ function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNode | undefin
     return undefined;
   }
 
-  return { id, name, file, startLine, endLine, kind: kind as CodeMapNodeKind };
+  // `summaryStatus` is a placeholder here (Story 1.5 Phase 2) — this module
+  // only ever sources structural graph data from the backend, which has no
+  // concept of summaries. `index.ts`'s `handleGetCodeMapRequest` always
+  // re-derives the real per-Node status (coverage-gap/ready/pending) from
+  // the coverage-gap set and the Node record store before this ever reaches
+  // main/the renderer — see `annotateNodesWithSummaryState` in
+  // `summary-generator.ts`.
+  return { id, name, file, startLine, endLine, kind: kind as CodeMapNodeKind, summaryStatus: 'pending' };
 }
 
 function parseCodeMapEdgeRow(row: Record<string, string>): CodeMapEdge | undefined {

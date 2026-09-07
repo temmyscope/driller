@@ -61,25 +61,46 @@
  *    attempt is not silently auto-retried — the renderer's retry affordance
  *    reuses `restartGraphService`, which respawns this subprocess (fresh
  *    module state) and re-sends the index request.
+ *
+ * Story 1.5 (Phase 2) adds the actual generation pipeline on top of both
+ * pieces of Phase 1 foundation: once a `graphService:getCodeMap` response is
+ * ready (never before — the Code Map must stay browsable while generation
+ * runs, AD-8), this module annotates every Node with its current
+ * `summaryStatus`/`summary` (`summary-generator.ts`'s
+ * `annotateNodesWithSummaryState`, sourced from the coverage-gap set
+ * captured off the same successful `indexRepository` call Phase 2 already
+ * parses `coverage` from, and the Node record store) and kicks off
+ * `generateSummaries` in the background, relaying its batched progress as
+ * `graphService:summaryProgress` posts. `activeSummaryGenerationId` gives a
+ * later `graphService:index` request (a different project, or a re-index)
+ * a way to invalidate a still-running generation tied to a now-stale
+ * project/index state — without it, a slow generation run's eventual
+ * `mergeNodeRecord` writes could land against `node-record-store.ts`'s
+ * `records` after `setActiveProject` has already swapped it to a different
+ * project (the same concurrency/correlation bug class that module's own doc
+ * comment flags as already fixed twice elsewhere in this build).
  */
 
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  CodeMapNode,
   GraphServiceCodeMapMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
   GraphServiceShutdownRequest,
   GraphServiceStatusMessage,
   ModelStatusMessage,
+  SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 // Type-only import: pulls in Electron's ambient `process.parentPort`
 // augmentation (real, present only when forked via `utilityProcess.fork`)
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
-import { ensureLocalModel } from './model-manager';
+import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { fetchCodeMap, indexRepository } from './mcp-client';
 import { flushNodeRecordStore, initNodeRecordStore, setActiveProject } from './node-record-store';
+import { annotateNodesWithSummaryState, disposeModelContext, generateSummaries } from './summary-generator';
 
 // Stays comfortably under main's 2s forced-kill fallback for the Graph
 // Service subprocess (apps/desktop/main/index.ts's teardownGraphService) —
@@ -111,6 +132,60 @@ let isShuttingDown = false;
 // (project A) rather than erroring outright, since main only ever calls
 // `getCodeMap` after its own `indexed` status for the project on screen.
 let activeProject: string | undefined;
+
+// The filesystem path paired with `activeProject` (Story 1.5 Phase 2) — set
+// together, on the same successful-index branch, for the same reason
+// `activeProject` itself is never cleared on a superseded/failed re-index.
+// `summary-generator.ts` needs the real absolute path to read source off
+// disk (AD-16); `activeProject` is the backend's own opaque identifier, not
+// a filesystem path.
+let activeProjectPath: string | undefined;
+
+// The current index's coverage-gap files (FR5), as POSIX-relative paths
+// matching `CodeMapNode.file`'s own format — the backend's `index_status`
+// reports `GapFile.path` as an absolute path (see ipc-contracts's doc
+// comment on it), so `handleIndexRequest`'s success branch below converts
+// each one via `toProjectRelativePosixPath` before storing it here. Set
+// alongside `activeProject`/`activeProjectPath`, same never-cleared-on-
+// failure reasoning.
+let coverageGapFileSet: ReadonlySet<string> = new Set();
+
+// The verified local model (Story 1.5 Phase 1's `ensureLocalModel` result),
+// captured once `modelAttempt` (below) resolves — `summary-generator.ts`
+// needs the model's file path/name, not just the fact that it's "ready"
+// (which is all `postModelStatus`'s posted message carries).
+let localModelReady: LocalModelReady | undefined;
+
+// Invalidates a still-running `generateSummaries` call tied to a now-stale
+// project/index state (Story 1.5 Phase 2) — bumped at the very start of
+// `handleIndexRequest`, the same point `activeIndexPath` itself is
+// reassigned, so a new index attempt (a different project, or a re-index of
+// the same one) immediately supersedes any in-flight generation from
+// before it. Without this, a slow generation run's eventual
+// `mergeNodeRecord`/progress-post could land after `setActiveProject` has
+// already swapped `node-record-store.ts`'s module state to a different
+// project (see that module's own doc comment on this exact bug class).
+let activeSummaryGenerationId = 0;
+
+// The `activeSummaryGenerationId` a `generateSummaries` run is currently in
+// flight for, or `null` when none is (review finding, High). Unlike
+// `graphService:index`'s own sibling handler (which explicitly ignores a
+// repeat request for an already-`activeIndexPath` project),
+// `graphService:getCodeMap` had no equivalent guard: two overlapping
+// requests for the same project (a fast double Retry click, or the
+// renderer's mount effect re-firing) both pass `isSuperseded()` (nothing
+// bumped `activeSummaryGenerationId` between them) and would each call
+// `startSummaryGenerationForProject`, each spinning up its own
+// `generateSummaries()` run against the exact same shared, memoized model
+// sequence/`LlamaChatSession` concurrently — not just doubled work, but
+// concurrent access to the underlying native llama.cpp binding the
+// concurrency-1 `p-queue` design specifically exists to prevent. Set
+// synchronously at the very top of `startSummaryGenerationForProject`,
+// before that function's first `await` — Node is single-threaded, so a
+// second overlapping call's own synchronous prologue can only run after
+// the first one yields at its first await point, guaranteeing it observes
+// this flag already set.
+let activeGenerationRunId: number | null = null;
 
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
@@ -155,6 +230,15 @@ function postModelStatus(status: ModelStatusMessage): void {
 }
 
 /**
+ * Relays batched summary-generation progress (Story 1.5 Phase 2, AD-8) — own
+ * `type`/channel, same disambiguation convention as `postCodeMapMessage`/
+ * `postModelStatus`.
+ */
+function postSummaryProgress(message: SummaryProgressMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/**
  * Kicks off `ensureLocalModel()`, translating its progress callbacks and
  * eventual resolve/throw into `graphService:modelStatus` posts (mirroring
  * how `handleIndexRequest` turns `indexRepository`'s return/throw into
@@ -194,6 +278,9 @@ function kickOffModelDownload(): void {
     },
   })
     .then((result) => {
+      // Captured for `summary-generator.ts` (Phase 2), which needs the
+      // model's real file path/name, not just this posted 'ready' signal.
+      localModelReady = result;
       postModelStatus({
         type: 'graphService:modelStatus',
         state: 'ready',
@@ -268,12 +355,26 @@ async function finishShutdown(): Promise<void> {
   // the debounce window rather than surviving to the next launch. Cheap
   // local JSON I/O; not worth racing against SHUTDOWN_GRACE_MS.
   await flushNodeRecordStore();
+  // Disposes the loaded local model/context if generation ever actually ran
+  // this session (review finding, Medium — previously never disposed,
+  // leaking the native llama.cpp resources rather than releasing them on a
+  // clean subprocess shutdown). Best-effort/never throws — see
+  // `disposeModelContext`'s own doc comment; not worth racing against
+  // SHUTDOWN_GRACE_MS either, same reasoning as the record-store flush.
+  await disposeModelContext();
   postStatus({ state: 'exited', pid: process.pid, at: now(), code: 0 });
   process.exit(0);
 }
 
 async function handleIndexRequest(projectPath: string): Promise<void> {
   activeIndexPath = projectPath;
+  // Story 1.5 Phase 2: a new index attempt (a different project, or a
+  // re-index of the same one) immediately invalidates any summary
+  // generation still running from a previous index/getCodeMap cycle — see
+  // `activeSummaryGenerationId`'s own doc comment for why this must happen
+  // here, not only once a later `getCodeMap` request actually restarts
+  // generation.
+  activeSummaryGenerationId += 1;
   // Visible within ~5s of folder selection (NFR1, AD-15): posted immediately,
   // before the potentially long-running backend call below.
   postStatus({ state: 'indexing', pid: process.pid, at: now(), path: projectPath });
@@ -309,6 +410,13 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
     // branch below) never overwrites the last project that actually
     // finished with `undefined` or a not-yet-indexed path.
     activeProject = project;
+    // Story 1.5 Phase 2: captured alongside `activeProject`, same
+    // never-on-failure reasoning — `activeProjectPath` is what
+    // `summary-generator.ts` reads source off disk relative to.
+    activeProjectPath = projectPath;
+    coverageGapFileSet = new Set(
+      (coverage?.gapPaths ?? []).map((gap) => toProjectRelativePosixPath(projectPath, gap.path)),
+    );
     postStatus({
       state: 'indexed',
       pid: process.pid,
@@ -347,6 +455,13 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
  * as `graphService:codeMapError` so main's pending request always settles
  * (matrix: "Map data fetch fails" — an explicit error/retry state, never a
  * hung request).
+ *
+ * Story 1.5 Phase 2: on success, every Node is annotated with its current
+ * `summaryStatus`/`summary` before the response is posted (Code Map:
+ * "populated at `getCodeMap` fetch time"), and `generateSummaries` is kicked
+ * off in the background afterward — never awaited here, so it can never
+ * delay this response (AD-8: the Code Map stays browsable while generation
+ * runs).
  */
 async function handleGetCodeMapRequest(): Promise<void> {
   if (activeProject === undefined) {
@@ -358,13 +473,157 @@ async function handleGetCodeMapRequest(): Promise<void> {
   }
   try {
     const { nodes, edges } = await fetchCodeMap(activeProject);
-    postCodeMapMessage({ type: 'graphService:codeMap', nodes, edges });
+    const annotatedNodes = annotateNodesWithSummaryState(nodes, coverageGapFileSet);
+    postCodeMapMessage({ type: 'graphService:codeMap', nodes: annotatedNodes, edges });
+    void startSummaryGenerationForProject(annotatedNodes);
   } catch (error) {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
       message: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/**
+ * Kicks off `generateSummaries` for the Nodes just posted in a
+ * `graphService:codeMap` response (Story 1.5 Phase 2), relaying its batched
+ * progress as `graphService:summaryProgress` posts. Fire-and-forget from the
+ * caller's perspective (`handleGetCodeMapRequest` never awaits this).
+ *
+ * Waits for the local-model download/verify (kicked off alongside indexing,
+ * Story 1.5 Phase 1) to settle before generation can start — reads the
+ * current `modelAttempt` at the moment this function runs, not a value
+ * captured earlier, so a since-failed-and-reset attempt (see
+ * `kickOffModelDownload`'s doc comment) is correctly treated as "no model
+ * available" rather than awaiting a stale reference forever.
+ *
+ * `generationId` snapshots `activeSummaryGenerationId` at the moment this
+ * run starts; every check against the live module variable below (both here
+ * and inside `generateSummaries` via `isSuperseded`) is what lets a later
+ * `graphService:index` request — for this same project or a different one —
+ * cleanly invalidate this run without it corrupting `node-record-store.ts`'s
+ * now-switched-away state (see that variable's own doc comment).
+ *
+ * Guarded by `activeGenerationRunId` (review finding, High — see that
+ * variable's own doc comment): two overlapping calls for the same
+ * `generationId` (a fast double Retry click, or the renderer's mount effect
+ * re-firing a `graphService:getCodeMap` request) must never both reach
+ * `generateSummaries`, since both would drive the same shared, memoized
+ * model sequence concurrently. The second call returns immediately; only
+ * the first proceeds.
+ */
+async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<void> {
+  const generationId = activeSummaryGenerationId;
+  const projectRoot = activeProjectPath;
+  const gapFiles = coverageGapFileSet;
+
+  if (activeGenerationRunId === generationId) {
+    // Already generating for this exact index generation — see
+    // `activeGenerationRunId`'s doc comment. Not an error/superseded case
+    // (this project's generation is legitimately still in flight), just a
+    // redundant second trigger that must not start a second run.
+    return;
+  }
+  activeGenerationRunId = generationId;
+
+  try {
+    if (modelAttempt) {
+      try {
+        await modelAttempt;
+      } catch {
+        // Already reported via `graphService:modelStatus` 'error' — nothing
+        // more to do; there is no model to generate with this session.
+        return;
+      }
+    }
+    if (generationId !== activeSummaryGenerationId || !localModelReady || !projectRoot) {
+      return;
+    }
+
+    await generateSummaries({
+      projectRoot,
+      nodes,
+      coverageGapFiles: gapFiles,
+      model: localModelReady,
+      onProgress: (updated) => {
+        if (generationId === activeSummaryGenerationId) {
+          // `path` lets the renderer filter stale progress by the currently-
+          // open project (review finding, Medium) — see
+          // `SummaryProgressMessage`'s own doc comment in ipc-contracts.
+          postSummaryProgress({ type: 'graphService:summaryProgress', path: projectRoot, updated });
+        }
+      },
+      isSuperseded: () => generationId !== activeSummaryGenerationId,
+    });
+  } catch (error) {
+    console.error(
+      `[graph-service] summary generation failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    // Only clears this run's own slot — a later, genuinely new generation
+    // (a different `generationId`, already holding its own value here by
+    // the time this `finally` runs) must never have its slot clobbered by
+    // an earlier, now-finishing run's cleanup.
+    if (activeGenerationRunId === generationId) {
+      activeGenerationRunId = null;
+    }
+  }
+}
+
+/**
+ * Converts a gap-file path (`GapFile.path`, as `index_status` reports it)
+ * into the same POSIX-relative-to-project-root format `CodeMapNode.file`
+ * already uses (AD-19), so `coverageGapFileSet` membership can be checked
+ * with a plain `Set.has(node.file)` rather than re-resolving paths on every
+ * Node.
+ *
+ * Handles both shapes defensively rather than trusting ipc-contracts's
+ * `GapFile.path` doc comment ("Absolute path...") at face value: live
+ * verification against the real backend (this phase's own verification
+ * pass) found `index_status` actually reporting a bare relative path (e.g.
+ * `"broken.js"`, matching `CodeMapNode.file` directly) for at least this
+ * backend build/invocation shape — `path.relative(projectRoot, "broken.js")`
+ * on an already-relative second argument silently resolves it against
+ * `process.cwd()` instead, producing a garbage path that never matches any
+ * real Node's `file` and letting an ineligible Node's file slip through the
+ * gap filter to generate a confident-looking summary anyway (a real,
+ * live-caught bug — see this spec's Verification section for the concrete
+ * before/after). Only an actually-absolute `gap.path` is resolved relative
+ * to `projectRoot`; an already-relative one is used as-is (after separator
+ * normalization), so this is correct regardless of which shape a given
+ * backend build/response reports.
+ *
+ * Two review-finding hardenings (Low ×2) on top of that live-verified fix:
+ *  - The resolved-absolute branch's result is checked for actually landing
+ *    inside `projectRoot` (never starting with `..`, never itself absolute
+ *    — the latter possible on Windows when `gapPath` names a different
+ *    drive). A path that escapes silently never matches any Node's `file`
+ *    either way, but previously left no diagnostic trail explaining why —
+ *    logged now so a genuine backend anomaly here is traceable instead of
+ *    looking identical to "no coverage gap for this Node."
+ *  - Separator normalization (`split`+`join` to POSIX `/`) is applied via a
+ *    regex matching either `/` or `\`, not `path.sep` — `path.sep` is this
+ *    *process's* own OS separator (`/` on macOS/Linux), so splitting on it
+ *    alone left a literal `\` untouched on a POSIX host even though it was
+ *    already being applied to both branches. A backend reporting a
+ *    Windows-style `\`-separated relative path (the already-relative
+ *    branch) or a resolved-absolute path that happens to retain a `\`
+ *    would otherwise silently fail to match `CodeMapNode.file`'s POSIX
+ *    format regardless of which branch produced it.
+ */
+function toProjectRelativePosixPath(projectRoot: string, gapPath: string): string {
+  let relative: string;
+  if (path.isAbsolute(gapPath)) {
+    relative = path.relative(projectRoot, gapPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      console.warn(
+        `[graph-service] coverage gap path "${gapPath}" resolved outside the project root "${projectRoot}" (got "${relative}"); this gap file will not match any Node and its Node(s) will be treated as eligible rather than coverage-gapped.`,
+      );
+    }
+  } else {
+    relative = gapPath;
+  }
+  return relative.split(/[\\/]+/).join('/');
 }
 
 process.parentPort?.on('message', (event) => {

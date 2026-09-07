@@ -52,6 +52,35 @@ function pick<T>(values: readonly T[], index: number): T {
   return value;
 }
 
+/**
+ * Deterministically assigns a realistic mix of `summaryStatus` (review
+ * finding, Low — Story 1.5 Phase 2) rather than a fixed `'pending'` for
+ * every synthetic Node: this fixture is the one dev tool built to validate
+ * rendering at 10,000-Node scale, and a hardcoded single status meant it
+ * never actually exercised the `'ready'` (real summary text + the
+ * `.code-map__node-summary` CSS line-clamp) or `'coverage-gap'` (icon+text
+ * indicator) rendering paths at scale — only `'pending'`. The exact ratios
+ * aren't meaningful, just plausible and deterministic (seeded by `index`,
+ * not `Math.random()`, matching this whole fixture's own reproducibility
+ * requirement): roughly 1-in-7 coverage-gap, half of the remainder ready,
+ * the rest pending.
+ */
+function pickSummaryState(index: number): { summaryStatus: CodeMapNode['summaryStatus']; summary?: string } {
+  if (index % 7 === 0) {
+    return { summaryStatus: 'coverage-gap' };
+  }
+  if (index % 2 === 0) {
+    return {
+      summaryStatus: 'ready',
+      // Deliberately long enough to exercise the two-line CSS clamp
+      // (`.code-map__node-summary`'s `-webkit-line-clamp: 2`) at scale, not
+      // just a short placeholder that always fits on one line.
+      summary: `Synthetic summary for node ${index}: a deterministic, plain-language placeholder sentence long enough to wrap across two lines in the Node card, exercising the real summary rendering and clamp styling at fixture scale.`,
+    };
+  }
+  return { summaryStatus: 'pending' };
+}
+
 export interface SyntheticCodeMap {
   nodes: CodeMapNode[];
   edges: CodeMapEdge[];
@@ -78,6 +107,12 @@ export function generateSyntheticCodeMap(nodeCount: number, edgeFanout: number):
       startLine: line,
       endLine: line + 4,
       kind: pick(NODE_KINDS, index),
+      // Story 1.5 Phase 2: never real generation (no fake Node record store
+      // wired into this dev-only path) — but a deterministic mix of all
+      // three states, not a fixed 'pending', so scale-testing actually
+      // covers the real/ready and coverage-gap rendering paths too (review
+      // finding, Low — see `pickSummaryState`).
+      ...pickSummaryState(index),
     });
   }
 

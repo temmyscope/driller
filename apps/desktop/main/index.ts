@@ -34,6 +34,7 @@ import {
   type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
+  type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 import { detectGitRepo } from './git-detect';
 import { listRecentProjects, recordProjectOpened } from './settings';
@@ -107,6 +108,17 @@ function sendModelStatus(status: ModelStatusMessage): void {
 }
 
 /**
+ * Relays batched summary-generation progress (Story 1.5 Phase 2, AD-8) to
+ * the renderer — same destroyed-webContents guard and same "own channel,
+ * distinguished by `type`" pattern as `sendModelStatus`.
+ */
+function sendSummaryProgress(message: SummaryProgressMessage): void {
+  if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(IpcChannels.summaryProgress, message);
+  }
+}
+
+/**
  * True for a `graphService:codeMap`/`graphService:codeMapError` reply —
  * distinguished from a `GraphServiceStatusMessage` by `type` rather than
  * `state`, per `ipc-contracts`'s doc comment on `GraphServiceCodeMapMessage`.
@@ -129,6 +141,18 @@ function isModelStatusMessage(message: unknown): message is ModelStatusMessage {
     return false;
   }
   return (message as { type?: unknown }).type === 'graphService:modelStatus';
+}
+
+/**
+ * True for a `graphService:summaryProgress` post — distinguished from the
+ * other message shapes on this same `parentPort` channel by `type`, same
+ * convention as `isCodeMapMessage`/`isModelStatusMessage`.
+ */
+function isSummaryProgressMessage(message: unknown): message is SummaryProgressMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:summaryProgress';
 }
 
 /**
@@ -182,7 +206,13 @@ function spawnGraphService(): void {
 
   graphService.on(
     'message',
-    (message: GraphServiceStatusMessage | GraphServiceCodeMapMessage | ModelStatusMessage) => {
+    (
+      message:
+        | GraphServiceStatusMessage
+        | GraphServiceCodeMapMessage
+        | ModelStatusMessage
+        | SummaryProgressMessage,
+    ) => {
       if (isCodeMapMessage(message)) {
         settlePendingCodeMapRequest(
           message.type === 'graphService:codeMap'
@@ -193,6 +223,10 @@ function spawnGraphService(): void {
       }
       if (isModelStatusMessage(message)) {
         sendModelStatus(message);
+        return;
+      }
+      if (isSummaryProgressMessage(message)) {
+        sendSummaryProgress(message);
         return;
       }
       sendGraphServiceStatus(message);

@@ -222,7 +222,14 @@ export function App() {
 
       {isIndexed && (
         <section className="app__map" aria-label="Code Map">
-          <CodeMap />
+          {/* `projectPath` (review finding, Medium) lets CodeMap reject a
+              stale `graphService:summaryProgress` message for a project the
+              user has since navigated away from — reliably non-null here:
+              `isIndexed` only becomes true once an `indexed` status has
+              already passed this component's own `currentProjectPathRef`
+              correlation filter above, by which point `currentProjectPath`
+              already reflects that same project. */}
+          <CodeMap projectPath={currentProjectPath} />
         </section>
       )}
 

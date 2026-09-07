@@ -124,7 +124,16 @@ export type GraphServiceState =
  * `string[]`.
  */
 export interface GapFile {
-  /** Absolute path of the gap file, as reported by `index_status`. */
+  /**
+   * The gap file's path exactly as `index_status` reported it. Documented
+   * here as "absolute" when this shape was first introduced, but Story 1.5
+   * Phase 2's live verification against the real backend found it actually
+   * reporting a bare project-relative path (e.g. `"broken.js"`, matching
+   * `CodeMapNode.file`'s own format directly) for at least one real
+   * build/invocation shape — never trust this field's absoluteness without
+   * checking `path.isAbsolute()` first (see `toProjectRelativePosixPath` in
+   * `services/graph-service/index.ts`, this contract's one real consumer).
+   */
   path: string;
   /** Which kind of coverage gap this file is. */
   kind: 'skipped' | 'parse_partial';
@@ -260,6 +269,20 @@ export type CodeMapNodeKind = 'Function' | 'Interface' | 'Type' | 'Module';
 /** The call/dependency edge kinds rendered on the Code Map (FR4) — never a containment edge. */
 export type CodeMapEdgeKind = 'CALLS' | 'IMPORTS' | 'USAGE';
 
+/**
+ * A Node's summary-generation state (Story 1.5 Phase 2):
+ *  - 'pending': eligible for generation (resolvable source, no coverage
+ *    gap) but generation hasn't completed for it yet — renders a
+ *    lightweight "summary pending" state, never a confident-looking
+ *    placeholder.
+ *  - 'ready': `summary` carries the generated one-line plain-language text.
+ *  - 'coverage-gap': this Node's file is in the current index's coverage
+ *    gap set (FR5) — ineligible for generation entirely; renders a real,
+ *    distinct coverage-gap indicator (icon+text, never color-only), never a
+ *    summary.
+ */
+export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
+
 export interface CodeMapNode {
   /** `qualified_name` — stable node identity, shown verbatim/monospace (Always: no summary content yet). */
   id: string;
@@ -270,6 +293,14 @@ export interface CodeMapNode {
   startLine: number;
   endLine: number;
   kind: CodeMapNodeKind;
+  /**
+   * Populated at `getCodeMap` fetch time from the Node record store's
+   * current state (Story 1.5 Phase 2) — never null/undefined standing in
+   * for "not generated yet" (AD-13's broader explicit-result-state pattern).
+   */
+  summaryStatus: SummaryStatus;
+  /** The generated one-line plain-language summary — present only when `summaryStatus === 'ready'`. */
+  summary?: string;
 }
 
 export interface CodeMapEdge {
@@ -380,6 +411,44 @@ export type ModelStatusMessage =
     };
 
 // ---------------------------------------------------------------------------
+// Story 1.5 (Phase 2): summary-generation progress (AD-8).
+//
+// A message stream distinct from both `GraphServiceStatusMessage` and
+// `ModelStatusMessage` (own `type`, same disambiguation convention) —
+// structural-indexing-complete and summary-generation progress are two
+// distinct signals per AD-8: the Code Map stays browsable via the existing
+// `getCodeMap` response while generation continues in the background.
+// Posted batched (every ~1s or N completions, whichever first) rather than
+// one message per Node (Always/AD-8) — `updated` carries however many Nodes
+// completed generation since the last batch.
+//
+// `path` (review finding, Medium) is the generation run's project — the
+// same absolute, OS-native path shape `RecentProject.path`/`ProjectOpenResult
+// ['opened'].project.path` already use — carried so the renderer has a
+// structural way to reject stale progress for a project it's since
+// navigated away from, mirroring the `currentProjectPathRef`-style
+// correlation pattern `App.tsx` already applies to `GraphServiceStatusMessage`
+// (Story 1.2/1.4): without it, a progress message racing a project switch
+// relied entirely on the backend never sending one late, rather than the
+// renderer being able to defensively filter by the project actually on
+// screen.
+// ---------------------------------------------------------------------------
+
+export interface SummaryProgressUpdate {
+  /** The completed Node's `id` (`qualified_name`). */
+  id: string;
+  /** The generated one-line plain-language summary. */
+  summary: string;
+}
+
+export interface SummaryProgressMessage {
+  type: 'graphService:summaryProgress';
+  /** Absolute, OS-native path of the project this progress batch is for. */
+  path: string;
+  updated: SummaryProgressUpdate[];
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -392,6 +461,7 @@ export const IpcChannels = {
   codeMapGet: 'codeMap:get',
   sourceReadRange: 'source:readRange',
   modelStatus: 'model:status',
+  summaryProgress: 'summary:progress',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -421,6 +491,13 @@ export interface DrillerApi {
    * independently of the other. Returns an unsubscribe function.
    */
   onModelStatus: (callback: (status: ModelStatusMessage) => void) => () => void;
+  /**
+   * Subscribes to batched summary-generation progress (Story 1.5 Phase 2,
+   * AD-8) — a stream distinct from both `onGraphServiceStatus` and
+   * `onModelStatus`, since generation runs in the background after the Code
+   * Map is already showing. Returns an unsubscribe function.
+   */
+  onSummaryProgress: (callback: (message: SummaryProgressMessage) => void) => () => void;
   /**
    * Fetches the Code Map (Nodes + call/dependency edges) for the most
    * recently `indexed` project. Called once per successful `indexed` state
