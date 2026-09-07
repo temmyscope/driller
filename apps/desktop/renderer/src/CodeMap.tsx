@@ -24,6 +24,7 @@ import {
   Position,
   ReactFlow,
   type Edge as FlowEdge,
+  type EdgeMouseHandler,
   type Node as FlowNode,
   type NodeMouseHandler,
   type NodeProps,
@@ -32,7 +33,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type { CodeMapEdge, CodeMapNode } from '@driller/ipc-contracts';
-import { computeLOD, type Cluster } from '../map/lod';
+import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
 
 type FetchState =
   | { status: 'loading' }
@@ -137,6 +138,107 @@ const PAN_QUANTIZE_RATIO = 0.25;
 // rather than growing without bound.
 const MAX_EXPANDED_CLUSTER_IDS = 500;
 
+// Defensive cap on the Back/Forward `history.stack` (review finding, same
+// spirit as `MAX_EXPANDED_CLUSTER_IDS` above) — unlike that Set, unbounded
+// growth here isn't self-trimming on any natural event, so a very long
+// session's worth of traversal would otherwise accumulate forever. Trimmed
+// from the front (oldest entries) once exceeded, with `index` shifted down
+// by the same amount so it keeps pointing at the same logical entry.
+const MAX_HISTORY_LENGTH = 500;
+
+// Hard termination guarantee for `resolveZoomToRevealNode`'s halving loop
+// (Story 1.4 Design Notes: reuse `expandCluster`'s own halve-the-
+// remaining-gap convergence, not a second zoom-convergence approach) — 24
+// halvings shrinks even fixture mode's extreme starting gap (0.02 vs.
+// `LOD_ZOOM_THRESHOLD`'s 0.2) to a fraction of a float's precision long
+// before this cap is reached. It exists only as a defensive termination
+// bound, not a value expected to be hit: the loop's own fallback (landing
+// exactly at `threshold`, always sufficient per `computeLOD`'s own
+// `zoom >= threshold` check) is what actually guarantees resolution.
+const MAX_ZOOM_RESOLVE_ITERATIONS = 24;
+
+interface ResolveZoomParams {
+  targetId: string;
+  targetPosition: LODInputNode['position'];
+  nodes: LODInputNode[];
+  currentZoom: number;
+  threshold: number;
+  containerWidth: number;
+  containerHeight: number;
+}
+
+/**
+ * The LOD-aware half of `navigateToNode` (Story 1.4 Design Notes): finds a
+ * zoom level — starting from `currentZoom`, reusing `expandCluster`'s own
+ * halve-the-remaining-gap convergence toward `threshold` — at which
+ * `targetId` resolves to a full, unclustered Node once the viewport is
+ * centered on it.
+ *
+ * Re-runs `computeLOD` against a *hypothetical* viewport centered on the
+ * target at each candidate zoom, rather than the map's actual current
+ * viewport (Code Map: "re-run computeLOD at the target zoom before
+ * deciding") — the target may currently be off-screen entirely (culled,
+ * not "clustered"), which the actual current `computeLOD` result alone
+ * can't distinguish from "grouped into a cluster with others." Each
+ * candidate zoom is banded via `quantizeZoomBand` before being fed to
+ * `computeLOD` — the same banding the live render path applies to
+ * `viewport.zoom` — so this simulation matches what will actually render
+ * once `setCenter` settles, rather than validating against unbanded
+ * precision the renderer will never use.
+ *
+ * Terminates as soon as `targetId` lands in `fullNodeIds`: immediately if
+ * it's already a singleton bucket (or `currentZoom` already bands to
+ * threshold-or-above) — no zoom change at all — otherwise after however
+ * many halving steps it takes to either isolate the target into its own
+ * bucket or reach `threshold` outright. Never falls back to an
+ * IDs-by-position/index shortcut (Boundaries & Constraints) — resolution
+ * is always by content-stable `targetId` membership in `fullNodeIds`.
+ */
+function resolveZoomToRevealNode({
+  targetId,
+  targetPosition,
+  nodes,
+  currentZoom,
+  threshold,
+  containerWidth,
+  containerHeight,
+}: ResolveZoomParams): number {
+  // An unmeasured container (`ResizeObserver` hasn't reported real
+  // dimensions yet — width/height still 0) can't produce a meaningful
+  // hypothetical `viewportBounds`: every candidate zoom would compute a
+  // degenerate zero-size box, burning the full `MAX_ZOOM_RESOLVE_ITERATIONS`
+  // budget before falling back to `threshold` regardless (review finding).
+  // Fail fast to `currentZoom` unchanged instead — `centerOnNode` still
+  // re-centers on the target, just without a wasted, meaningless zoom
+  // convergence attempt; a real `computeLOD`/`fitView` pass corrects itself
+  // once the container is actually measured.
+  if (containerWidth <= 0 || containerHeight <= 0) {
+    return currentZoom;
+  }
+  let zoom = currentZoom;
+  for (let iteration = 0; iteration < MAX_ZOOM_RESOLVE_ITERATIONS; iteration += 1) {
+    const band = quantizeZoomBand(zoom, threshold);
+    const worldWidth = containerWidth > 0 ? containerWidth / band : 0;
+    const worldHeight = containerHeight > 0 ? containerHeight / band : 0;
+    const viewportBounds = {
+      x: targetPosition.x - worldWidth / 2,
+      y: targetPosition.y - worldHeight / 2,
+      width: worldWidth,
+      height: worldHeight,
+    };
+    const result = computeLOD({ nodes, zoom: band, threshold, viewportBounds });
+    if (result.fullNodeIds.has(targetId)) {
+      return zoom;
+    }
+    zoom = zoom + (threshold - zoom) * 0.5;
+  }
+  // Ran out of halving steps while still asymptotically short of
+  // `threshold` — land exactly at it, always sufficient per computeLOD's
+  // own `zoom >= threshold` check once the viewport is centered on the
+  // target (guaranteeing `bucketInView`).
+  return threshold;
+}
+
 /**
  * Dev-only synthetic-fixture gate (Always: `import.meta.env.DEV`-gated, a
  * renderer-local URL param — no new IPC surface, no production code path
@@ -174,22 +276,55 @@ function readFixtureNodeCount(): number | undefined {
 // handler (Enter/Space, review finding — see `CodeMapNodeCard`) can trigger
 // the exact same one-click-to-source path a mouse click does, sharing one
 // implementation instead of two.
-type CodeMapFlowNode = FlowNode<{ node: CodeMapNode; onActivate: (node: CodeMapNode) => void }, 'codeMapNode'>;
+// `onNavigate`/the adjacency-derived counts+first-ids are threaded through
+// node `data` the same way `onActivate` already is (Story 1.4 Code Map:
+// "reused by both edge-click resolution and the affordance's counts/
+// targets") — the custom Node card's caller/callee affordances call
+// `onNavigate` directly, sharing the exact same `navigateToNode` path an
+// edge click resolves to.
+type CodeMapFlowNode = FlowNode<
+  {
+    node: CodeMapNode;
+    onActivate: (node: CodeMapNode) => void;
+    onNavigate: (id: string) => void;
+    callerCount: number;
+    firstCallerId: string | undefined;
+    calleeCount: number;
+    firstCalleeId: string | undefined;
+  },
+  'codeMapNode'
+>;
+
+/** Per-Node adjacency (Code Map: `Map<nodeId, {callers, callees}>`), built once from the fetched `CodeMapEdge[]`. */
+type NodeAdjacency = Map<string, { callers: string[]; callees: string[] }>;
 
 function layoutNodes(
   nodes: CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
+  onNavigate: (id: string) => void,
+  adjacency: NodeAdjacency,
 ): CodeMapFlowNode[] {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
-  return nodes.map((node, index) => ({
-    id: node.id,
-    type: 'codeMapNode',
-    position: {
-      x: (index % columns) * NODE_COLUMN_GAP,
-      y: Math.floor(index / columns) * NODE_ROW_GAP,
-    },
-    data: { node, onActivate },
-  }));
+  return nodes.map((node, index) => {
+    const entry = adjacency.get(node.id);
+    return {
+      id: node.id,
+      type: 'codeMapNode',
+      position: {
+        x: (index % columns) * NODE_COLUMN_GAP,
+        y: Math.floor(index / columns) * NODE_ROW_GAP,
+      },
+      data: {
+        node,
+        onActivate,
+        onNavigate,
+        callerCount: entry?.callers.length ?? 0,
+        firstCallerId: entry?.callers[0],
+        calleeCount: entry?.callees.length ?? 0,
+        firstCalleeId: entry?.callees[0],
+      },
+    };
+  });
 }
 
 function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
@@ -203,6 +338,23 @@ function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
     label: edge.kind,
     className: `code-map__edge code-map__edge--${edge.kind.toLowerCase()}`,
   }));
+}
+
+/**
+ * Resolves which endpoint of a clicked edge `navigateToNode` should target
+ * (Story 1.4 Code Map): the endpoint that ISN'T the currently-focused Node
+ * — tracked via `focusedNodeIdRef`, since Story 1.3 has no persistent
+ * Node-selection state (Design Notes) — defaulting to `target` when neither
+ * endpoint is focused (e.g. the very first edge click of a session).
+ */
+function resolveEdgeClickTarget(edge: { source: string; target: string }, focusedNodeId: string | null): string {
+  if (focusedNodeId === edge.source) {
+    return edge.target;
+  }
+  if (focusedNodeId === edge.target) {
+    return edge.source;
+  }
+  return edge.target;
 }
 
 /**
@@ -228,7 +380,7 @@ function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
  * presence.
  */
 function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
-  const { node, onActivate } = data;
+  const { node, onActivate, onNavigate, callerCount, firstCallerId, calleeCount, firstCalleeId } = data;
   return (
     <div
       className="code-map__node"
@@ -246,6 +398,53 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
       <Handle type="target" position={Position.Left} />
       <span className="code-map__node-kind">{node.kind}</span>
       <code className="code-map__node-id">{node.name}</code>
+      {/* Caller/callee affordances (Story 1.4): a lightweight alternative to
+          precisely clicking a thin edge line — hidden/inert entirely (not
+          just visually) when the count is 0, per this story's Code Map
+          section. `stopPropagation` on mousedown, click, AND keydown keeps
+          this nested control from also being read as an interaction with
+          the Node card itself: without it on keydown too (review finding —
+          a concrete bug, not just a style nit), pressing Enter/Space while
+          a button is focused still bubbles the keydown up to the card's own
+          `onKeyDown` below, firing `onActivate` (open source) at the same
+          time as `onNavigate` — the keydown that activates a native
+          `<button>` propagates regardless of the button's own click
+          response to it. Also initiating React Flow's own node-drag/
+          selection handling is what the mousedown stop guards against. */}
+      {(callerCount > 0 || calleeCount > 0) && (
+        <div className="code-map__node-affordances">
+          {callerCount > 0 && firstCallerId !== undefined && (
+            <button
+              type="button"
+              className="code-map__node-affordance"
+              aria-label={`${callerCount} called by, go to a caller`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onKeyDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onNavigate(firstCallerId);
+              }}
+            >
+              ↑{callerCount} called by
+            </button>
+          )}
+          {calleeCount > 0 && firstCalleeId !== undefined && (
+            <button
+              type="button"
+              className="code-map__node-affordance"
+              aria-label={`${calleeCount} calls, go to a callee`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onKeyDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onNavigate(firstCalleeId);
+              }}
+            >
+              ↓{calleeCount} calls
+            </button>
+          )}
+        </div>
+      )}
       <Handle type="source" position={Position.Right} />
     </div>
   );
@@ -398,8 +597,47 @@ export function CodeMap() {
   // once `sourceView` actually reaches `'open'` (see the effect below).
   const selectionStartRef = useRef<number | null>(null);
 
+  // Story 1.4 Design Notes: "track the most recently `navigateToNode`'d or
+  // clicked Node ID in a ref" — a traversal-local concept, not a new global
+  // selection state, that lets an edge click resolve to its non-focused
+  // endpoint. Set by both `activateNode` (a direct click/keyboard
+  // activation) and `centerOnNode` (a traversal via edge/affordance/
+  // back/forward).
+  const focusedNodeIdRef = useRef<string | null>(null);
+
+  // Back/forward navigation history (Story 1.4, AD-2 restated): renderer-
+  // local ephemeral state only — never persisted, never routed through
+  // IPC/main. `stack` holds visited Node ids in traversal order; `index`
+  // is the current position within it. Navigating to a new Node (not via
+  // Back/Forward) truncates any forward entries past `index` before
+  // appending, exactly like a browser's own history stack.
+  const [history, setHistory] = useState<{ stack: string[]; index: number }>({ stack: [], index: -1 });
+
+  // `navigateToNode` needs `flowNodesById`/`flowNodes` (built later, from
+  // this same render's `layoutNodes` call) to resolve a target's laid-out
+  // position — but every Node's `data.onNavigate` (the caller/callee
+  // affordance) is itself threaded through that same `layoutNodes` call,
+  // a direct circular dependency. Broken the same way `sourceRequestIdRef`
+  // breaks its own timing race: a ref holding the real implementation,
+  // synced via an effect below, behind a stable wrapper (identity never
+  // changes) so neither `flowNodes`' memoization nor `onEdgeClick`/the
+  // toolbar need the real implementation in their dependency arrays.
+  const navigateToNodeImplRef = useRef<(id: string) => void>(() => {});
+  const navigateToNode = useCallback((id: string) => {
+    navigateToNodeImplRef.current(id);
+  }, []);
+
   const loadCodeMap = useCallback(() => {
     setFetchState({ status: 'loading' });
+    // Review fix: `history` and `focusedNodeIdRef` are scoped to one
+    // fetched map — a Retry (this function is the Retry button's own
+    // `onClick`) or a future reload with a different project swaps in an
+    // entirely different node/edge set, so stale ids from the previous map
+    // must never survive into it (Back/Forward landing nowhere for a Node
+    // id that no longer exists, or an edge click resolving against a
+    // "focused" Node from a map that's gone).
+    setHistory({ stack: [], index: -1 });
+    focusedNodeIdRef.current = null;
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
       // `import.meta.env.DEV` — not just the runtime-derived
@@ -482,6 +720,9 @@ export function CodeMap() {
   // Map's Profiling methodology calls for.
   const activateNode = useCallback(
     (node: CodeMapNode) => {
+      // Design Notes: a click/keyboard activation counts as "focusing" a
+      // Node for the purpose of resolving a later edge click's endpoint.
+      focusedNodeIdRef.current = node.id;
       if (isDevFixtureMode) {
         selectionStartRef.current = performance.now();
       }
@@ -617,9 +858,59 @@ export function CodeMap() {
     getDevPerfState().selectionToDetailMs.push(elapsed);
   }, [isDevFixtureMode, sourceView]);
 
+  // Story 1.4 Code Map: "build a local adjacency map ... once per
+  // `fetchState.status === 'ready'` ... reused by both edge-click
+  // resolution and the affordance's counts/targets." Built directly from
+  // the already-fetched `CodeMapEdge[]` — no new IPC surface.
+  //
+  // Three review-fix exclusions applied while building it:
+  // - Self-loop edges (`source === target`, a recursive call) are skipped
+  //   entirely — a Node showing itself as its own "called by"/"calls"
+  //   target isn't a real traversal destination.
+  // - A duplicate `(source, target)` pair (two call sites between the same
+  //   two functions) is only counted once per direction — an `includes`
+  //   check before pushing — so the affordance's `N` reflects distinct
+  //   connected Nodes, not raw edge count.
+  // - Either endpoint absent from this fetch's own node set (e.g. an edge
+  //   pointing at a filtered external/library target) is skipped — an
+  //   affordance must never be able to target an id `flowNodesById` (built
+  //   from this same node set) can never resolve.
+  const adjacency = useMemo<NodeAdjacency>(() => {
+    const map: NodeAdjacency = new Map();
+    if (fetchState.status !== 'ready') {
+      return map;
+    }
+    const validNodeIds = new Set(fetchState.nodes.map((node) => node.id));
+    const ensure = (id: string) => {
+      let entry = map.get(id);
+      if (!entry) {
+        entry = { callers: [], callees: [] };
+        map.set(id, entry);
+      }
+      return entry;
+    };
+    for (const edge of fetchState.edges) {
+      if (edge.source === edge.target) {
+        continue;
+      }
+      if (!validNodeIds.has(edge.source) || !validNodeIds.has(edge.target)) {
+        continue;
+      }
+      const sourceEntry = ensure(edge.source);
+      if (!sourceEntry.callees.includes(edge.target)) {
+        sourceEntry.callees.push(edge.target);
+      }
+      const targetEntry = ensure(edge.target);
+      if (!targetEntry.callers.includes(edge.source)) {
+        targetEntry.callers.push(edge.source);
+      }
+    }
+    return map;
+  }, [fetchState]);
+
   const flowNodes = useMemo(
-    () => (fetchState.status === 'ready' ? layoutNodes(fetchState.nodes, activateNode) : []),
-    [fetchState, activateNode],
+    () => (fetchState.status === 'ready' ? layoutNodes(fetchState.nodes, activateNode, navigateToNode, adjacency) : []),
+    [fetchState, activateNode, navigateToNode, adjacency],
   );
   const flowEdges = useMemo(
     () => (fetchState.status === 'ready' ? toFlowEdges(fetchState.edges) : []),
@@ -633,6 +924,17 @@ export function CodeMap() {
     }
     return byId;
   }, [flowNodes]);
+
+  // Shared with both the live render's `lodResult` (below) and
+  // `centerOnNode`'s hypothetical-viewport resolution — the same
+  // already-laid-out Node-ID/position set `computeLOD` needs (Boundaries &
+  // Constraints: never by array index/position — this is the position
+  // `layoutNodes` already computed for each content-stable Node id, not a
+  // fresh derivation from list order).
+  const lodInputNodes = useMemo<LODInputNode[]>(
+    () => flowNodes.map((flowNode) => ({ id: flowNode.id, position: flowNode.position })),
+    [flowNodes],
+  );
 
   // `zoom` is banded (geometric, anchored on `LOD_ZOOM_THRESHOLD`) rather
   // than used raw — see `quantizeZoomBand`'s comment. `worldWidth`/
@@ -660,7 +962,7 @@ export function CodeMap() {
   const lodResult = useMemo(
     () =>
       computeLOD({
-        nodes: flowNodes.map((flowNode) => ({ id: flowNode.id, position: flowNode.position })),
+        nodes: lodInputNodes,
         zoom: zoomBand,
         threshold: LOD_ZOOM_THRESHOLD,
         viewportBounds: { x: boundsX, y: boundsY, width: worldWidth, height: worldHeight },
@@ -668,7 +970,7 @@ export function CodeMap() {
     // Depends on the individual quantized numbers, not a `viewportBounds`
     // object literal — a fresh object every render would defeat memoization
     // even when its numeric contents are unchanged.
-    [flowNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
+    [lodInputNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
   );
 
   const { renderedNodes, renderedEdges } = useMemo(() => {
@@ -727,6 +1029,150 @@ export function CodeMap() {
     [activateNode, expandCluster],
   );
 
+  // The shared traversal primitive (Story 1.4 Code Map: `navigateToNode`)
+  // both a fresh edge/affordance click and a Back/Forward replay funnel
+  // through — everything except history bookkeeping, which only the
+  // former does (see `navigateToNodeImpl` vs. `goBack`/`goForward` below).
+  // Returns whether it actually moved the viewport (false if the target
+  // Node or the `<ReactFlow>` instance can't be resolved — defensive; every
+  // edge/affordance target is a real Node ID sourced from the already-
+  // fetched map, so this should not happen in practice).
+  const centerOnNode = useCallback(
+    (id: string): boolean => {
+      const flowNode = flowNodesById.get(id);
+      const instance = reactFlowInstanceRef.current;
+      if (!flowNode || !instance) {
+        // Review fix: was a fully silent no-op — this is the one signal
+        // that surfaces a stale/unresolvable traversal target during
+        // development (e.g. a history entry left over from a discarded map
+        // before fix #1, or an adjacency id that somehow still doesn't
+        // resolve despite fix #10's validation).
+        console.warn(
+          `CodeMap: navigateToNode couldn't center on "${id}" — ${
+            !flowNode ? 'no Node with that id in the current map' : 'the ReactFlow instance is not ready yet'
+          }.`,
+        );
+        return false;
+      }
+      const currentZoom = instance.getViewport().zoom;
+      // Boundaries & Constraints: "Re-centering onto a Node currently
+      // inside a collapsed LOD cluster also zooms in enough to cross the
+      // cluster threshold at that position — never a re-center that lands
+      // on a still-clustered point." `resolveZoomToRevealNode` is a no-op
+      // (returns `currentZoom` unchanged) when the target already resolves
+      // full at the current zoom.
+      const zoom = resolveZoomToRevealNode({
+        targetId: id,
+        targetPosition: flowNode.position,
+        nodes: lodInputNodes,
+        currentZoom,
+        threshold: LOD_ZOOM_THRESHOLD,
+        containerWidth: containerSize.width,
+        containerHeight: containerSize.height,
+      });
+      instance.setCenter(flowNode.position.x, flowNode.position.y, { zoom, duration: 300 });
+      focusedNodeIdRef.current = id;
+      return true;
+    },
+    [flowNodesById, lodInputNodes, containerSize],
+  );
+
+  // Pure history-stack update (no side effects — safe under React's dev-
+  // mode double-invocation of state updaters): truncates any forward
+  // entries past the current position before appending, exactly like a
+  // browser's own history stack.
+  const pushHistory = useCallback((id: string) => {
+    setHistory((previous) => {
+      const truncated = previous.stack.slice(0, previous.index + 1);
+      // Review fix: two navigations resolving to the same Node back-to-back
+      // (an edge and an affordance both pointing at the same neighbor, or a
+      // duplicate click) would otherwise push a second identical entry,
+      // making a single Back click look like it did nothing. A no-op
+      // navigation leaves history exactly as-is — including any forward
+      // entries past it, the same way a browser doesn't clear forward
+      // history just because you "navigated" to the page you're already on.
+      if (truncated[truncated.length - 1] === id) {
+        return previous;
+      }
+      let nextStack = [...truncated, id];
+      let nextIndex = nextStack.length - 1;
+      // Review fix: unlike `expandedClusterIds`, nothing here naturally
+      // trims stale entries — cap and trim from the front (oldest first),
+      // shifting `index` down by the same amount so it keeps pointing at
+      // the same logical (now-renumbered) entry.
+      if (nextStack.length > MAX_HISTORY_LENGTH) {
+        const overflow = nextStack.length - MAX_HISTORY_LENGTH;
+        nextStack = nextStack.slice(overflow);
+        nextIndex -= overflow;
+      }
+      return { stack: nextStack, index: nextIndex };
+    });
+  }, []);
+
+  const navigateToNodeImpl = useCallback(
+    (id: string) => {
+      if (centerOnNode(id)) {
+        pushHistory(id);
+      }
+    },
+    [centerOnNode, pushHistory],
+  );
+
+  // Keeps `navigateToNode`'s stable wrapper (see its declaration above)
+  // pointed at the current implementation — see that declaration's comment
+  // for why this indirection exists.
+  useEffect(() => {
+    navigateToNodeImplRef.current = navigateToNodeImpl;
+  }, [navigateToNodeImpl]);
+
+  const handleEdgeClick: EdgeMouseHandler<FlowEdge> = useCallback(
+    (_event, edge) => {
+      navigateToNode(resolveEdgeClickTarget(edge, focusedNodeIdRef.current));
+    },
+    [navigateToNode],
+  );
+
+  // Back/Forward only move `history.index` and replay the viewport move via
+  // `centerOnNode` — they never call `navigateToNode`/`pushHistory`, which
+  // would truncate-and-append a fresh entry and make Forward permanently
+  // unreachable after every Back.
+  const goBack = useCallback(() => {
+    if (history.index <= 0) {
+      return;
+    }
+    const nextIndex = history.index - 1;
+    const id = history.stack[nextIndex];
+    if (id === undefined) {
+      return;
+    }
+    // Review fix: only move `history.index` if `centerOnNode` actually
+    // succeeded — a stale id (e.g. one somehow left over across a map
+    // reload) or the ReactFlow instance not being ready would otherwise
+    // move the toolbar's position without moving the viewport, permanently
+    // desyncing that history slot. `centerOnNode` itself already logs a
+    // `console.warn` on failure (fix #5).
+    if (!centerOnNode(id)) {
+      return;
+    }
+    setHistory((previous) => ({ ...previous, index: nextIndex }));
+  }, [history, centerOnNode]);
+
+  const goForward = useCallback(() => {
+    if (history.index >= history.stack.length - 1) {
+      return;
+    }
+    const nextIndex = history.index + 1;
+    const id = history.stack[nextIndex];
+    if (id === undefined) {
+      return;
+    }
+    // Review fix: see `goBack`'s matching comment — only advance on success.
+    if (!centerOnNode(id)) {
+      return;
+    }
+    setHistory((previous) => ({ ...previous, index: nextIndex }));
+  }, [history, centerOnNode]);
+
   const closeSourceView = useCallback(() => setSourceView({ status: 'closed' }), []);
 
   // Escape closes the source overlay (review finding — a real dialog needs
@@ -779,6 +1225,11 @@ export function CodeMap() {
           edges={renderedEdges}
           nodeTypes={nodeTypes}
           onNodeClick={handleNodeClick}
+          // Story 1.4, FR4: clicking an edge re-centers the map on the
+          // connected Node without leaving map context — additive to
+          // Story 1.3's existing click-a-Node's-body-opens-source
+          // behavior (`onNodeClick`), never a replacement for it.
+          onEdgeClick={handleEdgeClick}
           onInit={handleInit}
           onMove={handleMove}
           // Without this, `@xyflow/react`'s default `minZoom` (0.5) clamps
@@ -802,6 +1253,26 @@ export function CodeMap() {
           <Background />
           <Controls showInteractive={false} />
         </ReactFlow>
+      )}
+
+      {fetchState.status === 'ready' && fetchState.nodes.length > 0 && (
+        // Story 1.4 Code Map: "New lightweight Back/Forward toolbar ...
+        // disabled at either end of history" — renderer-local chrome over
+        // the ephemeral `history` state, never persisted/IPC'd (AD-2
+        // restated).
+        <div className="code-map__history-toolbar" role="toolbar" aria-label="Map traversal history">
+          <button type="button" onClick={goBack} disabled={history.index <= 0} aria-label="Back">
+            ← Back
+          </button>
+          <button
+            type="button"
+            onClick={goForward}
+            disabled={history.index >= history.stack.length - 1}
+            aria-label="Forward"
+          >
+            Forward →
+          </button>
+        </div>
       )}
 
       {sourceView.status !== 'closed' && (

@@ -312,6 +312,78 @@ code,
 
 .code-map__edge {
   stroke: var(--text-muted);
+  cursor: pointer;
+}
+
+/* Caller/callee affordances (Story 1.4, FR4): a lightweight alternative to
+   precisely clicking a thin edge line. Nested real <button> elements inside
+   the Node card's own `role="button"` container (review-aware: a card with
+   a primary action plus secondary actions is a common, workable pattern —
+   `stopPropagation` on the buttons themselves keeps them from also
+   triggering the card's own click-to-open-source). */
+.code-map__node-affordances {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.15rem;
+}
+
+.code-map__node-affordance {
+  padding: 0.1rem 0.4rem;
+  font-size: 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.code-map__node-affordance:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.code-map__node-affordance:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Back/Forward traversal history toolbar (Story 1.4): lightweight chrome
+   floated over the map, matching the source panel's close button and the
+   Retry button's plain bordered style rather than introducing a new visual
+   language. */
+.code-map__history-toolbar {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  z-index: 5;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.code-map__history-toolbar button {
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.code-map__history-toolbar button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.code-map__history-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.code-map__history-toolbar button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* LOD cluster card (Story 1.3 Phase 2, AD-2): a lightweight aggregate
