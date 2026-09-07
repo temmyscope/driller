@@ -249,6 +249,15 @@ export interface LocalModelReady {
   model: string;
   /** Absolute path to the verified GGUF file on disk. */
   path: string;
+  /**
+   * Which tier `selectModelTier()` chose (Story 1.5 Phase 3) — the
+   * already-computed `ModelTierConfig.tier`, just not previously exposed
+   * past this module's return. `index.ts` uses `tier === 'fallback'` as the
+   * hardware-adequacy proxy for the cloud-switch advisory: a cheap, already-
+   * live signal (this same `os.totalmem()` check already gates which model
+   * downloads) rather than a new GPU/hardware-detection dependency.
+   */
+  tier: 'primary' | 'fallback';
 }
 
 /**
@@ -300,5 +309,5 @@ async function runEnsureLocalModel(options: EnsureLocalModelOptions): Promise<Lo
     `[graph-service] local model ready: ${tier.fileName} (${tier.tier} tier), sha256 verified (${actualSha256}).`,
   );
 
-  return { model: tier.fileName, path: modelPath };
+  return { model: tier.fileName, path: modelPath, tier: tier.tier };
 }

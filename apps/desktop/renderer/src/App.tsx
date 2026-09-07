@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   GraphServiceStatusMessage,
+  HardwareAdvisoryMessage,
   IndexCoverageSummary,
   ModelStatusMessage,
   ProjectOpenResult,
@@ -24,6 +25,18 @@ export function App() {
   // way graphServiceStatus is: there's exactly one local model per
   // installation, not one per project.
   const [modelStatus, setModelStatus] = useState<ModelStatusMessage | null>(null);
+  // The hardware-adequacy advisory reasons currently active (Story 1.5
+  // Phase 3) — a `Set`, not a single value, since the two signal sources
+  // (constrained-tier, degenerate-results) are independent and can both be
+  // true at once; each renders its own honest, reason-specific sentence
+  // (Boundaries & Constraints: "wording distinguishes the two reasons
+  // honestly"). Like `modelStatus`, there's one local model/generation run
+  // per project, so this is reset on every fresh 'opened' project result
+  // (see `applyOpenResult`) rather than lingering from a previously open
+  // project.
+  const [hardwareAdvisories, setHardwareAdvisories] = useState<Set<HardwareAdvisoryMessage['reason']>>(
+    () => new Set(),
+  );
   // The currently-open project's path, so a status correlated to a
   // different (superseded) project can be told apart from one about the
   // project actually on screen. Mirrored into a ref because the status
@@ -76,7 +89,32 @@ export function App() {
     return unsubscribe;
   }, []);
 
+  useEffect(() => {
+    const unsubscribe = window.driller.onHardwareAdvisory((message) => {
+      // Additive, not replace: a second, different-reason advisory this
+      // session must not clobber a still-relevant earlier one (Boundaries &
+      // Constraints: both reasons can be independently true).
+      setHardwareAdvisories((current) => {
+        if (current.has(message.reason)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.add(message.reason);
+        return next;
+      });
+    });
+    return unsubscribe;
+  }, []);
+
   const applyOpenResult = useCallback((result: ProjectOpenResult) => {
+    // Any outcome here (review finding, Low — not just 'opened') is a
+    // transition away from whatever project/attempt the current
+    // `hardwareAdvisories` belonged to: a stale advisory must not survive a
+    // not-a-git-repo/error/cancelled result any more than it should survive
+    // opening a genuinely new project. The Graph Service subprocess posts a
+    // fresh advisory of its own for a newly-opened project if/when it's
+    // actually warranted again.
+    setHardwareAdvisories(new Set());
     switch (result.status) {
       case 'opened':
         setNotice(null);
@@ -153,6 +191,13 @@ export function App() {
   );
 
   const handleRetryGraphService = useCallback(() => {
+    // A restart respawns the Graph Service subprocess with fresh module
+    // state (review finding, Medium) — any advisory shown before Retry
+    // belonged to the pre-restart session and must not linger on screen
+    // through it, matching `applyOpenResult`'s own "any transition away"
+    // clearing. The fresh subprocess re-posts an advisory of its own, for
+    // the current project, if/when the condition is still actually true.
+    setHardwareAdvisories(new Set());
     window.driller.restartGraphService().catch(reportUnexpectedError);
   }, [reportUnexpectedError]);
 
@@ -261,8 +306,48 @@ export function App() {
           )}
         </footer>
       )}
+
+      {/* Story 1.5 Phase 3: the hardware-adequacy advisory — a real
+          Actionable-Notice-shaped element (icon+text, never color-only) near
+          the model-status indicator above (Code Map/Design Notes). Purely
+          informational: no action button, since Story 1.6 (the actual
+          cloud-key backend) doesn't exist yet — this never claims a
+          "switch to cloud" action exists (Boundaries & Constraints).
+
+          The `role="status"` region itself is always mounted (review
+          finding, Low) — unlike `graphServiceStatus`/`modelStatus`'s own
+          footers, which only mount once real content exists — because a
+          live region reliably announces a change only if it already
+          existed in the DOM before that change; mounting it for the first
+          time in the same update that adds its first text risks that first
+          advisory going unannounced by some screen readers. Empty (no
+          advisories yet) renders no `<p>` children and collapses to zero
+          visual footprint via `.hardware-advisory:empty` in styles.css,
+          so this is invisible, not just empty-of-text, until the first
+          advisory actually arrives. */}
+      <footer className="hardware-advisory" role="status">
+        {[...hardwareAdvisories].map((reason) => (
+          <p key={reason} className="hardware-advisory__notice">
+            <span aria-hidden="true">☁</span> {formatHardwareAdvisory(reason)}
+          </p>
+        ))}
+      </footer>
     </main>
   );
+}
+
+/**
+ * Honest, reason-specific advisory text (Boundaries & Constraints: "wording
+ * distinguishes the two reasons honestly") — never claims a functional
+ * "switch to cloud" action exists, since Story 1.6 doesn't yet.
+ */
+function formatHardwareAdvisory(reason: HardwareAdvisoryMessage['reason']): string {
+  switch (reason) {
+    case 'constrained-tier':
+      return 'This machine may be slow for local summaries — a cloud model would likely help, though that option isn’t available yet.';
+    case 'degenerate-results':
+      return 'Local summaries are returning empty or slow results — a cloud model would likely help, though that option isn’t available yet.';
+  }
 }
 
 /**

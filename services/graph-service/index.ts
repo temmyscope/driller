@@ -90,6 +90,8 @@ import type {
   GraphServiceIndexRequest,
   GraphServiceShutdownRequest,
   GraphServiceStatusMessage,
+  HardwareAdvisoryMessage,
+  HardwareAdvisoryReason,
   ModelStatusMessage,
   SummaryProgressMessage,
 } from '@driller/ipc-contracts';
@@ -187,6 +189,18 @@ let activeSummaryGenerationId = 0;
 // this flag already set.
 let activeGenerationRunId: number | null = null;
 
+// Story 1.5 Phase 3: which hardware-advisory signal source(s) have already
+// been posted this project session (Boundaries & Constraints: "sent at most
+// once per signal source per project session (no repeat spam)"). Reset at
+// the same point `activeSummaryGenerationId` itself is bumped, in
+// `handleIndexRequest` — a new index attempt (a different project, or a
+// re-index of the same one) is a fresh session, so a machine that was
+// advisory-worthy last session gets an honest fresh chance to trigger the
+// advisory again this session rather than staying permanently suppressed
+// for the rest of this subprocess's lifetime.
+let advisoryPostedForConstrainedTier = false;
+let advisoryPostedForDegenerateResults = false;
+
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
 // Node's own `child_process.fork` argv convention, which `utilityProcess.
@@ -236,6 +250,38 @@ function postModelStatus(status: ModelStatusMessage): void {
  */
 function postSummaryProgress(message: SummaryProgressMessage): void {
   process.parentPort?.postMessage(message);
+}
+
+/**
+ * Posts a `graphService:hardwareAdvisory` message, but at most once per
+ * `reason` per project session (Boundaries & Constraints: "no repeat spam")
+ * — `advisoryPostedForConstrainedTier`/`advisoryPostedForDegenerateResults`
+ * (reset alongside `activeSummaryGenerationId` in `handleIndexRequest`) are
+ * this function's own idempotency guard, so both call sites
+ * (`checkConstrainedTierAdvisory` and `startSummaryGenerationForProject`'s
+ * `onHardwareAdvisory` callback) can call this unconditionally without
+ * duplicating the once-per-source bookkeeping themselves. Each call site
+ * applies its own supersession guard (checking the project this check is
+ * about is still the active one) before calling this, so a stale check
+ * completing after the user has moved to a different project never reaches
+ * here at all.
+ */
+function postHardwareAdvisory(reason: HardwareAdvisoryReason): void {
+  if (reason === 'constrained-tier') {
+    if (advisoryPostedForConstrainedTier) {
+      return;
+    }
+    advisoryPostedForConstrainedTier = true;
+  } else {
+    if (advisoryPostedForDegenerateResults) {
+      return;
+    }
+    advisoryPostedForDegenerateResults = true;
+  }
+  process.parentPort?.postMessage({
+    type: 'graphService:hardwareAdvisory',
+    reason,
+  } satisfies HardwareAdvisoryMessage);
 }
 
 /**
@@ -300,6 +346,56 @@ function kickOffModelDownload(): void {
       // failed attempt.
       modelAttempt = null;
     });
+}
+
+/**
+ * Checks whether `projectPath`'s session should get the constrained-tier
+ * hardware advisory (Story 1.5 Phase 3), once the model attempt this
+ * subprocess is currently using has settled. Called once per
+ * `handleIndexRequest`, deliberately decoupled from `kickOffModelDownload`'s
+ * own one-shot `.then()` (review finding, High) — `kickOffModelDownload` is
+ * memoized for the whole subprocess lifetime (Story 1.5 Phase 1's "once per
+ * installation" design), so a check that only ran inside its `.then()` could
+ * only ever fire for the *first* project a session opened: opening a second
+ * project against an already-resolved `modelAttempt` would never re-enter
+ * that `.then()` at all, silently losing the advisory for every subsequent
+ * project on a genuinely constrained machine even though the condition
+ * still holds. This function instead re-checks the already-known (or
+ * soon-to-be-known) `localModelReady?.tier` fresh for every project.
+ *
+ * Guarded by `activeIndexPath !== projectPath` (review finding, Medium —
+ * matching the supersession guard `startSummaryGenerationForProject`'s own
+ * `onHardwareAdvisory` call site already applies) rather than posting
+ * unconditionally once the awaited attempt settles: a slower-resolving
+ * check for a project the user has since navigated away from (a fast
+ * double open, or opening project C while B's own check is still pending)
+ * must never post a stale/wrong-context advisory for a project no longer on
+ * screen. `postHardwareAdvisory`'s own per-project-session
+ * `advisoryPostedForConstrainedTier` flag (reset in `handleIndexRequest`)
+ * still applies underneath this, so the advisory posts at most once per
+ * project session even if this function is somehow invoked twice for it.
+ */
+async function checkConstrainedTierAdvisory(projectPath: string): Promise<void> {
+  if (modelAttempt) {
+    try {
+      await modelAttempt;
+    } catch {
+      // Already reported via `graphService:modelStatus` 'error' — no tier
+      // to check when the model never actually became ready.
+      return;
+    }
+  }
+  if (activeIndexPath !== projectPath || !localModelReady) {
+    return;
+  }
+  // Story 1.5 Phase 3: the initial hardware-adequacy signal (Intent) —
+  // Phase 1's own tier-selection heuristic already chose the fallback tier,
+  // which is itself a live, honest proxy for "this machine is constrained"
+  // (Design Notes). Checked fresh per project, per this function's own doc
+  // comment above — never gated on generation having started.
+  if (localModelReady.tier === 'fallback') {
+    postHardwareAdvisory('constrained-tier');
+  }
 }
 
 function isShutdownRequest(data: unknown): data is GraphServiceShutdownRequest {
@@ -375,6 +471,12 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
   // here, not only once a later `getCodeMap` request actually restarts
   // generation.
   activeSummaryGenerationId += 1;
+  // Story 1.5 Phase 3: a new index attempt starts a fresh project session
+  // for the hardware-advisory once-per-source guard too — see
+  // `advisoryPostedForConstrainedTier`/`advisoryPostedForDegenerateResults`'s
+  // own doc comment.
+  advisoryPostedForConstrainedTier = false;
+  advisoryPostedForDegenerateResults = false;
   // Visible within ~5s of folder selection (NFR1, AD-15): posted immediately,
   // before the potentially long-running backend call below.
   postStatus({ state: 'indexing', pid: process.pid, at: now(), path: projectPath });
@@ -388,6 +490,12 @@ async function handleIndexRequest(projectPath: string): Promise<void> {
   // a no-op after the first `graphService:index` request in this process's
   // lifetime.
   kickOffModelDownload();
+  // Story 1.5 Phase 3 (review finding, High): re-checked per project, not
+  // just inside `kickOffModelDownload`'s own one-shot `.then()` — see
+  // `checkConstrainedTierAdvisory`'s own doc comment for why. Fire-and-
+  // forget, same reasoning as `kickOffModelDownload` itself: never awaited
+  // here, so it can't delay `indexRepository` below.
+  void checkConstrainedTierAdvisory(projectPath);
   // Switches the Node record store to this project (AD-19/AD-20) before
   // indexing proceeds — cheap, local JSON I/O (see node-record-store.ts),
   // and a no-op when this is already the active project (re-index of the
@@ -551,6 +659,18 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
           // open project (review finding, Medium) — see
           // `SummaryProgressMessage`'s own doc comment in ipc-contracts.
           postSummaryProgress({ type: 'graphService:summaryProgress', path: projectRoot, updated });
+        }
+      },
+      // Story 1.5 Phase 3: the reactive hardware-adequacy signal (Intent) —
+      // `summary-generator.ts`'s own rolling completed/degenerate-rate
+      // tracker fires this at most once per `generateSummaries` call, once
+      // the *rate* (not a single fluke) crosses its threshold. Guarded the
+      // same way `onProgress` above is: a since-superseded run (a different
+      // project, or a re-index) must never post an advisory for a project
+      // no longer on screen.
+      onHardwareAdvisory: () => {
+        if (generationId === activeSummaryGenerationId) {
+          postHardwareAdvisory('degenerate-results');
         }
       },
       isSuperseded: () => generationId !== activeSummaryGenerationId,

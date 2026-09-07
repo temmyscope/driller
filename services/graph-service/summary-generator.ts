@@ -82,6 +82,16 @@ const SUMMARY_MAX_TOKENS = 96;
 const PROGRESS_FLUSH_INTERVAL_MS = 1000;
 const PROGRESS_FLUSH_BATCH_SIZE = 5;
 
+// Story 1.5 Phase 3: the reactive hardware-advisory trigger — a *rate*
+// within the current run, never a single fluke (Boundaries & Constraints).
+// `MIN_COMPLETED_FOR_ADVISORY` gates the check until enough of this run's
+// Nodes have actually been attempted for a rate to mean anything (one
+// degenerate result out of one attempted is a 100% rate but tells you
+// nothing about the hardware); `DEGENERATE_RATE_THRESHOLD` is the Code Map's
+// own example figure — a substantial fraction, not an occasional miss.
+const MIN_COMPLETED_FOR_ADVISORY = 5;
+const DEGENERATE_RATE_THRESHOLD = 0.3;
+
 // A generous cap well within this model's real context window (review
 // finding, Medium) — an unusually large indexed range (a big Module/
 // Interface) could otherwise overrun the model's context on its own,
@@ -108,15 +118,31 @@ const MAX_SOURCE_CHARS = 8000;
 const SUMMARY_PROMPT_TIMEOUT_MS = 2 * 60 * 1000;
 
 /**
- * Races `promise` against a timeout, rejecting with a descriptive error if
- * `ms` elapses first. Duplicated from mcp-client.ts's/model-manager.ts's own
- * `withTimeout` (same small-helper-not-worth-a-shared-module reasoning those
- * two already documented) — does not cancel the underlying work.
+ * The specific error `withTimeout` (below) rejects with — a dedicated,
+ * checkable subclass (review finding, Medium) rather than a plain `Error`
+ * identified only by its message text. `summarizeNode`'s own timeout
+ * classification (`isTimeoutError`, further down) is central to this
+ * story's whole hardware-advisory feature — it decides what counts as a
+ * "degenerate" result — so it deserves a real type/tag to check, not a
+ * regex coupled to this file's own message-format string only by a comment.
+ */
+class SummaryTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SummaryTimeoutError';
+  }
+}
+
+/**
+ * Races `promise` against a timeout, rejecting with a `SummaryTimeoutError`
+ * if `ms` elapses first. Duplicated from mcp-client.ts's/model-manager.ts's
+ * own `withTimeout` (same small-helper-not-worth-a-shared-module reasoning
+ * those two already documented) — does not cancel the underlying work.
  */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
+      reject(new SummaryTimeoutError(`${label} timed out after ${ms}ms`));
     }, ms);
     promise.then(
       (value) => {
@@ -299,31 +325,81 @@ function normalizeSummaryText(raw: string): string {
   return raw.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * `summarizeNode`'s outcome (Story 1.5 Phase 3) — a discriminated result
+ * rather than a bare `string | undefined`, so `generateSummaries` can tell
+ * apart the three cases that previously all collapsed into the same
+ * "nothing to persist" `undefined`:
+ *  - `'unreadable'`: the Node's source couldn't be read this round (file
+ *    changed/shrank since indexing) — not a hardware-adequacy signal at
+ *    all, so it must never count toward the reactive degenerate-rate
+ *    tracker below (Boundaries & Constraints: the *rate* signal is about
+ *    slow/empty *generation*, not source-availability churn).
+ *  - `'degenerate'`: a genuine empty/whitespace-only model response, or the
+ *    prompt timing out — exactly the two conditions the Code Map's own
+ *    tracker description names. Counts toward the rate.
+ *  - `'success'`: a real, non-empty summary. Counts toward the rate's
+ *    denominator, never its numerator.
+ */
+type SummarizeOutcome =
+  | { kind: 'success'; text: string }
+  | { kind: 'unreadable' }
+  | { kind: 'degenerate'; reason: 'empty' | 'timeout' };
+
+/**
+ * True for the specific error `withTimeout` throws — a real `instanceof`
+ * check against `SummaryTimeoutError` (review finding, Medium), not a regex
+ * matched against `withTimeout`'s own message text: this classification
+ * decides what counts as a "degenerate" result for the whole hardware-
+ * advisory feature, so it's checked against a type/tag `withTimeout` itself
+ * controls, immune to an unrelated future wording change to its message.
+ */
+function isTimeoutError(error: unknown): error is SummaryTimeoutError {
+  return error instanceof SummaryTimeoutError;
+}
+
 async function summarizeNode(
   node: CodeMapNode,
   projectRoot: string,
   sequence: LlamaContextSequence,
   LlamaChatSession: typeof LlamaChatSessionClass,
-): Promise<string | undefined> {
+): Promise<SummarizeOutcome> {
   const source = await readNodeSource(projectRoot, node);
   if (source === undefined) {
-    return undefined;
+    return { kind: 'unreadable' };
   }
 
   // A fresh session per job (Design Notes) — shares the already-loaded
   // `sequence`, so this is a cheap wrapper, not a new model/context load.
   const session = new LlamaChatSession({ contextSequence: sequence });
   try {
-    // Timeout-wrapped (review finding, Medium) — see SUMMARY_PROMPT_TIMEOUT_
-    // MS's comment for why a bounded, honest failure beats letting one
-    // hung call stall the whole concurrency-1 queue forever.
-    const response = await withTimeout(
-      session.prompt(buildPrompt(node, source), { maxTokens: SUMMARY_MAX_TOKENS }),
-      SUMMARY_PROMPT_TIMEOUT_MS,
-      `summary prompt for ${node.id}`,
-    );
+    let response: string;
+    try {
+      // Timeout-wrapped (review finding, Medium) — see SUMMARY_PROMPT_
+      // TIMEOUT_MS's comment for why a bounded, honest failure beats
+      // letting one hung call stall the whole concurrency-1 queue forever.
+      // A timeout here is itself one of the two degenerate conditions
+      // (Story 1.5 Phase 3's Code Map) — caught and classified rather than
+      // left to propagate to the generic error path below, which would
+      // otherwise just log-and-skip it without it ever counting toward the
+      // reactive hardware-advisory rate.
+      response = await withTimeout(
+        session.prompt(buildPrompt(node, source), { maxTokens: SUMMARY_MAX_TOKENS }),
+        SUMMARY_PROMPT_TIMEOUT_MS,
+        `summary prompt for ${node.id}`,
+      );
+    } catch (error) {
+      if (isTimeoutError(error)) {
+        return { kind: 'degenerate', reason: 'timeout' };
+      }
+      // A genuine, non-timeout failure (e.g. a native binding error) is not
+      // one of the two documented degenerate conditions — rethrown so the
+      // caller's existing catch-and-log path handles it exactly as before,
+      // uncounted toward the hardware-advisory rate.
+      throw error;
+    }
     const text = normalizeSummaryText(response);
-    return text.length > 0 ? text : undefined;
+    return text.length > 0 ? { kind: 'success', text } : { kind: 'degenerate', reason: 'empty' };
   } finally {
     // Disposes only the session wrapper, not the shared sequence (default
     // `disposeSequence: false`) — the sequence is reused by the next job.
@@ -373,6 +449,15 @@ export interface GenerateSummariesOptions {
   /** Fired with each batched group of completions (Always/AD-8: never one call per Node). */
   onProgress: (updated: SummaryProgressUpdate[]) => void;
   /**
+   * Story 1.5 Phase 3: fired at most once for this run, the moment the
+   * rolling `{completed, degenerate}` count first crosses
+   * `MIN_COMPLETED_FOR_ADVISORY`/`DEGENERATE_RATE_THRESHOLD` (Code Map:
+   * "once per run, not repeated per subsequent Node"). Optional — omitted
+   * entirely is a valid no-advisory-wanted caller, same as `isSuperseded`'s
+   * own default.
+   */
+  onHardwareAdvisory?: () => void;
+  /**
    * Checked before every merge-write/progress post — lets a caller (index.ts)
    * discard a superseded run's results (e.g. the user opened a different
    * project mid-generation) rather than letting a stale job corrupt the
@@ -394,7 +479,15 @@ export interface GenerateSummariesOptions {
  * in the background (never awaited alongside the Code Map response).
  */
 export async function generateSummaries(options: GenerateSummariesOptions): Promise<void> {
-  const { projectRoot, nodes, coverageGapFiles, model, onProgress, isSuperseded = () => false } = options;
+  const {
+    projectRoot,
+    nodes,
+    coverageGapFiles,
+    model,
+    onProgress,
+    onHardwareAdvisory,
+    isSuperseded = () => false,
+  } = options;
 
   const eligible = nodes.filter(
     (node) => classifyNode(node, coverageGapFiles).summaryStatus === 'pending',
@@ -417,15 +510,43 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
     onProgress(updated);
   });
 
+  // Story 1.5 Phase 3: this run's rolling `{completed, degenerate}` count
+  // (Code Map) — closed over by the queue jobs below, not shared across
+  // `generateSummaries` calls, since each run gets its own fresh read on
+  // "is this run's hardware struggling." `advisoryFired` makes the
+  // once-per-run trigger idempotent even though `recordOutcome` itself is
+  // only ever called from this single-concurrency queue (defense in depth,
+  // matching this file's existing caution around this exact bug class).
+  let completed = 0;
+  let degenerate = 0;
+  let advisoryFired = false;
+
+  function recordOutcome(isDegenerate: boolean): void {
+    completed += 1;
+    if (isDegenerate) {
+      degenerate += 1;
+    }
+    if (
+      !advisoryFired &&
+      completed >= MIN_COMPLETED_FOR_ADVISORY &&
+      degenerate / completed >= DEGENERATE_RATE_THRESHOLD
+    ) {
+      advisoryFired = true;
+      if (!isSuperseded()) {
+        onHardwareAdvisory?.();
+      }
+    }
+  }
+
   await Promise.all(
     eligible.map((node) =>
       queue.add(async () => {
         if (isSuperseded()) {
           return;
         }
-        let summaryText: string | undefined;
+        let outcome: SummarizeOutcome;
         try {
-          summaryText = await summarizeNode(node, projectRoot, sequence, LlamaChatSession);
+          outcome = await summarizeNode(node, projectRoot, sequence, LlamaChatSession);
         } catch (error) {
           console.error(
             `[graph-service] summary generation failed for ${node.id}: ${
@@ -434,9 +555,20 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
           );
           return;
         }
-        if (summaryText === undefined || isSuperseded()) {
+        if (isSuperseded()) {
           return;
         }
+        if (outcome.kind === 'unreadable') {
+          // Not a hardware-adequacy signal (Story 1.5 Phase 3's own
+          // `SummarizeOutcome` doc comment) — the Node simply stays
+          // `'pending'` for this session, same as before this phase.
+          return;
+        }
+        if (outcome.kind === 'degenerate') {
+          recordOutcome(true);
+          return;
+        }
+        recordOutcome(false);
         // Wrapped (review finding, Medium — matching `summarizeNode`'s own
         // try/catch right above): an uncaught persistence error here would
         // otherwise reject this queued job's promise, which rejects the
@@ -449,7 +581,7 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
         // batch down with it.
         try {
           mergeNodeRecord(node.id, {
-            summary: { text: summaryText, model: model.model, generatedAt: new Date().toISOString() },
+            summary: { text: outcome.text, model: model.model, generatedAt: new Date().toISOString() },
           });
         } catch (error) {
           console.error(
@@ -459,7 +591,7 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
           );
           return;
         }
-        batcher.add({ id: node.id, summary: summaryText });
+        batcher.add({ id: node.id, summary: outcome.text });
       }),
     ),
   );

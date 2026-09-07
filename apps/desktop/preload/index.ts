@@ -13,6 +13,7 @@ import {
   type CodeMapResult,
   type DrillerApi,
   type GraphServiceStatusMessage,
+  type HardwareAdvisoryMessage,
   type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
@@ -55,6 +56,14 @@ const drillerApi: DrillerApi = {
     ipcRenderer.on(IpcChannels.summaryProgress, listener);
     return () => {
       ipcRenderer.removeListener(IpcChannels.summaryProgress, listener);
+    };
+  },
+
+  onHardwareAdvisory: (callback: (message: HardwareAdvisoryMessage) => void) => {
+    const listener = (_event: IpcRendererEvent, message: HardwareAdvisoryMessage) => callback(message);
+    ipcRenderer.on(IpcChannels.hardwareAdvisory, listener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.hardwareAdvisory, listener);
     };
   },
 

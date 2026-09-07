@@ -449,6 +449,38 @@ export interface SummaryProgressMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 1.5 (Phase 3): hardware-adequacy advisory (Intent, Boundaries &
+// Constraints).
+//
+// A message stream distinct from `ModelStatusMessage`/`SummaryProgressMessage`
+// (own `type`, same disambiguation convention) — `services/graph-service/
+// index.ts` combines two independent signals into this one post:
+//  - 'constrained-tier': Phase 1's own tier-selection heuristic already
+//    signals constrained hardware (the fallback tier was chosen), surfaced
+//    once the local model is `ready`. No new GPU/hardware-detection
+//    dependency — reuses `LocalModelReady.tier` (Design Notes).
+//  - 'degenerate-results': `summary-generator.ts`'s reactive rolling
+//    completed/degenerate-result rate crossed its threshold within the
+//    current generation run (a *rate*, never a single fluke — Boundaries &
+//    Constraints).
+//
+// Informational only (Boundaries & Constraints): this never claims a
+// "switch to cloud" action exists, since Story 1.6 (the actual cloud-key
+// backend) doesn't exist yet — the renderer's Actionable Notice for this
+// message carries no action button, just an honest, reason-specific
+// sentence. Sent at most once per signal source per project session (Code
+// Map: "no repeat spam") — `index.ts` tracks that, not the renderer.
+// ---------------------------------------------------------------------------
+
+/** Which hardware-adequacy signal triggered the advisory — see `HardwareAdvisoryMessage`'s doc comment. */
+export type HardwareAdvisoryReason = 'constrained-tier' | 'degenerate-results';
+
+export interface HardwareAdvisoryMessage {
+  type: 'graphService:hardwareAdvisory';
+  reason: HardwareAdvisoryReason;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -462,6 +494,7 @@ export const IpcChannels = {
   sourceReadRange: 'source:readRange',
   modelStatus: 'model:status',
   summaryProgress: 'summary:progress',
+  hardwareAdvisory: 'hardware:advisory',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -498,6 +531,13 @@ export interface DrillerApi {
    * Map is already showing. Returns an unsubscribe function.
    */
   onSummaryProgress: (callback: (message: SummaryProgressMessage) => void) => () => void;
+  /**
+   * Subscribes to the hardware-adequacy advisory stream (Story 1.5 Phase 3)
+   * — a non-blocking, informational-only nudge toward the cloud path
+   * (Story 1.6, not yet built), distinct from both `onModelStatus` and
+   * `onSummaryProgress`. Returns an unsubscribe function.
+   */
+  onHardwareAdvisory: (callback: (message: HardwareAdvisoryMessage) => void) => () => void;
   /**
    * Fetches the Code Map (Nodes + call/dependency edges) for the most
    * recently `indexed` project. Called once per successful `indexed` state

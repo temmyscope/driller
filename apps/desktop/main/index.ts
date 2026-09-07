@@ -31,6 +31,7 @@ import {
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
   type GraphServiceStatusMessage,
+  type HardwareAdvisoryMessage,
   type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
@@ -119,6 +120,17 @@ function sendSummaryProgress(message: SummaryProgressMessage): void {
 }
 
 /**
+ * Relays the hardware-adequacy advisory (Story 1.5 Phase 3) to the renderer
+ * — same destroyed-webContents guard and "own channel" pattern as
+ * `sendModelStatus`/`sendSummaryProgress`.
+ */
+function sendHardwareAdvisory(message: HardwareAdvisoryMessage): void {
+  if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(IpcChannels.hardwareAdvisory, message);
+  }
+}
+
+/**
  * True for a `graphService:codeMap`/`graphService:codeMapError` reply —
  * distinguished from a `GraphServiceStatusMessage` by `type` rather than
  * `state`, per `ipc-contracts`'s doc comment on `GraphServiceCodeMapMessage`.
@@ -153,6 +165,19 @@ function isSummaryProgressMessage(message: unknown): message is SummaryProgressM
     return false;
   }
   return (message as { type?: unknown }).type === 'graphService:summaryProgress';
+}
+
+/**
+ * True for a `graphService:hardwareAdvisory` post — distinguished from the
+ * other message shapes on this same `parentPort` channel by `type`, same
+ * convention as `isCodeMapMessage`/`isModelStatusMessage`/
+ * `isSummaryProgressMessage`.
+ */
+function isHardwareAdvisoryMessage(message: unknown): message is HardwareAdvisoryMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:hardwareAdvisory';
 }
 
 /**
@@ -211,7 +236,8 @@ function spawnGraphService(): void {
         | GraphServiceStatusMessage
         | GraphServiceCodeMapMessage
         | ModelStatusMessage
-        | SummaryProgressMessage,
+        | SummaryProgressMessage
+        | HardwareAdvisoryMessage,
     ) => {
       if (isCodeMapMessage(message)) {
         settlePendingCodeMapRequest(
@@ -227,6 +253,10 @@ function spawnGraphService(): void {
       }
       if (isSummaryProgressMessage(message)) {
         sendSummaryProgress(message);
+        return;
+      }
+      if (isHardwareAdvisoryMessage(message)) {
+        sendHardwareAdvisory(message);
         return;
       }
       sendGraphServiceStatus(message);
