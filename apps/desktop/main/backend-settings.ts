@@ -133,6 +133,49 @@ function isLinuxInsecureBackend(): boolean {
   return typeof backend !== 'string' || !LINUX_SECURE_STORAGE_BACKENDS.has(backend);
 }
 
+/**
+ * Decrypts the stored cloud API key ciphertext for a transient handoff to
+ * the Graph Service subprocess (Story 1.6, Phase 2) — the one deliberate,
+ * bounded exception to "secrets stay in main" this story's Design Notes
+ * describe: `safeStorage` itself is unavailable inside a
+ * `utilityProcess`-forked subprocess (only `process.parentPort` is real
+ * there — see services/graph-service/index.ts's module doc), so the
+ * alternative would be routing every single cloud API call through main,
+ * which fights AD-8's "generation lives in the Graph Service" boundary far
+ * more than this one-time transient key handoff does. Called only at the
+ * two points a generation run can actually start/restart
+ * (`sendIndexRequest` and the `settingsSetActiveBackend` handler in
+ * main/index.ts) — the decrypted key is never stored in a module-level
+ * variable here, so nothing in this process retains it beyond the single
+ * call that needed it.
+ *
+ * Returns `undefined` when no key is stored, when `safeStorage` encryption
+ * is unavailable, or when decryption itself fails (e.g. ciphertext written
+ * under a different OS keychain/user) — logged as only `error.message`,
+ * never the ciphertext or any partial decryption result (this module's own
+ * "never log raw key material" invariant), so a corrupt/foreign ciphertext
+ * degrades to "no key" for the caller rather than crashing the index/
+ * backend-switch flow that called this.
+ */
+export function getDecryptedCloudApiKey(): string | undefined {
+  const ciphertextBase64 = store.getCloudKeyCiphertextBase64();
+  if (!ciphertextBase64) {
+    return undefined;
+  }
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      return undefined;
+    }
+    return safeStorage.decryptString(Buffer.from(ciphertextBase64, 'base64'));
+  } catch (error) {
+    console.error(
+      'Failed to decrypt the stored cloud API key.',
+      error instanceof Error ? error.message : 'Unknown error',
+    );
+    return undefined;
+  }
+}
+
 /** Returns the current backend config for the Settings panel. */
 export function getBackendConfig(): BackendConfig {
   return {

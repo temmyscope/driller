@@ -107,6 +107,25 @@ export function Settings({ onClose }: SettingsProps) {
             setKeyInput('');
             setKeyEntry({ kind: 'idle' });
             refetchConfig();
+            // Story 1.6 (Phase 2): if cloud is already the active backend
+            // (the "cloud selected, no key" case this exact form exists
+            // for), generation has been sitting blocked with no key to use.
+            // Re-invoking `setActiveBackend` with the same already-active
+            // value is a no-op for the persisted choice itself, but main's
+            // handler unconditionally relays a fresh `graphService:
+            // backendSwitched` (with the key now decryptable) whenever it's
+            // called — the same mechanism a genuine local<->cloud switch
+            // uses — so this is what actually resumes generation now that a
+            // key exists, rather than leaving the user stuck until they
+            // flip the radio away and back.
+            if (configRef.current?.activeBackend === 'cloud') {
+              window.driller.setActiveBackend('cloud').catch(() => {
+                // Best-effort nudge — a failure here just means generation
+                // stays blocked until the next real backend switch; nothing
+                // about the key save itself (already confirmed above) is
+                // affected.
+              });
+            }
             return;
           }
           if (result.status === 'warning') {
@@ -115,6 +134,22 @@ export function Settings({ onClose }: SettingsProps) {
               message: result.message ?? 'This machine has no secure keystore available.',
               pendingKey: key,
             });
+            // Review finding, Low: a key can reach real storage via this
+            // 'warning' branch too — the insecure-keystore warning still
+            // means the key ends up genuinely stored (either an already-
+            // stored key from an earlier save, or, once the user clicks
+            // "Store anyway" here, this same pending key on the resulting
+            // 'ok' call above) — so the same resume-generation nudge applies
+            // here, not just on a clean 'ok' result. Safe to fire
+            // unconditionally alongside the warning state: with the same-
+            // backend-value guard in services/graph-service/index.ts's
+            // `handleBackendSwitchedRequest`, this never wipes existing
+            // summaries — it only ever re-kicks still-pending Nodes.
+            if (configRef.current?.activeBackend === 'cloud') {
+              window.driller.setActiveBackend('cloud').catch(() => {
+                // Best-effort nudge, same reasoning as the 'ok' branch above.
+              });
+            }
             return;
           }
           setKeyEntry({ kind: 'error', message: result.message ?? 'Failed to save the API key.' });

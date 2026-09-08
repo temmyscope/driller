@@ -584,6 +584,16 @@ code,
   font-style: normal;
 }
 
+/* Story 1.6 (Phase 2): the "no summary backend available"/"cloud selected,
+   no key" Actionable Notices, rendered per-Node in place of the ordinary
+   pending state (CodeMap.tsx). Same "never color-only" treatment as
+   `--coverage-gap` above — the ☁/⚠ glyph and message text carry the signal
+   on their own. */
+.code-map__node-summary--notice {
+  color: var(--warning);
+  font-style: normal;
+}
+
 .code-map__edge {
   stroke: var(--text-muted);
   cursor: pointer;

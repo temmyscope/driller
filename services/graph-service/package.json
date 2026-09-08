@@ -7,6 +7,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
     "@driller/ipc-contracts": "*",
     "@modelcontextprotocol/client": "2.0.0",
     "codebase-memory-mcp": "^0.10.8",

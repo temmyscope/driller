@@ -79,12 +79,35 @@
  * `records` after `setActiveProject` has already swapped it to a different
  * project (the same concurrency/correlation bug class that module's own doc
  * comment flags as already fixed twice elsewhere in this build).
+ *
+ * Story 1.6 (Phase 2) makes which summarizer `startSummaryGenerationForProject`
+ * builds pluggable: every `graphService:index` request now carries
+ * `{activeBackend, cloudApiKey?}` (main resolves this from the persisted
+ * backend settings and, for cloud, a freshly-`safeStorage`-decrypted key —
+ * the only process with `safeStorage` access), cached here as
+ * `activeBackendConfig` and used to build either `summary-generator.ts`'s
+ * `createLocalSummarizer` or `cloud-summary-generator.ts`'s
+ * `createCloudSummarizer`. A new `graphService:backendSwitched` message
+ * (sent when Settings' backend choice changes while a project is already
+ * open) clears every persisted summary for the current project — via
+ * `node-record-store.ts`'s existing per-Node merge-write API, never a new
+ * store method — and re-kicks generation through the same job pool against
+ * the same cached `activeCodeMapNodes` (never a fresh `fetchCodeMap`/graph
+ * re-index, AD-18). Generation is simply skipped (no summarizer built at
+ * all) when the active backend can't actually produce anything this run —
+ * cloud with no decrypted key, or local while its own download/verify
+ * attempt has failed — and the renderer derives its own "no summary backend
+ * available"/"cloud selected, no key" Actionable Notices entirely from
+ * `BackendConfig`/`ModelStatusMessage`, so no additional message needs to be
+ * posted from here for either case.
  */
 
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  CloudBackend,
   CodeMapNode,
+  GraphServiceBackendSwitchedRequest,
   GraphServiceCodeMapMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
@@ -99,10 +122,23 @@ import type {
 // augmentation (real, present only when forked via `utilityProcess.fork`)
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
+import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { fetchCodeMap, indexRepository } from './mcp-client';
-import { flushNodeRecordStore, initNodeRecordStore, setActiveProject } from './node-record-store';
-import { annotateNodesWithSummaryState, disposeModelContext, generateSummaries } from './summary-generator';
+import {
+  flushNodeRecordStore,
+  getAllNodeRecords,
+  initNodeRecordStore,
+  mergeNodeRecord,
+  setActiveProject,
+} from './node-record-store';
+import {
+  annotateNodesWithSummaryState,
+  createLocalSummarizer,
+  disposeModelContext,
+  generateSummaries,
+  type SummarizeFn,
+} from './summary-generator';
 
 // Stays comfortably under main's 2s forced-kill fallback for the Graph
 // Service subprocess (apps/desktop/main/index.ts's teardownGraphService) —
@@ -200,6 +236,27 @@ let activeGenerationRunId: number | null = null;
 // for the rest of this subprocess's lifetime.
 let advisoryPostedForConstrainedTier = false;
 let advisoryPostedForDegenerateResults = false;
+
+// Story 1.6 (Phase 2): which summary backend to generate with, and the
+// freshly-decrypted cloud key if relevant — set from `graphService:index`'s
+// payload in `handleIndexRequest`, and updated in place by
+// `handleBackendSwitchedRequest` on a `graphService:backendSwitched`
+// message. Defaults to `'local'` only so this module has a well-typed value
+// before the first `graphService:index` request ever arrives; that first
+// request always overwrites it before generation can start.
+let activeBackendConfig: { activeBackend: CloudBackend; cloudApiKey?: string } = {
+  activeBackend: 'local',
+};
+
+// The most recently fetched Code Map's Nodes (Story 1.6, Phase 2) — cached
+// here (not just passed straight through from `handleGetCodeMapRequest` to
+// `startSummaryGenerationForProject`) so `handleBackendSwitchedRequest` can
+// re-kick generation for the same Node set a backend switch happens against
+// without re-fetching the Code Map (AD-18: a backend switch never triggers a
+// graph re-index). Reset to `undefined` on every new `graphService:index`
+// request — a Node set from a since-superseded project must never be reused
+// for a later backend switch belonging to a different project.
+let activeCodeMapNodes: CodeMapNode[] | undefined;
 
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
@@ -414,19 +471,50 @@ function isGetCodeMapRequest(data: unknown): data is GraphServiceGetCodeMapReque
   );
 }
 
+/** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
+function isCloudBackendValue(value: unknown): value is CloudBackend {
+  return value === 'local' || value === 'cloud';
+}
+
 function isIndexRequest(data: unknown): data is GraphServiceIndexRequest {
   if (typeof data !== 'object' || data === null) {
     return false;
   }
-  const { type, path: projectPath } = data as { type?: unknown; path?: unknown };
+  const { type, path: projectPath, activeBackend, cloudApiKey } = data as {
+    type?: unknown;
+    path?: unknown;
+    activeBackend?: unknown;
+    cloudApiKey?: unknown;
+  };
   // Mirrors the validation pattern main/index.ts's projectOpenPath handler
   // already uses for a renderer-supplied path: non-empty and absolute, not
-  // merely a string, before it reaches the backend uncaught.
+  // merely a string, before it reaches the backend uncaught. Story 1.6
+  // (Phase 2) adds the same defensive treatment for `activeBackend`/
+  // `cloudApiKey`, which cross the same untrusted-shape boundary (even
+  // though this particular sender is main, not the renderer).
   return (
     type === 'graphService:index' &&
     typeof projectPath === 'string' &&
     projectPath.length > 0 &&
-    path.isAbsolute(projectPath)
+    path.isAbsolute(projectPath) &&
+    isCloudBackendValue(activeBackend) &&
+    (cloudApiKey === undefined || typeof cloudApiKey === 'string')
+  );
+}
+
+function isBackendSwitchedRequest(data: unknown): data is GraphServiceBackendSwitchedRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, activeBackend, cloudApiKey } = data as {
+    type?: unknown;
+    activeBackend?: unknown;
+    cloudApiKey?: unknown;
+  };
+  return (
+    type === 'graphService:backendSwitched' &&
+    isCloudBackendValue(activeBackend) &&
+    (cloudApiKey === undefined || typeof cloudApiKey === 'string')
   );
 }
 
@@ -462,8 +550,20 @@ async function finishShutdown(): Promise<void> {
   process.exit(0);
 }
 
-async function handleIndexRequest(projectPath: string): Promise<void> {
+async function handleIndexRequest(
+  projectPath: string,
+  backendConfig: { activeBackend: CloudBackend; cloudApiKey?: string },
+): Promise<void> {
   activeIndexPath = projectPath;
+  // Story 1.6 Phase 2: this request's backend choice/decrypted key becomes
+  // the one `startSummaryGenerationForProject` resolves a summarizer from,
+  // whenever generation for this project actually starts (after the
+  // `getCodeMap` round trip below). A fresh Node set is about to be fetched
+  // for this (possibly new) project — any Node set cached from a previous
+  // project must not be reused by a `graphService:backendSwitched` request
+  // that's really about this new project.
+  activeBackendConfig = backendConfig;
+  activeCodeMapNodes = undefined;
   // Story 1.5 Phase 2: a new index attempt (a different project, or a
   // re-index of the same one) immediately invalidates any summary
   // generation still running from a previous index/getCodeMap cycle — see
@@ -583,7 +683,7 @@ async function handleGetCodeMapRequest(): Promise<void> {
     const { nodes, edges } = await fetchCodeMap(activeProject);
     const annotatedNodes = annotateNodesWithSummaryState(nodes, coverageGapFileSet);
     postCodeMapMessage({ type: 'graphService:codeMap', nodes: annotatedNodes, edges });
-    void startSummaryGenerationForProject(annotatedNodes);
+    void startSummaryGenerationForProject(nodes);
   } catch (error) {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
@@ -597,20 +697,37 @@ async function handleGetCodeMapRequest(): Promise<void> {
  * `graphService:codeMap` response (Story 1.5 Phase 2), relaying its batched
  * progress as `graphService:summaryProgress` posts. Fire-and-forget from the
  * caller's perspective (`handleGetCodeMapRequest` never awaits this).
+ * Caches `nodes` into `activeCodeMapNodes` (Story 1.6, Phase 2) so a later
+ * `graphService:backendSwitched` request can re-kick generation for the same
+ * Node set without a fresh `fetchCodeMap` call (AD-18: never a re-index).
  *
- * Waits for the local-model download/verify (kicked off alongside indexing,
- * Story 1.5 Phase 1) to settle before generation can start — reads the
- * current `modelAttempt` at the moment this function runs, not a value
- * captured earlier, so a since-failed-and-reset attempt (see
- * `kickOffModelDownload`'s doc comment) is correctly treated as "no model
- * available" rather than awaiting a stale reference forever.
+ * Resolves which summarizer to build from `activeBackendConfig` (Story 1.6,
+ * Phase 2), read fresh at the moment this function runs rather than a value
+ * captured earlier, mirroring how the local branch already re-reads
+ * `modelAttempt`/`localModelReady` fresh rather than a stale snapshot:
+ *  - `'cloud'` with a decrypted key: `cloud-summary-generator.ts`'s
+ *    `createCloudSummarizer`.
+ *  - `'cloud'` with no key: generation is skipped outright — Never a silent
+ *    local fallback (this story's Never constraint: no partial/mixed-backend
+ *    result). The renderer derives its own "cloud selected, no key"
+ *    Actionable Notice from `BackendConfig` directly; nothing further needs
+ *    to be posted from here.
+ *  - `'local'`: waits for the local-model download/verify (kicked off
+ *    alongside indexing, Story 1.5 Phase 1) to settle before generation can
+ *    start — reads the current `modelAttempt` at the moment this function
+ *    runs, not a value captured earlier, so a since-failed-and-reset attempt
+ *    (see `kickOffModelDownload`'s doc comment) is correctly treated as "no
+ *    model available" rather than awaiting a stale reference forever. If the
+ *    attempt failed, generation is likewise skipped — same "no silent
+ *    fallback" reasoning, mirrored for the local side.
  *
  * `generationId` snapshots `activeSummaryGenerationId` at the moment this
  * run starts; every check against the live module variable below (both here
  * and inside `generateSummaries` via `isSuperseded`) is what lets a later
- * `graphService:index` request — for this same project or a different one —
- * cleanly invalidate this run without it corrupting `node-record-store.ts`'s
- * now-switched-away state (see that variable's own doc comment).
+ * `graphService:index`/`graphService:backendSwitched` request — for this
+ * same project or a different one — cleanly invalidate this run without it
+ * corrupting `node-record-store.ts`'s now-switched-away state (see that
+ * variable's own doc comment).
  *
  * Guarded by `activeGenerationRunId` (review finding, High — see that
  * variable's own doc comment): two overlapping calls for the same
@@ -624,6 +741,9 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
   const generationId = activeSummaryGenerationId;
   const projectRoot = activeProjectPath;
   const gapFiles = coverageGapFileSet;
+  const backendConfig = activeBackendConfig;
+
+  activeCodeMapNodes = nodes;
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
@@ -635,16 +755,35 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
   activeGenerationRunId = generationId;
 
   try {
-    if (modelAttempt) {
-      try {
-        await modelAttempt;
-      } catch {
-        // Already reported via `graphService:modelStatus` 'error' — nothing
-        // more to do; there is no model to generate with this session.
+    let summarize: SummarizeFn;
+    let modelName: string;
+
+    if (backendConfig.activeBackend === 'cloud') {
+      if (!backendConfig.cloudApiKey) {
+        // Blocked, not a silent local fallback (Never constraint) — see this
+        // function's own doc comment for why nothing further is posted here.
         return;
       }
+      summarize = createCloudSummarizer(backendConfig.cloudApiKey);
+      modelName = CLOUD_SUMMARY_MODEL;
+    } else {
+      if (modelAttempt) {
+        try {
+          await modelAttempt;
+        } catch {
+          // Already reported via `graphService:modelStatus` 'error' — nothing
+          // more to do; there is no model to generate with this session.
+          return;
+        }
+      }
+      if (generationId !== activeSummaryGenerationId || !localModelReady) {
+        return;
+      }
+      summarize = createLocalSummarizer(localModelReady);
+      modelName = localModelReady.model;
     }
-    if (generationId !== activeSummaryGenerationId || !localModelReady || !projectRoot) {
+
+    if (generationId !== activeSummaryGenerationId || !projectRoot) {
       return;
     }
 
@@ -652,7 +791,8 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
       projectRoot,
       nodes,
       coverageGapFiles: gapFiles,
-      model: localModelReady,
+      summarize,
+      modelName,
       onProgress: (updated) => {
         if (generationId === activeSummaryGenerationId) {
           // `path` lets the renderer filter stale progress by the currently-
@@ -661,18 +801,21 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
           postSummaryProgress({ type: 'graphService:summaryProgress', path: projectRoot, updated });
         }
       },
-      // Story 1.5 Phase 3: the reactive hardware-adequacy signal (Intent) —
-      // `summary-generator.ts`'s own rolling completed/degenerate-rate
-      // tracker fires this at most once per `generateSummaries` call, once
-      // the *rate* (not a single fluke) crosses its threshold. Guarded the
-      // same way `onProgress` above is: a since-superseded run (a different
-      // project, or a re-index) must never post an advisory for a project
-      // no longer on screen.
-      onHardwareAdvisory: () => {
-        if (generationId === activeSummaryGenerationId) {
-          postHardwareAdvisory('degenerate-results');
-        }
-      },
+      // Story 1.5 Phase 3's reactive hardware-adequacy nudge only makes
+      // sense while local generation is what's actually running — it
+      // recommends switching to cloud, which would be a nonsensical thing to
+      // tell a user whose cloud generation is the very thing degenerating
+      // (Story 1.6, Phase 2: never a fabricated/irrelevant action). Wired
+      // only for the local branch; the same supersession guard `onProgress`
+      // above uses still applies underneath it.
+      onHardwareAdvisory:
+        backendConfig.activeBackend === 'local'
+          ? () => {
+              if (generationId === activeSummaryGenerationId) {
+                postHardwareAdvisory('degenerate-results');
+              }
+            }
+          : undefined,
       isSuperseded: () => generationId !== activeSummaryGenerationId,
     });
   } catch (error) {
@@ -688,6 +831,97 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
       activeGenerationRunId = null;
     }
   }
+}
+
+/**
+ * Handles a `graphService:backendSwitched` request (Story 1.6, Phase 2) —
+ * sent by main when Settings' backend choice changes while a project is
+ * already open. Updates `activeBackendConfig` to the new choice, clears
+ * every persisted summary for the current project via `node-record-store.
+ * ts`'s existing per-Node merge-write API (`mergeNodeRecord(id, {summary:
+ * undefined})` for every currently-recorded id — AD-20: a per-signal-family
+ * write, never a full-record wipe of any other family), and re-kicks
+ * generation for the same cached `activeCodeMapNodes` (never a fresh
+ * `fetchCodeMap`/graph re-index, AD-18, Boundaries & Constraints).
+ *
+ * A no-op if nothing has actually been fetched yet for this project
+ * (`activeCodeMapNodes` still `undefined` — e.g. the backend was switched
+ * before the first `graphService:getCodeMap` response ever landed): there's
+ * nothing to clear or re-queue yet, and the next `getCodeMap`-triggered
+ * `startSummaryGenerationForProject` call will already read the up-to-date
+ * `activeBackendConfig` this function just set.
+ *
+ * Bumps `activeSummaryGenerationId` (the same supersession mechanism
+ * `handleIndexRequest` uses) so a still-running generation for the old
+ * backend is invalidated before the fresh one starts — never a mixed-backend
+ * result set (this story's Always constraint).
+ */
+async function handleBackendSwitchedRequest(backendConfig: {
+  activeBackend: CloudBackend;
+  cloudApiKey?: string;
+}): Promise<void> {
+  // Review finding, High: captured before `activeBackendConfig` is
+  // overwritten below — this is what distinguishes a GENUINE backend switch
+  // (local<->cloud, or between local tiers) from a same-value
+  // re-affirmation. Settings.tsx's "resume blocked generation" nudge
+  // (`attemptSaveKey` re-invoking `setActiveBackend('cloud')` after a key
+  // save while cloud is already active) reuses this exact relay path with
+  // `activeBackend` unchanged — without this comparison, that resume nudge
+  // would silently wipe every already-successful summary just to retry the
+  // Nodes that were genuinely blocked, spending real Anthropic API calls
+  // regenerating summaries that already existed.
+  const previousBackend = activeBackendConfig.activeBackend;
+  activeBackendConfig = backendConfig;
+  const nodes = activeCodeMapNodes;
+  if (!nodes || nodes.length === 0) {
+    return;
+  }
+
+  if (backendConfig.activeBackend === previousBackend) {
+    // Same backend re-affirmed (the key-save resume case, or any other
+    // same-value call) — never clears (Boundaries & Constraints: "A backend
+    // switch ... clears the current project's persisted summaries" only
+    // applies to an actual switch). Just re-kicks generation:
+    // `generateSummaries`'s own eligibility filter (`classifyNode`) already
+    // only attempts Nodes still `'pending'` per the record store, so
+    // already-successful summaries are left untouched and only
+    // genuinely-blocked/pending Nodes (e.g. blocked on a missing key that
+    // now exists) are retried.
+    activeSummaryGenerationId += 1;
+    void startSummaryGenerationForProject(nodes);
+    return;
+  }
+
+  // Story 1.5 Phase 3 (review finding, Low): a genuine backend switch starts
+  // a fresh project session for the hardware-advisory once-per-source guard
+  // too, mirroring `handleIndexRequest`'s own reset — without this, an
+  // advisory that already fired during an earlier local run would never
+  // re-post even if the same degenerate condition recurs after switching
+  // away from local and back to it.
+  advisoryPostedForConstrainedTier = false;
+  advisoryPostedForDegenerateResults = false;
+
+  const allRecords = getAllNodeRecords();
+  for (const id of Object.keys(allRecords)) {
+    // Wrapped (review finding, Medium — matching every other
+    // `mergeNodeRecord` call site in this file/summary-generator.ts): an
+    // uncaught write error here would otherwise reject this fire-and-forget
+    // `void handleBackendSwitchedRequest(...)` call as an unhandled
+    // rejection instead of being logged and skipped, aborting the rest of
+    // this clear loop for every remaining id.
+    try {
+      mergeNodeRecord(id, { summary: undefined });
+    } catch (error) {
+      console.error(
+        `[graph-service] failed to clear summary for ${id} during backend switch: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  activeSummaryGenerationId += 1;
+  void startSummaryGenerationForProject(nodes);
 }
 
 /**
@@ -765,7 +999,20 @@ process.parentPort?.on('message', (event) => {
     }
     // Fire-and-forget from the message handler's perspective: progress is
     // reported asynchronously via postStatus, not this handler's return.
-    activeIndexRequest = handleIndexRequest(event.data.path);
+    activeIndexRequest = handleIndexRequest(event.data.path, {
+      activeBackend: event.data.activeBackend,
+      cloudApiKey: event.data.cloudApiKey,
+    });
+    return;
+  }
+  if (!isShuttingDown && isBackendSwitchedRequest(event.data)) {
+    // Fire-and-forget, same reasoning as the index/getCodeMap branches above
+    // — this message's own effects (cleared summaries, re-queued Nodes,
+    // batched progress posts) are all observed asynchronously.
+    void handleBackendSwitchedRequest({
+      activeBackend: event.data.activeBackend,
+      cloudApiKey: event.data.cloudApiKey,
+    });
   }
 });
 

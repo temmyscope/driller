@@ -301,6 +301,13 @@ type CodeMapFlowNode = FlowNode<
     firstCallerId: string | undefined;
     calleeCount: number;
     firstCalleeId: string | undefined;
+    // Story 1.6 (Phase 2): threaded through the same way `onActivate`/
+    // `onNavigate` already are — a `'pending'` Node renders one of these two
+    // Actionable Notices instead of the ordinary "Summary pending…" text
+    // when generation can't actually produce anything right now (Boundaries
+    // & Constraints: never a silent empty summary).
+    noSummaryBackendAvailable: boolean;
+    cloudSelectedNoKey: boolean;
   },
   'codeMapNode'
 >;
@@ -313,6 +320,8 @@ function layoutNodes(
   onActivate: (node: CodeMapNode) => void,
   onNavigate: (id: string) => void,
   adjacency: NodeAdjacency,
+  noSummaryBackendAvailable: boolean,
+  cloudSelectedNoKey: boolean,
 ): CodeMapFlowNode[] {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
   return nodes.map((node, index) => {
@@ -332,6 +341,8 @@ function layoutNodes(
         firstCallerId: entry?.callers[0],
         calleeCount: entry?.callees.length ?? 0,
         firstCalleeId: entry?.callees[0],
+        noSummaryBackendAvailable,
+        cloudSelectedNoKey,
       },
     };
   });
@@ -392,7 +403,17 @@ function resolveEdgeClickTarget(edge: { source: string; target: string }, focuse
  * presence.
  */
 function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
-  const { node, onActivate, onNavigate, callerCount, firstCallerId, calleeCount, firstCalleeId } = data;
+  const {
+    node,
+    onActivate,
+    onNavigate,
+    callerCount,
+    firstCallerId,
+    calleeCount,
+    firstCalleeId,
+    noSummaryBackendAvailable,
+    cloudSelectedNoKey,
+  } = data;
   return (
     <div
       className="code-map__node"
@@ -421,7 +442,26 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
       {node.summaryStatus === 'ready' && node.summary !== undefined && (
         <p className="code-map__node-summary">{node.summary}</p>
       )}
-      {node.summaryStatus === 'pending' && (
+      {/* Story 1.6 (Phase 2): a `'pending'` Node that will genuinely never
+          get a summary this session — either backend is unusable — renders
+          the matching Actionable Notice instead of the ordinary "Summary
+          pending…" text (Boundaries & Constraints: never a silent empty
+          summary; UX-DR17: "cloud selected, no key" is the more specific
+          message and takes priority when both technically apply — already
+          resolved in App.tsx, so at most one of these two is ever true
+          here). */}
+      {node.summaryStatus === 'pending' && cloudSelectedNoKey && (
+        <p className="code-map__node-summary code-map__node-summary--notice" role="status">
+          <span aria-hidden="true">☁</span> Cloud is selected but no API key is set — add one in
+          Settings.
+        </p>
+      )}
+      {node.summaryStatus === 'pending' && !cloudSelectedNoKey && noSummaryBackendAvailable && (
+        <p className="code-map__node-summary code-map__node-summary--notice" role="status">
+          <span aria-hidden="true">⚠</span> No summary backend is available — check Settings.
+        </p>
+      )}
+      {node.summaryStatus === 'pending' && !cloudSelectedNoKey && !noSummaryBackendAvailable && (
         <p className="code-map__node-summary code-map__node-summary--pending" role="status">
           Summary pending…
         </p>
@@ -592,9 +632,23 @@ export interface CodeMapProps {
    * patching a Node id that may not even belong to the map on screen.
    */
   projectPath: string | null;
+  /**
+   * Story 1.6 (Phase 2): true when neither summary backend can produce
+   * anything at all right now (local unusable AND no cloud key) — derived
+   * by App.tsx from `BackendConfig`/`ModelStatusMessage`, already resolved
+   * against `cloudSelectedNoKey`'s own priority (UX-DR17), so CodeMap just
+   * renders whichever of the two is true.
+   */
+  noSummaryBackendAvailable: boolean;
+  /**
+   * Story 1.6 (Phase 2): true when the active backend is cloud but no key is
+   * stored — the more specific of the two notices (UX-DR17), derived by
+   * App.tsx the same way `noSummaryBackendAvailable` is.
+   */
+  cloudSelectedNoKey: boolean;
 }
 
-export function CodeMap({ projectPath }: CodeMapProps) {
+export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
   // Correlates a `readSourceRange` response back to the click that started
@@ -999,8 +1053,18 @@ export function CodeMap({ projectPath }: CodeMapProps) {
   }, [fetchState]);
 
   const flowNodes = useMemo(
-    () => (fetchState.status === 'ready' ? layoutNodes(fetchState.nodes, activateNode, navigateToNode, adjacency) : []),
-    [fetchState, activateNode, navigateToNode, adjacency],
+    () =>
+      fetchState.status === 'ready'
+        ? layoutNodes(
+            fetchState.nodes,
+            activateNode,
+            navigateToNode,
+            adjacency,
+            noSummaryBackendAvailable,
+            cloudSelectedNoKey,
+          )
+        : [],
+    [fetchState, activateNode, navigateToNode, adjacency, noSummaryBackendAvailable, cloudSelectedNoKey],
   );
   const flowEdges = useMemo(
     () => (fetchState.status === 'ready' ? toFlowEdges(fetchState.edges) : []),

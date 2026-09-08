@@ -28,6 +28,7 @@ import {
   type BackendConfig,
   type CodeMapResult,
   type GitDetectionResult,
+  type GraphServiceBackendSwitchedRequest,
   type GraphServiceCodeMapMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
@@ -39,7 +40,12 @@ import {
   type SetCloudApiKeyResult,
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
-import { getBackendConfig, setActiveBackend, setCloudApiKey } from './backend-settings';
+import {
+  getBackendConfig,
+  getDecryptedCloudApiKey,
+  setActiveBackend,
+  setCloudApiKey,
+} from './backend-settings';
 import { detectGitRepo } from './git-detect';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
@@ -300,11 +306,22 @@ function spawnGraphService(): void {
  * Sends an index-start request to a running Graph Service subprocess
  * (Story 1.2, Phase 1). A no-op if the subprocess isn't up — callers only
  * invoke this once `spawnGraphService()` has run.
+ *
+ * Story 1.6 (Phase 2) adds the backend choice: `activeBackend` is read from
+ * the persisted backend settings at the moment this is called, and the
+ * cloud key — decrypted here, in main, the only process with `safeStorage`
+ * access (this story's Design Notes) — is included only when cloud is
+ * actually active. The Graph Service never receives a key it can't use.
  */
 function sendIndexRequest(projectPath: string): void {
+  const backendConfig = getBackendConfig();
   graphService?.postMessage({
     type: 'graphService:index',
     path: projectPath,
+    activeBackend: backendConfig.activeBackend,
+    ...(backendConfig.activeBackend === 'cloud'
+      ? { cloudApiKey: getDecryptedCloudApiKey() }
+      : {}),
   } satisfies GraphServiceIndexRequest);
 }
 
@@ -616,6 +633,18 @@ function registerIpcHandlers(): void {
       return;
     }
     setActiveBackend(backend);
+    // Story 1.6 (Phase 2): relay the switch to a running Graph Service only
+    // when a project is actually open — a no-op backend change before any
+    // project has ever been opened has nothing to clear/re-queue, and the
+    // next `graphService:index` (once a project is opened) already carries
+    // this same up-to-date backend choice on its own.
+    if (graphService && currentProjectPath) {
+      graphService.postMessage({
+        type: 'graphService:backendSwitched',
+        activeBackend: backend,
+        ...(backend === 'cloud' ? { cloudApiKey: getDecryptedCloudApiKey() } : {}),
+      } satisfies GraphServiceBackendSwitchedRequest);
+    }
   });
 
   ipcMain.handle(

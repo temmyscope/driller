@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
+  BackendConfig,
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   IndexCoverageSummary,
@@ -29,6 +30,14 @@ export function App() {
   // way graphServiceStatus is: there's exactly one local model per
   // installation, not one per project.
   const [modelStatus, setModelStatus] = useState<ModelStatusMessage | null>(null);
+  // Story 1.6 (Phase 2): the backend config (already used by Settings) —
+  // fetched once here too so App.tsx can derive the two new Actionable
+  // Notice conditions (`noSummaryBackendAvailable`/`cloudSelectedNoKey`,
+  // below) without CodeMap needing its own `getBackendConfig()` fetch.
+  // Refetched whenever Settings closes (see `isSettingsOpen`'s `onClose`
+  // below), since that's the only place `activeBackend`/`hasCloudKey` can
+  // actually change during a session.
+  const [backendConfig, setBackendConfig] = useState<BackendConfig | null>(null);
   // The hardware-adequacy advisory reasons currently active (Story 1.5
   // Phase 3) — a `Set`, not a single value, since the two signal sources
   // (constrained-tier, degenerate-results) are independent and can both be
@@ -70,6 +79,29 @@ export function App() {
       cancelled = true;
     };
   }, []);
+
+  // Story 1.6 (Phase 2): fetched once on mount, and again whenever Settings
+  // closes (its own `onClose` below) — the only place `activeBackend`/
+  // `hasCloudKey` can change during a session. A failed fetch leaves
+  // `backendConfig` at `null` rather than throwing; the derived booleans
+  // below already treat `null` as "nothing to warn about yet" (same
+  // conservative default a not-yet-loaded `modelStatus` gets).
+  const refetchBackendConfig = useCallback(() => {
+    window.driller
+      .getBackendConfig()
+      .then((config) => {
+        setBackendConfig(config);
+      })
+      .catch(() => {
+        // No explicit error surface for this — `noSummaryBackendAvailable`/
+        // `cloudSelectedNoKey` simply stay false (via the `null` fallback in
+        // their derivation below) rather than showing a wrong/stale notice.
+      });
+  }, []);
+
+  useEffect(() => {
+    refetchBackendConfig();
+  }, [refetchBackendConfig]);
 
   useEffect(() => {
     const unsubscribe = window.driller.onGraphServiceStatus((status) => {
@@ -213,6 +245,31 @@ export function App() {
   // persistent footer rather than the main content (Code Map task list).
   const isIndexed = graphServiceStatus?.state === 'indexed';
 
+  // Story 1.6 (Phase 2): the two new Actionable Notice conditions (Boundaries
+  // & Constraints), derived entirely from already-fetched/subscribed state —
+  // no new Graph Service message exists for either, by design (the Graph
+  // Service just silently skips generation in both cases; see
+  // services/graph-service/index.ts's `startSummaryGenerationForProject`).
+  //
+  // `localUnusable` only ever reflects a genuine reported failure
+  // (`modelStatus?.state === 'error'`) — `null`/'downloading'/'verifying'/
+  // 'ready' all read as "not (yet) unusable," never a false-positive notice
+  // while the local model attempt is still in flight or hasn't been
+  // observed yet this session.
+  const localUnusable = modelStatus?.state === 'error';
+  const hasCloudKey = backendConfig?.hasCloudKey ?? false;
+  // "cloud selected, no key" — the currently *active* backend is cloud but
+  // has no key to generate with, regardless of whether local happens to be
+  // usable (Boundaries & Constraints: cloud being selected means the user
+  // wants cloud, not a silent local fallback).
+  const cloudSelectedNoKey = backendConfig?.activeBackend === 'cloud' && !hasCloudKey;
+  // "no summary backend available" — neither backend can produce anything at
+  // all (local unusable AND no cloud key to fall back to), independent of
+  // which one is currently selected. The more specific `cloudSelectedNoKey`
+  // takes priority when both technically apply (UX-DR17) — resolved here,
+  // once, rather than leaving CodeMap to re-derive the same priority rule.
+  const noSummaryBackendAvailable = !cloudSelectedNoKey && localUnusable && !hasCloudKey;
+
   return (
     <main className={`app${isIndexed ? ' app--map' : ''}`}>
       <header className="app__header">
@@ -289,7 +346,11 @@ export function App() {
               already passed this component's own `currentProjectPathRef`
               correlation filter above, by which point `currentProjectPath`
               already reflects that same project. */}
-          <CodeMap projectPath={currentProjectPath} />
+          <CodeMap
+            projectPath={currentProjectPath}
+            noSummaryBackendAvailable={noSummaryBackendAvailable}
+            cloudSelectedNoKey={cloudSelectedNoKey}
+          />
         </section>
       )}
 
@@ -324,10 +385,15 @@ export function App() {
 
       {/* Story 1.5 Phase 3: the hardware-adequacy advisory — a real
           Actionable-Notice-shaped element (icon+text, never color-only) near
-          the model-status indicator above (Code Map/Design Notes). Purely
-          informational: no action button, since Story 1.6 (the actual
-          cloud-key backend) doesn't exist yet — this never claims a
-          "switch to cloud" action exists (Boundaries & Constraints).
+          the model-status indicator above (Code Map/Design Notes). Still
+          purely informational, with no button/action of its own (review
+          finding, Low — comment updated for Story 1.6 Phase 2, which
+          shipped the real cloud backend this advisory nudges toward):
+          `formatHardwareAdvisory` below now correctly says cloud is a real,
+          switchable option (Settings) rather than the pre-Phase-2 "isn't
+          available yet" wording, but this footer itself still renders no
+          button — the nudge only ever points the user at Settings by name,
+          it doesn't add a shortcut into it.
 
           The `role="status"` region itself is always mounted (review
           finding, Low) — unlike `graphServiceStatus`/`modelStatus`'s own
@@ -348,22 +414,36 @@ export function App() {
         ))}
       </footer>
 
-      {isSettingsOpen && <Settings onClose={() => setIsSettingsOpen(false)} />}
+      {isSettingsOpen && (
+        <Settings
+          onClose={() => {
+            setIsSettingsOpen(false);
+            // Story 1.6 (Phase 2): the backend choice/key may have just
+            // changed inside Settings — refresh `backendConfig` so
+            // `noSummaryBackendAvailable`/`cloudSelectedNoKey` reflect it
+            // immediately rather than waiting for some unrelated re-render.
+            refetchBackendConfig();
+          }}
+        />
+      )}
     </main>
   );
 }
 
 /**
  * Honest, reason-specific advisory text (Boundaries & Constraints: "wording
- * distinguishes the two reasons honestly") — never claims a functional
- * "switch to cloud" action exists, since Story 1.6 doesn't yet.
+ * distinguishes the two reasons honestly") — updated for Story 1.6 Phase 2
+ * (review finding, Low): the cloud backend is now real and switchable from
+ * Settings, so the wording says so, rather than the pre-Phase-2 "isn't
+ * available yet." Still purely a nudge, not a literal action: it names
+ * where to go (Settings), not a button this component itself renders.
  */
 function formatHardwareAdvisory(reason: HardwareAdvisoryMessage['reason']): string {
   switch (reason) {
     case 'constrained-tier':
-      return 'This machine may be slow for local summaries — a cloud model would likely help, though that option isn’t available yet.';
+      return 'This machine may be slow for local summaries — switching to the cloud backend in Settings would likely help.';
     case 'degenerate-results':
-      return 'Local summaries are returning empty or slow results — a cloud model would likely help, though that option isn’t available yet.';
+      return 'Local summaries are returning empty or slow results — switching to the cloud backend in Settings would likely help.';
   }
 }
 

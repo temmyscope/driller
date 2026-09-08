@@ -31,6 +31,17 @@
  * Runs only in the Graph Service subprocess (AD-16: no code content leaves
  * the machine) — reads source directly off disk via `fs.readFile`, never
  * through the renderer's `readSourceRange` IPC path.
+ *
+ * Story 1.6 (Phase 2) makes the actual model call pluggable: `generateSummaries`
+ * no longer knows anything local-model-specific — it drives a `SummarizeFn`
+ * (`(node, projectRoot) => Promise<SummarizeOutcome>`) supplied by the
+ * caller (index.ts), which builds either this module's own
+ * `createLocalSummarizer(model)` (the `LlamaChatSession` logic previously
+ * inlined here, unchanged in behavior) or `cloud-summary-generator.ts`'s
+ * `createCloudSummarizer(apiKey)`. The job pool, eligibility filter,
+ * progress batcher, and merge-write logic below are otherwise unchanged —
+ * only the per-Node model call itself is swappable (this story's Never
+ * constraint).
  */
 
 import { readFile } from 'node:fs/promises';
@@ -270,8 +281,13 @@ export function annotateNodesWithSummaryState(
  * whole batch when a Node's source can't be read — e.g. the file changed or
  * shrank since the last index; that Node simply stays `'pending'` for this
  * session rather than blocking every other Node's generation.
+ *
+ * Exported (Story 1.6, Phase 2): shared by both `createLocalSummarizer`
+ * below and `cloud-summary-generator.ts`'s `createCloudSummarizer` — reading
+ * a Node's source off disk is identical regardless of which backend ends up
+ * summarizing it, so this stays the one implementation both call.
  */
-async function readNodeSource(projectRoot: string, node: CodeMapNode): Promise<string | undefined> {
+export async function readNodeSource(projectRoot: string, node: CodeMapNode): Promise<string | undefined> {
   // Defensive (review finding, Low): a malformed/corrupt indexed range would
   // otherwise slice backwards (`Array.prototype.slice(end, start)` with
   // `start > end` yields an empty array, silently sending the model an
@@ -320,31 +336,51 @@ function buildPrompt(node: CodeMapNode, source: string): string {
   ].join('\n');
 }
 
-/** Collapses a model response into a genuine single line, trimmed of surrounding whitespace. */
-function normalizeSummaryText(raw: string): string {
+/**
+ * Collapses a model response into a genuine single line, trimmed of
+ * surrounding whitespace. Exported (Story 1.6, Phase 2): shared by
+ * `cloud-summary-generator.ts`, so a cloud response is normalized exactly
+ * the same way a local one already is.
+ */
+export function normalizeSummaryText(raw: string): string {
   return raw.replace(/\s+/g, ' ').trim();
 }
 
 /**
- * `summarizeNode`'s outcome (Story 1.5 Phase 3) — a discriminated result
- * rather than a bare `string | undefined`, so `generateSummaries` can tell
- * apart the three cases that previously all collapsed into the same
- * "nothing to persist" `undefined`:
+ * A backend-agnostic per-Node summarization outcome (Story 1.5 Phase 3;
+ * generalized in Story 1.6 Phase 2 to cover the cloud path too) — a
+ * discriminated result rather than a bare `string | undefined`, so
+ * `generateSummaries` can tell apart the three cases that would otherwise
+ * all collapse into the same "nothing to persist" `undefined`:
  *  - `'unreadable'`: the Node's source couldn't be read this round (file
  *    changed/shrank since indexing) — not a hardware-adequacy signal at
  *    all, so it must never count toward the reactive degenerate-rate
  *    tracker below (Boundaries & Constraints: the *rate* signal is about
  *    slow/empty *generation*, not source-availability churn).
- *  - `'degenerate'`: a genuine empty/whitespace-only model response, or the
- *    prompt timing out — exactly the two conditions the Code Map's own
- *    tracker description names. Counts toward the rate.
+ *  - `'degenerate'`: a genuine empty/whitespace-only model response, or (for
+ *    the local backend) the prompt timing out — exactly the two conditions
+ *    the Code Map's own tracker description names. Counts toward the rate.
  *  - `'success'`: a real, non-empty summary. Counts toward the rate's
  *    denominator, never its numerator.
+ *
+ * `cloud-summary-generator.ts`'s `createCloudSummarizer` uses this same
+ * shape (Code Map: "same shape as the local path") — an authentication/rate-
+ * limit failure from the Anthropic API is neither of these; it's thrown
+ * instead, so it reaches `generateSummaries`' own generic catch-and-log path
+ * uncounted toward the (local-hardware-specific) degenerate rate.
  */
-type SummarizeOutcome =
+export type SummarizeOutcome =
   | { kind: 'success'; text: string }
   | { kind: 'unreadable' }
   | { kind: 'degenerate'; reason: 'empty' | 'timeout' };
+
+/**
+ * The pluggable per-Node summarization step (Story 1.6, Phase 2) —
+ * `generateSummaries` drives one of these instead of knowing anything
+ * backend-specific itself. `createLocalSummarizer` (below) and
+ * `cloud-summary-generator.ts`'s `createCloudSummarizer` both produce one.
+ */
+export type SummarizeFn = (node: CodeMapNode, projectRoot: string) => Promise<SummarizeOutcome>;
 
 /**
  * True for the specific error `withTimeout` throws — a real `instanceof`
@@ -358,53 +394,64 @@ function isTimeoutError(error: unknown): error is SummaryTimeoutError {
   return error instanceof SummaryTimeoutError;
 }
 
-async function summarizeNode(
-  node: CodeMapNode,
-  projectRoot: string,
-  sequence: LlamaContextSequence,
-  LlamaChatSession: typeof LlamaChatSessionClass,
-): Promise<SummarizeOutcome> {
-  const source = await readNodeSource(projectRoot, node);
-  if (source === undefined) {
-    return { kind: 'unreadable' };
-  }
-
-  // A fresh session per job (Design Notes) — shares the already-loaded
-  // `sequence`, so this is a cheap wrapper, not a new model/context load.
-  const session = new LlamaChatSession({ contextSequence: sequence });
-  try {
-    let response: string;
-    try {
-      // Timeout-wrapped (review finding, Medium) — see SUMMARY_PROMPT_
-      // TIMEOUT_MS's comment for why a bounded, honest failure beats
-      // letting one hung call stall the whole concurrency-1 queue forever.
-      // A timeout here is itself one of the two degenerate conditions
-      // (Story 1.5 Phase 3's Code Map) — caught and classified rather than
-      // left to propagate to the generic error path below, which would
-      // otherwise just log-and-skip it without it ever counting toward the
-      // reactive hardware-advisory rate.
-      response = await withTimeout(
-        session.prompt(buildPrompt(node, source), { maxTokens: SUMMARY_MAX_TOKENS }),
-        SUMMARY_PROMPT_TIMEOUT_MS,
-        `summary prompt for ${node.id}`,
-      );
-    } catch (error) {
-      if (isTimeoutError(error)) {
-        return { kind: 'degenerate', reason: 'timeout' };
-      }
-      // A genuine, non-timeout failure (e.g. a native binding error) is not
-      // one of the two documented degenerate conditions — rethrown so the
-      // caller's existing catch-and-log path handles it exactly as before,
-      // uncounted toward the hardware-advisory rate.
-      throw error;
+/**
+ * Builds a `SummarizeFn` backed by the local GGUF model (Story 1.6, Phase 2
+ * — this is the `LlamaChatSession` logic previously inlined directly in
+ * `generateSummaries`/`summarizeNode`, unchanged in behavior, just extracted
+ * behind the same pluggable interface `createCloudSummarizer` also
+ * implements). Lazily resolves the shared, memoized model context
+ * (`ensureModelContext`) on first use rather than requiring the caller to
+ * await it up front — cheap after the first call, since that promise is
+ * memoized for the process's lifetime (see `ensureModelContext`'s own doc
+ * comment).
+ */
+export function createLocalSummarizer(model: LocalModelReady): SummarizeFn {
+  return async (node, projectRoot) => {
+    const source = await readNodeSource(projectRoot, node);
+    if (source === undefined) {
+      return { kind: 'unreadable' };
     }
-    const text = normalizeSummaryText(response);
-    return text.length > 0 ? { kind: 'success', text } : { kind: 'degenerate', reason: 'empty' };
-  } finally {
-    // Disposes only the session wrapper, not the shared sequence (default
-    // `disposeSequence: false`) — the sequence is reused by the next job.
-    session.dispose();
-  }
+
+    const { LlamaChatSession } = await loadNodeLlamaCppModule();
+    const { sequence } = await ensureModelContext(model.path);
+
+    // A fresh session per job (Design Notes) — shares the already-loaded
+    // `sequence`, so this is a cheap wrapper, not a new model/context load.
+    const session = new LlamaChatSession({ contextSequence: sequence });
+    try {
+      let response: string;
+      try {
+        // Timeout-wrapped (review finding, Medium) — see SUMMARY_PROMPT_
+        // TIMEOUT_MS's comment for why a bounded, honest failure beats
+        // letting one hung call stall the whole concurrency-1 queue forever.
+        // A timeout here is itself one of the two degenerate conditions
+        // (Story 1.5 Phase 3's Code Map) — caught and classified rather than
+        // left to propagate to the generic error path below, which would
+        // otherwise just log-and-skip it without it ever counting toward the
+        // reactive hardware-advisory rate.
+        response = await withTimeout(
+          session.prompt(buildPrompt(node, source), { maxTokens: SUMMARY_MAX_TOKENS }),
+          SUMMARY_PROMPT_TIMEOUT_MS,
+          `summary prompt for ${node.id}`,
+        );
+      } catch (error) {
+        if (isTimeoutError(error)) {
+          return { kind: 'degenerate', reason: 'timeout' };
+        }
+        // A genuine, non-timeout failure (e.g. a native binding error) is not
+        // one of the two documented degenerate conditions — rethrown so the
+        // caller's existing catch-and-log path handles it exactly as before,
+        // uncounted toward the hardware-advisory rate.
+        throw error;
+      }
+      const text = normalizeSummaryText(response);
+      return text.length > 0 ? { kind: 'success', text } : { kind: 'degenerate', reason: 'empty' };
+    } finally {
+      // Disposes only the session wrapper, not the shared sequence (default
+      // `disposeSequence: false`) — the sequence is reused by the next job.
+      session.dispose();
+    }
+  };
 }
 
 /** Batches individual completions into `onProgress` posts (Always/AD-8). */
@@ -444,8 +491,22 @@ export interface GenerateSummariesOptions {
   nodes: CodeMapNode[];
   /** POSIX-relative paths (matching `CodeMapNode.file`) currently in the index's coverage gap set (FR5). */
   coverageGapFiles: ReadonlySet<string>;
-  /** The verified local model (Story 1.5 Phase 1's `ensureLocalModel` result). */
-  model: LocalModelReady;
+  /**
+   * The pluggable per-Node summarization step (Story 1.6, Phase 2) — built
+   * by the caller (index.ts) via `createLocalSummarizer`/`cloud-summary-
+   * generator.ts`'s `createCloudSummarizer` depending on the active backend.
+   * `generateSummaries` itself is fully backend-agnostic; this is its only
+   * point of contact with either model.
+   */
+  summarize: SummarizeFn;
+  /**
+   * The backend/model name persisted into `NodeRecord.summary.model` for
+   * every Node this run successfully summarizes (Story 1.6, Phase 2 — was
+   * previously always `model.model`, the local GGUF filename; now supplied
+   * directly by the caller since `generateSummaries` no longer holds a
+   * `LocalModelReady` to read it from).
+   */
+  modelName: string;
   /** Fired with each batched group of completions (Always/AD-8: never one call per Node). */
   onProgress: (updated: SummaryProgressUpdate[]) => void;
   /**
@@ -483,7 +544,8 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
     projectRoot,
     nodes,
     coverageGapFiles,
-    model,
+    summarize,
+    modelName,
     onProgress,
     onHardwareAdvisory,
     isSuperseded = () => false,
@@ -493,12 +555,6 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
     (node) => classifyNode(node, coverageGapFiles).summaryStatus === 'pending',
   );
   if (eligible.length === 0 || isSuperseded()) {
-    return;
-  }
-
-  const { LlamaChatSession } = await loadNodeLlamaCppModule();
-  const { sequence } = await ensureModelContext(model.path);
-  if (isSuperseded()) {
     return;
   }
 
@@ -546,7 +602,7 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
         }
         let outcome: SummarizeOutcome;
         try {
-          outcome = await summarizeNode(node, projectRoot, sequence, LlamaChatSession);
+          outcome = await summarize(node, projectRoot);
         } catch (error) {
           console.error(
             `[graph-service] summary generation failed for ${node.id}: ${
@@ -581,7 +637,7 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
         // batch down with it.
         try {
           mergeNodeRecord(node.id, {
-            summary: { text: outcome.text, model: model.model, generatedAt: new Date().toISOString() },
+            summary: { text: outcome.text, model: modelName, generatedAt: new Date().toISOString() },
           });
         } catch (error) {
           console.error(

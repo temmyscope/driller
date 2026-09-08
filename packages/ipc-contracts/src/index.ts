@@ -238,11 +238,56 @@ export interface GraphServiceShutdownRequest {
  * Sent after `spawnGraphService()` on a confirmed git-repo folder open (and,
  * to retry a failed index without needing a full folder re-pick, on a manual
  * Graph Service restart while a project is open).
+ *
+ * Story 1.6 (Phase 2) adds `activeBackend`/`cloudApiKey`: main resolves
+ * which summary backend to generate with from the persisted backend
+ * settings (backend-settings.ts) at the moment this request is sent, and
+ * includes the freshly-decrypted cloud key when relevant — see
+ * `GraphServiceBackendSwitchedRequest.cloudApiKey`'s doc comment for the
+ * exact presence/absence rules, which apply here identically.
  */
 export interface GraphServiceIndexRequest {
   type: 'graphService:index';
   /** Absolute, OS-native path to the project root to index. */
   path: string;
+  /** Which summary backend to generate with for this project (Story 1.6, Phase 2). */
+  activeBackend: CloudBackend;
+  /** The decrypted cloud API key — see `GraphServiceBackendSwitchedRequest.cloudApiKey`'s doc comment. */
+  cloudApiKey?: string;
+}
+
+/**
+ * Message main sends to ask the Graph Service subprocess to switch its
+ * active summary backend for the currently open project (Story 1.6, Phase
+ * 2) — sent from `settingsSetActiveBackend`'s IPC handler when the backend
+ * choice changes while a project is already open (a fresh `graphService:
+ * index` for a newly-opened project already carries this same
+ * `{activeBackend, cloudApiKey}` shape, so there's no separate "initial
+ * backend" message).
+ *
+ * Triggers clearing every persisted summary for the current project via
+ * `node-record-store.ts`'s existing merge-write API (`summary: undefined`
+ * per Node — AD-20: a per-signal-family write, never a full-record wipe of
+ * any other family) and re-queuing every Node through the same job pool —
+ * never a partial/mixed-backend result set, and never a graph re-index
+ * (AD-18, Boundaries & Constraints).
+ */
+export interface GraphServiceBackendSwitchedRequest {
+  type: 'graphService:backendSwitched';
+  /** The newly-active summary backend. */
+  activeBackend: CloudBackend;
+  /**
+   * The decrypted cloud API key, present only when `activeBackend ===
+   * 'cloud'` and a key is actually stored — decrypted transiently in main
+   * (the only process with `safeStorage` access, per this story's Design
+   * Notes) and never persisted or logged in the Graph Service. Absent when
+   * switching to `'local'`, or when switching to `'cloud'` with no key
+   * stored yet — generation is blocked in that case (Boundaries &
+   * Constraints), and the renderer's own "cloud selected, no key"
+   * Actionable Notice covers it, derived entirely from `BackendConfig`
+   * rather than a new posted message.
+   */
+  cloudApiKey?: string;
 }
 
 // ---------------------------------------------------------------------------
