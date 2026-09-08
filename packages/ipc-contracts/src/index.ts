@@ -481,6 +481,52 @@ export interface HardwareAdvisoryMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 1.6 (Phase 1): cloud API key storage (FR6, AD-4).
+//
+// driller's first Settings UI surface and its first `safeStorage`
+// integration (see apps/desktop/main/backend-settings.ts). The cloud API
+// key is stored only as `safeStorage.encryptString()` ciphertext — this
+// contract never carries the raw key back out to the renderer; the
+// renderer only ever learns whether a key is stored (`hasCloudKey`), never
+// its value. `isLinuxInsecureBackend` mirrors
+// `safeStorage.getSelectedStorageBackend()` reporting `basic_text` (no
+// secure OS keystore available) so the renderer can render the Linux
+// warning proactively, not only in reaction to a `SetCloudApiKeyResult`
+// with `status: 'warning'`.
+//
+// This phase only proves the configuration surface is trustworthy — no
+// actual cloud API call happens here (Story 1.6 Phase 2's job).
+// ---------------------------------------------------------------------------
+
+/** The two summary backends a Settings user can choose between (Story 1.6). */
+export type CloudBackend = 'local' | 'cloud';
+
+export interface BackendConfig {
+  activeBackend: CloudBackend;
+  /** True once a cloud API key ciphertext is persisted — never the key itself. */
+  hasCloudKey: boolean;
+  /** True on Linux with no secure OS keystore (`safeStorage` reports `basic_text`). */
+  isLinuxInsecureBackend: boolean;
+}
+
+/**
+ * Result of a `setCloudApiKey` attempt:
+ *  - `'ok'`: stored as ciphertext.
+ *  - `'warning'`: Linux with no secure keystore and no acknowledgment yet —
+ *    nothing was stored; `message` is the warning text to show the user, who
+ *    must resubmit with `acknowledgeInsecureStorage: true` to actually store
+ *    the key.
+ *  - `'error'`: encryption unavailable, a write failure, or invalid input
+ *    (e.g. an empty key) — `message` is safe, user-facing text; the raw key
+ *    never appears in it, on this or any other path (AD-21, security audit
+ *    finding).
+ */
+export interface SetCloudApiKeyResult {
+  status: 'ok' | 'warning' | 'error';
+  message?: string;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -495,6 +541,9 @@ export const IpcChannels = {
   modelStatus: 'model:status',
   summaryProgress: 'summary:progress',
   hardwareAdvisory: 'hardware:advisory',
+  settingsGetBackendConfig: 'settings:getBackendConfig',
+  settingsSetActiveBackend: 'settings:setActiveBackend',
+  settingsSetCloudApiKey: 'settings:setCloudApiKey',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -554,4 +603,25 @@ export interface DrillerApi {
     startLine: number,
     endLine: number,
   ) => Promise<ReadSourceRangeResult>;
+  /**
+   * Fetches the current backend config (Story 1.6 Phase 1): the active
+   * local/cloud choice, whether a cloud key is already stored, and whether
+   * this machine is Linux with no secure OS keystore.
+   */
+  getBackendConfig: () => Promise<BackendConfig>;
+  /** Sets the active summary backend (local/cloud) choice. */
+  setActiveBackend: (backend: CloudBackend) => Promise<void>;
+  /**
+   * Attempts to store a cloud API key as ciphertext. On Linux with no
+   * secure keystore, the first call (without `acknowledgeInsecureStorage`)
+   * returns `status: 'warning'` and stores nothing; resubmit with
+   * `acknowledgeInsecureStorage: true` to actually store it. The raw key is
+   * only ever transiently held in main for the duration of this call — main
+   * never returns it back to the renderer, logs it, or retains it beyond the
+   * encrypt call.
+   */
+  setCloudApiKey: (
+    key: string,
+    acknowledgeInsecureStorage?: boolean,
+  ) => Promise<SetCloudApiKeyResult>;
 }

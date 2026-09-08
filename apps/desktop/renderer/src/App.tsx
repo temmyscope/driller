@@ -8,6 +8,7 @@ import type {
   RecentProject,
 } from '@driller/ipc-contracts';
 import { CodeMap } from './CodeMap';
+import { Settings } from './Settings';
 
 type Notice =
   | { kind: 'not-a-git-repo'; path: string }
@@ -17,6 +18,9 @@ export function App() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[] | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [isOpening, setIsOpening] = useState(false);
+  // Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
+  // surface, opened via the gear-icon button in the header below.
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [graphServiceStatus, setGraphServiceStatus] =
     useState<GraphServiceStatusMessage | null>(null);
   // The local-model download/verify status (Story 1.5 Phase 1, AD-18) — a
@@ -212,10 +216,21 @@ export function App() {
   return (
     <main className={`app${isIndexed ? ' app--map' : ''}`}>
       <header className="app__header">
-        <h1 className="app__title">driller</h1>
-        {!isIndexed && (
-          <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
-        )}
+        <div className="app__header-text">
+          <h1 className="app__title">driller</h1>
+          {!isIndexed && (
+            <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
+          )}
+        </div>
+        <button
+          type="button"
+          className="app__settings-button"
+          onClick={() => setIsSettingsOpen(true)}
+          aria-label="Settings"
+          title="Settings"
+        >
+          <span aria-hidden="true">⚙</span>
+        </button>
       </header>
 
       {!isIndexed && (
@@ -332,6 +347,8 @@ export function App() {
           </p>
         ))}
       </footer>
+
+      {isSettingsOpen && <Settings onClose={() => setIsSettingsOpen(false)} />}
     </main>
   );
 }

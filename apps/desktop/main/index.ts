@@ -25,6 +25,7 @@ import {
 import started from 'electron-squirrel-startup';
 import {
   IpcChannels,
+  type BackendConfig,
   type CodeMapResult,
   type GitDetectionResult,
   type GraphServiceCodeMapMessage,
@@ -35,8 +36,10 @@ import {
   type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
+  type SetCloudApiKeyResult,
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
+import { getBackendConfig, setActiveBackend, setCloudApiKey } from './backend-settings';
 import { detectGitRepo } from './git-detect';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
@@ -593,6 +596,35 @@ function registerIpcHandlers(): void {
         return Promise.resolve({ status: 'error', message: 'Invalid source range request.' });
       }
       return handleReadSourceRange(currentProjectPath, file, startLine, endLine);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Story 1.6 (Phase 1): backend config + cloud API key storage. Thin
+  // delegation to backend-settings.ts — main owns no storage/encryption
+  // logic of its own (same "thin shell" boundary as every other handler
+  // here).
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(IpcChannels.settingsGetBackendConfig, (): BackendConfig => getBackendConfig());
+
+  ipcMain.handle(IpcChannels.settingsSetActiveBackend, (_event, backend: unknown): void => {
+    // Renderer-supplied value crosses the contextBridge boundary untyped at
+    // runtime (same precedent as projectOpenPath above); setActiveBackend
+    // itself also defensively no-ops on an invalid value.
+    if (backend !== 'local' && backend !== 'cloud') {
+      return;
+    }
+    setActiveBackend(backend);
+  });
+
+  ipcMain.handle(
+    IpcChannels.settingsSetCloudApiKey,
+    (_event, key: unknown, acknowledgeInsecureStorage: unknown): SetCloudApiKeyResult => {
+      if (typeof key !== 'string') {
+        return { status: 'error', message: 'Invalid API key.' };
+      }
+      return setCloudApiKey(key, acknowledgeInsecureStorage === true);
     },
   );
 }

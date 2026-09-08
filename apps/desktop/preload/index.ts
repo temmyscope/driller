@@ -10,6 +10,8 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import {
   IpcChannels,
+  type BackendConfig,
+  type CloudBackend,
   type CodeMapResult,
   type DrillerApi,
   type GraphServiceStatusMessage,
@@ -18,6 +20,7 @@ import {
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
+  type SetCloudApiKeyResult,
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 
@@ -71,6 +74,15 @@ const drillerApi: DrillerApi = {
 
   readSourceRange: (file: string, startLine: number, endLine: number): Promise<ReadSourceRangeResult> =>
     ipcRenderer.invoke(IpcChannels.sourceReadRange, file, startLine, endLine),
+
+  getBackendConfig: (): Promise<BackendConfig> =>
+    ipcRenderer.invoke(IpcChannels.settingsGetBackendConfig),
+
+  setActiveBackend: (backend: CloudBackend): Promise<void> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetActiveBackend, backend),
+
+  setCloudApiKey: (key: string, acknowledgeInsecureStorage?: boolean): Promise<SetCloudApiKeyResult> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetCloudApiKey, key, acknowledgeInsecureStorage),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);
