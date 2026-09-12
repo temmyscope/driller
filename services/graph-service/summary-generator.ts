@@ -44,7 +44,8 @@
  * constraint).
  */
 
-import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type {
   getLlama as GetLlama,
@@ -275,19 +276,25 @@ export function annotateNodesWithSummaryState(
 }
 
 /**
- * Reads a Node's exact source line range directly off disk (graph-service-
- * local `fs.readFile`, AD-16 — never the renderer's `readSourceRange` IPC
- * path). Returns `undefined` (logged, not thrown) rather than failing the
- * whole batch when a Node's source can't be read — e.g. the file changed or
- * shrank since the last index; that Node simply stays `'pending'` for this
- * session rather than blocking every other Node's generation.
+ * Reads a Node's exact, untruncated source line range directly off disk
+ * (graph-service-local `fs.readFile`, AD-16 — never the renderer's
+ * `readSourceRange` IPC path). Returns `undefined` (logged, not thrown)
+ * rather than failing the whole batch when a Node's source can't be read —
+ * e.g. the file changed or shrank since the last index; that Node simply
+ * stays `'pending'` for this session rather than blocking every other
+ * Node's generation.
  *
- * Exported (Story 1.6, Phase 2): shared by both `createLocalSummarizer`
- * below and `cloud-summary-generator.ts`'s `createCloudSummarizer` — reading
- * a Node's source off disk is identical regardless of which backend ends up
- * summarizing it, so this stays the one implementation both call.
+ * The shared core behind two callers with genuinely different needs:
+ * `readNodeSource` (below) truncates this for the LLM prompt's sake;
+ * `captureSourceBaseline` (Story 1.8, Phase 1, review finding — High) must
+ * hash the true, untruncated range, since hashing a truncated-and-annotated
+ * stand-in would silently stop reflecting any edit past the truncation
+ * point for exactly the largest Nodes, defeating the whole staleness
+ * mechanism for them. Not exported — both callers within this file/module
+ * boundary reach it directly; `cloud-summary-generator.ts` still only ever
+ * needs `readNodeSource`'s own (truncated) output.
  */
-export async function readNodeSource(projectRoot: string, node: CodeMapNode): Promise<string | undefined> {
+async function readNodeSourceRaw(projectRoot: string, node: CodeMapNode): Promise<string | undefined> {
   // Defensive (review finding, Low): a malformed/corrupt indexed range would
   // otherwise slice backwards (`Array.prototype.slice(end, start)` with
   // `start > end` yields an empty array, silently sending the model an
@@ -318,12 +325,85 @@ export async function readNodeSource(projectRoot: string, node: CodeMapNode): Pr
     );
     return undefined;
   }
-  const content = lines.slice(node.startLine - 1, node.endLine).join('\n');
+  return lines.slice(node.startLine - 1, node.endLine).join('\n');
+}
+
+/**
+ * Reads a Node's exact source line range, truncated to `MAX_SOURCE_CHARS`
+ * for the LLM prompt's sake (see `MAX_SOURCE_CHARS`'s own comment) — never
+ * changed by Story 1.8 Phase 1's review pass; only its untruncated core
+ * (`readNodeSourceRaw`, above) gained a second caller.
+ *
+ * Exported (Story 1.6, Phase 2): shared by both `createLocalSummarizer`
+ * below and `cloud-summary-generator.ts`'s `createCloudSummarizer` — reading
+ * a Node's source off disk is identical regardless of which backend ends up
+ * summarizing it, so this stays the one implementation both call.
+ */
+export async function readNodeSource(projectRoot: string, node: CodeMapNode): Promise<string | undefined> {
+  const content = await readNodeSourceRaw(projectRoot, node);
+  if (content === undefined) {
+    return undefined;
+  }
   // Truncated, not rejected (review finding, Medium) — see MAX_SOURCE_CHARS'
   // comment.
   return content.length > MAX_SOURCE_CHARS
     ? `${content.slice(0, MAX_SOURCE_CHARS)}\n… (truncated)`
     : content;
+}
+
+/**
+ * Captures a staleness baseline for `node`'s source at the moment its
+ * summary was generated (Story 1.8, Phase 1): a real `fs.stat` of the
+ * Node's source file (`sourceMtimeMs`/`sourceSize`) plus a SHA-256 content
+ * hash (mirroring `node-record-store.ts`'s own existing use of `createHash`
+ * for project-slug hashing) of the exact, untruncated source range
+ * `readNodeSourceRaw` re-reads for this Node — the same range the summary
+ * was actually generated from.
+ *
+ * Hashes `readNodeSourceRaw`'s output, never `readNodeSource`'s (review
+ * finding, High): `readNodeSource` truncates anything over
+ * `MAX_SOURCE_CHARS` and appends a literal "… (truncated)" marker for the
+ * LLM prompt's sake — hashing that would mean an edit past the truncation
+ * point never changes the stored hash, silently defeating staleness
+ * detection for exactly the largest Nodes. `captureSourceBaseline` needs
+ * the real bytes, not the LLM-facing stand-in.
+ *
+ * `absolutePath` is resolved via `path.resolve` (review finding, Low),
+ * matching `readNodeSourceRaw`/`readNodeSource`'s own resolution — dormant
+ * today since `CodeMapNode.file` is always POSIX-relative (Story 1.7), but
+ * keeps this function's own `fs.stat` call and its `readNodeSourceRaw` call
+ * agreeing on the same path if that ever changed.
+ *
+ * Never throws: baseline capture is best-effort provenance, not part of the
+ * summary write's own success/failure. A failure here (e.g. the file
+ * vanished in the narrow window between generation and this call) is
+ * logged and resolves to `undefined` so the caller can simply omit the
+ * three fields from that Node's merge-write rather than blocking or
+ * failing the summary write itself. When the source simply can't be
+ * re-read, `readNodeSourceRaw` has already logged its own warning for that
+ * failure (review finding, Low) — this function doesn't log a second,
+ * redundant one for the same event.
+ */
+export async function captureSourceBaseline(
+  projectRoot: string,
+  node: CodeMapNode,
+): Promise<{ sourceMtimeMs: number; sourceSize: number; sourceHash: string } | undefined> {
+  try {
+    const absolutePath = path.resolve(projectRoot, node.file);
+    const [stats, source] = await Promise.all([stat(absolutePath), readNodeSourceRaw(projectRoot, node)]);
+    if (source === undefined) {
+      return undefined;
+    }
+    const sourceHash = createHash('sha256').update(source).digest('hex');
+    return { sourceMtimeMs: stats.mtimeMs, sourceSize: stats.size, sourceHash };
+  } catch (error) {
+    console.warn(
+      `[graph-service] staleness baseline: failed to capture for ${node.id}; omitting baseline for this write: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return undefined;
+  }
 }
 
 function buildPrompt(node: CodeMapNode, source: string): string {
@@ -636,8 +716,30 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
         // if the write didn't actually happen) rather than taking the whole
         // batch down with it.
         try {
+          // Story 1.8 Phase 1: captured right before this same merge-write,
+          // never a second write — a baseline-capture failure resolves to
+          // `undefined` (never throws) and simply omits the three fields
+          // below rather than blocking or failing this summary write.
+          const baseline = await captureSourceBaseline(projectRoot, node);
+          // Re-checked (review finding, Medium): `captureSourceBaseline`'s
+          // own `await` above is a new async gap between the `isSuperseded`
+          // check already done right after `summarize()` resolved (above)
+          // and this merge-write — long enough for the run to become
+          // superseded (e.g. the user opened a different project) in
+          // between. Without this second check, the write below would
+          // proceed anyway, reopening the exact cross-project record-store
+          // write race this file's own module doc already flags as "fixed
+          // twice elsewhere in this build."
+          if (isSuperseded()) {
+            return;
+          }
           mergeNodeRecord(node.id, {
-            summary: { text: outcome.text, model: modelName, generatedAt: new Date().toISOString() },
+            summary: {
+              text: outcome.text,
+              model: modelName,
+              generatedAt: new Date().toISOString(),
+              ...baseline,
+            },
           });
         } catch (error) {
           console.error(

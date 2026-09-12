@@ -40,6 +40,22 @@ export interface NodeRecord {
     text: string;
     model: string;
     generatedAt: string;
+    // Story 1.8 Phase 1: an optional staleness baseline captured at
+    // generation time (`summary-generator.ts`'s `captureSourceBaseline`) —
+    // the real on-disk mtime/size of the Node's source file plus a SHA-256
+    // of the exact summarized source range. Nested inside `summary` itself
+    // (not a new top-level signal family) since a baseline is provenance
+    // about that exact summary, the same category as `model`/`generatedAt`
+    // — a regeneration overwrites the whole object, baseline included,
+    // atomically, in the same merge-write. Omitted (never a partial/
+    // zeroed-out triple) when baseline capture fails — e.g. the source file
+    // vanished in the narrow window after generation — since that failure
+    // must never block or fail the summary write itself (Phase 2 will
+    // treat a Node with no baseline as simply not-yet-checkable for
+    // staleness).
+    sourceMtimeMs?: number;
+    sourceSize?: number;
+    sourceHash?: string;
   };
 }
 
