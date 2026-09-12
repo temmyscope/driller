@@ -135,6 +135,7 @@ import {
 import {
   annotateNodesWithSummaryState,
   createLocalSummarizer,
+  detectStaleness,
   disposeModelContext,
   generateSummaries,
   type SummarizeFn,
@@ -224,6 +225,23 @@ let activeSummaryGenerationId = 0;
 // the first one yields at its first await point, guaranteeing it observes
 // this flag already set.
 let activeGenerationRunId: number | null = null;
+
+// The `activeSummaryGenerationId` a `detectStaleness` pass is currently in
+// flight for, or `null` when none is (Story 1.8 Phase 2 review finding,
+// Medium) — the exact same guard shape as `activeGenerationRunId` above,
+// for the same reason: two overlapping `graphService:getCodeMap` requests
+// for the same, unchanged index generation (two renderer refetches with no
+// intervening re-index) would otherwise both pass `isSuperseded()` (nothing
+// bumped `activeSummaryGenerationId` between them) and each run a full,
+// redundant `detectStaleness` pass over the same Nodes concurrently — not
+// unsafe (unlike the generation case, there's no shared native resource),
+// but wasted duplicate stat/hash I/O and duplicate `mergeNodeRecord` calls.
+// Set synchronously in `handleGetCodeMapRequest` right before kicking off
+// `detectStaleness`, before that call's first `await` — Node is
+// single-threaded, so a second overlapping request's own synchronous
+// prologue can only run after the first one yields, guaranteeing it
+// observes this flag already set.
+let activeStalenessRunId: number | null = null;
 
 // Story 1.5 Phase 3: which hardware-advisory signal source(s) have already
 // been posted this project session (Boundaries & Constraints: "sent at most
@@ -673,6 +691,14 @@ async function handleIndexRequest(
  * delay this response (AD-8: the Code Map stays browsable while generation
  * runs).
  *
+ * Story 1.8 Phase 2: `detectStaleness` is likewise kicked off in the
+ * background right after, against this same `normalizedNodes` set — this
+ * app has no separate incremental-refresh mechanism, so every
+ * `graphService:getCodeMap` fetch (today's only "index refresh") is when
+ * staleness gets (re-)checked. Fire-and-forget for the same reason
+ * `generateSummaries` is; writes only the independent `stale` field
+ * (`node-record-store.ts`'s `NodeRecord.stale`), never touching `summary`.
+ *
  * Story 1.7: every fetched Node's `file` is normalized via
  * `toProjectRelativePosixPath` immediately after `fetchCodeMap` returns —
  * before `annotateNodesWithSummaryState`, `startSummaryGenerationForProject`,
@@ -708,6 +734,12 @@ async function handleGetCodeMapRequest(): Promise<void> {
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
     postCodeMapMessage({ type: 'graphService:codeMap', nodes: annotatedNodes, edges });
     void startSummaryGenerationForProject(normalizedNodes);
+    // Story 1.8 Phase 2: staleness detection runs on every Code Map fetch
+    // (Design Notes — this app has no separate incremental-refresh
+    // mechanism, so this *is* "the next index refresh"), fire-and-forget
+    // exactly like `startSummaryGenerationForProject` above so it can never
+    // delay this response.
+    void startStalenessDetectionForProject(projectRoot, normalizedNodes);
   } catch (error) {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
@@ -858,6 +890,72 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
 }
 
 /**
+ * Kicks off `detectStaleness` for the Nodes just posted in a
+ * `graphService:codeMap` response (Story 1.8, Phase 2), fire-and-forget from
+ * the caller's perspective (`handleGetCodeMapRequest` never awaits this) —
+ * mirrors `startSummaryGenerationForProject` immediately above in every
+ * structural respect, including its two supersession guards, since
+ * `detectStaleness` needs exactly the same protection `generateSummaries`
+ * does:
+ *
+ *  - `isSuperseded` (passed to `detectStaleness` itself) is keyed off
+ *    `activeSummaryGenerationId`, the SAME id `startSummaryGenerationForProject`
+ *    uses (review finding, High) — not `activeProjectPath`. A naive
+ *    `activeProjectPath !== projectRoot` check only catches a switch to a
+ *    *different* project: `handleIndexRequest` sets `activeProjectPath =
+ *    projectPath` on every successful index, including a re-index of the
+ *    *same* already-active project, so that check alone never goes true
+ *    across a same-project re-index — a `detectStaleness` pass started
+ *    before that re-index would keep running/writing throughout it.
+ *    `activeSummaryGenerationId`, by contrast, is unconditionally bumped at
+ *    the top of every `handleIndexRequest` call (a different project OR a
+ *    re-index of the same one both bump it), so comparing against it catches
+ *    both supersession shapes, exactly like `generateSummaries`'s own
+ *    `isSuperseded` already does.
+ *  - `activeStalenessRunId` (review finding, Medium — see that variable's own
+ *    doc comment) guards against two overlapping passes for the same,
+ *    unchanged generation — e.g. two renderer refetches with no intervening
+ *    re-index — which would otherwise both pass `isSuperseded()` and run a
+ *    full, redundant stat/hash sweep concurrently. Set synchronously before
+ *    this function's first `await`, same single-threaded guarantee
+ *    `activeGenerationRunId` relies on.
+ *
+ * `generationId` snapshots `activeSummaryGenerationId` at the moment this run
+ * starts, same as `startSummaryGenerationForProject`'s own `generationId`.
+ */
+async function startStalenessDetectionForProject(
+  projectRoot: string,
+  nodes: CodeMapNode[],
+): Promise<void> {
+  const generationId = activeSummaryGenerationId;
+
+  if (activeStalenessRunId === generationId) {
+    // Already detecting staleness for this exact index generation — not an
+    // error/superseded case, just a redundant second trigger that must not
+    // start a second, wastefully-duplicate pass.
+    return;
+  }
+  activeStalenessRunId = generationId;
+
+  try {
+    await detectStaleness(projectRoot, nodes, () => generationId !== activeSummaryGenerationId);
+  } catch (error) {
+    console.error(
+      `[graph-service] staleness detection failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    // Only clears this run's own slot — same reasoning as
+    // `startSummaryGenerationForProject`'s own `finally`: a later, genuinely
+    // new pass (a different `generationId`, already holding its own value
+    // here by the time this runs) must never have its slot clobbered by an
+    // earlier, now-finishing pass's cleanup.
+    if (activeStalenessRunId === generationId) {
+      activeStalenessRunId = null;
+    }
+  }
+}
+
+/**
  * Handles a `graphService:backendSwitched` request (Story 1.6, Phase 2) —
  * sent by main when Settings' backend choice changes while a project is
  * already open. Updates `activeBackendConfig` to the new choice, clears
@@ -934,7 +1032,14 @@ async function handleBackendSwitchedRequest(backendConfig: {
     // rejection instead of being logged and skipped, aborting the rest of
     // this clear loop for every remaining id.
     try {
-      mergeNodeRecord(id, { summary: undefined });
+      // Story 1.8 Phase 2 review finding, Medium: `stale` is cleared
+      // alongside `summary`, never left behind — `stale` means nothing
+      // without the baseline that lived inside the now-cleared `summary`
+      // (its own doc comment: "undefined means not evaluated — no baseline
+      // recorded, or no summary at all"), so leaving a stray `stale: true`
+      // here would report staleness for a Node that no longer has a summary
+      // to be stale/fresh relative to at all.
+      mergeNodeRecord(id, { summary: undefined, stale: undefined });
     } catch (error) {
       console.error(
         `[graph-service] failed to clear summary for ${id} during backend switch: ${

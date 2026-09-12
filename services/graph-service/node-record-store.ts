@@ -57,6 +57,16 @@ export interface NodeRecord {
     sourceSize?: number;
     sourceHash?: string;
   };
+  // Story 1.8 Phase 2: whether this Node's source has drifted from the
+  // baseline captured in `summary` (`summary-generator.ts`'s
+  // `detectStaleness`) — a new top-level signal family in its own right
+  // (AD-20), never nested inside `summary`, so a staleness write can never
+  // touch `summary`'s own keys by construction: `mergeNodeRecord`'s
+  // shallow top-level merge means a `{ stale }` partial simply cannot
+  // reach into `summary`. Left `undefined` (never defaulted to `false`)
+  // for a Node that hasn't been evaluated yet — no baseline recorded, or
+  // no summary at all.
+  stale?: boolean;
 }
 
 const WRITE_DEBOUNCE_MS = 500;

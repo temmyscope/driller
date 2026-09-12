@@ -406,6 +406,117 @@ export async function captureSourceBaseline(
   }
 }
 
+/**
+ * Detects staleness for every Node with a full recorded baseline (Story 1.8,
+ * Phase 2) — run fire-and-forget from `index.ts`'s `handleGetCodeMapRequest`
+ * on every `graphService:getCodeMap` fetch, since this app has no separate
+ * incremental-refresh mechanism (Design Notes): today, this *is* "the next
+ * index refresh" the feature description means.
+ *
+ * A Node is skipped entirely (its `stale` field left exactly as it already
+ * is) unless it has a full baseline — `summary.sourceMtimeMs`/`sourceSize`/
+ * `sourceHash` all present (Phase 1 omits all three together on capture
+ * failure, never a partial triple, so checking `sourceHash` alone is
+ * sufficient to know the other two are there too). This deliberately never
+ * touches a Node with no `summary` at all, or one whose baseline capture
+ * failed — nothing to compare against.
+ *
+ * Hybrid check, matching the Code Map's own description: a fresh `fs.stat`
+ * (`path.resolve`, matching `captureSourceBaseline`) first — if both mtime
+ * and size still match the baseline exactly, the source is unchanged and no
+ * hash is computed at all (the common case: cheap, no disk read of the
+ * source itself). Only a mismatch on either falls back to a real content-
+ * hash comparison, via the same module-private `readNodeSourceRaw` and
+ * hashing approach `captureSourceBaseline` uses, so a re-save with no actual
+ * content change (mtime/size churn alone) never produces a false positive.
+ *
+ * Writes only `{ stale }` via `mergeNodeRecord` (AD-20) — never `summary` —
+ * so this can never disturb what Phase 1 already proved non-clobbering by
+ * construction. The write (and the hash re-read leading to it) is skipped
+ * outright when `isStale` matches the record's current `stale` value
+ * (nothing to change) or when `isSuperseded()` reports this pass's project
+ * is no longer the active one — re-checked right before each write, the
+ * same race shape Phase 1's own review found and fixed for
+ * `captureSourceBaseline`'s merge-write.
+ *
+ * Never throws: a `fs.stat`/read failure for one Node (e.g. the file was
+ * deleted since baseline capture) is logged and that Node is simply skipped
+ * for this pass, rather than aborting detection for every other Node. The
+ * `mergeNodeRecord` write itself is likewise wrapped (review finding, Low —
+ * matching every other `mergeNodeRecord` call site in this file/index.ts,
+ * including `captureSourceBaseline`'s own call): an uncaught write error
+ * there would otherwise reject this whole fire-and-forget pass as an
+ * unhandled rejection instead of being logged and skipped, aborting
+ * detection for every remaining Node behind it.
+ */
+export async function detectStaleness(
+  projectRoot: string,
+  nodes: CodeMapNode[],
+  isSuperseded: () => boolean,
+): Promise<void> {
+  for (const node of nodes) {
+    if (isSuperseded()) {
+      return;
+    }
+    const record = getNodeRecord(node.id);
+    const baseline = record?.summary;
+    if (
+      baseline?.sourceHash === undefined ||
+      baseline.sourceMtimeMs === undefined ||
+      baseline.sourceSize === undefined
+    ) {
+      // No full baseline yet (Phase 1 never captured one, capture failed, or
+      // no summary exists at all) — not evaluated; `stale` stays untouched.
+      continue;
+    }
+
+    let isStale: boolean;
+    try {
+      const absolutePath = path.resolve(projectRoot, node.file);
+      const stats = await stat(absolutePath);
+      if (stats.mtimeMs === baseline.sourceMtimeMs && stats.size === baseline.sourceSize) {
+        isStale = false;
+      } else {
+        const source = await readNodeSourceRaw(projectRoot, node);
+        if (source === undefined) {
+          // Source couldn't be re-read this round (e.g. shrank below the
+          // indexed range) — `readNodeSourceRaw` already logged its own
+          // warning for this; nothing safe to compare against, so this
+          // Node is simply skipped for this pass rather than guessed at.
+          continue;
+        }
+        const sourceHash = createHash('sha256').update(source).digest('hex');
+        isStale = sourceHash !== baseline.sourceHash;
+      }
+    } catch (error) {
+      console.warn(
+        `[graph-service] staleness detection: failed to check ${node.id}; skipping for this pass: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      continue;
+    }
+
+    if (isSuperseded()) {
+      return;
+    }
+    if (record?.stale === isStale) {
+      // No change from the record's current state — skip the write
+      // entirely (nothing for `mergeNodeRecord` to actually do).
+      continue;
+    }
+    try {
+      mergeNodeRecord(node.id, { stale: isStale });
+    } catch (error) {
+      console.error(
+        `[graph-service] staleness detection: failed to persist stale=${isStale} for ${node.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
 function buildPrompt(node: CodeMapNode, source: string): string {
   return [
     `You are documenting a codebase for another engineer. Below is the real source of a ${node.kind.toLowerCase()} named "${node.name}", from ${node.file}.`,
