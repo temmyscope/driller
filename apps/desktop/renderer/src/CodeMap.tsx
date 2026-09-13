@@ -24,6 +24,15 @@
  * trigger a full remap/refetch. Never a BI/analytics-dashboard treatment
  * (UX-DR3): no stat tiles, no data-viz divorced from the map's own
  * structure.
+ *
+ * Story 1.8 (Phase 4) adds the on-demand single-Node regenerate action: a
+ * "Details" affordance next to the caller/callee ones, shown only when a
+ * Node is `summaryStatus === 'ready' && stale === true`, opening an inline
+ * Node Detail overlay (matching the existing source-view overlay's own
+ * pattern — no shared Modal component) with a Regenerate button wired to
+ * `window.driller.regenerateNode` — this app's first id-keyed mutating IPC
+ * round-trip. On success, patches `fetchState.nodes` in place by id, the
+ * same idiom `onSummaryProgress` already uses, rather than refetching.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -55,6 +64,24 @@ type SourceViewState =
   | { status: 'loading'; node: CodeMapNode }
   | { status: 'open'; node: CodeMapNode; content: string }
   | { status: 'error'; node: CodeMapNode; message: string };
+
+/**
+ * The Node Detail panel's own state (Story 1.8, Phase 4) — mirrors
+ * `SourceViewState`'s shape, but simpler: opening it never involves an async
+ * fetch (everything it shows is already on the fetched `CodeMapNode`), so
+ * there's no `'loading'`/`'error'` state of its own here — only whether it's
+ * open, and for which Node. `node` is replaced in place (not just read once
+ * at open time) once a regenerate succeeds, so the panel reflects the fresh
+ * summary/staleness without needing a second lookup.
+ */
+type NodeDetailState = { status: 'closed' } | { status: 'open'; node: CodeMapNode };
+
+/**
+ * The Node Detail panel's Regenerate button state — mirrors Settings.tsx's
+ * `KeyEntryState` shape (a similar "idle/in-flight/error" async-action
+ * pattern), simplified: no `'warning'` state exists for this action.
+ */
+type RegenerateState = { kind: 'idle' | 'regenerating' } | { kind: 'error'; message: string };
 
 // No LOD/layout library yet (Design Notes: acceptable at this phase's real
 // scale) — a plain deterministic grid, roughly square, is enough to lay the
@@ -297,6 +324,10 @@ type CodeMapFlowNode = FlowNode<
     node: CodeMapNode;
     onActivate: (node: CodeMapNode) => void;
     onNavigate: (id: string) => void;
+    // Story 1.8 (Phase 4): threaded through the same way `onActivate`/
+    // `onNavigate` already are — the "Details" affordance (rendered only on
+    // a stale Node) calls this to open the Node Detail panel.
+    onOpenDetail: (node: CodeMapNode) => void;
     callerCount: number;
     firstCallerId: string | undefined;
     calleeCount: number;
@@ -319,6 +350,7 @@ function layoutNodes(
   nodes: CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
   onNavigate: (id: string) => void,
+  onOpenDetail: (node: CodeMapNode) => void,
   adjacency: NodeAdjacency,
   noSummaryBackendAvailable: boolean,
   cloudSelectedNoKey: boolean,
@@ -337,6 +369,7 @@ function layoutNodes(
         node,
         onActivate,
         onNavigate,
+        onOpenDetail,
         callerCount: entry?.callers.length ?? 0,
         firstCallerId: entry?.callers[0],
         calleeCount: entry?.callees.length ?? 0,
@@ -407,6 +440,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     node,
     onActivate,
     onNavigate,
+    onOpenDetail,
     callerCount,
     firstCallerId,
     calleeCount,
@@ -414,6 +448,12 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     noSummaryBackendAvailable,
     cloudSelectedNoKey,
   } = data;
+  // Story 1.8 (Phase 4): the "Details" affordance is shown only on a stale
+  // Node (Always) — mirroring the caller/callee affordances' own
+  // shown-only-when-relevant treatment, never on a Node that's merely
+  // `'pending'`/`'coverage-gap'` (staleness is only meaningful once a
+  // summary actually exists).
+  const showDetailsAffordance = node.summaryStatus === 'ready' && node.stale === true;
   return (
     <div
       className="code-map__node"
@@ -507,7 +547,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           `<button>` propagates regardless of the button's own click
           response to it. Also initiating React Flow's own node-drag/
           selection handling is what the mousedown stop guards against. */}
-      {(callerCount > 0 || calleeCount > 0) && (
+      {(callerCount > 0 || calleeCount > 0 || showDetailsAffordance) && (
         <div className="code-map__node-affordances">
           {callerCount > 0 && firstCallerId !== undefined && (
             <button
@@ -537,6 +577,27 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
               }}
             >
               ↓{calleeCount} calls
+            </button>
+          )}
+          {/* Story 1.8 (Phase 4): the Regenerate entry point — shown only on
+              a stale Node (Always), same `stopPropagation` discipline
+              (mousedown/click/keydown) as the caller/callee affordances
+              above, so opening the Node Detail panel never also fires the
+              card's own click-to-source (Story 1.7's whole-card click is
+              never altered). */}
+          {showDetailsAffordance && (
+            <button
+              type="button"
+              className="code-map__node-affordance code-map__node-affordance--details"
+              aria-label={`Open Node detail for ${node.name}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onKeyDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenDetail(node);
+              }}
+            >
+              Details
             </button>
           )}
         </div>
@@ -674,6 +735,31 @@ export interface CodeMapProps {
 export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
+  // Story 1.8 (Phase 4): the Node Detail panel's own state, plus the
+  // Regenerate button's in-flight/error state — kept separate from
+  // `sourceView` since the two overlays are independent (opening Node
+  // Detail never reads source, and the source overlay's own state shape has
+  // no room for a staleness/regenerate concept).
+  const [nodeDetail, setNodeDetail] = useState<NodeDetailState>({ status: 'closed' });
+  const [regenerateState, setRegenerateState] = useState<RegenerateState>({ kind: 'idle' });
+  // Mirrors `nodeDetail` for `handleRegenerate`'s `.then`/`.catch` (Spec
+  // Change Log Round 1) — the same `configRef`-style pattern Settings.tsx
+  // already uses to read the LATEST state from inside an async callback
+  // without depending on `nodeDetail` itself (which would otherwise force
+  // `handleRegenerate` to be recreated, and re-subscribe its own
+  // closures, on every panel open/close). Synced synchronously inside
+  // `updateNodeDetail` below (review round 2) rather than via a separate
+  // `useEffect(() => { nodeDetailRef.current = nodeDetail }, [nodeDetail])`
+  // — an effect only flushes after React commits the render it was
+  // scheduled from, a theoretical (if unlikely) lag a fast-resolving
+  // `regenerateNode()` promise's `.then` could read through: this way the
+  // ref is always current the instant `nodeDetail` state changes, with no
+  // window in between.
+  const nodeDetailRef = useRef<NodeDetailState>({ status: 'closed' });
+  const updateNodeDetail = useCallback((next: NodeDetailState) => {
+    nodeDetailRef.current = next;
+    setNodeDetail(next);
+  }, []);
   // Correlates a `readSourceRange` response back to the click that started
   // it (review finding — the same concurrency/correlation bug class as
   // Story 1.2's indexing-status races): clicking Node A then quickly Node B
@@ -761,6 +847,12 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     // "focused" Node from a map that's gone).
     setHistory({ stack: [], index: -1 });
     focusedNodeIdRef.current = null;
+    // Story 1.8 (Phase 4): a Retry/reload swaps in an entirely different
+    // Node set, same reasoning as the history reset just above — a Node
+    // Detail panel left open for a Node from the previous map must not
+    // survive into this one.
+    updateNodeDetail({ status: 'closed' });
+    setRegenerateState({ kind: 'idle' });
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
       // `import.meta.env.DEV` — not just the runtime-derived
@@ -897,6 +989,90 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     },
     [openSourceForNode, isDevFixtureMode],
   );
+
+  // Story 1.8 (Phase 4): opens the Node Detail panel for a stale Node
+  // (the "Details" affordance's own `onClick`) — resets any leftover
+  // Regenerate state from a previously-viewed Node so a fresh open never
+  // shows a stale error/"Regenerating…" from a different Node.
+  const openNodeDetail = useCallback((node: CodeMapNode) => {
+    updateNodeDetail({ status: 'open', node });
+    setRegenerateState({ kind: 'idle' });
+  }, []);
+
+  const closeNodeDetail = useCallback(() => {
+    updateNodeDetail({ status: 'closed' });
+    setRegenerateState({ kind: 'idle' });
+  }, []);
+
+  /**
+   * Wires the Node Detail panel's Regenerate button to
+   * `window.driller.regenerateNode` (Story 1.8, Phase 4) — this app's first
+   * id-keyed mutating IPC round-trip. On success, patches `fetchState.nodes`
+   * in place by id (reusing the `onSummaryProgress` batched-patch idiom
+   * above) rather than refetching — unconditionally, the same way an
+   * `onSummaryProgress` batch patches the map in the background regardless
+   * of what's currently selected/open, since the regeneration genuinely did
+   * happen and the map's card for this Node should reflect it either way.
+   *
+   * **Spec Change Log Round 1:** by contrast, `updateNodeDetail`/
+   * `setRegenerateState` — the Node Detail *panel's own* displayed state —
+   * are only ever called after checking the panel is still open for the
+   * SAME Node ID (`nodeDetailRef.current`, not the `nodeDetail` this
+   * callback closed over at click time). Without that check, closing the
+   * panel and opening a different stale Node before this request settles
+   * would let the first Node's late result overwrite the second Node's
+   * displayed panel/button state.
+   */
+  const handleRegenerate = useCallback(() => {
+    if (nodeDetail.status !== 'open') {
+      return;
+    }
+    const targetNode = nodeDetail.node;
+    setRegenerateState({ kind: 'regenerating' });
+    window.driller
+      .regenerateNode(targetNode.id)
+      .then((result) => {
+        if (result.status === 'ok') {
+          setFetchState((previous) => {
+            if (previous.status !== 'ready') {
+              // The map isn't showing this fetch's Nodes (yet, or anymore)
+              // — nothing to patch, same reasoning as the summary-progress
+              // patch above.
+              return previous;
+            }
+            const nodes = previous.nodes.map((candidate) =>
+              candidate.id === result.node.id ? result.node : candidate,
+            );
+            return { ...previous, nodes };
+          });
+        }
+        const current = nodeDetailRef.current;
+        if (current.status !== 'open' || current.node.id !== targetNode.id) {
+          // The panel has since closed, or moved on to a different stale
+          // Node — this response is stale for the PANEL's own display
+          // (the map card was already patched above regardless), so discard
+          // applying it to `nodeDetail`/`regenerateState` rather than let it
+          // clobber whatever the user is now looking at (Round 1 fix).
+          return;
+        }
+        if (result.status === 'ok') {
+          updateNodeDetail({ status: 'open', node: result.node });
+          setRegenerateState({ kind: 'idle' });
+        } else {
+          setRegenerateState({ kind: 'error', message: result.message });
+        }
+      })
+      .catch((error: unknown) => {
+        const current = nodeDetailRef.current;
+        if (current.status !== 'open' || current.node.id !== targetNode.id) {
+          return;
+        }
+        setRegenerateState({
+          kind: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [nodeDetail]);
 
   const expandCluster = useCallback((cluster: Cluster) => {
     if (cluster.nodeIds.length > CLUSTER_EXPAND_MAX) {
@@ -1082,12 +1258,21 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             fetchState.nodes,
             activateNode,
             navigateToNode,
+            openNodeDetail,
             adjacency,
             noSummaryBackendAvailable,
             cloudSelectedNoKey,
           )
         : [],
-    [fetchState, activateNode, navigateToNode, adjacency, noSummaryBackendAvailable, cloudSelectedNoKey],
+    [
+      fetchState,
+      activateNode,
+      navigateToNode,
+      openNodeDetail,
+      adjacency,
+      noSummaryBackendAvailable,
+      cloudSelectedNoKey,
+    ],
   );
   const flowEdges = useMemo(
     () => (fetchState.status === 'ready' ? toFlowEdges(fetchState.edges) : []),
@@ -1368,6 +1553,22 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [sourceView.status, closeSourceView]);
 
+  // Story 1.8 (Phase 4): same Escape-dismissal pattern as the source
+  // overlay's own effect just above — only listens while the Node Detail
+  // panel is actually open.
+  useEffect(() => {
+    if (nodeDetail.status === 'closed') {
+      return undefined;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeNodeDetail();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [nodeDetail.status, closeNodeDetail]);
+
   return (
     <div className="code-map" ref={containerRef}>
       {fetchState.status === 'loading' && (
@@ -1474,6 +1675,59 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                 <code>{sourceView.content}</code>
               </pre>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Story 1.8 (Phase 4): the Node Detail panel — inline overlay JSX
+          matching the source overlay's own pattern immediately above
+          (Never: no shared Modal/Panel component extracted — no such
+          component exists yet elsewhere in this codebase). Opened only via
+          the "Details" affordance (shown only on a stale Node); Regenerate
+          reuses Story 1.5/1.6's existing generation pipeline for this one
+          Node via `window.driller.regenerateNode`. */}
+      {nodeDetail.status === 'open' && (
+        <div className="code-map__node-detail-overlay" role="dialog" aria-modal="true" aria-label="Node detail">
+          <div className="code-map__node-detail-panel">
+            <div className="code-map__node-detail-header">
+              <code>{nodeDetail.node.name}</code>
+              <button type="button" onClick={closeNodeDetail} aria-label="Close Node detail">
+                ×
+              </button>
+            </div>
+            <div className="code-map__node-detail-body">
+              <p className="code-map__node-detail-location">
+                <code>
+                  {nodeDetail.node.file}:{nodeDetail.node.startLine}-{nodeDetail.node.endLine}
+                </code>
+              </p>
+              {nodeDetail.node.summaryStatus === 'ready' && nodeDetail.node.summary !== undefined && (
+                <p className="code-map__node-detail-summary">{nodeDetail.node.summary}</p>
+              )}
+              {/* Same "never color-only" treatment as the card's own
+                  staleness note (Accessibility Floor) — the icon and exact
+                  copy carry the signal, not color alone. Disappears the
+                  moment a successful regenerate replaces `nodeDetail.node`
+                  with one that has `stale: false`. */}
+              {nodeDetail.node.stale === true && (
+                <p className="code-map__node-staleness" role="status">
+                  <span aria-hidden="true">⏳</span> Summary may be stale — source changed since generation
+                </p>
+              )}
+              <button
+                type="button"
+                className="code-map__node-detail-regenerate"
+                onClick={handleRegenerate}
+                disabled={regenerateState.kind === 'regenerating'}
+              >
+                {regenerateState.kind === 'regenerating' ? 'Regenerating…' : 'Regenerate'}
+              </button>
+              {regenerateState.kind === 'error' && (
+                <p className="notice notice--error" role="alert">
+                  {regenerateState.message}
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}

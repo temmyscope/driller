@@ -42,6 +42,34 @@
  * progress batcher, and merge-write logic below are otherwise unchanged —
  * only the per-Node model call itself is swappable (this story's Never
  * constraint).
+ *
+ * Story 1.8 (Phase 4) adds `regenerateNodeSummary`, the on-demand
+ * single-Node counterpart to `generateSummaries`'s whole-project batch —
+ * used only by an explicit Node Detail "Regenerate" action (index.ts's
+ * `handleRegenerateNodeRequest`), never auto-triggered. It bypasses
+ * `generateSummaries`'s `'pending'`-only eligibility filter (a stale Node is
+ * already `'ready'`) entirely by design, but its `summarize()` call still
+ * MUST go through the exact same `sharedSummaryQueue` `generateSummaries`
+ * uses (Spec Change Log Round 1 — the first implementation attempt called
+ * `summarize()` directly, with no serialization against an in-progress
+ * whole-project batch or another overlapping regenerate call): a single
+ * local GGUF model instance has no meaningful way to run two generations in
+ * parallel (see this comment's next paragraph), so every local-model call —
+ * regardless of which of these two functions it comes from — funnels
+ * through the one concurrency-1 queue.
+ *
+ * Review round 2 found that sharing one FIFO queue traded the round-1
+ * concurrency bug for a new starvation one: a regenerate call issued while a
+ * whole-project batch was still processing pending Nodes could queue behind
+ * the ENTIRE remaining batch, run long past main's own round-trip timeout,
+ * and then still persist via `mergeNodeRecord` after main had already given
+ * up and reported a false timeout to the renderer. Fixed two ways:
+ * `regenerateNodeSummary` enqueues at `{priority: 1}` so it jumps ahead of
+ * `generateSummaries`'s default-priority jobs still waiting in the queue
+ * (though not one already dequeued and running); and `regenerateNodeSummary`
+ * takes a `revalidate` callback, re-checked immediately before persisting,
+ * so a job that DOES end up waiting a while can never write into a
+ * meanwhile-switched project or a meanwhile-coverage-gapped Node.
  */
 
 import { createHash } from 'node:crypto';
@@ -85,6 +113,26 @@ function loadNodeLlamaCppModule(): Promise<{
 
 /** `p-queue` concurrency (Design Notes) — a single local model instance, not a placeholder. */
 const SUMMARY_QUEUE_CONCURRENCY = 1;
+
+/**
+ * The one shared job queue every local-model `summarize()` call funnels
+ * through, regardless of whether it came from `generateSummaries`'s
+ * whole-project batch or `regenerateNodeSummary`'s single-Node on-demand
+ * path (Story 1.8 Phase 4, Spec Change Log Round 1). A single, module-level
+ * singleton rather than one `PQueue` created per call (as `generateSummaries`
+ * used to do internally): a fresh per-call queue would only ever bound
+ * concurrency *within* that one call, letting an overlapping regenerate
+ * call — or a second overlapping regenerate call for a different Node —
+ * spin up its own `LlamaChatSession` against the same shared, memoized
+ * model `sequence` concurrently, exactly the unreachable-by-design state
+ * this concurrency-1 bound exists to prevent everywhere else in this file.
+ * Cloud-backed jobs share this same queue too, purely for code-path
+ * uniformity (Code Map) — the cloud path has no such hardware constraint,
+ * but a queue shared by both backends still correctly serializes the rare
+ * case of a cloud regenerate overlapping a cloud batch against the same
+ * underlying rate limits.
+ */
+export const sharedSummaryQueue = new PQueue({ concurrency: SUMMARY_QUEUE_CONCURRENCY });
 
 // Small enough to keep a generated summary genuinely one line/sentence
 // without an expensive, unbounded generation per Node.
@@ -244,9 +292,17 @@ export async function disposeModelContext(): Promise<void> {
  * Classifies one Node's summary state (Story 1.5 Phase 2, FR5) — shared by
  * `annotateNodesWithSummaryState` (what `getCodeMap` responses show) and
  * `generateSummaries`'s own eligibility filter below, so the two can never
- * disagree about which Nodes are eligible/ineligible/already-done.
+ * disagree about which Nodes are eligible/ineligible/already-done. Exported
+ * (Story 1.8, Phase 4) so index.ts's `handleRegenerateNodeRequest` can
+ * re-check the exact same coverage-gap classification before regenerating —
+ * that handler intentionally bypasses `generateSummaries`'s `'pending'`-only
+ * filter, but must still respect this same coverage-gap exclusion (Spec
+ * Change Log Round 1), and reusing this function (rather than re-deriving
+ * `coverageGapFiles.has(node.file)` inline) guarantees it can never silently
+ * drift out of sync with what this file's other two callers already agree
+ * on.
  */
-function classifyNode(
+export function classifyNode(
   node: CodeMapNode,
   coverageGapFiles: ReadonlySet<string>,
 ): { summaryStatus: SummaryStatus; summary?: string; stale?: boolean } {
@@ -755,7 +811,11 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
     return;
   }
 
-  const queue = new PQueue({ concurrency: SUMMARY_QUEUE_CONCURRENCY });
+  // Story 1.8 Phase 4, Spec Change Log Round 1: the shared module-level
+  // queue, not a fresh `PQueue` scoped to this one call — see
+  // `sharedSummaryQueue`'s own doc comment for why a per-call queue would
+  // fail to serialize against an overlapping `regenerateNodeSummary` call.
+  const queue = sharedSummaryQueue;
   const batcher = createProgressBatcher((updated) => {
     if (isSuperseded()) {
       return;
@@ -871,4 +931,156 @@ export async function generateSummaries(options: GenerateSummariesOptions): Prom
     ),
   );
   batcher.flush();
+}
+
+/**
+ * Result of a `regenerateNodeSummary` revalidation check (review round 2) —
+ * `ok: false` carries a user-facing reason so the caller can resolve with an
+ * explicit error rather than a generic one.
+ */
+export type RegenerateRevalidationResult = { ok: true } | { ok: false; message: string };
+
+/**
+ * Regenerates exactly one Node's summary on demand (Story 1.8, Phase 4) —
+ * the single-Node counterpart to `generateSummaries`'s whole-project batch,
+ * used only from an explicit Node Detail "Regenerate" action (index.ts's
+ * `handleRegenerateNodeRequest`), never auto-triggered. Deliberately runs
+ * with NO eligibility filter (`classifyNode` is not consulted here at all —
+ * a stale Node this is called for is already `'ready'`, which
+ * `generateSummaries`'s own filter would otherwise skip) and outside the
+ * whole-project `activeGenerationRunId`/`activeSummaryGenerationId`
+ * supersession gates those belong to index.ts, not this function.
+ *
+ * The `summarize()` call itself is still routed through `sharedSummaryQueue`
+ * (Spec Change Log Round 1) — the same concurrency-1 queue
+ * `generateSummaries` uses — so this can never run a local-model generation
+ * concurrently with another regenerate call or an in-progress whole-project
+ * batch, regardless of how many callers invoke this function at once.
+ * Enqueued at `{priority: 1}` (review round 2), above `generateSummaries`'s
+ * own default-priority batch jobs — an on-demand regenerate reliably jumps
+ * ahead of whatever whole-project batch jobs are still *waiting* in the
+ * queue, rather than queuing behind the entire remaining batch. Priority
+ * only reorders jobs still waiting, though: it cannot preempt a job the
+ * queue has already dequeued and started running (concurrency is fixed at
+ * 1), so this can still sit behind up to one already-in-flight job — see
+ * index.ts's `REGENERATE_NODE_TIMEOUT_MS`-mirroring backstop, sized with
+ * that in mind.
+ *
+ * `revalidate` (review round 2) is called by the caller (index.ts) to
+ * re-check the request is still valid against LIVE state, not just what was
+ * true when the request was first made — the queue-priority fix above still
+ * leaves a real wait window (behind one already-running job, or briefly
+ * behind other regenerate calls) during which the open project could switch
+ * or this Node could newly enter the coverage-gap set. Checked three times,
+ * mirroring `generateSummaries`'s own already-review-fixed
+ * `isSuperseded()` checkpoints: right after this job is dequeued (before
+ * even calling `summarize()`), right after `summarize()` resolves, and
+ * again right before the final `mergeNodeRecord` write (the async gap
+ * `captureSourceBaseline` opens, exactly like `generateSummaries`'s own
+ * doc comment on its matching check explains). Defaults to always-valid
+ * when omitted (matches `generateSummaries`'s own `isSuperseded` default).
+ *
+ * On success, persists the new summary and a refreshed staleness baseline
+ * together with `mergeNodeRecord(id, {summary: {...}, stale: false})` in one
+ * atomic merge-write (AD-20, Always: "never a separate clear-then-write").
+ * On any failure — unreadable source, a degenerate (empty/timeout) result,
+ * a failed revalidation, or a persistence error — resolves to
+ * `{status: 'error', ...}` and never calls `mergeNodeRecord` at all, leaving
+ * the existing `summary`/baseline/`stale` fields completely untouched
+ * (Always).
+ */
+export async function regenerateNodeSummary(
+  node: CodeMapNode,
+  projectRoot: string,
+  summarize: SummarizeFn,
+  modelName: string,
+  revalidate: () => RegenerateRevalidationResult = () => ({ ok: true }),
+): Promise<{ status: 'ok' } | { status: 'error'; message: string }> {
+  return sharedSummaryQueue.add(
+    async (): Promise<{ status: 'ok' } | { status: 'error'; message: string }> => {
+      // Checked right after dequeue, before doing any real work — catches a
+      // project switch/coverage-gap change that happened while this job sat
+      // waiting behind an in-progress batch (review round 2).
+      const dequeueCheck = revalidate();
+      if (!dequeueCheck.ok) {
+        return { status: 'error', message: dequeueCheck.message };
+      }
+
+      let outcome: SummarizeOutcome;
+      try {
+        outcome = await summarize(node, projectRoot);
+      } catch (error) {
+        return {
+          status: 'error',
+          message: `Regeneration failed for ${node.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+
+      // Re-checked after the (potentially long) summarize() call resolves —
+      // same reasoning as `generateSummaries`'s own matching checkpoint.
+      const postSummarizeCheck = revalidate();
+      if (!postSummarizeCheck.ok) {
+        return { status: 'error', message: postSummarizeCheck.message };
+      }
+
+      if (outcome.kind === 'unreadable') {
+        return {
+          status: 'error',
+          message: `Couldn't read the source for ${node.id} — it may have changed or been deleted since the last index.`,
+        };
+      }
+      if (outcome.kind === 'degenerate') {
+        return {
+          status: 'error',
+          message:
+            outcome.reason === 'timeout'
+              ? `Regenerating the summary for ${node.id} timed out.`
+              : `Regenerating the summary for ${node.id} produced an empty result.`,
+        };
+      }
+
+      // Story 1.8 Phase 1: captured right before this same merge-write, same
+      // as `generateSummaries`'s own per-Node block — a baseline-capture
+      // failure resolves to `undefined` (never throws) and simply omits the
+      // three baseline fields from the write below rather than blocking or
+      // failing the summary write itself.
+      const baseline = await captureSourceBaseline(projectRoot, node);
+
+      // Re-checked once more (review round 2, mirroring `generateSummaries`'s
+      // own review-fixed check here): `captureSourceBaseline`'s own `await`
+      // above is a new async gap since the last check — long enough for a
+      // project switch or coverage-gap change to land in between. Without
+      // this, the write below would proceed anyway, persisting into what
+      // may now be the wrong project's record store.
+      const preWriteCheck = revalidate();
+      if (!preWriteCheck.ok) {
+        return { status: 'error', message: preWriteCheck.message };
+      }
+
+      try {
+        // AD-20: one atomic merge-write, never a separate clear-then-write —
+        // `stale: false` lands in the same call as the fresh `summary`.
+        mergeNodeRecord(node.id, {
+          summary: {
+            text: outcome.text,
+            model: modelName,
+            generatedAt: new Date().toISOString(),
+            ...baseline,
+          },
+          stale: false,
+        });
+      } catch (error) {
+        return {
+          status: 'error',
+          message: `Failed to persist the regenerated summary for ${node.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+      return { status: 'ok' };
+    },
+    { priority: 1 },
+  );
 }

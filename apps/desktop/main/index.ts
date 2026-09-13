@@ -32,11 +32,14 @@ import {
   type GraphServiceCodeMapMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
+  type GraphServiceRegenerateNodeRequest,
+  type GraphServiceRegenerateNodeResultMessage,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type ModelStatusMessage,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
+  type RegenerateNodeResult,
   type SetCloudApiKeyResult,
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
@@ -88,6 +91,53 @@ let pendingCodeMapPromise: Promise<CodeMapResult> | null = null;
 // `requestCodeMap`'s own doc comment that it "rejects nothing... never
 // hanging").
 const CODE_MAP_REQUEST_TIMEOUT_MS = 30 * 60 * 1000 + 10_000;
+
+// Story 1.8 (Phase 4): a dedicated, much shorter backstop than
+// `CODE_MAP_REQUEST_TIMEOUT_MS` (sized for a whole-project fetch) — a
+// single-Node regenerate call is bounded by summary-generator.ts's own
+// per-Node `SUMMARY_PROMPT_TIMEOUT_MS` (2 min, local backend) / cloud-
+// summary-generator.ts's `CLOUD_SUMMARY_TIMEOUT_MS` (3 min, cloud backend)
+// call timeouts. Those constants are mirrored here rather than imported —
+// main never imports the Graph Service's own subprocess-only modules (it
+// only ever talks to that process over `postMessage`), and this codebase's
+// own established precedent (see those two modules' own duplicated
+// `withTimeout` helpers) is to mirror small cross-module constants with an
+// explaining comment rather than force a shared import across this process
+// boundary.
+//
+// Doubled (review round 2) rather than used as-is: `regenerateNodeSummary`
+// enqueues at `{priority: 1}`, so it jumps ahead of every `generateSummaries`
+// batch job still *waiting* in the shared queue — but priority can't preempt
+// a job the queue has already dequeued and started running (concurrency is
+// fixed at 1), so a regenerate call can still sit behind up to one
+// already-in-flight job of the same worst-case (cloud) duration before its
+// own `summarize()` call even starts. Sized for that one-job-ahead-plus-
+// its-own-attempt worst case, plus a small margin — comfortably short of
+// `CODE_MAP_REQUEST_TIMEOUT_MS`, but no longer prone to firing prematurely
+// while a whole-project batch is still in progress (the false "timed out"
+// report review round 2 found: main would give up and report an error while
+// the Graph Service job kept running and eventually still persisted via
+// `mergeNodeRecord`, with its late reply then silently discarded since
+// `settlePendingRegenerateRequest` had nothing left to settle).
+const REGENERATE_NODE_TIMEOUT_MS = 2 * (3 * 60 * 1000) + 10_000;
+
+// Story 1.8 (Phase 4): correlates each in-flight `node:regenerate` request
+// to its eventual Graph Service reply — a generalized, id-keyed version of
+// `pendingCodeMapResolve`'s single slot (Design Notes: "this app's first
+// id-keyed *mutating* IPC request/reply pattern"). Settled by whichever
+// comes first: the 'message' handler below (a genuine
+// `graphService:regenerateNodeResult` reply for that `nodeId`), the 'exit'
+// handler (the subprocess died mid-request — every still-pending entry is
+// settled, not just one), or that request's own per-nodeId timeout timer
+// (`REGENERATE_NODE_TIMEOUT_MS`'s backstop — Spec Change Log Round 1,
+// re-sized in review round 2). `reject` is provided for a well-formed
+// `Promise` executor but is never actually invoked — like `requestCodeMap`,
+// every failure path resolves to an explicit `{status: 'error', ...}`
+// result rather than rejecting.
+const pendingRegenerateResolvers = new Map<
+  string,
+  { resolve: (result: RegenerateNodeResult) => void; reject: (error: unknown) => void }
+>();
 
 // ---------------------------------------------------------------------------
 // Graph Service subprocess (AD-1): spawned via `utilityProcess.fork`, never
@@ -153,6 +203,18 @@ function isCodeMapMessage(message: unknown): message is GraphServiceCodeMapMessa
 }
 
 /**
+ * True for a `graphService:regenerateNodeResult` reply (Story 1.8, Phase 4)
+ * — distinguished from every other message shape on this same channel by
+ * `type`, same convention as `isCodeMapMessage`.
+ */
+function isRegenerateNodeResultMessage(message: unknown): message is GraphServiceRegenerateNodeResultMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:regenerateNodeResult';
+}
+
+/**
  * True for a `graphService:modelStatus` post — distinguished from a
  * `GraphServiceStatusMessage` by `type` the same way `isCodeMapMessage` is,
  * since both status unions use overlapping `state` values (e.g. `'error'`).
@@ -207,6 +269,39 @@ function settlePendingCodeMapRequest(result: CodeMapResult): void {
   resolve(result);
 }
 
+/**
+ * Settles the pending `node:regenerate` request for `nodeId`, if any — used
+ * both by a genuine `graphService:regenerateNodeResult` reply and by that
+ * request's own timeout backstop (Story 1.8, Phase 4, Spec Change Log Round
+ * 1). A no-op if there's no entry for `nodeId` (already settled by whichever
+ * of those two fired first, or none was ever made).
+ */
+function settlePendingRegenerateRequest(nodeId: string, result: RegenerateNodeResult): void {
+  const pending = pendingRegenerateResolvers.get(nodeId);
+  if (!pending) {
+    return;
+  }
+  pendingRegenerateResolvers.delete(nodeId);
+  pending.resolve(result);
+}
+
+/**
+ * Settles EVERY still-pending `node:regenerate` request with an explicit
+ * error — used when the Graph Service subprocess exits with one or more
+ * regenerate requests outstanding (Always: "settling every still-pending
+ * entry with an error result if the Graph Service subprocess exits
+ * mid-request"). Without this, a subprocess crash mid-regenerate would leave
+ * the renderer's `regenerateNode()` promise(s) hanging forever, exactly the
+ * failure `settlePendingCodeMapRequest`'s own 'exit' handling already
+ * guards against for the read-only Code Map fetch.
+ */
+function settleAllPendingRegenerateRequests(message: string): void {
+  for (const [nodeId, pending] of pendingRegenerateResolvers) {
+    pendingRegenerateResolvers.delete(nodeId);
+    pending.resolve({ status: 'error', message });
+  }
+}
+
 function spawnGraphService(): void {
   if (graphService) {
     return;
@@ -244,6 +339,7 @@ function spawnGraphService(): void {
       message:
         | GraphServiceStatusMessage
         | GraphServiceCodeMapMessage
+        | GraphServiceRegenerateNodeResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | HardwareAdvisoryMessage,
@@ -254,6 +350,10 @@ function spawnGraphService(): void {
             ? { status: 'ok', nodes: message.nodes, edges: message.edges }
             : { status: 'error', message: message.message },
         );
+        return;
+      }
+      if (isRegenerateNodeResultMessage(message)) {
+        settlePendingRegenerateRequest(message.nodeId, message.result);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -282,6 +382,11 @@ function spawnGraphService(): void {
       status: 'error',
       message: 'Graph Service exited before the Code Map could be fetched.',
     });
+    // Story 1.8 (Phase 4, Always): every still-pending regenerate request is
+    // settled with an explicit error too — the subprocess dying mid-request
+    // will never post the `graphService:regenerateNodeResult` reply those
+    // promises are waiting on.
+    settleAllPendingRegenerateRequests('Graph Service exited before the Node could be regenerated.');
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -381,6 +486,79 @@ function requestCodeMap(): Promise<CodeMapResult> {
     settlePendingCodeMapRequest({
       status: 'error',
       message: `Failed to send the Code Map request to the Graph Service: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+
+  return promise;
+}
+
+/**
+ * Relays a single-Node regenerate request to the Graph Service subprocess
+ * (Story 1.8, Phase 4) and resolves once it replies — this app's first
+ * id-keyed *mutating* IPC round-trip. Unlike `requestCodeMap`'s own
+ * overlapping-call handling (which shares one in-flight promise, safe only
+ * because a Code Map fetch is read-only/idempotent), a second regenerate
+ * call for a Node already in flight is rejected immediately with an
+ * explicit error result (Always) — never queued behind the first, never
+ * silently dropped — since a mutating request has no such idempotent-replay
+ * safety.
+ *
+ * Rejects nothing, matching `requestCodeMap`'s own framing: every failure
+ * path (no subprocess running, an already-in-flight request for this exact
+ * Node, the subprocess's own error reply, it exiting mid-request,
+ * `postMessage` itself throwing, or the request timing out) resolves to
+ * `{status: 'error', ...}`.
+ *
+ * Carries its own timeout backstop (Spec Change Log Round 1) — `REGENERATE_
+ * NODE_TIMEOUT_MS`, NOT `requestCodeMap`'s own `CODE_MAP_REQUEST_TIMEOUT_MS`
+ * (review round 2: that 30-minute, whole-project-fetch-sized value let a
+ * regenerate call queued behind an in-progress batch appear to "succeed"
+ * eventually while main had already reported a false timeout — see
+ * `REGENERATE_NODE_TIMEOUT_MS`'s own doc comment for the sizing rationale).
+ * If the Graph Service never posts a `graphService:regenerateNodeResult`
+ * for this `nodeId` within that window (a lost message, a hung call, no
+ * exit), this settles the pending entry with an explicit error and removes
+ * it from `pendingRegenerateResolvers`, so a retry is possible rather than
+ * the Regenerate button staying stuck "Regenerating…" forever.
+ */
+function requestRegenerateNode(nodeId: string): Promise<RegenerateNodeResult> {
+  if (pendingRegenerateResolvers.has(nodeId)) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'A regenerate request for this Node is already in progress.',
+    });
+  }
+  if (!graphService) {
+    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+  }
+  const service = graphService;
+
+  const promise = new Promise<RegenerateNodeResult>((resolve, reject) => {
+    pendingRegenerateResolvers.set(nodeId, { resolve, reject });
+  });
+
+  const timeoutTimer = setTimeout(() => {
+    settlePendingRegenerateRequest(nodeId, {
+      status: 'error',
+      message: 'Timed out waiting for the Graph Service to respond to the regenerate request.',
+    });
+  }, REGENERATE_NODE_TIMEOUT_MS);
+  void promise.finally(() => clearTimeout(timeoutTimer));
+
+  try {
+    service.postMessage({
+      type: 'graphService:regenerateNode',
+      nodeId,
+    } satisfies GraphServiceRegenerateNodeRequest);
+  } catch (error) {
+    // A synchronous throw here would otherwise leave this nodeId's resolver
+    // set with nothing left to ever call it, leaking the request forever —
+    // same reasoning as `requestCodeMap`'s own matching catch block.
+    settlePendingRegenerateRequest(nodeId, {
+      status: 'error',
+      message: `Failed to send the regenerate request to the Graph Service: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
     });
   }
 
@@ -654,6 +832,23 @@ function registerIpcHandlers(): void {
         return { status: 'error', message: 'Invalid API key.' };
       }
       return setCloudApiKey(key, acknowledgeInsecureStorage === true);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Story 1.8 (Phase 4): on-demand single-Node regeneration — this app's
+  // first id-keyed mutating IPC channel.
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.nodeRegenerate,
+    (_event, nodeId: unknown): Promise<RegenerateNodeResult> => {
+      // Renderer-supplied value crosses the contextBridge boundary untyped
+      // at runtime (same precedent as `sourceReadRange`'s own guard above).
+      if (typeof nodeId !== 'string' || nodeId.length === 0) {
+        return Promise.resolve({ status: 'error', message: 'Invalid Node ID.' });
+      }
+      return requestRegenerateNode(nodeId);
     },
   );
 }

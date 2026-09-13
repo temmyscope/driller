@@ -20,6 +20,7 @@ import {
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
+  type RegenerateNodeResult,
   type SetCloudApiKeyResult,
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
@@ -83,6 +84,9 @@ const drillerApi: DrillerApi = {
 
   setCloudApiKey: (key: string, acknowledgeInsecureStorage?: boolean): Promise<SetCloudApiKeyResult> =>
     ipcRenderer.invoke(IpcChannels.settingsSetCloudApiKey, key, acknowledgeInsecureStorage),
+
+  regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
+    ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

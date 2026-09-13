@@ -100,6 +100,21 @@
  * available"/"cloud selected, no key" Actionable Notices entirely from
  * `BackendConfig`/`ModelStatusMessage`, so no additional message needs to be
  * posted from here for either case.
+ *
+ * Story 1.8 (Phase 4) adds `handleRegenerateNodeRequest`, dispatched off a
+ * `graphService:regenerateNode` request — this app's first id-keyed mutating
+ * IPC round-trip. It resolves a summarizer the same way
+ * `startSummaryGenerationForProject` does (reading `activeBackendConfig`/
+ * `modelAttempt`/`localModelReady` fresh), but drives exactly one Node
+ * through `summary-generator.ts`'s new `regenerateNodeSummary` instead of
+ * the whole-project `generateSummaries` batch — bypassing that function's
+ * `'pending'`-only eligibility filter and the `activeGenerationRunId`/
+ * `activeSummaryGenerationId` supersession gates entirely, since this is a
+ * single explicit action scoped to one Node ID, never a broader run. Both
+ * paths' `summarize()` calls still funnel through the same
+ * `sharedSummaryQueue` (summary-generator.ts), so a regenerate call can
+ * never run a local-model generation concurrently with another regenerate
+ * call or an in-progress whole-project batch.
  */
 
 import os from 'node:os';
@@ -111,11 +126,14 @@ import type {
   GraphServiceCodeMapMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
+  GraphServiceRegenerateNodeRequest,
+  GraphServiceRegenerateNodeResultMessage,
   GraphServiceShutdownRequest,
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   HardwareAdvisoryReason,
   ModelStatusMessage,
+  RegenerateNodeResult,
   SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 // Type-only import: pulls in Electron's ambient `process.parentPort`
@@ -134,10 +152,13 @@ import {
 } from './node-record-store';
 import {
   annotateNodesWithSummaryState,
+  classifyNode,
   createLocalSummarizer,
   detectStaleness,
   disposeModelContext,
   generateSummaries,
+  regenerateNodeSummary,
+  type RegenerateRevalidationResult,
   type SummarizeFn,
 } from './summary-generator';
 
@@ -314,6 +335,14 @@ function postCodeMapMessage(message: GraphServiceCodeMapMessage): void {
   process.parentPort?.postMessage(message);
 }
 
+/**
+ * Posts a `graphService:regenerateNodeResult` reply (Story 1.8, Phase 4) —
+ * own `type`/channel, same disambiguation convention as `postCodeMapMessage`.
+ */
+function postRegenerateNodeResultMessage(message: GraphServiceRegenerateNodeResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
 function postModelStatus(status: ModelStatusMessage): void {
   process.parentPort?.postMessage(status);
 }
@@ -487,6 +516,21 @@ function isGetCodeMapRequest(data: unknown): data is GraphServiceGetCodeMapReque
     data !== null &&
     (data as { type?: unknown }).type === 'graphService:getCodeMap'
   );
+}
+
+/**
+ * True for a `graphService:regenerateNode` request (Story 1.8, Phase 4) —
+ * mirrors `isGetCodeMapRequest`'s shape, plus a defensive check that
+ * `nodeId` is actually a non-empty string, the same untrusted-shape
+ * treatment `isIndexRequest` already applies to values crossing this
+ * `parentPort` boundary from main.
+ */
+function isRegenerateNodeRequest(data: unknown): data is GraphServiceRegenerateNodeRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, nodeId } = data as { type?: unknown; nodeId?: unknown };
+  return type === 'graphService:regenerateNode' && typeof nodeId === 'string' && nodeId.length > 0;
 }
 
 /** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
@@ -746,6 +790,141 @@ async function handleGetCodeMapRequest(): Promise<void> {
       message: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/**
+ * Handles a `graphService:regenerateNode` request (Story 1.8, Phase 4) —
+ * this app's first id-keyed mutating IPC round-trip. Regenerates exactly one
+ * Node's summary, reusing Story 1.5/1.6's existing `summarize`/
+ * `captureSourceBaseline`/backend-selection logic as-is (Always: "no new
+ * generation orchestration path") via `summary-generator.ts`'s
+ * `regenerateNodeSummary` — deliberately bypassing `generateSummaries`'s
+ * `'pending'`-only eligibility filter (a stale Node is already `'ready'`)
+ * and the whole-project `activeGenerationRunId`/`activeSummaryGenerationId`
+ * supersession gates, which belong to the whole-project batch path, not
+ * this single-Node one.
+ *
+ * The whole body is wrapped in one try/catch (Spec Change Log Round 1,
+ * mirroring `startSummaryGenerationForProject`'s own try/catch/finally) so
+ * an unexpected throw anywhere in here — including inside
+ * `regenerateNodeSummary` itself — still posts an explicit
+ * `{status: 'error', ...}` reply rather than leaking main's pending
+ * `pendingRegenerateResolvers` entry forever (a permanently-stuck
+ * "Regenerating…" button with no recovery short of restarting the app).
+ *
+ * Re-checks `classifyNode(node, coverageGapFileSet).summaryStatus !==
+ * 'coverage-gap'` before regenerating (Spec Change Log Round 1) — this
+ * handler intentionally bypasses `generateSummaries`'s `'pending'`-only
+ * filter, but must still respect Story 1.5 Phase 2's coverage-gap exclusion:
+ * a coverage-gap Node must never get a persisted summary.
+ *
+ * Looks the Node up in `activeCodeMapNodes` (the most recently fetched Code
+ * Map's Nodes, cached for the backend-switch re-kick path too) rather than
+ * the Node record store — a record doesn't exist at all for a Node that has
+ * never been summarized, so the record store alone can't distinguish "Node
+ * not found" from "Node exists but has no summary yet."
+ *
+ * On success, builds the reply's `node` via the already-exported
+ * `annotateNodesWithSummaryState([node], coverageGapFileSet)[0]` (KEEP, Spec
+ * Change Log) so the renderer gets the exact same shape `getCodeMap`
+ * produces — reading the Node record store fresh, which already reflects
+ * `regenerateNodeSummary`'s just-completed in-memory merge-write (disk
+ * persistence is debounced, but `node-record-store.ts`'s in-memory `records`
+ * map is updated synchronously).
+ */
+async function handleRegenerateNodeRequest(nodeId: string): Promise<void> {
+  let result: RegenerateNodeResult;
+  try {
+    result = await computeRegenerateNodeResult(nodeId);
+  } catch (error) {
+    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+  postRegenerateNodeResultMessage({ type: 'graphService:regenerateNodeResult', nodeId, result });
+}
+
+async function computeRegenerateNodeResult(nodeId: string): Promise<RegenerateNodeResult> {
+  const nodes = activeCodeMapNodes;
+  const projectRoot = activeProjectPath;
+  if (!nodes || !projectRoot) {
+    return { status: 'error', message: 'No project has finished indexing yet.' };
+  }
+  const node = nodes.find((candidate) => candidate.id === nodeId);
+  if (!node) {
+    return { status: 'error', message: `Node "${nodeId}" was not found in the current Code Map.` };
+  }
+  if (classifyNode(node, coverageGapFileSet).summaryStatus === 'coverage-gap') {
+    return {
+      status: 'error',
+      message: `Node "${nodeId}" is in the current index's coverage gap set and cannot be regenerated.`,
+    };
+  }
+
+  const backendConfig = activeBackendConfig;
+  let summarize: SummarizeFn;
+  let modelName: string;
+  if (backendConfig.activeBackend === 'cloud') {
+    if (!backendConfig.cloudApiKey) {
+      return {
+        status: 'error',
+        message: 'Cloud is selected but no API key is set — add one in Settings.',
+      };
+    }
+    summarize = createCloudSummarizer(backendConfig.cloudApiKey);
+    modelName = CLOUD_SUMMARY_MODEL;
+  } else {
+    if (modelAttempt) {
+      try {
+        await modelAttempt;
+      } catch {
+        // Already reported via `graphService:modelStatus` 'error' — nothing
+        // more to do; there is no model to regenerate with this session.
+        return { status: 'error', message: 'The local model failed to load — no summary backend is available.' };
+      }
+    }
+    if (!localModelReady) {
+      return { status: 'error', message: 'No summary backend is available yet — check Settings.' };
+    }
+    summarize = createLocalSummarizer(localModelReady);
+    modelName = localModelReady.model;
+  }
+
+  // Review round 2: snapshot the project/generation identity this request
+  // was validated against — the queue-priority fix on `regenerateNodeSummary`
+  // still leaves a real wait window (behind one already-running job, or
+  // briefly behind other regenerate calls), during which the open project
+  // could switch (or be re-indexed) or this Node could newly enter the
+  // coverage-gap set. `revalidate` re-checks both against the LIVE module
+  // state at write time, not just this snapshot taken at request entry.
+  const requestGenerationId = activeSummaryGenerationId;
+  const requestProjectPath = projectRoot;
+  const revalidate = (): RegenerateRevalidationResult => {
+    if (activeSummaryGenerationId !== requestGenerationId || activeProjectPath !== requestProjectPath) {
+      return {
+        ok: false,
+        message: 'The open project changed while this request was queued — regeneration was cancelled.',
+      };
+    }
+    if (classifyNode(node, coverageGapFileSet).summaryStatus === 'coverage-gap') {
+      return {
+        ok: false,
+        message: `Node "${nodeId}" entered the coverage gap set while this request was queued — regeneration was cancelled.`,
+      };
+    }
+    return { ok: true };
+  };
+
+  const outcome = await regenerateNodeSummary(node, projectRoot, summarize, modelName, revalidate);
+  if (outcome.status === 'error') {
+    return { status: 'error', message: outcome.message };
+  }
+  const refreshedNode = annotateNodesWithSummaryState([node], coverageGapFileSet)[0];
+  if (!refreshedNode) {
+    // Unreachable in practice (`annotateNodesWithSummaryState` maps a
+    // one-element array to a one-element array) — a defensive explicit
+    // error rather than letting `undefined` reach the IPC boundary.
+    return { status: 'error', message: 'Regenerated the summary but failed to build the updated Node.' };
+  }
+  return { status: 'ok', node: refreshedNode };
 }
 
 /**
@@ -1130,6 +1309,14 @@ process.parentPort?.on('message', (event) => {
   }
   if (!isShuttingDown && isGetCodeMapRequest(event.data)) {
     void handleGetCodeMapRequest();
+    return;
+  }
+  if (!isShuttingDown && isRegenerateNodeRequest(event.data)) {
+    // Fire-and-forget from the message handler's perspective, same as every
+    // other branch here — `handleRegenerateNodeRequest` posts its own
+    // `graphService:regenerateNodeResult` reply asynchronously and never
+    // throws (its own top-level try/catch guarantees that).
+    void handleRegenerateNodeRequest(event.data.nodeId);
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {

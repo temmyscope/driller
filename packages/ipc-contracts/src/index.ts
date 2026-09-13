@@ -583,6 +583,62 @@ export interface SetCloudApiKeyResult {
 }
 
 // ---------------------------------------------------------------------------
+// Story 1.8 (Phase 4): on-demand single-Node regeneration (AD-7).
+//
+// `node:regenerate` is this app's first id-keyed *mutating* IPC channel —
+// every prior IPC surface is read-only (Design Notes). The renderer sends a
+// request keyed by exactly one Node ID (from the Node Detail panel's
+// Regenerate button, shown only for a stale Node); main relays it to the
+// Graph Service and the reply reports the outcome for that Node only, never
+// a broader re-index or whole-project regeneration (Boundaries &
+// Constraints).
+//
+// `RegenerateNodeResult` mirrors `CodeMapResult`'s own explicit-result-state
+// shape (AD-13): on success, `node` carries the exact same annotated shape
+// `getCodeMap` produces (via `annotateNodesWithSummaryState`), so the
+// renderer can patch its already-rendered Node set in place without a
+// refetch. On any failure (unreadable source, degenerate output, no usable
+// backend, Node not found, an already-in-flight request for the same Node,
+// or the coverage-gap exclusion), the existing record is left completely
+// untouched and `message` carries safe, user-facing text.
+// ---------------------------------------------------------------------------
+
+export type RegenerateNodeResult =
+  | { status: 'ok'; node: CodeMapNode }
+  | { status: 'error'; message: string };
+
+/**
+ * Message main sends to ask the Graph Service subprocess to regenerate one
+ * Node's summary. Unlike `GraphServiceGetCodeMapRequest`, this carries a
+ * `nodeId` — main correlates the eventual `graphService:regenerateNodeResult`
+ * reply back to the right renderer-side request via a `Map<nodeId, {resolve,
+ * reject}>` (generalizing `pendingCodeMapResolve`'s single slot), since
+ * multiple regenerate requests for different Nodes can legitimately be in
+ * flight at once (Boundaries & Constraints: a second request for the SAME
+ * Node already in flight is rejected immediately in main instead, never
+ * reaching this message).
+ */
+export interface GraphServiceRegenerateNodeRequest {
+  type: 'graphService:regenerateNode';
+  /** The Node's `qualified_name`-derived `id` (AD-19) — exactly one Node, never a batch. */
+  nodeId: string;
+}
+
+/**
+ * Message the Graph Service subprocess posts back in response to a
+ * `GraphServiceRegenerateNodeRequest`, over the same `parentPort` channel as
+ * every other Graph Service message — distinguished by `type`, same
+ * convention as `GraphServiceCodeMapMessage`. `nodeId` echoes the request so
+ * main can settle the exact pending entry this reply is for, even though
+ * `result`'s own `node.id` (on success) already carries the same value.
+ */
+export interface GraphServiceRegenerateNodeResultMessage {
+  type: 'graphService:regenerateNodeResult';
+  nodeId: string;
+  result: RegenerateNodeResult;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -600,6 +656,7 @@ export const IpcChannels = {
   settingsGetBackendConfig: 'settings:getBackendConfig',
   settingsSetActiveBackend: 'settings:setActiveBackend',
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
+  nodeRegenerate: 'node:regenerate',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -680,4 +737,13 @@ export interface DrillerApi {
     key: string,
     acknowledgeInsecureStorage?: boolean,
   ) => Promise<SetCloudApiKeyResult>;
+  /**
+   * Regenerates exactly one Node's summary on demand (Story 1.8, Phase 4) —
+   * this app's first id-keyed mutating IPC round-trip. Scoped to `nodeId`
+   * only: never triggers a broader re-index or whole-project generation run
+   * (AD-7), and never runs except from this explicit call. A second call for
+   * a Node already in flight resolves immediately with an explicit error
+   * (Boundaries & Constraints) rather than queuing behind the first.
+   */
+  regenerateNode: (nodeId: string) => Promise<RegenerateNodeResult>;
 }
