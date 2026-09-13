@@ -442,6 +442,29 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
       {node.summaryStatus === 'ready' && node.summary !== undefined && (
         <p className="code-map__node-summary">{node.summary}</p>
       )}
+      {/* Story 1.8 (Phase 3): a `'ready'` Node's summary can still drift out
+          of sync with its source — that's a different failure mode from
+          Coverage Gap (no summary was ever possible) and Actionable Notices
+          (no summary backend), so it gets its own icon (never `⚠`, already
+          spoken for by those) and always renders alongside the summary text
+          rather than replacing it or hiding behind hover/click (Boundaries
+          & Constraints). Non-color-only (Accessibility Floor): the icon and
+          exact copy carry the signal on their own.
+
+          The `node.summary !== undefined` guard mirrors the summary
+          paragraph's own condition just above (review finding, Low):
+          `classifyNode` only ever returns `stale` alongside a defined
+          `summary` today, but `CodeMapNode.summary` is independently
+          optional in the type, so nothing enforces that pairing at the type
+          level — without this guard, a future `classifyNode`/construction-
+          site change could produce `stale: true` with no summary text
+          rendered above it, leaving the staleness note floating with
+          nothing for it to describe. */}
+      {node.summaryStatus === 'ready' && node.summary !== undefined && node.stale === true && (
+        <p className="code-map__node-staleness" role="status">
+          <span aria-hidden="true">⏳</span> Summary may be stale — source changed since generation
+        </p>
+      )}
       {/* Story 1.6 (Phase 2): a `'pending'` Node that will genuinely never
           get a summary this session — either backend is unusable — renders
           the matching Actionable Notice instead of the ordinary "Summary

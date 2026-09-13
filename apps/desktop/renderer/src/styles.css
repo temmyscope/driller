@@ -594,6 +594,24 @@ code,
   font-style: normal;
 }
 
+/* Story 1.8 (Phase 3): the Staleness Indicator — a distinct, always-visible
+   treatment alongside a `'ready'` Node's summary (never replacing it) when
+   the source has drifted since generation. Deliberately its own rule
+   (`.code-map__node-staleness`, not a `.code-map__node-summary--*` modifier)
+   since it renders as a second, always-present line next to the summary
+   rather than swapping the summary's own text out like the pending/
+   coverage-gap/notice variants above do. Same "never color-only" treatment
+   as `--coverage-gap`/`--notice`: the "⏳" glyph (distinct from Coverage
+   Gap's/the Actionable Notices' "⚠") and the exact copy carry the signal on
+   their own — color is reinforcement, not the only cue. */
+.code-map__node-staleness {
+  margin: 0.15rem 0 0;
+  font-size: 0.75rem;
+  line-height: 1.3;
+  color: var(--warning);
+  font-style: normal;
+}
+
 .code-map__edge {
   stroke: var(--text-muted);
   cursor: pointer;

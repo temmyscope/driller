@@ -346,6 +346,17 @@ export interface CodeMapNode {
   summaryStatus: SummaryStatus;
   /** The generated one-line plain-language summary — present only when `summaryStatus === 'ready'`. */
   summary?: string;
+  /**
+   * Story 1.8 Phase 3: whether this Node's summary has drifted from its
+   * source since generation (the record store's `NodeRecord.stale`,
+   * populated at `getCodeMap` fetch time by the same `classifyNode` step
+   * that populates `summaryStatus`/`summary` above). Meaningful only when
+   * `summaryStatus === 'ready'` — `true` only when the record's `stale`
+   * flag is actually set; absent otherwise (never a default `false`
+   * standing in for "not evaluated", matching `NodeRecord.stale`'s own
+   * tri-state contract).
+   */
+  stale?: boolean;
 }
 
 export interface CodeMapEdge {

@@ -249,13 +249,19 @@ export async function disposeModelContext(): Promise<void> {
 function classifyNode(
   node: CodeMapNode,
   coverageGapFiles: ReadonlySet<string>,
-): { summaryStatus: SummaryStatus; summary?: string } {
+): { summaryStatus: SummaryStatus; summary?: string; stale?: boolean } {
   if (coverageGapFiles.has(node.file)) {
     return { summaryStatus: 'coverage-gap' };
   }
   const record = getNodeRecord(node.id);
   if (record?.summary) {
-    return { summaryStatus: 'ready', summary: record.summary.text };
+    // Story 1.8 Phase 3: thread the record's `stale` flag through the same
+    // classification step that already threads `summary` — `record.stale`
+    // is itself already tri-state (`true`/`false`/`undefined`; see
+    // `NodeRecord.stale`'s own doc), so passing it straight through
+    // preserves "absent means not evaluated" rather than coercing it to a
+    // default `false`.
+    return { summaryStatus: 'ready', summary: record.summary.text, stale: record.stale };
   }
   return { summaryStatus: 'pending' };
 }
