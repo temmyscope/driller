@@ -869,6 +869,38 @@ code,
   font-weight: 600;
 }
 
+/* Story 1.9 (Phase 3) — review fix: every candidate in one `ambiguous`
+   result shares the same `name` by construction, so `.code-map__path-trace-step`'s
+   base single-row layout (name only) would render indistinguishable
+   buttons. This variant stacks the name above its distinguishing
+   `formatCandidateLocation` text instead — same base button shape/classes,
+   just a column layout for this one case. */
+.code-map__path-trace-candidate {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+}
+
+.code-map__path-trace-candidate-location {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+/* Review fix: the render-layer cap on how many `ambiguous` candidates get
+   rendered (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`, CodeMap.tsx) — shown only
+   when the full candidate list is longer than what's rendered, so
+   truncation is explicit rather than silently dropping matches from view. */
+.code-map__path-trace-candidates-truncated {
+  margin: 0.35rem 0 0;
+  padding: 0 0.15rem;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
 /* A `found` path's own Node/edge highlight (Code Map: "no existing highlight
    mechanism to extend, this is new"). Never color-only (Accessibility
    Floor): a thicker solid border + glow ring is a shape/weight cue on its

@@ -51,6 +51,13 @@ export interface PathTraceEdge {
  *    entry first. A Node with zero outgoing `CALLS` edges still produces a
  *    valid single-element `found` path (Always) — `'no-path-found'` is
  *    reserved exclusively for zero query matches (Always).
+ *  - `'ambiguous'` (Story 1.9, Phase 3): the query matched more than one
+ *    Node at the tier that resolves it (see `resolveEntryNode`'s doc
+ *    comment for the per-tier resolution rule) — `candidates` is that
+ *    tier's full match list, sorted ascending by `id` (Always — the same
+ *    deterministic order Phase 1's interim tie-break already used), never
+ *    silently narrowed to one. The exact-id tier never produces this state
+ *    (AD-19: `id` is unique identity, a match there wins immediately).
  *  - `'no-path-found'`: the query resolved to no Node at all.
  *  - `'error'`: the trace couldn't even be attempted (e.g. no project
  *    indexed yet, or the Graph Service unavailable) — `message` is safe,
@@ -58,6 +65,7 @@ export interface PathTraceEdge {
  */
 export type PathTraceResult =
   | { status: 'found'; path: string[] }
+  | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
   | { status: 'error'; message: string };
 
@@ -82,9 +90,14 @@ export type PathTraceResult =
  * edge order (see `fixtures/path-trace-basic/README.md`, whose hand-verified
  * sibling order this sort makes actually true by construction).
  *
- * A query matching more than one Node at any resolution tier deterministically
- * resolves to the first match by sorted `id` (Always — interim disambiguation
- * ahead of Phase 3's real UI; never silently arbitrary, e.g. array order).
+ * A query matching more than one Node at the tier that resolves it (Story
+ * 1.9, Phase 3) returns `{status: 'ambiguous', candidates}` instead of
+ * picking one — `candidates` is that tier's full match list, sorted
+ * ascending by `id` (Always — the same deterministic order Phase 1's
+ * interim tie-break used, generalized from "pick the first" to "return them
+ * all"). The exact-id tier is the one exception: a match there wins
+ * immediately and unconditionally, never producing `ambiguous` (AD-19 — see
+ * `resolveEntryNode`'s doc comment).
  *
  * Pure and transport-agnostic (Always): no I/O, no dependency on
  * `@driller/ipc-contracts` or any other package — `nodes`/`edges` are plain
@@ -95,10 +108,17 @@ export function traceCallPath(
   edges: PathTraceEdge[],
   query: string,
 ): PathTraceResult {
-  const entry = resolveEntryNode(nodes, query);
-  if (!entry) {
+  const resolution = resolveEntryNode(nodes, query);
+  if (resolution.kind === 'not-found') {
     return { status: 'no-path-found' };
   }
+  if (resolution.kind === 'ambiguous') {
+    return {
+      status: 'ambiguous',
+      candidates: resolution.candidates.map((node) => ({ id: node.id, name: node.name })),
+    };
+  }
+  const entry = resolution.node;
 
   // Dangling-edge exclusion (mirrors the renderer's own `NodeAdjacency`
   // builder over this same data): a `target` id with no corresponding Node
@@ -151,45 +171,67 @@ export function traceCallPath(
 }
 
 /**
- * Resolves `query` against `nodes`, in strict tier order — each tier is
- * tried only if the previous one produced zero matches:
- *  1. Exact case-insensitive match on `id`.
+ * The result of resolving a query against `nodes`, in strict tier order —
+ * each tier is tried only if the previous one produced zero matches:
+ *  1. Exact case-insensitive match on `id` — matches wins immediately and
+ *     unconditionally (never `'ambiguous'`, even with >1 match: `id` is
+ *     unique identity by construction, AD-19).
  *  2. Exact case-insensitive match on `name`.
  *  3. Case-insensitive substring match on `name`.
  *
- * `id` and `name` exact matches are deliberately NOT pooled together before
- * the sorted-`id` tie-break (a prior version did this) — pooling let a Node
- * whose `name` merely happens to equal the query beat the Node whose `id`
- * actually equals it, whenever both existed and sorted differently. Checking
- * `id` as its own priority tier first means an exact `id` match always wins
- * outright, matching `id`'s role as the stable identity field (AD-19)
- * callers are far more likely to pass verbatim.
+ * `id` and `name` exact matches are deliberately NOT pooled together (a
+ * prior version did this) — pooling let a Node whose `name` merely happens
+ * to equal the query beat the Node whose `id` actually equals it, whenever
+ * both existed. Checking `id` as its own priority tier first means an exact
+ * `id` match always wins outright, matching `id`'s role as the stable
+ * identity field (AD-19) callers are far more likely to pass verbatim.
  *
- * A tier producing more than one match still resolves deterministically via
- * `firstBySortedId` (Always) before falling through to the next tier.
+ * Within tiers 2/3, exactly one match resolves that tier (`'resolved'`);
+ * more than one match resolves the *whole* query to `'ambiguous'` for that
+ * tier's full candidate list (Story 1.9, Phase 3 — never falls through to
+ * the next tier); zero matches falls through to the next tier, or
+ * `'not-found'` after the last one.
  */
-function resolveEntryNode(nodes: PathTraceNode[], query: string): PathTraceNode | undefined {
+type EntryResolution =
+  | { kind: 'resolved'; node: PathTraceNode }
+  | { kind: 'ambiguous'; candidates: PathTraceNode[] }
+  | { kind: 'not-found' };
+
+function resolveEntryNode(nodes: PathTraceNode[], query: string): EntryResolution {
   const normalizedQuery = query.toLowerCase();
 
   const exactIdMatches = nodes.filter((node) => node.id.toLowerCase() === normalizedQuery);
   if (exactIdMatches.length > 0) {
-    return firstBySortedId(exactIdMatches);
+    // Exact-id tier: unconditional immediate win, never ambiguous (see this
+    // function's doc comment / AD-19) — even a defensively-unexpected >1
+    // match still just resolves via the same sorted-id tie-break as before.
+    return { kind: 'resolved', node: sortBySortedId(exactIdMatches)[0]! };
   }
 
   const exactNameMatches = nodes.filter((node) => node.name.toLowerCase() === normalizedQuery);
   if (exactNameMatches.length > 0) {
-    return firstBySortedId(exactNameMatches);
+    return exactNameMatches.length === 1
+      ? { kind: 'resolved', node: exactNameMatches[0]! }
+      : { kind: 'ambiguous', candidates: sortBySortedId(exactNameMatches) };
   }
 
   const substringMatches = nodes.filter((node) => node.name.toLowerCase().includes(normalizedQuery));
   if (substringMatches.length > 0) {
-    return firstBySortedId(substringMatches);
+    return substringMatches.length === 1
+      ? { kind: 'resolved', node: substringMatches[0]! }
+      : { kind: 'ambiguous', candidates: sortBySortedId(substringMatches) };
   }
 
-  return undefined;
+  return { kind: 'not-found' };
 }
 
-/** Deterministic tie-break for a multi-match query — see `traceCallPath`'s doc comment. */
-function firstBySortedId(matches: PathTraceNode[]): PathTraceNode {
-  return [...matches].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]!;
+/**
+ * Deterministic sort order for a multi-match candidate set (Always) —
+ * ascending by `id`. Generalized from Phase 1/2's `firstBySortedId`
+ * (formerly returned only the first element for its interim tie-break) now
+ * that Phase 3 needs the full sorted candidate list for `'ambiguous'`, not
+ * just its first entry.
+ */
+function sortBySortedId(matches: PathTraceNode[]): PathTraceNode[] {
+  return [...matches].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }

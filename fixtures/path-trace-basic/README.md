@@ -28,6 +28,12 @@ handleRequest (entry.ts)
   Path Trace visits each of them exactly once and terminates rather than
   looping.
 
+Story 1.9 (Phase 3) adds two more files, `utilA.ts` and `utilB.ts`, each
+exporting a standalone `helper()` — uncalled by anything above and calling
+nothing themselves, so they can't affect any of the call-graph scenarios
+above. They exist purely to give a `"helper"` query two same-named matches
+at the exact-name tier, exercising the new `ambiguous` result.
+
 ## Hand-verified expected `traceCallPath`/`window.driller.tracePath(...)` output
 
 Node ids are whatever the indexing backend's qualified-name scheme actually
@@ -78,3 +84,40 @@ of looping). Two Nodes total, each exactly once; does not hang.
 
 No Node's `id` or `name` matches this query at all (exact or substring) —
 `no-path-found`, never an ambiguous empty `path` array.
+
+### `"helper"` (Story 1.9, Phase 3 — the ambiguous case)
+
+```
+{
+  status: 'ambiguous',
+  candidates: [
+    { id: <utilA.ts's `helper` qualified-name id>, name: 'helper' },
+    { id: <utilB.ts's `helper` qualified-name id>, name: 'helper' },
+  ],
+}
+```
+
+Hand-verified by indexing this fixture folder with the real backend
+(`codebase-memory-mcp`) and querying it directly: `"helper"` matches exactly
+two Nodes, both at the exact-name tier (neither Node's `id` — its qualified
+name, path + symbol per AD-19 — equals the literal string `"helper"`, so the
+exact-id tier contributes nothing and the exact-name tier is what resolves
+this query). Two matches at that tier means the *whole* query resolves
+`ambiguous` there — it never falls through to the substring tier, and never
+auto-picks one.
+
+`candidates` is sorted ascending by `id`. Each Node's `id` embeds its file's
+path (AD-19), and `utilA.ts` sorts before `utilB.ts` — confirmed against the
+real backend's actual qualified names — so `utilA.ts`'s `helper` is always
+`candidates[0]` and `utilB.ts`'s `helper` is always `candidates[1]`,
+regardless of which project-root prefix a given machine's backend derives
+(that prefix is environment-specific — derived from the repo's absolute
+path — so it's deliberately not reproduced verbatim here; what's
+hand-verified and stable across environments is each result's `status`, the
+match count, the tier that resolved it, and the `utilA`-before-`utilB`
+sort order).
+
+Clicking either candidate re-runs the trace with that exact `id` as the new
+query, which resolves via the untouched exact-id tier: `{ status: 'found',
+path: [that Node's id] }` — a single-element path, since neither `helper`
+calls anything.

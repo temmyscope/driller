@@ -97,14 +97,17 @@ type RegenerateState = { kind: 'idle' | 'regenerating' } | { kind: 'error'; mess
 /**
  * The search toolbar's own result state (Story 1.9, Phase 2) — mirrors
  * `RegenerateState`'s idle/in-flight/error shape (Code Map), but carries
- * Phase 1's `PathTraceResult` states directly (`'found'`/`'no-path-found'`/
- * `'error'`) rather than collapsing them into one generic error: Boundaries
- * & Constraints requires `'no-path-found'` to render "visibly distinct from
- * the `searching` state" (UX-DR16), and distinct from a real `'error'` too,
- * so each is its own explicit state rather than folded together.
- * `PathTraceResult` (`@driller/ipc-contracts`, re-exported from
- * `@driller/graph-contracts`) is assignable directly into this type's
- * `'found'`/`'no-path-found'`/`'error'` members — `window.driller.tracePath`'s
+ * `PathTraceResult` states directly (`'found'`/`'ambiguous'`/
+ * `'no-path-found'`/`'error'`) rather than collapsing them into one generic
+ * error: Boundaries & Constraints requires `'no-path-found'` to render
+ * "visibly distinct from the `searching` state" (UX-DR16), and distinct from
+ * a real `'error'` too, so each is its own explicit state rather than folded
+ * together. `'ambiguous'` (Story 1.9, Phase 3) is the same idea applied to a
+ * multi-match query: it gets its own explicit state and its own Actionable
+ * Notice rendering, never folded into `'found'`/`'error'`. `PathTraceResult`
+ * (`@driller/ipc-contracts`, re-exported from `@driller/graph-contracts`) is
+ * assignable directly into this type's `'found'`/`'ambiguous'`/
+ * `'no-path-found'`/`'error'` members — `window.driller.tracePath`'s
  * resolved value is set into this state as-is, only `'idle'`/`'searching'`
  * are local additions.
  */
@@ -112,6 +115,7 @@ type PathTraceState =
   | { status: 'idle' }
   | { status: 'searching' }
   | { status: 'found'; path: string[] }
+  | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
   | { status: 'error'; message: string };
 
@@ -453,6 +457,39 @@ function resolveEdgeClickTarget(edge: { source: string; target: string }, focuse
     return edge.source;
   }
   return edge.target;
+}
+
+// Review fix (Story 1.9, Phase 3): the search toolbar's ambiguous-match
+// panel is a small fixed-width surface (`code-map__path-trace`'s own
+// `width: min(320px, ...)`), never meant to hold more than a handful of
+// items — but `traceCallPath`'s `ambiguous` result carries a tier's FULL
+// match list with no upper bound (Always, in `packages/graph-contracts`: an
+// honest, never-silently-narrowed candidate set). A short/common substring
+// query against a real 10,000-Node-scale project could plausibly return
+// dozens or hundreds of candidates. Rather than cap the engine's own
+// contract (which would silently drop real matches from the data itself),
+// the cap lives here at the render layer: only the first
+// `MAX_RENDERED_AMBIGUOUS_CANDIDATES` are rendered, with an explicit
+// truncation notice when there are more — honest about being partial
+// rather than silently dropping matches from view.
+const MAX_RENDERED_AMBIGUOUS_CANDIDATES = 20;
+
+/**
+ * Review fix (Story 1.9, Phase 3): every candidate in one `ambiguous`
+ * result shares the exact same `name` by construction (that's why they're
+ * ambiguous) — rendering `candidate.name` alone would make two candidates
+ * indistinguishable, defeating the point of disambiguation. `candidate.id`
+ * is the Node's qualified name (path + symbol, AD-19), so this strips just
+ * the trailing `.<name>` symbol segment (when present) to surface the
+ * distinguishing file/location part alone, e.g. an id of
+ * `…fixtures/path-trace-basic.utilA.helper` for a `helper` candidate
+ * becomes `…fixtures/path-trace-basic.utilA` — falls back to the full `id`
+ * verbatim if it doesn't end with that exact suffix (a defensive case, not
+ * one the current qualified-name scheme is expected to hit).
+ */
+function formatCandidateLocation(candidate: { id: string; name: string }): string {
+  const symbolSuffix = `.${candidate.name}`;
+  return candidate.id.endsWith(symbolSuffix) ? candidate.id.slice(0, -symbolSuffix.length) : candidate.id;
 }
 
 /**
@@ -1713,44 +1750,36 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   );
 
   /**
-   * The search toolbar's submit handler (Story 1.9, Phase 2). Boundaries &
-   * Constraints: transitions to `searching` before `tracePath` resolves —
-   * which also clears any previous highlight/step-list/notice, since those
-   * are all derived from `pathTrace`, and setting it to `searching` moves it
-   * away from whatever `'found'`/`'no-path-found'`/`'error'` it last held
-   * the instant this fires — and no-ops entirely while already `searching`
-   * (also belt-and-suspenders disabled on the input/button themselves
-   * below).
+   * The shared "run a trace, apply the result" round trip (Story 1.9, Phase
+   * 3 extraction — Phase 2 had this inlined directly in
+   * `handlePathTraceSubmit` below, but a disambiguation-candidate click
+   * needs the identical staleness-guarded round trip with a different query
+   * source: the picked candidate's exact `id`, not the input field's typed
+   * text). Boundaries & Constraints: transitions to `searching` before
+   * `tracePath` resolves — which also clears any previous
+   * highlight/step-list/notice, since those are all derived from
+   * `pathTrace`, and setting it to `searching` moves it away from whatever
+   * `'found'`/`'ambiguous'`/`'no-path-found'`/`'error'` it last held the
+   * instant this fires — and no-ops entirely while already `searching`
+   * (also belt-and-suspenders disabled on the input/button/candidate
+   * buttons themselves below).
    *
-   * Review fix: a trimmed-empty query is rejected client-side before ever
-   * calling `tracePath` — `traceCallPath`'s own substring-match tier
-   * (`name.includes(normalizedQuery)`) is vacuously true for `''`, so an
-   * empty/whitespace-only query would otherwise silently match every Node
-   * and trace from whichever sorts first by id, rather than reaching
-   * `'no-path-found'`. Mirrors the same trim+reject-empty guard Phase 1's
-   * own `apps/desktop/main/index.ts` IPC handler already applies for this
-   * exact reason.
-   *
-   * Review fix: `pathTraceRequestIdRef` is bumped and captured before the
-   * async call, then checked again once it resolves/rejects — a
-   * Retry/reload in the meantime (`loadCodeMap`, which bumps this same ref)
-   * must not let a since-superseded response apply a highlight/step-list
-   * for a Node id that no longer belongs to the current map.
+   * Review fix (Phase 2, still applies): `pathTraceRequestIdRef` is bumped
+   * and captured before the async call, then checked again once it
+   * resolves/rejects — a Retry/reload in the meantime (`loadCodeMap`, which
+   * bumps this same ref) must not let a since-superseded response apply a
+   * highlight/step-list for a Node id that no longer belongs to the current
+   * map.
    */
-  const handlePathTraceSubmit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
+  const runPathTrace = useCallback(
+    (query: string) => {
       if (pathTrace.status === 'searching') {
-        return;
-      }
-      const trimmedQuery = pathQuery.trim();
-      if (trimmedQuery.length === 0) {
         return;
       }
       const requestId = ++pathTraceRequestIdRef.current;
       setPathTrace({ status: 'searching' });
       window.driller
-        .tracePath(trimmedQuery)
+        .tracePath(query)
         .then((result) => {
           if (pathTraceRequestIdRef.current !== requestId) {
             // Superseded by a Retry/reload (or another search) — discard
@@ -1772,7 +1801,35 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
           });
         });
     },
-    [pathTrace.status, pathQuery, fitViewToPath],
+    [pathTrace.status, fitViewToPath],
+  );
+
+  /**
+   * The search toolbar's submit handler (Story 1.9, Phase 2) — now a thin
+   * wrapper around `runPathTrace` (Phase 3 extraction, see its doc comment
+   * above).
+   *
+   * Review fix: a trimmed-empty query is rejected client-side before ever
+   * calling `tracePath` — `traceCallPath`'s own substring-match tier
+   * (`name.includes(normalizedQuery)`) is vacuously true for `''`, so an
+   * empty/whitespace-only query would otherwise silently match every Node
+   * and trace from whichever sorts first by id, rather than reaching
+   * `'no-path-found'`. Mirrors the same trim+reject-empty guard Phase 1's
+   * own `apps/desktop/main/index.ts` IPC handler already applies for this
+   * exact reason. A disambiguation candidate's `id` (`runPathTrace`'s other
+   * call site, in the JSX below) needs no such guard — it's always a real,
+   * non-empty Node id, never user-typed free text.
+   */
+  const handlePathTraceSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const trimmedQuery = pathQuery.trim();
+      if (trimmedQuery.length === 0) {
+        return;
+      }
+      runPathTrace(trimmedQuery);
+    },
+    [pathQuery, runPathTrace],
   );
 
   const closeSourceView = useCallback(() => setSourceView({ status: 'closed' }), []);
@@ -1808,6 +1865,20 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [nodeDetail.status, closeNodeDetail]);
+
+  // Review fix: a plain boolean, computed once here rather than re-reading
+  // `pathTrace.status === 'searching'` inline inside the `ambiguous` JSX
+  // branch below — TS narrows `pathTrace` to its `'ambiguous'` member for
+  // the whole of that branch (it's how `pathTrace.candidates` is accessible
+  // there at all), so a literal `pathTrace.status === 'searching'` comparison
+  // written inside it doesn't type-check (the two members never overlap).
+  // Hoisting the read to here, before any narrowing, keeps the candidate
+  // buttons' `disabled` belt-and-suspenders guard consistent with the
+  // search input/submit button just below without fighting the type
+  // checker — always `false` while the `ambiguous` panel is actually
+  // rendered (searching moves `pathTrace` away from `'ambiguous'` and
+  // unmounts it), same defense-in-depth reasoning as those two.
+  const pathTraceIsSearching = pathTrace.status === 'searching';
 
   return (
     <div className="code-map" ref={containerRef}>
@@ -1942,6 +2013,61 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             <p className="notice notice--error" role="alert">
               {pathTrace.message}
             </p>
+          )}
+
+          {pathTrace.status === 'ambiguous' && (
+            // Story 1.9 (Phase 3): the disambiguation Actionable Notice —
+            // one sentence plus one next action (pick a candidate), same
+            // Actionable Notice shape every other "needs attention" state
+            // in the app already uses (Epic 1 context, UX & Interaction
+            // Patterns). Reuses the `code-map__path-trace-steps`/`-step`
+            // list classes from the `found` step list just below rather
+            // than a new shared component (Boundaries & Constraints) — a
+            // clickable named list is the same shape either way, it's just
+            // candidates instead of path steps. Each candidate's click
+            // re-runs the trace pinned to that exact `id` via the shared
+            // `runPathTrace` (resolves deterministically through the
+            // untouched exact-id tier) — never a new "resume" IPC
+            // parameter (Never).
+            <div className="code-map__path-trace-steps-panel" role="region" aria-label="Multiple matches — pick one">
+              <p className="notice notice--warning" role="status">
+                Multiple matches found — pick one to trace:
+              </p>
+              <ol className="code-map__path-trace-steps">
+                {/* Review fix: render-layer cap (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`,
+                    see its own doc comment above) — `pathTrace.candidates`
+                    itself is never truncated (the engine's own `ambiguous`
+                    contract stays the full, honest match list), only what
+                    gets rendered into this small fixed-width panel is. */}
+                {pathTrace.candidates.slice(0, MAX_RENDERED_AMBIGUOUS_CANDIDATES).map((candidate) => (
+                  <li key={candidate.id}>
+                    <button
+                      type="button"
+                      className="code-map__path-trace-step code-map__path-trace-candidate"
+                      disabled={pathTraceIsSearching}
+                      onClick={() => runPathTrace(candidate.id)}
+                    >
+                      {/* Review fix: every candidate in one `ambiguous`
+                          result shares the same `name` by construction —
+                          `formatCandidateLocation` surfaces the
+                          distinguishing file/location part of `candidate.id`
+                          so two same-named candidates never render as
+                          identical, unlabeled buttons. */}
+                      <code>{candidate.name}</code>
+                      <span className="code-map__path-trace-candidate-location">
+                        {formatCandidateLocation(candidate)}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+              {pathTrace.candidates.length > MAX_RENDERED_AMBIGUOUS_CANDIDATES && (
+                <p className="code-map__path-trace-candidates-truncated">
+                  Showing the first {MAX_RENDERED_AMBIGUOUS_CANDIDATES} of {pathTrace.candidates.length} matches —
+                  refine your query for a shorter list.
+                </p>
+              )}
+            </div>
           )}
 
           {pathTrace.status === 'found' && (
