@@ -33,9 +33,20 @@
  * `window.driller.regenerateNode` — this app's first id-keyed mutating IPC
  * round-trip. On success, patches `fetchState.nodes` in place by id, the
  * same idiom `onSummaryProgress` already uses, rather than refetching.
+ *
+ * Story 1.9 (Phase 2) adds the first search affordance: a persistent,
+ * non-modal toolbar (never `App.tsx`'s header — Phase 1's frozen boundary)
+ * that calls Phase 1's `window.driller.tracePath(query)`. On `found`, the
+ * path's Nodes/edges get a distinct highlight treatment threaded into the
+ * `renderedNodes`/`renderedEdges` memo below, the view fits to show the
+ * whole route (`reactFlowInstanceRef`), and an ordered, clickable step list
+ * renders alongside it — each entry re-using `navigateToNode` (Story 1.4),
+ * never a new traversal mechanism. `no-path-found`/`error` reuse this
+ * file's existing ad hoc notice conventions rather than a new shared Notice
+ * component (Design Notes).
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   Background,
   Controls,
@@ -82,6 +93,27 @@ type NodeDetailState = { status: 'closed' } | { status: 'open'; node: CodeMapNod
  * pattern), simplified: no `'warning'` state exists for this action.
  */
 type RegenerateState = { kind: 'idle' | 'regenerating' } | { kind: 'error'; message: string };
+
+/**
+ * The search toolbar's own result state (Story 1.9, Phase 2) — mirrors
+ * `RegenerateState`'s idle/in-flight/error shape (Code Map), but carries
+ * Phase 1's `PathTraceResult` states directly (`'found'`/`'no-path-found'`/
+ * `'error'`) rather than collapsing them into one generic error: Boundaries
+ * & Constraints requires `'no-path-found'` to render "visibly distinct from
+ * the `searching` state" (UX-DR16), and distinct from a real `'error'` too,
+ * so each is its own explicit state rather than folded together.
+ * `PathTraceResult` (`@driller/ipc-contracts`, re-exported from
+ * `@driller/graph-contracts`) is assignable directly into this type's
+ * `'found'`/`'no-path-found'`/`'error'` members — `window.driller.tracePath`'s
+ * resolved value is set into this state as-is, only `'idle'`/`'searching'`
+ * are local additions.
+ */
+type PathTraceState =
+  | { status: 'idle' }
+  | { status: 'searching' }
+  | { status: 'found'; path: string[] }
+  | { status: 'no-path-found' }
+  | { status: 'error'; message: string };
 
 // No LOD/layout library yet (Design Notes: acceptable at this phase's real
 // scale) — a plain deterministic grid, roughly square, is enough to lay the
@@ -401,6 +433,18 @@ function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
  * Node-selection state (Design Notes) — defaulting to `target` when neither
  * endpoint is focused (e.g. the very first edge click of a session).
  */
+// Story 1.9 (Phase 2): a stable, reused-across-renders empty Set for
+// `pathHighlightNodeIds`/`pathHighlightEdgeKeys` outside a `'found'` result
+// — a fresh `new Set()` every render would still be referentially new each
+// time (defeating the `useMemo`s that return it), so it's declared once at
+// module scope instead.
+const EMPTY_ID_SET: ReadonlySet<string> = new Set();
+
+/** Consecutive-pair key for `pathHighlightEdgeKeys` (Story 1.9, Phase 2) — matches `toFlowEdges`'s own `id` separator. */
+function pathEdgeKey(source: string, target: string): string {
+  return `${source}→${target}`;
+}
+
 function resolveEdgeClickTarget(edge: { source: string; target: string }, focusedNodeId: string | null): string {
   if (focusedNodeId === edge.source) {
     return edge.target;
@@ -742,6 +786,25 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // no room for a staleness/regenerate concept).
   const [nodeDetail, setNodeDetail] = useState<NodeDetailState>({ status: 'closed' });
   const [regenerateState, setRegenerateState] = useState<RegenerateState>({ kind: 'idle' });
+  // Story 1.9 (Phase 2): the search toolbar's own query text and its
+  // `tracePath` result state — kept separate (rather than folding the query
+  // string into `PathTraceState` itself) since the input stays editable
+  // (and its own value persists) independently of whatever the last search
+  // resolved to.
+  const [pathQuery, setPathQuery] = useState('');
+  const [pathTrace, setPathTrace] = useState<PathTraceState>({ status: 'idle' });
+  // Review fix: correlates a `tracePath` response back to the search that
+  // started it — the same generation-id pattern `sourceRequestIdRef` below
+  // already applies to `readSourceRange`, and Phase 1's own
+  // `pendingPathTraceToken` applies on the main-process side. Without this,
+  // an in-flight search that resolves *after* a Retry/project reload (which
+  // resets `pathTrace` to `'idle'` in `loadCodeMap` below but can't cancel
+  // an already-inflight promise) would silently reapply a highlight/
+  // step-list/`fitViewToPath` lookup for Node ids belonging to the
+  // already-discarded map. Bumped in both `handlePathTraceSubmit` (captured
+  // at call time) and `loadCodeMap`'s reset; a response is only applied if
+  // it's still the latest.
+  const pathTraceRequestIdRef = useRef(0);
   // Mirrors `nodeDetail` for `handleRegenerate`'s `.then`/`.catch` (Spec
   // Change Log Round 1) — the same `configRef`-style pattern Settings.tsx
   // already uses to read the LATEST state from inside an async callback
@@ -853,6 +916,15 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     // survive into this one.
     updateNodeDetail({ status: 'closed' });
     setRegenerateState({ kind: 'idle' });
+    // Story 1.9 (Phase 2): same reasoning as the Node Detail reset just
+    // above — a Retry/reload swaps in an entirely different Node/edge set,
+    // so a highlighted route or step list from the previous map must not
+    // survive into this one. Bumping the request id too (review fix) means
+    // an already-inflight `tracePath` promise from before this reload can
+    // no longer apply its result once it resolves — see
+    // `pathTraceRequestIdRef`'s own doc comment.
+    setPathTrace({ status: 'idle' });
+    pathTraceRequestIdRef.current += 1;
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
       // `import.meta.env.DEV` — not just the runtime-derived
@@ -1335,14 +1407,54 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     [lodInputNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
   );
 
+  // Story 1.9 (Phase 2): the `found` path's Node ids and its consecutive-pair
+  // `CALLS` edges (Code Map: "compute a Set of path Node ids +
+  // consecutive-pair edges") — the two Sets `renderedNodes`/`renderedEdges`
+  // below consult to thread a distinguishing `className` onto matching
+  // rendered nodes/edges. Empty (never recreated) outside `'found'` so the
+  // highlight clears the instant a new search starts or a prior result is
+  // superseded — no separate cleanup step needed.
+  const pathHighlightNodeIds = useMemo<ReadonlySet<string>>(
+    () => (pathTrace.status === 'found' ? new Set(pathTrace.path) : EMPTY_ID_SET),
+    [pathTrace],
+  );
+  const pathHighlightEdgeKeys = useMemo<ReadonlySet<string>>(() => {
+    if (pathTrace.status !== 'found') {
+      return EMPTY_ID_SET;
+    }
+    const keys = new Set<string>();
+    for (let i = 0; i < pathTrace.path.length - 1; i += 1) {
+      keys.add(pathEdgeKey(pathTrace.path[i]!, pathTrace.path[i + 1]!));
+    }
+    return keys;
+  }, [pathTrace]);
+
   const { renderedNodes, renderedEdges } = useMemo(() => {
     const visibleNodeIds = new Set(lodResult.fullNodeIds);
     const nodes: CodeMapAnyFlowNode[] = [];
 
+    // Story 1.9 (Phase 2): a highlighted path Node gets an additional
+    // `className` on the `@xyflow/react` node wrapper itself (no existing
+    // highlight mechanism to extend — Code Map) — never mutating the shared
+    // `flowNode` object from `flowNodesById` in place, since that same
+    // object is reused across renders/clusters.
+    // Only applied to a full (non-clustered) rendered card — a path Node
+    // still folded into an unexpanded LOD cluster has no card of its own to
+    // mark. `fitViewToPath` zooming in on just the path's own tight bounding
+    // box makes this a non-issue in practice (a real repo's default view
+    // already exceeds `LOD_ZOOM_THRESHOLD` per this file's own live-verified
+    // numbers above, and fitting to a small path subset only zooms in
+    // further); the 10,000-Node dev fixture is the only case where a path
+    // Node could plausibly still be clustered post-fit.
+    const withPathHighlight = (flowNode: CodeMapFlowNode): CodeMapFlowNode =>
+      pathHighlightNodeIds.has(flowNode.id)
+        ? { ...flowNode, className: 'code-map__path-highlight' }
+        : flowNode;
+
     for (const id of lodResult.fullNodeIds) {
       const flowNode = flowNodesById.get(id);
       if (flowNode) {
-        nodes.push(flowNode);
+        nodes.push(withPathHighlight(flowNode));
       }
     }
 
@@ -1354,7 +1466,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         for (const nodeId of cluster.nodeIds) {
           const flowNode = flowNodesById.get(nodeId);
           if (flowNode) {
-            nodes.push(flowNode);
+            nodes.push(withPathHighlight(flowNode));
             visibleNodeIds.add(nodeId);
           }
         }
@@ -1373,12 +1485,24 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     // rendered Node to attach to — filtered out here rather than left for
     // `@xyflow/react` to warn about a missing source/target, which would
     // also mean thousands of console warnings at 10,000-Node scale.
-    const edges = flowEdges.filter(
-      (edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target),
-    );
+    const edges = flowEdges
+      .filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
+      .map((edge) => {
+        // Story 1.9 (Phase 2): only a `CALLS` edge can be part of a traced
+        // path (`traceCallPath` walks `CALLS` only) — `edge.label` carries
+        // the same `CodeMapEdgeKind` `toFlowEdges` set it from, so checking
+        // it here (rather than re-deriving from `className`) keeps a
+        // same-pair `IMPORTS`/`USAGE` edge from getting highlighted just
+        // because it happens to share (source, target) with a real path
+        // step.
+        if (edge.label === 'CALLS' && pathHighlightEdgeKeys.has(pathEdgeKey(edge.source, edge.target))) {
+          return { ...edge, className: `${edge.className ?? ''} code-map__edge--path-highlight`.trim() };
+        }
+        return edge;
+      });
 
     return { renderedNodes: nodes, renderedEdges: edges };
-  }, [lodResult, flowNodesById, expandedClusterIds, expandCluster, flowEdges]);
+  }, [lodResult, flowNodesById, expandedClusterIds, expandCluster, flowEdges, pathHighlightNodeIds, pathHighlightEdgeKeys]);
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(
     (_event, flowNode) => {
@@ -1535,6 +1659,122 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     setHistory((previous) => ({ ...previous, index: nextIndex }));
   }, [history, centerOnNode]);
 
+  /**
+   * Story 1.9 (Phase 2): fits the viewport to show every Node in a `found`
+   * path at once (Boundaries & Constraints: "an off-screen highlight isn't
+   * one"). Computes the bounding box directly from `flowNodesById`'s own
+   * laid-out positions — the same world-space source `centerOnNode`/
+   * `resolveZoomToRevealNode` already read from above — rather than
+   * `reactFlowInstance.fitView({ nodes })`, which can only resolve Nodes
+   * currently registered in `@xyflow/react`'s own internal store (i.e.
+   * already present in `renderedNodes`); a path Node still folded into an
+   * unexpanded LOD cluster wouldn't be in that store yet, so `fitView`
+   * alone could silently fail to include it. `fitBounds` has no such
+   * requirement — it just needs the raw rectangle.
+   */
+  const fitViewToPath = useCallback(
+    (path: string[]) => {
+      const instance = reactFlowInstanceRef.current;
+      if (!instance) {
+        console.warn('CodeMap: tracePath found a path but the ReactFlow instance is not ready yet.');
+        return;
+      }
+      const positions = path
+        .map((id) => flowNodesById.get(id)?.position)
+        .filter((position): position is { x: number; y: number } => position !== undefined);
+      if (positions.length === 0) {
+        return;
+      }
+      // Review fix: `Math.min(...positions.map(...))`-style spread has a
+      // practical engine argument-count ceiling well under this app's own
+      // validated 10,000-Node scale (Story 1.3 Phase 2) — a large enough
+      // `found` path would throw a `RangeError` here. `.reduce()` has no
+      // such limit.
+      const firstPosition = positions[0]!;
+      const minX = positions.reduce((min, position) => Math.min(min, position.x), firstPosition.x);
+      const maxX = positions.reduce((max, position) => Math.max(max, position.x), firstPosition.x);
+      const minY = positions.reduce((min, position) => Math.min(min, position.y), firstPosition.y);
+      const maxY = positions.reduce((max, position) => Math.max(max, position.y), firstPosition.y);
+      // Padded by roughly one Node card's own footprint on each side (the
+      // same `NODE_COLUMN_GAP`/`NODE_ROW_GAP` grid spacing `layoutNodes`
+      // lays every card out on) so a card sitting exactly at the bounding
+      // box's edge isn't clipped flush against the viewport border.
+      instance.fitBounds(
+        {
+          x: minX - NODE_COLUMN_GAP / 2,
+          y: minY - NODE_ROW_GAP / 2,
+          width: maxX - minX + NODE_COLUMN_GAP,
+          height: maxY - minY + NODE_ROW_GAP,
+        },
+        { duration: 300 },
+      );
+    },
+    [flowNodesById],
+  );
+
+  /**
+   * The search toolbar's submit handler (Story 1.9, Phase 2). Boundaries &
+   * Constraints: transitions to `searching` before `tracePath` resolves —
+   * which also clears any previous highlight/step-list/notice, since those
+   * are all derived from `pathTrace`, and setting it to `searching` moves it
+   * away from whatever `'found'`/`'no-path-found'`/`'error'` it last held
+   * the instant this fires — and no-ops entirely while already `searching`
+   * (also belt-and-suspenders disabled on the input/button themselves
+   * below).
+   *
+   * Review fix: a trimmed-empty query is rejected client-side before ever
+   * calling `tracePath` — `traceCallPath`'s own substring-match tier
+   * (`name.includes(normalizedQuery)`) is vacuously true for `''`, so an
+   * empty/whitespace-only query would otherwise silently match every Node
+   * and trace from whichever sorts first by id, rather than reaching
+   * `'no-path-found'`. Mirrors the same trim+reject-empty guard Phase 1's
+   * own `apps/desktop/main/index.ts` IPC handler already applies for this
+   * exact reason.
+   *
+   * Review fix: `pathTraceRequestIdRef` is bumped and captured before the
+   * async call, then checked again once it resolves/rejects — a
+   * Retry/reload in the meantime (`loadCodeMap`, which bumps this same ref)
+   * must not let a since-superseded response apply a highlight/step-list
+   * for a Node id that no longer belongs to the current map.
+   */
+  const handlePathTraceSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (pathTrace.status === 'searching') {
+        return;
+      }
+      const trimmedQuery = pathQuery.trim();
+      if (trimmedQuery.length === 0) {
+        return;
+      }
+      const requestId = ++pathTraceRequestIdRef.current;
+      setPathTrace({ status: 'searching' });
+      window.driller
+        .tracePath(trimmedQuery)
+        .then((result) => {
+          if (pathTraceRequestIdRef.current !== requestId) {
+            // Superseded by a Retry/reload (or another search) — discard
+            // rather than let it clobber the map the user is now looking at.
+            return;
+          }
+          setPathTrace(result);
+          if (result.status === 'found') {
+            fitViewToPath(result.path);
+          }
+        })
+        .catch((error: unknown) => {
+          if (pathTraceRequestIdRef.current !== requestId) {
+            return;
+          }
+          setPathTrace({
+            status: 'error',
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+    },
+    [pathTrace.status, pathQuery, fitViewToPath],
+  );
+
   const closeSourceView = useCallback(() => setSourceView({ status: 'closed' }), []);
 
   // Escape closes the source overlay (review finding — a real dialog needs
@@ -1650,6 +1890,91 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
           >
             Forward →
           </button>
+        </div>
+      )}
+
+      {fetchState.status === 'ready' && fetchState.nodes.length > 0 && (
+        // Story 1.9 (Phase 2): the always-reachable Path Trace search
+        // affordance — persistent/non-modal, mirroring the history
+        // toolbar's own `role="toolbar"`/absolute-over-canvas pattern just
+        // above (Boundaries & Constraints: "never a `role="dialog"`
+        // overlay ... must stay usable while the map is still interacted
+        // with"). Positioned opposite the history toolbar (top-left vs.
+        // top-right) so the two never overlap.
+        <div className="code-map__path-trace">
+          <form
+            className="code-map__path-trace-toolbar"
+            role="toolbar"
+            aria-label="Search a traced path"
+            onSubmit={handlePathTraceSubmit}
+          >
+            <input
+              type="text"
+              className="code-map__path-trace-input"
+              placeholder="Trace a path from an entry point…"
+              aria-label="Path Trace query"
+              value={pathQuery}
+              onChange={(event) => setPathQuery(event.target.value)}
+              disabled={pathTrace.status === 'searching'}
+            />
+            {/* I/O Matrix: "Second submit while a search is in flight ...
+                No-op — input/button disabled until the first resolves" —
+                the `disabled` attributes here are belt-and-suspenders on
+                top of `handlePathTraceSubmit`'s own no-op guard. */}
+            <button type="submit" disabled={pathTrace.status === 'searching'}>
+              {pathTrace.status === 'searching' ? 'Searching…' : 'Trace'}
+            </button>
+          </form>
+
+          {/* `no-path-found`/`error` reuse this file's existing ad hoc
+              notice convention (Design Notes) — the same compact
+              `notice`/`notice--*` treatment the Node Detail panel's own
+              Regenerate error already uses, rather than the full-canvas
+              `.code-map__notice` reserved above for a whole-map-replacing
+              state (loading/fetch-error/empty-map): this notice sits
+              alongside a still-interactive map, never over it. */}
+          {pathTrace.status === 'no-path-found' && (
+            <p className="notice notice--warning" role="status">
+              No path found for that query.
+            </p>
+          )}
+          {pathTrace.status === 'error' && (
+            <p className="notice notice--error" role="alert">
+              {pathTrace.message}
+            </p>
+          )}
+
+          {pathTrace.status === 'found' && (
+            // Boundaries & Constraints (UX-DR10): "leaves the
+            // highlight/step list visible for further stepping" — clicking
+            // an entry only re-centers the map via `navigateToNode`, it
+            // never closes/collapses this panel.
+            <div className="code-map__path-trace-steps-panel" role="region" aria-label="Traced path steps">
+              <ol className="code-map__path-trace-steps">
+                {pathTrace.path.map((id, index) => {
+                  const node = flowNodesById.get(id)?.data.node;
+                  return (
+                    // Review fix: `id` alone isn't guaranteed unique — nothing
+                    // rules out a real graph shape producing a path that
+                    // revisits the same Node id twice — so the index is
+                    // folded into the key too.
+                    <li key={`${id}-${index}`}>
+                      <button
+                        type="button"
+                        className="code-map__path-trace-step"
+                        onClick={() => navigateToNode(id)}
+                      >
+                        <span className="code-map__path-trace-step-index" aria-hidden="true">
+                          {index + 1}
+                        </span>
+                        <code>{node?.name ?? id}</code>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ol>
+            </div>
+          )}
         </div>
       )}
 

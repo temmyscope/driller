@@ -736,6 +736,160 @@ code,
   color: var(--accent);
 }
 
+/* Story 1.9 (Phase 2): the Path Trace search toolbar + notice + step list —
+   a single positioned wrapper (top-left, opposite the history toolbar's
+   top-right) so its children can lay out with plain flow instead of each
+   needing its own `position: absolute`. Matches `.code-map__history-
+   toolbar`'s own floated-chrome treatment (Code Map: "follow
+   `.code-map__history-toolbar`: absolute, z-index over canvas,
+   non-blocking") rather than a new visual language. */
+.code-map__path-trace {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(320px, calc(100vw - 1.5rem));
+}
+
+.code-map__path-trace-toolbar {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.code-map__path-trace-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.code-map__path-trace-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.code-map__path-trace-input:disabled {
+  opacity: 0.6;
+}
+
+.code-map__path-trace-toolbar button {
+  flex-shrink: 0;
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.code-map__path-trace-toolbar button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.code-map__path-trace-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.code-map__path-trace-toolbar button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The step-list panel: same floated-chrome surface as the search toolbar
+   above (`var(--surface)`/`var(--border)`), capped in height with its own
+   scroll so a long path never grows past the visible map. */
+.code-map__path-trace-steps-panel {
+  max-height: min(360px, calc(100vh - 8rem));
+  overflow-y: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 0.35rem;
+}
+
+.code-map__path-trace-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.code-map__path-trace-step {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font-size: 0.8rem;
+}
+
+.code-map__path-trace-step:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.code-map__path-trace-step:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.code-map__path-trace-step code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-map__path-trace-step-index {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-size: 0.65rem;
+  font-weight: 600;
+}
+
+/* A `found` path's own Node/edge highlight (Code Map: "no existing highlight
+   mechanism to extend, this is new"). Never color-only (Accessibility
+   Floor): a thicker solid border + glow ring is a shape/weight cue on its
+   own, not just a color swap, and every highlighted Node also carries its
+   step number via the step list above. Applied as a `className` directly on
+   the `@xyflow/react` node wrapper (`renderedNodes`'s own `withPathHighlight`
+   helper), which wraps this file's own `.code-map__node` card — styled here
+   as a descendant so the existing card markup/component needs no change. */
+.code-map__path-highlight .code-map__node {
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* The route's own consecutive-pair `CALLS` edges — thicker + solid accent
+   stroke, distinguishing a traced route from every other rendered edge (also
+   never color-only: the width change alone reads at a glance). */
+.code-map__edge--path-highlight {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
 .code-map__cluster .react-flow__handle {
   opacity: 0;
   pointer-events: none;
