@@ -13,6 +13,7 @@ import {
   type BackendConfig,
   type CloudBackend,
   type CodeMapResult,
+  type DiagnosticLogEntry,
   type DrillerApi,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
@@ -91,6 +92,13 @@ const drillerApi: DrillerApi = {
 
   tracePath: (query: string): Promise<PathTraceResult> =>
     ipcRenderer.invoke(IpcChannels.pathTrace, query),
+
+  // Review fix: `.catch` here is what actually makes `DrillerApi.
+  // logDiagnosticEvent`'s documented "never rejects" contract hold at this
+  // boundary — without it, the guarantee only held by accident of the sole
+  // current caller (CodeMap.tsx) adding its own `.catch`.
+  logDiagnosticEvent: (entry: DiagnosticLogEntry): Promise<void> =>
+    ipcRenderer.invoke(IpcChannels.diagnosticLog, entry).catch(() => undefined),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

@@ -842,6 +842,18 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // at call time) and `loadCodeMap`'s reset; a response is only applied if
   // it's still the latest.
   const pathTraceRequestIdRef = useRef(0);
+  // Review fix (Phase 4): the query text that actually produced the
+  // *currently-displayed* `pathTrace` result — set alongside
+  // `pathTraceRequestIdRef` at the top of `runPathTrace`, so it always holds
+  // whatever string was actually passed into that call (the input field's
+  // text on a fresh search, or a disambiguation candidate's exact `id` on a
+  // candidate-pick re-trace). Live `pathQuery` state is NOT a safe substitute
+  // here: the input stays editable once a result is showing (only disabled
+  // during `searching`), so a user can change its text before clicking
+  // Dismiss, and a candidate-pick trace never updates `pathQuery` to the
+  // candidate's id at all. `handleDismissPathTrace` reads this ref, never
+  // `pathQuery`, when building the diagnostic log entry.
+  const lastTracedQueryRef = useRef('');
   // Mirrors `nodeDetail` for `handleRegenerate`'s `.then`/`.catch` (Spec
   // Change Log Round 1) — the same `configRef`-style pattern Settings.tsx
   // already uses to read the LATEST state from inside an async callback
@@ -1777,6 +1789,9 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         return;
       }
       const requestId = ++pathTraceRequestIdRef.current;
+      // Review fix (Phase 4): captured here, not from `pathQuery` state — see
+      // `lastTracedQueryRef`'s own doc comment for why the two can diverge.
+      lastTracedQueryRef.current = query;
       setPathTrace({ status: 'searching' });
       window.driller
         .tracePath(query)
@@ -1830,6 +1845,38 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       runPathTrace(trimmedQuery);
     },
     [pathQuery, runPathTrace],
+  );
+
+  /**
+   * Story 1.9 (Phase 4): "Dismiss" — shown only on `found`/`no-path-found`/
+   * `ambiguous` results (the AC's explicit list; never `searching`/`idle`/
+   * `error`). Fires a fire-and-forget diagnostic-log write for driller's
+   * first local-only signal-accuracy sink (AD-21) and unconditionally resets
+   * the panel to `idle` — the reset never waits on the log write settling,
+   * and a write failure (swallowed/console-logged in main only) never blocks
+   * or surfaces here (Boundaries & Constraints). Also resolves Phase 2's
+   * deferred "no clear-search affordance" gap as a side effect (Always).
+   */
+  const handleDismissPathTrace = useCallback(
+    (resultStatus: 'found' | 'no-path-found' | 'ambiguous') => {
+      window.driller
+        .logDiagnosticEvent({
+          eventType: 'path-trace-dismissed',
+          timestamp: new Date().toISOString(),
+          // Review fix: the query that actually produced the currently-
+          // displayed result, not live `pathQuery` input-field state — see
+          // `lastTracedQueryRef`'s own doc comment.
+          query: lastTracedQueryRef.current,
+          resultStatus,
+        })
+        .catch(() => {
+          // Fire-and-forget (Boundaries & Constraints): a log-write failure
+          // is already swallowed/console-logged in main; nothing further to
+          // do here, and this must never block the reset below.
+        });
+      setPathTrace({ status: 'idle' });
+    },
+    [],
   );
 
   const closeSourceView = useCallback(() => setSourceView({ status: 'closed' }), []);
@@ -2005,9 +2052,21 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
               state (loading/fetch-error/empty-map): this notice sits
               alongside a still-interactive map, never over it. */}
           {pathTrace.status === 'no-path-found' && (
-            <p className="notice notice--warning" role="status">
-              No path found for that query.
-            </p>
+            <div className="code-map__path-trace-dismissable-notice">
+              <p className="notice notice--warning" role="status">
+                No path found for that query.
+              </p>
+              {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+                  the panel to `idle` — also driller's first clear-search
+                  affordance, resolving Phase 2's deferred gap. */}
+              <button
+                type="button"
+                className="code-map__path-trace-dismiss"
+                onClick={() => handleDismissPathTrace('no-path-found')}
+              >
+                Dismiss
+              </button>
+            </div>
           )}
           {pathTrace.status === 'error' && (
             <p className="notice notice--error" role="alert">
@@ -2067,6 +2126,16 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                   refine your query for a shorter list.
                 </p>
               )}
+              {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+                  the panel to `idle` — also driller's first clear-search
+                  affordance, resolving Phase 2's deferred gap. */}
+              <button
+                type="button"
+                className="code-map__path-trace-dismiss"
+                onClick={() => handleDismissPathTrace('ambiguous')}
+              >
+                Dismiss
+              </button>
             </div>
           )}
 
@@ -2099,6 +2168,16 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                   );
                 })}
               </ol>
+              {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+                  the panel to `idle` — also driller's first clear-search
+                  affordance, resolving Phase 2's deferred gap. */}
+              <button
+                type="button"
+                className="code-map__path-trace-dismiss"
+                onClick={() => handleDismissPathTrace('found')}
+              >
+                Dismiss
+              </button>
             </div>
           )}
         </div>

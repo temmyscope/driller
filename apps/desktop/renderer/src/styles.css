@@ -901,6 +901,47 @@ code,
   color: var(--text-muted);
 }
 
+/* Story 1.9 (Phase 4): "Dismiss" — shown on `found`/`no-path-found`/
+   `ambiguous` results (never `searching`/`idle`/`error`). Follows
+   `.code-map__path-trace-toolbar button`'s own bordered-chrome button shape
+   (this file's closest precedent for a small secondary action floated over
+   the map) rather than the primary `.code-map__node-detail-regenerate`
+   treatment — Dismiss is a low-emphasis "done with this" action, not a
+   primary async one. */
+.code-map__path-trace-dismissable-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.code-map__path-trace-dismiss {
+  align-self: flex-start;
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+/* Spacing for the two step-list-panel contexts (`ambiguous`/`found`), where
+   Dismiss sits below the `<ol>` rather than inline next to a `<p>` like the
+   `no-path-found` notice above. */
+.code-map__path-trace-steps-panel .code-map__path-trace-dismiss {
+  margin-top: 0.35rem;
+}
+
+.code-map__path-trace-dismiss:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.code-map__path-trace-dismiss:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* A `found` path's own Node/edge highlight (Code Map: "no existing highlight
    mechanism to extend, this is new"). Never color-only (Accessibility
    Floor): a thicker solid border + glow ring is a shape/weight cue on its

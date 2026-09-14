@@ -27,6 +27,7 @@ import {
   IpcChannels,
   type BackendConfig,
   type CodeMapResult,
+  type DiagnosticLogEntry,
   type GitDetectionResult,
   type GraphServiceBackendSwitchedRequest,
   type GraphServiceCodeMapMessage,
@@ -52,6 +53,7 @@ import {
   setActiveBackend,
   setCloudApiKey,
 } from './backend-settings';
+import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { detectGitRepo } from './git-detect';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
@@ -1082,6 +1084,54 @@ function registerIpcHandlers(): void {
       return requestPathTrace(trimmedQuery);
     },
   );
+
+  // ---------------------------------------------------------------------------
+  // Story 1.9 (Phase 4): the local-only diagnostic log sink (AD-21). Fire-
+  // and-forget from the renderer's perspective — this handler never rejects;
+  // `appendDiagnosticLogEntry` itself swallows/console-logs any write
+  // failure (Boundaries & Constraints: best-effort by design).
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(IpcChannels.diagnosticLog, (_event, entry: unknown): Promise<void> => {
+    // Renderer-supplied value crosses the contextBridge boundary untyped at
+    // runtime (same precedent as `sourceReadRange`/`pathTrace`'s own guards
+    // above) — validated here before it reaches the filesystem write.
+    const candidate = entry as {
+      eventType?: unknown;
+      timestamp?: unknown;
+      query?: unknown;
+      resultStatus?: unknown;
+    } | null;
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      candidate.eventType !== 'path-trace-dismissed' ||
+      typeof candidate.timestamp !== 'string' ||
+      typeof candidate.query !== 'string' ||
+      (candidate.resultStatus !== 'found' &&
+        candidate.resultStatus !== 'no-path-found' &&
+        candidate.resultStatus !== 'ambiguous')
+    ) {
+      // Review fix: still dropped rather than written (matching this sink's
+      // own best-effort-never-surfaced-to-the-user contract), but no longer
+      // silently — a malformed IPC argument here can only come from a real
+      // bug (never user action), so it's worth a developer-visible signal.
+      console.warn('Dropped malformed diagnostic log entry.', candidate);
+      return Promise.resolve();
+    }
+    // Review fix: rebuilt from just the four validated fields, never the raw
+    // `entry` object forwarded as-is — the validation above only checks that
+    // these fields exist with the right types, so passing `entry` through
+    // unchanged would let any extra enumerable property on it get
+    // `JSON.stringify`'d and persisted to disk verbatim.
+    const sanitizedEntry: DiagnosticLogEntry = {
+      eventType: 'path-trace-dismissed',
+      timestamp: candidate.timestamp,
+      query: candidate.query,
+      resultStatus: candidate.resultStatus,
+    };
+    return appendDiagnosticLogEntry(sanitizedEntry);
+  });
 }
 
 // ---------------------------------------------------------------------------

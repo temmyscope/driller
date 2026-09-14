@@ -702,6 +702,37 @@ export interface GraphServicePathTraceResultMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 1.9 (Phase 4): the local-only diagnostic log sink (AD-21).
+//
+// driller's first diagnostic log sink, and its first departure from the
+// `electron-store`-under-`userData` pattern (settings.ts/backend-settings.ts)
+// — see apps/desktop/main/diagnostic-log.ts's own doc comment for why an
+// append-only event log is a different shape than that single-blob store.
+//
+// `DiagnosticLogEntry` is a discriminated union on `eventType` — this phase
+// implements exactly one member, `'path-trace-dismissed'`, posted when the
+// user clicks "Dismiss" on a `found`/`no-path-found`/`ambiguous` Path Trace
+// result (Story 1.9, Phases 1-3). Designed for reuse: a future Epic 2 Risk
+// Overlay event type extends this union with a new member rather than
+// redefining this one (Never: no other `eventType` is added in this phase).
+// ---------------------------------------------------------------------------
+
+/** One local-only diagnostic log entry — never transmitted anywhere (AD-21). */
+export type DiagnosticLogEntry = {
+  eventType: 'path-trace-dismissed';
+  /** ISO-8601 timestamp of the dismissal. */
+  timestamp: string;
+  /** The Path Trace query that produced the dismissed result. */
+  query: string;
+  /**
+   * The dismissed result's status — matches the AC's explicit list
+   * (`found`/`no-path-found`/`ambiguous`); Dismiss never renders for
+   * `searching`/`idle`/`error`, so no other value ever reaches this field.
+   */
+  resultStatus: 'found' | 'no-path-found' | 'ambiguous';
+};
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -721,6 +752,7 @@ export const IpcChannels = {
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
+  diagnosticLog: 'diagnostic:log',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -818,4 +850,11 @@ export interface DrillerApi {
    * route-highlighting consumer exists yet (Phase 2).
    */
   tracePath: (query: string) => Promise<PathTraceResult>;
+  /**
+   * Fire-and-forget: appends one entry to driller's local-only diagnostic
+   * log (Story 1.9, Phase 4, AD-21). Never rejects — a log-write failure is
+   * swallowed/console-logged in main only, never surfaced to the caller or
+   * allowed to block whatever UI action triggered it.
+   */
+  logDiagnosticEvent: (entry: DiagnosticLogEntry) => Promise<void>;
 }
