@@ -15,6 +15,7 @@ import {
   type CodeMapResult,
   type DiagnosticLogEntry,
   type DrillerApi,
+  type EditorPreference,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type ModelStatusMessage,
@@ -86,6 +87,12 @@ const drillerApi: DrillerApi = {
 
   setCloudApiKey: (key: string, acknowledgeInsecureStorage?: boolean): Promise<SetCloudApiKeyResult> =>
     ipcRenderer.invoke(IpcChannels.settingsSetCloudApiKey, key, acknowledgeInsecureStorage),
+
+  getEditorPreference: (): Promise<EditorPreference> =>
+    ipcRenderer.invoke(IpcChannels.settingsGetEditorPreference),
+
+  setEditorPreference: (value: EditorPreference): Promise<void> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetEditorPreference, value),
 
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),

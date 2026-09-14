@@ -166,6 +166,26 @@ code,
   cursor: pointer;
 }
 
+/* Story 1.10 (Phase 1): the external editor preference fieldset — mirrors
+   .settings-panel__backend's own styling exactly (own class only so each
+   fieldset's border/legend rules stay independently editable). */
+.settings-panel__editor {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.settings-panel__editor legend {
+  padding: 0 0.25rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .settings-panel__cloud-key {
   display: flex;
   flex-direction: column;

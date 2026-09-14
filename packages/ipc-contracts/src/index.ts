@@ -733,6 +733,29 @@ export type DiagnosticLogEntry = {
 };
 
 // ---------------------------------------------------------------------------
+// Story 1.10 (Phase 1): external editor preference (AD-23).
+//
+// A required, always-populated Settings field — Phase 2's external-editor
+// hand-off (this app's first `shell.openExternal`/`shell.openPath` call
+// site) reads it to decide which editor to launch and whether it can
+// exact-line-jump. No consumer exists yet in this phase (Never); the field
+// simply must never be undefined/unset once read, per AD-23.
+//
+// Persisted via `apps/desktop/main/editor-settings.ts`'s own
+// `electron-store` file (AD-5) — a separate store from
+// backend-settings.ts's `activeBackend`/cloud-key fields (Never: no change
+// to that existing store), following the same shape (Schema + defaults +
+// coerce-with-safe-fallback).
+// ---------------------------------------------------------------------------
+
+/**
+ * The three external-editor choices a Settings user can pick between.
+ * `'system-default'` is the always-safe fallback (no line-jump support in
+ * Phase 2); `'vscode'`/`'jetbrains'` get exact-line-jump there.
+ */
+export type EditorPreference = 'vscode' | 'jetbrains' | 'system-default';
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -750,6 +773,8 @@ export const IpcChannels = {
   settingsGetBackendConfig: 'settings:getBackendConfig',
   settingsSetActiveBackend: 'settings:setActiveBackend',
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
+  settingsGetEditorPreference: 'settings:getEditorPreference',
+  settingsSetEditorPreference: 'settings:setEditorPreference',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
   diagnosticLog: 'diagnostic:log',
@@ -833,6 +858,16 @@ export interface DrillerApi {
     key: string,
     acknowledgeInsecureStorage?: boolean,
   ) => Promise<SetCloudApiKeyResult>;
+  /**
+   * Fetches the current external editor preference (Story 1.10, Phase 1,
+   * AD-23) — always resolves to one of the three known values, never
+   * undefined/unset, even on first launch (`'system-default'`, the
+   * persisted default) or after the store coerces a corrupted value back to
+   * it.
+   */
+  getEditorPreference: () => Promise<EditorPreference>;
+  /** Sets the external editor preference choice. */
+  setEditorPreference: (value: EditorPreference) => Promise<void>;
   /**
    * Regenerates exactly one Node's summary on demand (Story 1.8, Phase 4) —
    * this app's first id-keyed mutating IPC round-trip. Scoped to `nodeId`

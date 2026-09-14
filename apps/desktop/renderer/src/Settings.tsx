@@ -15,10 +15,18 @@
  *    warning and requires an explicit "Store anyway" click (which resubmits
  *    with `acknowledgeInsecureStorage: true`) before anything is persisted
  *    — never a silent insecure store.
+ *
+ * Story 1.10 (Phase 1) adds a second, independent radio group: the external
+ * editor preference (AD-23: required, always-populated — `system-default`
+ * shows selected on first launch, never a blank/unset state). It loads and
+ * saves independently of the backend-config group above (its own IPC round
+ * trip, its own optimistic-update-plus-rollback-on-failure state) — the two
+ * groups share only the overall panel shell and the same interaction
+ * pattern, not any state.
  */
 
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
-import type { BackendConfig, CloudBackend } from '@driller/ipc-contracts';
+import type { BackendConfig, CloudBackend, EditorPreference } from '@driller/ipc-contracts';
 
 interface SettingsProps {
   onClose: () => void;
@@ -44,6 +52,19 @@ export function Settings({ onClose }: SettingsProps) {
     configRef.current = config;
   }, [config]);
 
+  // Story 1.10 (Phase 1): the editor preference group's own state, loaded
+  // and saved independently of `config` above (own IPC round trip, own
+  // optimistic-update-plus-rollback). `null` only until the first fetch
+  // resolves — AD-23 guarantees the resolved value is never itself
+  // undefined/unset.
+  const [editorPreference, setEditorPreferenceState] = useState<EditorPreference | null>(null);
+  const [editorPreferenceLoadError, setEditorPreferenceLoadError] = useState<string | null>(null);
+  const [editorPreferenceSaveError, setEditorPreferenceSaveError] = useState<string | null>(null);
+  const editorPreferenceRef = useRef<EditorPreference | null>(null);
+  useEffect(() => {
+    editorPreferenceRef.current = editorPreference;
+  }, [editorPreference]);
+
   const refetchConfig = useCallback(() => {
     window.driller
       .getBackendConfig()
@@ -56,9 +77,27 @@ export function Settings({ onClose }: SettingsProps) {
       });
   }, []);
 
+  const refetchEditorPreference = useCallback(() => {
+    window.driller
+      .getEditorPreference()
+      .then((next) => {
+        setEditorPreferenceState(next);
+        setEditorPreferenceLoadError(null);
+        // Review finding: a stale save-error from an earlier failed save
+        // attempt must not linger once a later successful load confirms
+        // current state is correct — otherwise it can persist indefinitely
+        // even after nothing is actually wrong anymore.
+        setEditorPreferenceSaveError(null);
+      })
+      .catch((error) => {
+        setEditorPreferenceLoadError(error instanceof Error ? error.message : String(error));
+      });
+  }, []);
+
   useEffect(() => {
     refetchConfig();
-  }, [refetchConfig]);
+    refetchEditorPreference();
+  }, [refetchConfig, refetchEditorPreference]);
 
   // Escape closes the Settings overlay — same keyboard-dismissal pattern
   // already established for Story 1.3 Phase 1's source-view overlay
@@ -92,6 +131,32 @@ export function Settings({ onClose }: SettingsProps) {
         });
     },
     [refetchConfig],
+  );
+
+  // Story 1.10 (Phase 1): mirrors `handleBackendChange`'s exact
+  // optimistic-update-plus-rollback-on-failure shape (Always, this story's
+  // Boundaries & Constraints) — a same-machine, near-instant local write,
+  // applied immediately and confirmed/corrected by a refetch, rolled back to
+  // the pre-click value with an inline error on failure (I/O & Edge-Case
+  // Matrix: "Write to the store fails").
+  const handleEditorPreferenceChange = useCallback(
+    (value: EditorPreference) => {
+      const previousEditorPreference = editorPreferenceRef.current;
+      setEditorPreferenceSaveError(null);
+      setEditorPreferenceState(value);
+      window.driller
+        .setEditorPreference(value)
+        .then(refetchEditorPreference)
+        .catch((error) => {
+          setEditorPreferenceSaveError(error instanceof Error ? error.message : String(error));
+          // Roll back the optimistic update on failure — otherwise the UI
+          // keeps showing a selection that was never actually persisted,
+          // silently diverging from real state (same reasoning as
+          // handleBackendChange's own rollback above).
+          setEditorPreferenceState(previousEditorPreference);
+        });
+    },
+    [refetchEditorPreference],
   );
 
   const attemptSaveKey = useCallback(
@@ -294,6 +359,59 @@ export function Settings({ onClose }: SettingsProps) {
               </section>
             )}
           </>
+        )}
+
+        {editorPreferenceLoadError && (
+          <div className="notice notice--error" role="alert">
+            <p>{editorPreferenceLoadError}</p>
+            {/* Same "retry the exact fetch that failed" convention as the
+                backend-config load-error notice above. */}
+            <button type="button" onClick={refetchEditorPreference}>
+              Retry
+            </button>
+          </div>
+        )}
+
+        {editorPreference && (
+          <fieldset className="settings-panel__editor">
+            <legend>External editor</legend>
+            <label className="settings-panel__radio">
+              <input
+                type="radio"
+                name="editorPreference"
+                value="vscode"
+                checked={editorPreference === 'vscode'}
+                onChange={() => handleEditorPreferenceChange('vscode')}
+              />
+              VS Code
+            </label>
+            <label className="settings-panel__radio">
+              <input
+                type="radio"
+                name="editorPreference"
+                value="jetbrains"
+                checked={editorPreference === 'jetbrains'}
+                onChange={() => handleEditorPreferenceChange('jetbrains')}
+              />
+              JetBrains
+            </label>
+            <label className="settings-panel__radio">
+              <input
+                type="radio"
+                name="editorPreference"
+                value="system-default"
+                checked={editorPreference === 'system-default'}
+                onChange={() => handleEditorPreferenceChange('system-default')}
+              />
+              System default
+            </label>
+
+            {editorPreferenceSaveError && (
+              <p className="notice notice--error" role="alert">
+                {editorPreferenceSaveError}
+              </p>
+            )}
+          </fieldset>
         )}
       </div>
     </div>

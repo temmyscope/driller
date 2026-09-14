@@ -28,6 +28,7 @@ import {
   type BackendConfig,
   type CodeMapResult,
   type DiagnosticLogEntry,
+  type EditorPreference,
   type GitDetectionResult,
   type GraphServiceBackendSwitchedRequest,
   type GraphServiceCodeMapMessage,
@@ -54,6 +55,7 @@ import {
   setCloudApiKey,
 } from './backend-settings';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
+import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
@@ -1036,6 +1038,29 @@ function registerIpcHandlers(): void {
       return setCloudApiKey(key, acknowledgeInsecureStorage === true);
     },
   );
+
+  // -------------------------------------------------------------------------
+  // Story 1.10 (Phase 1): external editor preference. Thin delegation to
+  // editor-settings.ts, same shape as the settingsGetBackendConfig/
+  // settingsSetActiveBackend handlers above — no consumer of the value yet
+  // (Never: the actual hand-off is Phase 2).
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.settingsGetEditorPreference,
+    (): EditorPreference => getEditorPreference(),
+  );
+
+  ipcMain.handle(IpcChannels.settingsSetEditorPreference, (_event, value: unknown): void => {
+    // Renderer-supplied value crosses the contextBridge boundary untyped at
+    // runtime (same precedent as settingsSetActiveBackend above);
+    // setEditorPreference itself also defensively no-ops on an invalid
+    // value.
+    if (value !== 'vscode' && value !== 'jetbrains' && value !== 'system-default') {
+      return;
+    }
+    setEditorPreference(value);
+  });
 
   // ---------------------------------------------------------------------------
   // Story 1.8 (Phase 4): on-demand single-Node regeneration — this app's
