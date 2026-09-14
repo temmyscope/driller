@@ -14,10 +14,15 @@
  *
  * Per ARCHITECTURE-SPINE.md's Consistency Conventions, IPC channel names are
  * namespaced `<domain>:<action>`. The real Graph Service query surface
- * (Node lookup, Path Trace, Blast Radius, coverage-check, etc. — AD-13) is
- * NOT part of this story; it belongs in packages/graph-contracts, built out
- * starting with Story 1.2.
+ * (Node lookup, Path Trace, Blast Radius, coverage-check, etc. — AD-13)
+ * belongs in packages/graph-contracts — Story 1.9 (Phase 1) is its first real
+ * content (Path Trace), reused here for the `path:trace` IPC envelope rather
+ * than redefined ad hoc (see `PathTraceResult`'s import below).
  */
+
+import type { PathTraceResult } from '@driller/graph-contracts';
+
+export type { PathTraceResult } from '@driller/graph-contracts';
 
 // ---------------------------------------------------------------------------
 // Recent Projects (AD-5: persisted via electron-store under userData)
@@ -639,6 +644,64 @@ export interface GraphServiceRegenerateNodeResultMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 1.9 (Phase 1): Path Trace (FR10, AD-13).
+//
+// A transport-agnostic `traceCallPath` (packages/graph-contracts) reached
+// through a new, dedicated, strictly read-only `path:trace` IPC round trip
+// (Boundaries & Constraints) — never touching the Node record store,
+// `activeCodeMapNodes`, or generation/staleness state; the Graph Service
+// handler re-fetches nodes+edges via the existing `fetchCodeMap(activeProject)`
+// on every call instead of adding new cached state (mirrors
+// `handleGetCodeMapRequest`). No search UI or route highlighting yet
+// (Phase 2) — this phase is callable directly via `window.driller.
+// tracePath(query)` (e.g. from the DevTools console).
+// ---------------------------------------------------------------------------
+
+/**
+ * Message main sends to ask the Graph Service subprocess to trace a call
+ * path from a query-resolved entry Node. Carries `query` (unlike
+ * `GraphServiceGetCodeMapRequest`, which carries no params) since a Path
+ * Trace is parameterized per call — mirrors `GraphServiceRegenerateNodeRequest`'s
+ * `nodeId` in that both add extra fields on top of the bare `{type}` shape
+ * `GraphServiceGetCodeMapRequest` establishes.
+ *
+ * `requestId` is a main-generated correlation token (Spec Change Log,
+ * post-review hardening), echoed back verbatim in
+ * `GraphServicePathTraceResultMessage.requestId` — same correlation role
+ * `GraphServiceRegenerateNodeRequest.nodeId` already plays for its own
+ * reply, needed here because `path:trace` has only a single pending-request
+ * slot in main (unlike `nodeId`'s per-Node `Map`): without an id the Graph
+ * Service echoes back, main cannot tell a genuine reply for the request
+ * currently occupying that slot apart from a late reply for an earlier
+ * request that already timed out and had its slot reassigned to a newer
+ * one — see `pendingPathTraceToken`'s doc comment in apps/desktop/main/
+ * index.ts for the exact race this closes.
+ */
+export interface GraphServicePathTraceRequest {
+  type: 'graphService:pathTrace';
+  query: string;
+  requestId: number;
+}
+
+/**
+ * Message the Graph Service subprocess posts back in response to a
+ * `GraphServicePathTraceRequest`, over the same `parentPort` channel as
+ * every other Graph Service message — distinguished by `type`, same
+ * convention as `GraphServiceCodeMapMessage`/
+ * `GraphServiceRegenerateNodeResultMessage`. `result` is `PathTraceResult`
+ * itself (imported from `@driller/graph-contracts` above) — this message
+ * type only wraps it for the `parentPort` channel, never redefines its
+ * result states. `requestId` echoes `GraphServicePathTraceRequest.requestId`
+ * verbatim — see that field's own doc comment for why this correlation is
+ * needed.
+ */
+export interface GraphServicePathTraceResultMessage {
+  type: 'graphService:pathTraceResult';
+  requestId: number;
+  result: PathTraceResult;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -657,6 +720,7 @@ export const IpcChannels = {
   settingsSetActiveBackend: 'settings:setActiveBackend',
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
   nodeRegenerate: 'node:regenerate',
+  pathTrace: 'path:trace',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -746,4 +810,12 @@ export interface DrillerApi {
    * (Boundaries & Constraints) rather than queuing behind the first.
    */
   regenerateNode: (nodeId: string) => Promise<RegenerateNodeResult>;
+  /**
+   * Traces the call-reachable subgraph from a query-resolved entry Node
+   * (Story 1.9, Phase 1, FR10) — a read-only round trip to
+   * `packages/graph-contracts`'s `traceCallPath` via the Graph Service.
+   * Callable directly (e.g. from the DevTools console); no search UI or
+   * route-highlighting consumer exists yet (Phase 2).
+   */
+  tracePath: (query: string) => Promise<PathTraceResult>;
 }

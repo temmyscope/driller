@@ -11,6 +11,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
+  "dependencies": {
+    "@driller/graph-contracts": "*"
+  },
   "devDependencies": {
     "typescript": "5.9.3"
   }

@@ -17,6 +17,7 @@ import {
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type ModelStatusMessage,
+  type PathTraceResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
@@ -87,6 +88,9 @@ const drillerApi: DrillerApi = {
 
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),
+
+  tracePath: (query: string): Promise<PathTraceResult> =>
+    ipcRenderer.invoke(IpcChannels.pathTrace, query),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

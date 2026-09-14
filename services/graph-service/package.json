@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
+    "@driller/graph-contracts": "*",
     "@driller/ipc-contracts": "*",
     "@modelcontextprotocol/client": "2.0.0",
     "codebase-memory-mcp": "^0.10.8",

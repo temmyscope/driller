@@ -119,6 +119,7 @@
 
 import os from 'node:os';
 import path from 'node:path';
+import { traceCallPath } from '@driller/graph-contracts';
 import type {
   CloudBackend,
   CodeMapNode,
@@ -126,6 +127,8 @@ import type {
   GraphServiceCodeMapMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
+  GraphServicePathTraceRequest,
+  GraphServicePathTraceResultMessage,
   GraphServiceRegenerateNodeRequest,
   GraphServiceRegenerateNodeResultMessage,
   GraphServiceShutdownRequest,
@@ -343,6 +346,15 @@ function postRegenerateNodeResultMessage(message: GraphServiceRegenerateNodeResu
   process.parentPort?.postMessage(message);
 }
 
+/**
+ * Posts a `graphService:pathTraceResult` reply (Story 1.9, Phase 1) — own
+ * `type`/channel, same disambiguation convention as
+ * `postRegenerateNodeResultMessage`/`postCodeMapMessage`.
+ */
+function postPathTraceResultMessage(message: GraphServicePathTraceResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
 function postModelStatus(status: ModelStatusMessage): void {
   process.parentPort?.postMessage(status);
 }
@@ -515,6 +527,34 @@ function isGetCodeMapRequest(data: unknown): data is GraphServiceGetCodeMapReque
     typeof data === 'object' &&
     data !== null &&
     (data as { type?: unknown }).type === 'graphService:getCodeMap'
+  );
+}
+
+/**
+ * True for a `graphService:pathTrace` request (Story 1.9, Phase 1) — mirrors
+ * `isGetCodeMapRequest`'s shape, plus defensive checks that `query` is
+ * actually a non-whitespace-only string and `requestId` is actually a
+ * number, the same untrusted-shape treatment `isRegenerateNodeRequest`
+ * already applies to `nodeId` for values crossing this `parentPort` boundary
+ * from main (main's own `ipcMain.handle` already validates `query` before
+ * sending, but this process trusts nothing crossing its own boundary
+ * either). `query.trim().length > 0` (not just `query.length > 0`) rejects a
+ * whitespace-only query the same way main's own IPC handler does — see that
+ * handler's doc comment for why (a whitespace-only query is otherwise easy
+ * to produce calling `window.driller.tracePath(...)` by hand, this phase's
+ * documented entry point, and would otherwise silently fall through to
+ * `traceCallPath`'s substring-match tier and match every Node).
+ */
+function isPathTraceRequest(data: unknown): data is GraphServicePathTraceRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, query, requestId } = data as { type?: unknown; query?: unknown; requestId?: unknown };
+  return (
+    type === 'graphService:pathTrace' &&
+    typeof query === 'string' &&
+    query.trim().length > 0 &&
+    typeof requestId === 'number'
   );
 }
 
@@ -788,6 +828,56 @@ async function handleGetCodeMapRequest(): Promise<void> {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
       message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * Handles a `graphService:pathTrace` request (Story 1.9, Phase 1) — computes
+ * a deterministic call-path trace from a query-resolved entry Node via
+ * `@driller/graph-contracts`'s `traceCallPath`, and posts back exactly one
+ * `graphService:pathTraceResult` message. Never throws — every failure path
+ * (no successful index yet, or `fetchCodeMap` itself failing) is reported as
+ * an explicit `{status: 'error', ...}` `PathTraceResult` so main's pending
+ * request always settles, same "never a hung request" framing as
+ * `handleGetCodeMapRequest`.
+ *
+ * Strictly read-only (Always: "never touches the Node record store,
+ * `activeCodeMapNodes`, or generation/staleness state"): re-fetches
+ * nodes+edges fresh via `fetchCodeMap(activeProject)` on every call —
+ * mirroring `handleGetCodeMapRequest`'s own fetch — rather than reusing
+ * `activeCodeMapNodes` (which exists only to support the summary-generation/
+ * backend-switch paths) or writing anything to `node-record-store.ts`.
+ *
+ * Guarded on `activeProject` alone (not `activeProjectPath`, unlike
+ * `handleGetCodeMapRequest`) — `traceCallPath` only needs `id`/`name` off
+ * each Node and `source`/`target`/`kind` off each edge, never `file`, so
+ * there's no need to normalize `file` via `toProjectRelativePosixPath` here
+ * the way the Code Map response does for its own downstream consumers.
+ */
+async function handlePathTraceRequest(query: string, requestId: number): Promise<void> {
+  if (activeProject === undefined) {
+    postPathTraceResultMessage({
+      type: 'graphService:pathTraceResult',
+      requestId,
+      result: { status: 'error', message: 'No project has finished indexing yet.' },
+    });
+    return;
+  }
+  try {
+    const { nodes, edges } = await fetchCodeMap(activeProject);
+    // Defense in depth: main already sends a trimmed query (its own
+    // `ipcMain.handle` validation), but this process trusts nothing crossing
+    // its own boundary (same stance `isPathTraceRequest`'s own doc comment
+    // takes) — trimming again here means incidental whitespace can never
+    // affect matching regardless of which boundary it slipped past.
+    const result = traceCallPath(nodes, edges, query.trim());
+    postPathTraceResultMessage({ type: 'graphService:pathTraceResult', requestId, result });
+  } catch (error) {
+    postPathTraceResultMessage({
+      type: 'graphService:pathTraceResult',
+      requestId,
+      result: { status: 'error', message: error instanceof Error ? error.message : String(error) },
     });
   }
 }
@@ -1309,6 +1399,13 @@ process.parentPort?.on('message', (event) => {
   }
   if (!isShuttingDown && isGetCodeMapRequest(event.data)) {
     void handleGetCodeMapRequest();
+    return;
+  }
+  if (!isShuttingDown && isPathTraceRequest(event.data)) {
+    // Fire-and-forget from the message handler's perspective, same as every
+    // other branch here — `handlePathTraceRequest` posts its own
+    // `graphService:pathTraceResult` reply asynchronously and never throws.
+    void handlePathTraceRequest(event.data.query, event.data.requestId);
     return;
   }
   if (!isShuttingDown && isRegenerateNodeRequest(event.data)) {

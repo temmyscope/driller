@@ -32,11 +32,14 @@ import {
   type GraphServiceCodeMapMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
+  type GraphServicePathTraceRequest,
+  type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRegenerateNodeResultMessage,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type ModelStatusMessage,
+  type PathTraceResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RegenerateNodeResult,
@@ -139,6 +142,51 @@ const pendingRegenerateResolvers = new Map<
   { resolve: (result: RegenerateNodeResult) => void; reject: (error: unknown) => void }
 >();
 
+// Story 1.9 (Phase 1): a single-slot resolver for an in-flight `path:trace`
+// request, mirroring `pendingCodeMapResolve`'s own single-slot shape rather
+// than `pendingRegenerateResolvers`'s id-keyed Map — `requestPathTrace` has
+// no natural id to key overlapping calls by the way a Node's `nodeId` does
+// (two different queries in flight at once would need one slot each). Unlike
+// `pendingCodeMapResolve`, a second overlapping call is never given a shared
+// promise either (that's only safe for `requestCodeMap` because every caller
+// wants the exact same code map back) — a different query in flight would
+// get the wrong result if it shared this slot, so `requestPathTrace` instead
+// rejects a second concurrent call outright with an explicit error, same
+// spirit as `requestRegenerateNode`'s per-nodeId "already in progress" guard.
+let pendingPathTraceResolve: ((result: PathTraceResult) => void) | null = null;
+
+// Monotonic counter for `pendingPathTraceToken` below (Spec Change Log,
+// post-review hardening) — every `requestPathTrace` call bumps this and
+// captures its own value.
+let pathTraceRequestToken = 0;
+
+// The token (see `pathTraceRequestToken`) of whichever request currently
+// owns `pendingPathTraceResolve`'s single slot, or `null` when nothing is
+// pending. This is what closes a real stale/late-reply race the single-slot
+// design alone doesn't handle: request A starts (token 1), times out —
+// `settlePendingPathTraceRequest` resolves A's promise with a timeout error
+// and frees the slot. Request B then starts (token 2), claiming the now-free
+// slot. A's *original* subprocess-side call was never actually cancelable
+// (MCP calls aren't cancelable mid-flight, same limitation
+// `services/graph-service/index.ts`'s module doc comment already notes for
+// indexing) and can still eventually reply — when that late
+// `graphService:pathTraceResult` reply for token 1 arrives, comparing its
+// echoed `requestId` (ipc-contracts's `GraphServicePathTraceRequest.
+// requestId`/`GraphServicePathTraceResultMessage.requestId`) against this
+// variable (now 2) is what lets `settlePendingPathTraceRequest` recognize
+// it's stale and discard it, rather than misattributing A's result to B's
+// still-pending promise. Every settle call site (timeout, the subprocess's
+// own error/message-handler reply, `postMessage` throwing) goes through
+// `settlePendingPathTraceRequest` with its own request's token, mirroring
+// the snapshot-and-compare shape `services/graph-service/index.ts`'s own
+// `activeSummaryGenerationId` uses for the same class of staleness problem
+// (a slow, non-cancelable async result completing after something newer has
+// superseded it). The one exception is the Graph Service subprocess exiting
+// entirely (see the `'exit'` handler below) — that settles whatever is
+// currently pending unconditionally, since no reply for ANY token will ever
+// arrive once the subprocess is gone.
+let pendingPathTraceToken: number | null = null;
+
 // ---------------------------------------------------------------------------
 // Graph Service subprocess (AD-1): spawned via `utilityProcess.fork`, never
 // `child_process.fork` or inline indexing work in main. This story only
@@ -212,6 +260,18 @@ function isRegenerateNodeResultMessage(message: unknown): message is GraphServic
     return false;
   }
   return (message as { type?: unknown }).type === 'graphService:regenerateNodeResult';
+}
+
+/**
+ * True for a `graphService:pathTraceResult` reply (Story 1.9, Phase 1) —
+ * distinguished from every other message shape on this same channel by
+ * `type`, same convention as `isCodeMapMessage`/`isRegenerateNodeResultMessage`.
+ */
+function isPathTraceResultMessage(message: unknown): message is GraphServicePathTraceResultMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:pathTraceResult';
 }
 
 /**
@@ -302,6 +362,48 @@ function settleAllPendingRegenerateRequests(message: string): void {
   }
 }
 
+/**
+ * Settles the pending `path:trace` request for `token` (if it's still the
+ * one occupying the slot) with an explicit result — used both for a genuine
+ * `graphService:pathTraceResult` reply (whose echoed `requestId` becomes
+ * `token`) and for that same request's own failure paths (`postMessage`
+ * throwing, its timeout backstop firing).
+ *
+ * A no-op — deliberately discarding `result` — when `token` no longer
+ * matches `pendingPathTraceToken`: see that variable's own doc comment for
+ * the exact stale/late-reply race this guards against (a request that
+ * already timed out and had the slot reassigned to a newer request must
+ * never have its late reply resolve that newer request's promise instead).
+ */
+function settlePendingPathTraceRequest(token: number, result: PathTraceResult): void {
+  if (pendingPathTraceResolve === null || token !== pendingPathTraceToken) {
+    return;
+  }
+  const resolve = pendingPathTraceResolve;
+  pendingPathTraceResolve = null;
+  pendingPathTraceToken = null;
+  resolve(result);
+}
+
+/**
+ * Settles whatever `path:trace` request is currently pending, regardless of
+ * its token — used only when the Graph Service subprocess itself exits: no
+ * reply, for any token, will ever arrive once the subprocess is gone, so
+ * there's no staleness ambiguity left to check for (unlike
+ * `settlePendingPathTraceRequest`'s own token comparison, which exists
+ * specifically to disambiguate between two requests that could both still
+ * be alive).
+ */
+function settleAnyPendingPathTraceRequest(result: PathTraceResult): void {
+  const resolve = pendingPathTraceResolve;
+  if (!resolve) {
+    return;
+  }
+  pendingPathTraceResolve = null;
+  pendingPathTraceToken = null;
+  resolve(result);
+}
+
 function spawnGraphService(): void {
   if (graphService) {
     return;
@@ -340,6 +442,7 @@ function spawnGraphService(): void {
         | GraphServiceStatusMessage
         | GraphServiceCodeMapMessage
         | GraphServiceRegenerateNodeResultMessage
+        | GraphServicePathTraceResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | HardwareAdvisoryMessage,
@@ -354,6 +457,10 @@ function spawnGraphService(): void {
       }
       if (isRegenerateNodeResultMessage(message)) {
         settlePendingRegenerateRequest(message.nodeId, message.result);
+        return;
+      }
+      if (isPathTraceResultMessage(message)) {
+        settlePendingPathTraceRequest(message.requestId, message.result);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -387,6 +494,15 @@ function spawnGraphService(): void {
     // will never post the `graphService:regenerateNodeResult` reply those
     // promises are waiting on.
     settleAllPendingRegenerateRequests('Graph Service exited before the Node could be regenerated.');
+    // Story 1.9 (Phase 1, matrix: "No project indexed yet, or Graph Service
+    // unavailable" -> "Trace refused" with an explicit `error` result): a
+    // Path Trace request still outstanding when the subprocess exits will
+    // never get its reply now — settle it as an explicit failure, same
+    // reasoning as the two settle calls above it.
+    settleAnyPendingPathTraceRequest({
+      status: 'error',
+      message: 'Graph Service exited before the Path Trace could complete.',
+    });
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -557,6 +673,90 @@ function requestRegenerateNode(nodeId: string): Promise<RegenerateNodeResult> {
     settlePendingRegenerateRequest(nodeId, {
       status: 'error',
       message: `Failed to send the regenerate request to the Graph Service: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+
+  return promise;
+}
+
+/**
+ * Relays a Path Trace request to the Graph Service subprocess (Story 1.9,
+ * Phase 1) and resolves once it replies — read-only, single-slot, mirroring
+ * `requestCodeMap`'s overall shape (subprocess-running check, timeout
+ * backstop reusing `CODE_MAP_REQUEST_TIMEOUT_MS`, a wrapped `postMessage`
+ * call). Unlike `requestCodeMap`, a second overlapping call is never given a
+ * shared promise (see `pendingPathTraceResolve`'s own doc comment for why a
+ * different query in flight makes that unsafe here) — it's rejected outright
+ * with an explicit error instead, same spirit as `requestRegenerateNode`'s
+ * per-nodeId "already in progress" guard, just keyed on the single global
+ * slot rather than a per-id Map since a trace request carries no id of its
+ * own to key by.
+ *
+ * Also checks `isGraphServiceShuttingDown` (Spec Change Log, post-review
+ * hardening), not just `!graphService` — a request sent while the
+ * subprocess is mid-shutdown would otherwise be silently dropped by the
+ * subprocess's own `!isShuttingDown` message-handler guard
+ * (services/graph-service/index.ts), leaving the caller to wait out the
+ * full timeout instead of getting an immediate explicit error; every other
+ * request-sending function in this file (`sendIndexRequest`'s callers,
+ * `requestRegenerateNode`, etc.) already treats a shutting-down subprocess
+ * as unusable.
+ *
+ * Every request gets its own `requestId` token (`pathTraceRequestToken`,
+ * bumped here) that `settlePendingPathTraceRequest` compares against
+ * `pendingPathTraceToken` before resolving anything — see that variable's
+ * own doc comment for the stale/late-reply race this closes.
+ *
+ * Rejects nothing, matching `requestCodeMap`/`requestRegenerateNode`'s own
+ * framing: every failure path (no subprocess running or shutting down, a
+ * request already in flight, the subprocess's own error reply, it exiting
+ * mid-request, `postMessage` itself throwing, or the request timing out)
+ * resolves to `{status: 'error', ...}` — the matrix's "No project indexed
+ * yet, or Graph Service unavailable" -> "Trace refused" / "Explicit `error`
+ * result with message" applies here exactly like the Code Map fetch.
+ */
+function requestPathTrace(query: string): Promise<PathTraceResult> {
+  if (pendingPathTraceResolve) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'A Path Trace request is already in progress.',
+    });
+  }
+  if (!graphService || isGraphServiceShuttingDown) {
+    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+  }
+  const service = graphService;
+
+  const myToken = ++pathTraceRequestToken;
+  pendingPathTraceToken = myToken;
+
+  const promise = new Promise<PathTraceResult>((resolve) => {
+    pendingPathTraceResolve = resolve;
+  });
+
+  const timeoutTimer = setTimeout(() => {
+    settlePendingPathTraceRequest(myToken, {
+      status: 'error',
+      message: 'Timed out waiting for the Graph Service to respond to the Path Trace request.',
+    });
+  }, CODE_MAP_REQUEST_TIMEOUT_MS);
+  void promise.finally(() => clearTimeout(timeoutTimer));
+
+  try {
+    service.postMessage({
+      type: 'graphService:pathTrace',
+      query,
+      requestId: myToken,
+    } satisfies GraphServicePathTraceRequest);
+  } catch (error) {
+    // A synchronous throw here would otherwise leave pendingPathTraceResolve
+    // set with nothing left to ever call it, leaking the request forever —
+    // same reasoning as `requestCodeMap`'s own matching catch block.
+    settlePendingPathTraceRequest(myToken, {
+      status: 'error',
+      message: `Failed to send the Path Trace request to the Graph Service: ${
         error instanceof Error ? error.message : String(error)
       }`,
     });
@@ -849,6 +1049,37 @@ function registerIpcHandlers(): void {
         return Promise.resolve({ status: 'error', message: 'Invalid Node ID.' });
       }
       return requestRegenerateNode(nodeId);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Story 1.9 (Phase 1): Path Trace — a new, dedicated, strictly read-only IPC
+  // round trip (Boundaries & Constraints). Callable directly via
+  // `window.driller.tracePath(query)` (e.g. from the DevTools console); no
+  // search UI consumes it yet (Phase 2).
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.pathTrace,
+    (_event, query: unknown): Promise<PathTraceResult> => {
+      // Renderer-supplied value crosses the contextBridge boundary untyped at
+      // runtime (same precedent as `sourceReadRange`'s own guard above). The
+      // trimmed value — not the raw one — is both what's validated and what
+      // gets sent onward: incidental leading/trailing whitespace (easy to
+      // produce calling `window.driller.tracePath(...)` by hand, this
+      // phase's documented entry point) would otherwise either silently fall
+      // through to `no-path-found` (an exact match no longer matches with
+      // the padding attached) or, worse, still match via the substring tier
+      // against an unintended Node. A whitespace-only query is rejected the
+      // same as an empty one.
+      if (typeof query !== 'string') {
+        return Promise.resolve({ status: 'error', message: 'Invalid Path Trace query.' });
+      }
+      const trimmedQuery = query.trim();
+      if (trimmedQuery.length === 0) {
+        return Promise.resolve({ status: 'error', message: 'Invalid Path Trace query.' });
+      }
+      return requestPathTrace(trimmedQuery);
     },
   );
 }
