@@ -95,6 +95,15 @@ type NodeDetailState = { status: 'closed' } | { status: 'open'; node: CodeMapNod
 type RegenerateState = { kind: 'idle' | 'regenerating' } | { kind: 'error'; message: string };
 
 /**
+ * The source overlay's "Open in external editor" affordance state (Story
+ * 1.10, Phase 2) — mirrors `RegenerateState`'s idle/in-flight/error shape.
+ * Reset to `'idle'` whenever the source overlay opens for a (possibly new)
+ * Node or closes, so a leftover error from a previous Node/attempt never
+ * bleeds into the next.
+ */
+type OpenInEditorState = { status: 'idle' } | { status: 'opening' } | { status: 'error'; message: string };
+
+/**
  * The search toolbar's own result state (Story 1.9, Phase 2) — mirrors
  * `RegenerateState`'s idle/in-flight/error shape (Code Map), but carries
  * `PathTraceResult` states directly (`'found'`/`'ambiguous'`/
@@ -816,6 +825,11 @@ export interface CodeMapProps {
 export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
+  // Story 1.10 (Phase 2): the source overlay's "Open in external editor"
+  // button state — kept separate from `sourceView` itself (the overlay's
+  // own loading/error state is about reading the source range, not about
+  // the hand-off action a user can trigger once it's open).
+  const [openInEditorState, setOpenInEditorState] = useState<OpenInEditorState>({ status: 'idle' });
   // Story 1.8 (Phase 4): the Node Detail panel's own state, plus the
   // Regenerate button's in-flight/error state — kept separate from
   // `sourceView` since the two overlays are independent (opening Node
@@ -879,6 +893,13 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // `sourceView` after the user has already moved on to B. Incremented on
   // every activation; a response is only applied if it's still the latest.
   const sourceRequestIdRef = useRef(0);
+  // Correlates an `openInEditor` response back to the click that started it
+  // (Story 1.10, Phase 2) — same stale-response guard as
+  // `sourceRequestIdRef` above: bumped whenever the source overlay opens for
+  // a (possibly different) Node or closes, so a late reply for a Node the
+  // user has since moved on from (or a closed overlay) never resurrects
+  // `openInEditorState`.
+  const openInEditorRequestIdRef = useRef(0);
 
   // Dev-only synthetic-fixture node count (Always: `import.meta.env.DEV`
   // plus `?fixtureNodes=N`) — read once per mount; the URL doesn't change
@@ -1067,6 +1088,11 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
 
   const openSourceForNode = useCallback((node: CodeMapNode) => {
     const requestId = ++sourceRequestIdRef.current;
+    // A fresh source-view open (possibly for a different Node) invalidates
+    // any still-in-flight `openInEditor` request from whatever was
+    // previously shown, and resets its own idle/error display.
+    openInEditorRequestIdRef.current += 1;
+    setOpenInEditorState({ status: 'idle' });
     setSourceView({ status: 'loading', node });
     window.driller
       .readSourceRange(node.file, node.startLine, node.endLine)
@@ -1879,7 +1905,69 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     [],
   );
 
-  const closeSourceView = useCallback(() => setSourceView({ status: 'closed' }), []);
+  const closeSourceView = useCallback(() => {
+    // Invalidate any in-flight `openInEditor` request the same way a fresh
+    // `openSourceForNode` call does — a late reply must never resurrect
+    // `openInEditorState` after the overlay it belonged to is gone.
+    openInEditorRequestIdRef.current += 1;
+    setOpenInEditorState({ status: 'idle' });
+    setSourceView({ status: 'closed' });
+  }, []);
+
+  /**
+   * Wires the source overlay's "Open in external editor" button to
+   * `window.driller.openInEditor` (Story 1.10, Phase 2) — main resolves
+   * `node.file` to an absolute path and launches the Phase 1-configured
+   * editor at `node.startLine`. Every failure surfaces as an explicit
+   * Actionable Notice via `openInEditorState`, rendered next to the source
+   * panel's own error convention — never a silent no-op.
+   *
+   * Review fix: the "Editor not found / handler unavailable... check
+   * install or Settings" framing is only accurate for a `result.stage ===
+   * 'launch'` failure (an `openExternal` rejection, or a non-empty
+   * `openPath` result) — a `'validate'`/`'resolve'` failure (a malformed
+   * request, no project open, or a containment violation) never even
+   * reached the launch attempt, so those are shown plainly instead (same
+   * convention as the source panel's own `Couldn't open source:` message
+   * just above), rather than misattributing the cause and suggesting an
+   * install/Settings fix that wouldn't address it.
+   */
+  const handleOpenInEditor = useCallback((node: CodeMapNode) => {
+    const requestId = ++openInEditorRequestIdRef.current;
+    setOpenInEditorState({ status: 'opening' });
+    window.driller
+      .openInEditor(node.file, node.startLine)
+      .then((result) => {
+        if (openInEditorRequestIdRef.current !== requestId) {
+          // Superseded by closing the overlay or opening a different Node —
+          // discard rather than let a stale reply clobber the current view.
+          return;
+        }
+        if (result.status === 'ok') {
+          setOpenInEditorState({ status: 'idle' });
+        } else if (result.stage === 'launch') {
+          setOpenInEditorState({
+            status: 'error',
+            message: `Editor not found / handler unavailable: ${result.message}. Check that it's installed, or change the editor in Settings.`,
+          });
+        } else {
+          setOpenInEditorState({ status: 'error', message: result.message });
+        }
+      })
+      .catch((error: unknown) => {
+        if (openInEditorRequestIdRef.current !== requestId) {
+          return;
+        }
+        // The IPC call itself rejected, rather than resolving with an
+        // explicit `OpenInEditorResult` — an unexpected lower-level
+        // failure with no `stage` to check, so this also uses the plain
+        // framing rather than assuming the cause was a launch failure.
+        setOpenInEditorState({
+          status: 'error',
+          message: `Couldn't open in editor: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      });
+  }, []);
 
   // Escape closes the source overlay (review finding — a real dialog needs
   // a keyboard dismissal path, not just the × button). Only listens while
@@ -2190,14 +2278,34 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
               <code>
                 {sourceView.node.file}:{sourceView.node.startLine}-{sourceView.node.endLine}
               </code>
-              <button type="button" onClick={closeSourceView} aria-label="Close source view">
-                ×
-              </button>
+              <div className="code-map__source-header-actions">
+                <button
+                  type="button"
+                  className="code-map__source-open-in-editor"
+                  onClick={() => handleOpenInEditor(sourceView.node)}
+                  disabled={openInEditorState.status === 'opening'}
+                >
+                  {openInEditorState.status === 'opening' ? 'Opening…' : 'Open in external editor'}
+                </button>
+                <button
+                  type="button"
+                  className="code-map__source-close"
+                  onClick={closeSourceView}
+                  aria-label="Close source view"
+                >
+                  ×
+                </button>
+              </div>
             </div>
             {sourceView.status === 'loading' && <p role="status">Loading source…</p>}
             {sourceView.status === 'error' && (
               <p role="alert" className="code-map__source-error">
                 Couldn&rsquo;t open source: {sourceView.message}
+              </p>
+            )}
+            {openInEditorState.status === 'error' && (
+              <p role="alert" className="code-map__source-error">
+                {openInEditorState.message}
               </p>
             )}
             {sourceView.status === 'open' && (

@@ -19,6 +19,7 @@ import {
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type ModelStatusMessage,
+  type OpenInEditorResult,
   type PathTraceResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
@@ -78,6 +79,9 @@ const drillerApi: DrillerApi = {
 
   readSourceRange: (file: string, startLine: number, endLine: number): Promise<ReadSourceRangeResult> =>
     ipcRenderer.invoke(IpcChannels.sourceReadRange, file, startLine, endLine),
+
+  openInEditor: (file: string, startLine: number): Promise<OpenInEditorResult> =>
+    ipcRenderer.invoke(IpcChannels.shellOpenInEditor, file, startLine),
 
   getBackendConfig: (): Promise<BackendConfig> =>
     ipcRenderer.invoke(IpcChannels.settingsGetBackendConfig),

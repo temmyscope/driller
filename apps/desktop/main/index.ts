@@ -19,6 +19,7 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  shell,
   utilityProcess,
   type UtilityProcess,
 } from 'electron';
@@ -41,6 +42,7 @@ import {
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type ModelStatusMessage,
+  type OpenInEditorResult,
   type PathTraceResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
@@ -777,47 +779,43 @@ function requestPathTrace(query: string): Promise<PathTraceResult> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Result of `resolveProjectFilePath`: either the `realpath`-resolved
+ * absolute path (containment-checked, safe to pass to `readFile`/
+ * `shell.openPath`/an editor URI), or an explicit containment-violation
+ * error.
+ */
+type ResolveProjectFilePathResult =
+  | { status: 'ok'; absolutePath: string }
+  | { status: 'error'; message: string };
+
+/**
  * Resolves a Node's POSIX-relative `file` (AD-19) to an absolute, OS-native
- * path under `projectRoot`, and reads back the `[startLine, endLine]` line
- * range (1-indexed, inclusive) as read-only raw source (Non-Goal: no editing
- * surface). Line endings are normalized to `\n` for display (see the
- * `readFile` block below) — this returns the requested lines' *content*
- * verbatim, not necessarily the source file's original bytes, so a CRLF/CR
- * file's line terminators are not reproduced byte-for-byte.
+ * path under `projectRoot` — the shared containment-checked resolution both
+ * `handleReadSourceRange` (one-click-to-source, FR3/FR17 groundwork) and
+ * `requestOpenInEditor` (Story 1.10, Phase 2, the external-editor hand-off)
+ * call, extracted rather than duplicated (Boundaries & Constraints: "never
+ * duplicated").
  *
  * Rejects a path that would resolve outside `projectRoot` — the Graph
  * Service backend is trusted for graph *content*, but a `file` value
- * reaching this handler still crosses the same untrusted IPC boundary as
+ * reaching either caller still crosses the same untrusted IPC boundary as
  * any other renderer-supplied input (main/index.ts's existing
  * `projectOpenPath` validation is the precedent), so it's checked here
  * rather than assumed safe. Checked twice: once lexically (cheap, catches
  * an obvious `../`-escape even for a path that doesn't exist on disk), and
  * once against the `realpath`-resolved path (review finding: a symlink
  * *inside* `projectRoot` pointing outside it passes the lexical check alone
- * — `path.resolve()` never follows symlinks — and `readFile` would then
+ * — `path.resolve()` never follows symlinks — and a consumer would then
  * happily follow it). `projectRoot` itself is resolved the same way before
  * the second comparison, since a legitimate project root can itself sit
  * behind a symlinked ancestor (e.g. macOS's `/tmp` -> `/private/tmp`) —
  * otherwise a perfectly legitimate file would fail containment because only
  * one side of the comparison got de-symlinked.
  */
-async function handleReadSourceRange(
+async function resolveProjectFilePath(
   projectRoot: string,
   file: string,
-  startLine: number,
-  endLine: number,
-): Promise<ReadSourceRangeResult> {
-  if (
-    typeof file !== 'string' ||
-    file.length === 0 ||
-    !Number.isFinite(startLine) ||
-    !Number.isFinite(endLine) ||
-    startLine < 1 ||
-    endLine < startLine
-  ) {
-    return { status: 'error', message: 'Invalid source range request.' };
-  }
-
+): Promise<ResolveProjectFilePathResult> {
   const absolutePath = path.resolve(projectRoot, file);
   const rootWithSep = projectRoot.endsWith(path.sep) ? projectRoot : projectRoot + path.sep;
   if (absolutePath !== projectRoot && !absolutePath.startsWith(rootWithSep)) {
@@ -842,8 +840,47 @@ async function handleReadSourceRange(
     return { status: 'error', message: 'Resolved path is outside the project root.' };
   }
 
+  return { status: 'ok', absolutePath: realAbsolutePath };
+}
+
+/**
+ * Resolves a Node's POSIX-relative `file` (AD-19) to an absolute, OS-native
+ * path under `projectRoot` (via `resolveProjectFilePath`), and reads back
+ * the `[startLine, endLine]` line range (1-indexed, inclusive) as read-only
+ * raw source (Non-Goal: no editing surface). Line endings are normalized to
+ * `\n` for display (see the `readFile` block below) — this returns the
+ * requested lines' *content* verbatim, not necessarily the source file's
+ * original bytes, so a CRLF/CR file's line terminators are not reproduced
+ * byte-for-byte.
+ *
+ * This is a pure refactor of already-shipped, already-reviewed logic (Design
+ * Notes) — `resolveProjectFilePath`'s extraction changes nothing about this
+ * function's own behavior.
+ */
+async function handleReadSourceRange(
+  projectRoot: string,
+  file: string,
+  startLine: number,
+  endLine: number,
+): Promise<ReadSourceRangeResult> {
+  if (
+    typeof file !== 'string' ||
+    file.length === 0 ||
+    !Number.isFinite(startLine) ||
+    !Number.isFinite(endLine) ||
+    startLine < 1 ||
+    endLine < startLine
+  ) {
+    return { status: 'error', message: 'Invalid source range request.' };
+  }
+
+  const resolved = await resolveProjectFilePath(projectRoot, file);
+  if (resolved.status === 'error') {
+    return resolved;
+  }
+
   try {
-    const raw = await readFile(realAbsolutePath, 'utf8');
+    const raw = await readFile(resolved.absolutePath, 'utf8');
     const lines = raw.split(/\r\n|\r|\n/);
     if (lines.length < endLine) {
       // The file is shorter than the Node's indexed range — it likely
@@ -860,6 +897,127 @@ async function handleReadSourceRange(
     return { status: 'ok', content };
   } catch (error) {
     return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * URI-encodes an absolute filesystem path for insertion into the
+ * `vscode://file{path}:{line}` / `idea://open?file={path}&line={line}`
+ * editor-launch URIs (Story 1.10, Phase 2, AD-23) — encoded per path
+ * segment, not via a single `encodeURIComponent` over the whole string
+ * (which would also escape the `/` separators and corrupt the path), so an
+ * unusual-but-legal filename character (a space, `#`, `&`, `%`, non-ASCII,
+ * ...) can never be interpreted as URI syntax by the receiving editor or the
+ * OS's protocol dispatch. Never raw string interpolation (Always).
+ *
+ * A POSIX absolute path (`/Users/foo/bar.ts`) splits on its leading `/`
+ * into a leading empty segment, which re-joining with `/` reproduces as the
+ * URI's own leading slash for free. A Windows absolute path
+ * (`C:\Users\foo\bar.ts`) has no such leading separator to split on — its
+ * first segment is the drive letter (`C:`) — so without special handling
+ * this would both lose the leading `/` the `vscode://file/...`/`idea://
+ * open?file=...` shape expects, and have its drive-letter colon
+ * percent-encoded to `%3A` by the same per-segment `encodeURIComponent`
+ * every other segment needs (review finding: this silently broke the
+ * Windows hand-off — `openExternal` still resolves on a malformed URI, so
+ * nothing would visibly fail even though the editor never actually opens).
+ * Detected and special-cased below: the drive segment keeps its colon
+ * literal and a `/` is prepended, matching the `file:///C:/...` shape every
+ * consumer here expects; every other segment (Windows or POSIX) is
+ * unaffected.
+ */
+function encodePathForEditorUri(absolutePath: string): string {
+  const rawSegments = absolutePath.split(path.sep);
+  const isWindowsDrivePath = /^[a-zA-Z]:$/.test(rawSegments[0] ?? '');
+  const encodedSegments = rawSegments.map((segment, index) =>
+    isWindowsDrivePath && index === 0 ? segment : encodeURIComponent(segment),
+  );
+  return isWindowsDrivePath ? `/${encodedSegments.join('/')}` : encodedSegments.join('/');
+}
+
+/**
+ * Hands a Node's exact source location off to the Phase 1-configured
+ * external editor (Story 1.10, Phase 2, AD-23) — this app's first
+ * `shell.openExternal`/`shell.openPath` call site, reachable only from main
+ * (Always: "renderer never calls `shell.openExternal`/`shell.openPath`
+ * directly"). `file` is resolved to an absolute path via the same
+ * containment-checked `resolveProjectFilePath` helper `handleReadSourceRange`
+ * uses, then:
+ * - `vscode` builds `vscode://file/{absolutePath}:{startLine}` and dispatches
+ *   it via `shell.openExternal` (exact-line-jump).
+ * - `jetbrains` builds `idea://open?file={absolutePath}&line={startLine}`
+ *   (IntelliJ IDEA's own scheme, user-confirmed — a product sub-selector is
+ *   tracked in `deferred-work.md`, not this phase) via `shell.openExternal`.
+ * - `system-default` calls `shell.openPath(absolutePath)` — the OS's generic
+ *   file-open mechanism, no line-jump.
+ *
+ * Every failure path resolves to an explicit `{status: 'error', message}` —
+ * never a silent no-op (Always): a containment violation from
+ * `resolveProjectFilePath`, an `openExternal` rejection, or a non-empty
+ * `openPath` result (Electron's own failure shape — it resolves with a
+ * human-readable error string on failure rather than rejecting, so that's
+ * checked explicitly rather than treated as success just because the
+ * promise resolved) are all surfaced this way.
+ *
+ * `shell.openExternal` resolving successfully doesn't guarantee the target
+ * editor actually opened the file — it's a fire-and-forget OS-level
+ * protocol dispatch (Design Notes) — so an `'ok'` result here is a
+ * best-effort signal, not a hard guarantee, consistent with AD-23's own
+ * framing.
+ */
+async function requestOpenInEditor(
+  projectRoot: string,
+  file: string,
+  startLine: number,
+): Promise<OpenInEditorResult> {
+  if (
+    typeof file !== 'string' ||
+    file.length === 0 ||
+    !Number.isInteger(startLine) ||
+    startLine < 1
+  ) {
+    return { status: 'error', stage: 'validate', message: 'Invalid open-in-editor request.' };
+  }
+
+  const resolved = await resolveProjectFilePath(projectRoot, file);
+  if (resolved.status === 'error') {
+    // A containment violation — failed before any launch was attempted, so
+    // this is NOT "editor not found" (review finding: the caller uses
+    // `stage` to tell these apart and frame each correctly).
+    return { status: 'error', stage: 'resolve', message: resolved.message };
+  }
+
+  const preference = getEditorPreference();
+
+  try {
+    if (preference === 'vscode') {
+      const encodedPath = encodePathForEditorUri(resolved.absolutePath);
+      await shell.openExternal(`vscode://file${encodedPath}:${startLine}`);
+      return { status: 'ok' };
+    }
+    if (preference === 'jetbrains') {
+      const encodedPath = encodePathForEditorUri(resolved.absolutePath);
+      await shell.openExternal(`idea://open?file=${encodedPath}&line=${startLine}`);
+      return { status: 'ok' };
+    }
+    // 'system-default': the OS's generic file-open mechanism, no line-jump.
+    // `shell.openPath` resolves with a non-empty string describing the
+    // failure rather than rejecting (Electron's own shape) — checked
+    // explicitly below rather than assumed to have succeeded.
+    const failure = await shell.openPath(resolved.absolutePath);
+    if (failure.length > 0) {
+      return { status: 'error', stage: 'launch', message: failure };
+    }
+    return { status: 'ok' };
+  } catch (error) {
+    // `openExternal` rejecting — an unregistered URI scheme, or the OS
+    // reporting it can't dispatch the protocol (matrix: "Editor not
+    // found / handler unavailable") — a genuine launch-stage failure.
+    return {
+      status: 'error',
+      stage: 'launch',
+      message: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -995,6 +1153,30 @@ function registerIpcHandlers(): void {
         return Promise.resolve({ status: 'error', message: 'Invalid source range request.' });
       }
       return handleReadSourceRange(currentProjectPath, file, startLine, endLine);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Story 1.10 (Phase 2): external-editor hand-off — the one call site
+  // reachable from main for `shell.openExternal`/`shell.openPath` (AD-11,
+  // AD-23). Same untyped-arg validation discipline as `sourceReadRange`
+  // immediately above.
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.shellOpenInEditor,
+    (_event, file: unknown, startLine: unknown): Promise<OpenInEditorResult> => {
+      if (!currentProjectPath) {
+        return Promise.resolve({ status: 'error', stage: 'validate', message: 'No project is open.' });
+      }
+      if (typeof file !== 'string' || typeof startLine !== 'number') {
+        return Promise.resolve({
+          status: 'error',
+          stage: 'validate',
+          message: 'Invalid open-in-editor request.',
+        });
+      }
+      return requestOpenInEditor(currentProjectPath, file, startLine);
     },
   );
 

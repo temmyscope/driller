@@ -1025,13 +1025,53 @@ code,
   font-size: 0.85rem;
 }
 
-.code-map__source-header button {
+/* Scoped to its own class (Story 1.10, Phase 2 fix) rather than a generic
+   `.code-map__source-header button` descendant selector — that broader
+   selector's specificity (class + element) would otherwise outrank and
+   clobber `.code-map__source-open-in-editor`'s own styling below (a plain
+   class selector), since both buttons now share this header. */
+.code-map__source-close {
   background: transparent;
   border: none;
   color: var(--text-muted);
   font-size: 1.25rem;
   line-height: 1;
   cursor: pointer;
+}
+
+/* Story 1.10 (Phase 2): groups the "Open in external editor" affordance
+   with the existing close button so `.code-map__source-header`'s own
+   `justify-content: space-between` still splits just two items (the file
+   location on the left, this group on the right) rather than spreading
+   three items unevenly. */
+.code-map__source-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* A labeled secondary action, distinct from the icon-only `×` close button
+   immediately next to it (same header, same `button` selector above would
+   otherwise apply its icon-sized 1.25rem/transparent styling here too). */
+.code-map__source-open-in-editor {
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.8rem;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.code-map__source-open-in-editor:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.code-map__source-open-in-editor:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .code-map__source-error {

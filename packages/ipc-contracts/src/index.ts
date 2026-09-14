@@ -393,6 +393,28 @@ export type ReadSourceRangeResult =
   | { status: 'error'; message: string };
 
 /**
+ * Result of the external-editor hand-off (Story 1.10, Phase 2, AD-23) —
+ * `'ok'` covers both a successful line-jump launch (`vscode`/`jetbrains`)
+ * and a successful `system-default` `shell.openPath` call; every failure
+ * path (a malformed request, a containment violation from the shared
+ * `resolveProjectFilePath` resolution, an `openExternal` rejection, or a
+ * non-empty `openPath` result) resolves to an explicit
+ * `{status: 'error', stage, message}` — never a silent no-op (Always).
+ *
+ * `stage` (review finding, post-implementation fix) distinguishes how far
+ * the attempt got before failing: `'validate'` (a malformed request or no
+ * project open) and `'resolve'` (a containment violation) both failed
+ * before any launch was even attempted; only `'launch'` (an `openExternal`
+ * rejection, or a non-empty `openPath` result) means the configured
+ * editor/handler itself is unavailable. A caller must not apply "editor not
+ * found / check install or Settings" framing to a `'validate'`/`'resolve'`
+ * failure — that framing is only accurate for `'launch'`.
+ */
+export type OpenInEditorResult =
+  | { status: 'ok' }
+  | { status: 'error'; stage: 'validate' | 'resolve' | 'launch'; message: string };
+
+/**
  * Message main sends to ask the Graph Service subprocess for the Code Map
  * of the most recently `indexed` project. Carries no path/params — the
  * Graph Service already knows which project it most recently finished
@@ -767,6 +789,7 @@ export const IpcChannels = {
   graphServiceRestart: 'graphService:restart',
   codeMapGet: 'codeMap:get',
   sourceReadRange: 'source:readRange',
+  shellOpenInEditor: 'shell:openInEditor',
   modelStatus: 'model:status',
   summaryProgress: 'summary:progress',
   hardwareAdvisory: 'hardware:advisory',
@@ -837,6 +860,18 @@ export interface DrillerApi {
     startLine: number,
     endLine: number,
   ) => Promise<ReadSourceRangeResult>;
+  /**
+   * Hands off a Node's exact source location to the Phase 1-configured
+   * external editor (Story 1.10, Phase 2, AD-23) — main resolves `file`
+   * (the Node's POSIX-relative path) to an absolute path under the same
+   * containment-checked resolution `readSourceRange` uses, then launches
+   * VS Code/JetBrains via that editor's own URI scheme at the exact
+   * `startLine`, or the OS's generic file-open mechanism for System default
+   * (no line-jump). Never callable directly against `shell.openExternal`/
+   * `shell.openPath` from the renderer (AD-11) — this is the one hand-off
+   * point.
+   */
+  openInEditor: (file: string, startLine: number) => Promise<OpenInEditorResult>;
   /**
    * Fetches the current backend config (Story 1.6 Phase 1): the active
    * local/cloud choice, whether a cloud key is already stored, and whether
