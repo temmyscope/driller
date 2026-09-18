@@ -63,7 +63,12 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import type { CodeMapEdge, CodeMapNode, DeterministicRiskSignalType } from '@driller/ipc-contracts';
+import type {
+  CodeMapEdge,
+  CodeMapNode,
+  DeterministicRiskSignal,
+  DeterministicRiskSignalType,
+} from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
 
 type FetchState =
@@ -585,21 +590,34 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
   // `'pending'`/`'coverage-gap'` (staleness is only meaningful once a
   // summary actually exists).
   const showDetailsAffordance = node.summaryStatus === 'ready' && node.stale === true;
-  // Story 2.1 (Phase 3): filtered, not assumed — Story 2.2/2.3's future
-  // `llm-judgment`/`ingested` families extend `RiskSignal['family']` later,
-  // and this same loop must never render them through this one unfiltered
-  // (Boundaries & Constraints, epics.md Phase 3 AC). A Node with none (or
-  // every entry filtered out) renders no strip at all — never an empty row
-  // — enforced by the `.length > 0` gate below, not by this filter alone.
-  // Review round (patch): also drops a repeat `type` defensively — see the
-  // signal-strip JSX's own comment below for why.
-  const seenDeterministicSignalTypes = new Set<string>();
-  const deterministicSignals = node.riskSignals.filter(
-    (signal) =>
-      signal.family === 'deterministic' &&
-      !seenDeterministicSignalTypes.has(signal.type) &&
-      seenDeterministicSignalTypes.add(signal.type),
-  );
+  // Story 2.1 (Phase 3): filtered, not assumed — Story 2.2 (Phase 1) turned
+  // `RiskSignal` into a real discriminated union (`llm-judgment` now exists
+  // as a sibling shape with no `type`/`value`; Story 2.3's `ingested` family
+  // still to come), and this same loop must never render a non-deterministic
+  // signal through this one unfiltered (Boundaries & Constraints, epics.md
+  // Phase 3 AC). A Node with none (or every entry filtered out) renders no
+  // strip at all — never an empty row — enforced by the `.length > 0` gate
+  // below, not by this filter alone. Review round (patch): also drops a
+  // repeat `type` defensively — see the signal-strip JSX's own comment below
+  // for why. Written as an explicit type-predicate (rather than a plain
+  // boolean-returning callback) so `deterministicSignals` below is actually
+  // typed as `DeterministicRiskSignal[]`, not still the wider `RiskSignal[]`
+  // union — `Array.prototype.filter` only narrows the element type with a
+  // predicate, and without it `signal.type`/`signal.value` below would no
+  // longer compile now that not every union member has those fields.
+  // Review round (patch): typed against `DeterministicRiskSignalType`
+  // specifically (not a bare `Set<string>`) — this Set exists purely to
+  // guard `signal.type` below, so the narrower type catches a typo/drift
+  // against that union at compile time instead of silently accepting any
+  // string.
+  const seenDeterministicSignalTypes = new Set<DeterministicRiskSignalType>();
+  const deterministicSignals = node.riskSignals.filter((signal): signal is DeterministicRiskSignal => {
+    if (signal.family !== 'deterministic' || seenDeterministicSignalTypes.has(signal.type)) {
+      return false;
+    }
+    seenDeterministicSignalTypes.add(signal.type);
+    return true;
+  });
   return (
     <div
       className="code-map__node"

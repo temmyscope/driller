@@ -335,13 +335,18 @@ export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
 
 // ---------------------------------------------------------------------------
 // Story 2.1 (Phase 1): deterministic risk signals (FR7, AD-9 corrected).
+// Story 2.2 (Phase 1): `RiskSignal` splits into a discriminated union —
+// `DeterministicRiskSignal` (renamed from the former single `RiskSignal`
+// interface, no field changes) and the new `LlmJudgmentRiskSignal` — so the
+// qualitative `'llm-judgment'` family (FR8) has a shape to persist into and
+// render, distinct from a deterministic signal's mandatory numeric `value`.
 //
-// `RiskSignalFamily` is deliberately its own (currently single-member) union
-// rather than a bare string literal inlined on `RiskSignal` — Epic 2's other
-// two families (`llm-judgment`, Story 2.2; `ingested`, Story 2.3) extend this
-// union as sibling members later, never redefine/compete with it (Consistency
-// Conventions). `DeterministicRiskSignalType` is likewise extensible: Phase 2
-// adds `'test-coverage-gap'` as a fifth sibling member.
+// `RiskSignalFamily` is deliberately its own union rather than a bare string
+// literal inlined on each signal interface — Epic 2's third family
+// (`ingested`, Story 2.3) extends this union as a sibling member later,
+// never redefine/compete with it (Consistency Conventions).
+// `DeterministicRiskSignalType` is likewise extensible: Phase 2 adds
+// `'test-coverage-gap'` as a fifth sibling member.
 //
 // Every `RiskSignal` carries its own `location` — for this phase, always the
 // owning Node's own `{file, startLine, endLine}` range (a duplicate of the
@@ -360,8 +365,20 @@ export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
 // unchanged repo state yields byte-identical `riskSignals` (FR7).
 // ---------------------------------------------------------------------------
 
-/** The Risk Overlay's three signal families (Epic 2) — this phase implements only `'deterministic'`. */
-export type RiskSignalFamily = 'deterministic';
+/** The Risk Overlay's three signal families (Epic 2) — this phase adds `'llm-judgment'`; `'ingested'` (Story 2.3) is still to come. */
+export type RiskSignalFamily = 'deterministic' | 'llm-judgment';
+
+/**
+ * Review round (patch): factored out of `DeterministicRiskSignal`/
+ * `LlmJudgmentRiskSignal` — before this phase there was one `RiskSignal`
+ * interface with one `location` field; the union split would otherwise leave
+ * two independent inline copies of this same shape to keep in sync by hand.
+ */
+export interface RiskSignalLocation {
+  file: string;
+  startLine: number;
+  endLine: number;
+}
 
 /**
  * Deterministic risk signal types (Story 2.1 Phase 1; Phase 2 adds
@@ -388,13 +405,56 @@ export type DeterministicRiskSignalType =
  * an undefined/null `value` standing in for "absent" (AD-13's explicit-
  * result-state pattern applied at the array level: absence is expressed by
  * omission from the array, not by a placeholder entry).
+ *
+ * Story 2.2 (Phase 1): this was formerly the single `RiskSignal` interface,
+ * renamed here as part of `RiskSignal`'s split into a discriminated union —
+ * every already-shipped Story 2.1 consumer keeps behaving identically
+ * against this renamed shape, though two call sites (`buildRiskSignals`'s
+ * return type in `services/graph-service/index.ts`, and the import there)
+ * needed a mechanical update to the new name (review round: the original
+ * comment overstated this as needing zero consumer changes). The only real
+ * field change is `family`'s type narrowing from the old `RiskSignalFamily`
+ * union to the literal `'deterministic'`, required for discriminant
+ * narrowing — not a new/removed field.
  */
-export interface RiskSignal {
-  family: RiskSignalFamily;
+export interface DeterministicRiskSignal {
+  family: 'deterministic';
   type: DeterministicRiskSignalType;
   value: number;
-  location: { file: string; startLine: number; endLine: number };
+  location: RiskSignalLocation;
 }
+
+/**
+ * Story 2.2 (Phase 1): the qualitative LLM-judgment risk signal (FR8) — a
+ * free-text `judgment` in place of a deterministic signal's mandatory
+ * numeric `value`, and no `type` (deterministic-only; see
+ * `DeterministicRiskSignalType`). No `model`/`generatedAt` provenance here —
+ * consistent with `CodeMapNode.summary`'s own wire shape (a bare `string`,
+ * its provenance never reaches the renderer either), not an oversight.
+ * `judgment` here corresponds to `NodeRecord.llmJudgment.text` on the
+ * persisted side (`services/graph-service/node-record-store.ts`) — the two
+ * names differ deliberately (this is the wire/render-facing shape, that one
+ * follows `summary`'s own provenance-object naming) but describe the same
+ * value; whoever bridges the two (Phase 2) reads `record.llmJudgment.text`
+ * into this field's `judgment`. This phase only defines the shape — no code
+ * yet produces one (Phase 2's job) or renders one (Phase 3's job); nothing
+ * in this codebase can construct an `LlmJudgmentRiskSignal` yet.
+ */
+export interface LlmJudgmentRiskSignal {
+  family: 'llm-judgment';
+  judgment: string;
+  location: RiskSignalLocation;
+}
+
+/**
+ * The Risk Overlay's per-signal shape (Epic 2) — a discriminated union on
+ * `family`, so each family's own fields (a deterministic signal's `value`
+ * vs. an LLM-judgment signal's `judgment`) are only ever accessed after
+ * narrowing, never assumed present across the whole union. Two families so
+ * far; `'ingested'` (Story 2.3) extends this union as a third sibling member
+ * later, never redefine/compete with the two here.
+ */
+export type RiskSignal = DeterministicRiskSignal | LlmJudgmentRiskSignal;
 
 export interface CodeMapNode {
   /** `qualified_name` — stable node identity, shown verbatim/monospace (Always: no summary content yet). */

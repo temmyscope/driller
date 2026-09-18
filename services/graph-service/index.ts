@@ -128,6 +128,7 @@ import {
 import type {
   CloudBackend,
   CodeMapNode,
+  DeterministicRiskSignal,
   GraphServiceBackendSwitchedRequest,
   GraphServiceCodeMapMessage,
   GraphServiceGetCodeMapRequest,
@@ -142,7 +143,6 @@ import type {
   HardwareAdvisoryReason,
   ModelStatusMessage,
   RegenerateNodeResult,
-  RiskSignal,
   SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 // Type-only import: pulls in Electron's ambient `process.parentPort`
@@ -933,9 +933,9 @@ function buildRiskSignals(
   node: CodeMapNodeWithSignalSources,
   adjacency: BidirectionalAdjacency,
   coverage: LcovCoverage | undefined,
-): RiskSignal[] {
+): DeterministicRiskSignal[] {
   const location = { file: node.file, startLine: node.startLine, endLine: node.endLine };
-  const signals: RiskSignal[] = [];
+  const signals: DeterministicRiskSignal[] = [];
 
   if (node.complexity !== undefined) {
     signals.push({ family: 'deterministic', type: 'complexity', value: node.complexity, location });

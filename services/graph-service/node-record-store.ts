@@ -7,14 +7,16 @@
  * `CodeMapNode.id`, never a line number or array index).
  *
  * `NodeRecord` is intentionally extensible per future signal family — this
- * phase defines only `summary` (Story 1.5 Phase 2's job to actually write),
- * but the write model below already treats every top-level key as an
- * independently-mergeable signal family per AD-20: `mergeNodeRecord` only
- * ever shallow-merges the top-level keys present in `partial` into the
- * existing record, so a write to one family (e.g. a future `hotspot` or
- * `llmJudgment` field) never touches another (e.g. `summary`), and a
- * structural re-index — which never calls this module with anything but
- * fields it owns — can never clear a previously-written one.
+ * phase defines `summary` (Story 1.5 Phase 2's job to actually write) and
+ * `llmJudgment` (Story 2.2 Phase 1 adds the field/shape; Phase 2 is the job
+ * that actually writes it — this phase writes/reads neither), but the write
+ * model below already treats every top-level key as an independently-
+ * mergeable signal family per AD-20: `mergeNodeRecord` only ever shallow-
+ * merges the top-level keys present in `partial` into the existing record,
+ * so a write to one family (e.g. `llmJudgment` or a future `hotspot` field)
+ * never touches another (e.g. `summary`), and a structural re-index — which
+ * never calls this module with anything but fields it owns — can never
+ * clear a previously-written one.
  *
  * This module runs inside the Graph Service subprocess (AD-18's process
  * boundary), which has no runtime access to Electron's `app` module (only
@@ -67,6 +69,28 @@ export interface NodeRecord {
   // for a Node that hasn't been evaluated yet — no baseline recorded, or
   // no summary at all.
   stale?: boolean;
+  /**
+   * Story 2.2 (Phase 1): the qualitative LLM-judgment risk signal's
+   * persisted text (FR8) — its own top-level signal family (AD-20), never
+   * nested inside `summary`, mirroring `summary`'s own
+   * text/model/generatedAt provenance shape so the two families stay
+   * structurally consistent. Written only via `mergeNodeRecord`, same as
+   * every other field here. This phase only adds the shape: no code in
+   * this phase writes or reads this field — Phase 2 (generation) is the
+   * first writer, Phase 3 (rendering) the first reader.
+   *
+   * Review round (patch): a single object, not an array or a keyed
+   * collection — at most one judgment ever exists per Node, the same
+   * single-current-value cardinality `summary` already has (never a history
+   * of past judgments). A future regeneration overwrites this field
+   * wholesale via the same atomic merge-write `summary` regeneration
+   * already uses, never appends.
+   */
+  llmJudgment?: {
+    text: string;
+    model: string;
+    generatedAt: string;
+  };
 }
 
 const WRITE_DEBOUNCE_MS = 500;
