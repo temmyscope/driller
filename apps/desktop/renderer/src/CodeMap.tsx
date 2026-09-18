@@ -51,6 +51,7 @@ import {
   Background,
   Controls,
   Handle,
+  Panel,
   Position,
   ReactFlow,
   type Edge as FlowEdge,
@@ -62,7 +63,7 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import type { CodeMapEdge, CodeMapNode } from '@driller/ipc-contracts';
+import type { CodeMapEdge, CodeMapNode, DeterministicRiskSignalType } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
 
 type FetchState =
@@ -384,6 +385,12 @@ type CodeMapFlowNode = FlowNode<
     // & Constraints: never a silent empty summary).
     noSummaryBackendAvailable: boolean;
     cloudSelectedNoKey: boolean;
+    // Story 2.1 (Phase 3): threaded through the same way `noSummaryBackend
+    // Available` already is — a renderer-local, no-persistence/no-IPC
+    // toggle (Boundaries & Constraints) for the whole deterministic
+    // `riskSignals` family's visibility, read by `CodeMapNodeCard` to gate
+    // its signal strip.
+    showDeterministicSignals: boolean;
   },
   'codeMapNode'
 >;
@@ -399,6 +406,7 @@ function layoutNodes(
   adjacency: NodeAdjacency,
   noSummaryBackendAvailable: boolean,
   cloudSelectedNoKey: boolean,
+  showDeterministicSignals: boolean,
 ): CodeMapFlowNode[] {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
   return nodes.map((node, index) => {
@@ -421,6 +429,7 @@ function layoutNodes(
         firstCalleeId: entry?.callees[0],
         noSummaryBackendAvailable,
         cloudSelectedNoKey,
+        showDeterministicSignals,
       },
     };
   });
@@ -502,6 +511,37 @@ function formatCandidateLocation(candidate: { id: string; name: string }): strin
 }
 
 /**
+ * Story 2.1 (Phase 3): one distinct shape glyph per `DeterministicRiskSignalType`
+ * — Accessibility Floor requires shape distinction, never color alone. The
+ * five values are geometrically distinct on sight (●/■/▲/◆/⊘) so Story
+ * 2.2/2.3's own future families can pick their own equally-distinct shapes
+ * without colliding with these (Design Notes). Rendered `aria-hidden` inside
+ * each chip — the chip's own `aria-label` carries the accessible name, not
+ * this glyph.
+ */
+const DETERMINISTIC_SIGNAL_ICONS: Record<DeterministicRiskSignalType, string> = {
+  complexity: '●',
+  'cognitive-complexity': '■',
+  hotspot: '▲',
+  'blast-radius': '◆',
+  'test-coverage-gap': '⊘',
+};
+
+/**
+ * The full, never-truncated signal name for each chip's `aria-label` (e.g.
+ * `"Complexity: 4"`) — the visible chip itself only ever shows icon+number
+ * (Design Notes: mirrors `.code-map__node-affordance`'s own existing
+ * "glyph+abbreviated-text, full meaning in `aria-label`" convention).
+ */
+const DETERMINISTIC_SIGNAL_LABELS: Record<DeterministicRiskSignalType, string> = {
+  complexity: 'Complexity',
+  'cognitive-complexity': 'Cognitive complexity',
+  hotspot: 'Hotspot',
+  'blast-radius': 'Blast radius',
+  'test-coverage-gap': 'Test coverage gap',
+};
+
+/**
  * The custom Node component: identifier verbatim, monospace (Always),
  * plus its one-line summary/pending/coverage-gap state (Story 1.5 Phase 2 —
  * see this file's module doc comment). `tabIndex`/`role="button"`/
@@ -537,6 +577,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     firstCalleeId,
     noSummaryBackendAvailable,
     cloudSelectedNoKey,
+    showDeterministicSignals,
   } = data;
   // Story 1.8 (Phase 4): the "Details" affordance is shown only on a stale
   // Node (Always) — mirroring the caller/callee affordances' own
@@ -544,6 +585,21 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
   // `'pending'`/`'coverage-gap'` (staleness is only meaningful once a
   // summary actually exists).
   const showDetailsAffordance = node.summaryStatus === 'ready' && node.stale === true;
+  // Story 2.1 (Phase 3): filtered, not assumed — Story 2.2/2.3's future
+  // `llm-judgment`/`ingested` families extend `RiskSignal['family']` later,
+  // and this same loop must never render them through this one unfiltered
+  // (Boundaries & Constraints, epics.md Phase 3 AC). A Node with none (or
+  // every entry filtered out) renders no strip at all — never an empty row
+  // — enforced by the `.length > 0` gate below, not by this filter alone.
+  // Review round (patch): also drops a repeat `type` defensively — see the
+  // signal-strip JSX's own comment below for why.
+  const seenDeterministicSignalTypes = new Set<string>();
+  const deterministicSignals = node.riskSignals.filter(
+    (signal) =>
+      signal.family === 'deterministic' &&
+      !seenDeterministicSignalTypes.has(signal.type) &&
+      seenDeterministicSignalTypes.add(signal.type),
+  );
   return (
     <div
       className="code-map__node"
@@ -623,6 +679,54 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
         <p className="code-map__node-summary code-map__node-summary--coverage-gap">
           <span aria-hidden="true">⚠</span> Coverage gap — no summary
         </p>
+      )}
+      {/* Story 2.1 (Phase 3): the deterministic risk-signal strip — one chip
+          per `riskSignals` entry with `family === 'deterministic'`, gated on
+          the map-level toggle (`showDeterministicSignals`) AND on actually
+          having at least one such signal (Boundaries & Constraints: "A Node
+          with `riskSignals: []` ... renders no signal strip at all — never
+          an empty row"). Keyed by `type` — a Node carries at most one
+          `RiskSignal` per `DeterministicRiskSignalType` by construction
+          (AD-9 corrected), but review round (patch): that invariant lives in
+          a different module (`graph-service/index.ts`'s `buildRiskSignals`)
+          this file can't see, so `deterministicSignals` above additionally
+          drops a repeat `type` defensively rather than trusting the
+          invariant blind — a future bug there would otherwise produce
+          colliding React keys here (Blind Hunter + Edge Case Hunter,
+          independently). Each chip: `role="img"` (review round, patch) —
+          `aria-label` alone on a bare, non-interactive `<span>` (implicit
+          role `generic`) is not reliably exposed to assistive technology,
+          unlike `.code-map__node-affordance`'s own `aria-label` convention
+          this comment originally (incorrectly) claimed to mirror — that
+          convention only holds for a real `<button>`, which is unambiguously
+          interactive; `role="img"` is the standard fix for a static
+          icon+label combination (Verification Gap review, confirmed my own
+          pre-review suspicion). `title` (review round, patch) gives sighted
+          mouse users — who never see `aria-label` — the same glyph→meaning
+          mapping via the native hover tooltip (Blind Hunter). An unrecognized
+          `signal.type` (review round, patch: Edge Case Hunter) — e.g. a
+          runtime value from a future backend build that doesn't match this
+          renderer's still-five-member union — falls back to `'?'`/the raw
+          type string rather than rendering a literal "undefined". */}
+      {showDeterministicSignals && deterministicSignals.length > 0 && (
+        <div className="code-map__node-signal-strip">
+          {deterministicSignals.map((signal) => {
+            const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+            const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
+            return (
+              <span
+                key={signal.type}
+                className="code-map__signal-chip"
+                role="img"
+                aria-label={`${label}: ${signal.value}`}
+                title={`${label}: ${signal.value}`}
+              >
+                <span aria-hidden="true">{icon}</span>
+                {signal.value}
+              </span>
+            );
+          })}
+        </div>
       )}
       {/* Caller/callee affordances (Story 1.4): a lightweight alternative to
           precisely clicking a thin edge line — hidden/inert entirely (not
@@ -844,6 +948,15 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // resolved to.
   const [pathQuery, setPathQuery] = useState('');
   const [pathTrace, setPathTrace] = useState<PathTraceState>({ status: 'idle' });
+  // Story 2.1 (Phase 3): the deterministic risk-signal layer's own toggle —
+  // a renderer-local `useState`, no persistence, no IPC round trip (Boundaries
+  // & Constraints, UX-DR21). Defaults to visible/on (EXPERIENCE.md: the
+  // signal strip is part of what a Node "Always shows"). Threaded through
+  // `layoutNodes`/`CodeMapFlowNode.data` the same way `noSummaryBackend
+  // Available` already is, rather than read from context/a prop, since it's
+  // controlled entirely from within this component (the new `Panel` toggle
+  // below).
+  const [showDeterministicSignals, setShowDeterministicSignals] = useState(true);
   // Review fix: correlates a `tracePath` response back to the search that
   // started it — the same generation-id pattern `sourceRequestIdRef` below
   // already applies to `readSourceRange`, and Phase 1's own
@@ -1409,6 +1522,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             adjacency,
             noSummaryBackendAvailable,
             cloudSelectedNoKey,
+            showDeterministicSignals,
           )
         : [],
     [
@@ -1419,6 +1533,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       adjacency,
       noSummaryBackendAvailable,
       cloudSelectedNoKey,
+      showDeterministicSignals,
     ],
   );
   const flowEdges = useMemo(
@@ -2076,6 +2191,46 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         >
           <Background />
           <Controls showInteractive={false} />
+          {/* Story 2.1 (Phase 3): driller's first custom map-level control —
+              a `Panel`-hosted checkbox toggling the whole deterministic
+              `riskSignals` layer's visibility (Boundaries & Constraints:
+              renderer-local `useState`, no persistence, no IPC — only the
+              whole family toggles, never individual signal types within
+              it). Review round (patch): `bottom-right`, not `top-right` —
+              every other corner is already claimed by pre-existing chrome
+              this phase doesn't touch: `.code-map__history-toolbar`
+              (top-right, Story 1.4), `.code-map__path-trace` (top-left,
+              Story 1.9), and React Flow's own `<Controls>` default
+              (bottom-left) — `top-right` would have sat directly on top of
+              the history toolbar (same corner, same `z-index: 5`, nearly
+              identical offset). `bottom-right` is the one corner nothing
+              else claims. Review round (patch): `role="group"
+              aria-label="Risk signal layer controls"` — this Panel had
+              neither, unlike `.code-map__history-toolbar`'s own
+              `role="toolbar" aria-label=...` a few lines below, which this
+              comment already cites as the chrome convention to match (Blind
+              Hunter). Visible label reads "Risk signals", not "Deterministic
+              signals" — `family: 'deterministic'` is this codebase's own
+              internal taxonomy (distinguishing it from Story 2.2/2.3's
+              future `llm-judgment`/`ingested` families), not end-user
+              copy — a user with no visibility into that distinction
+              couldn't infer what the checkbox does from the internal term
+              alone (Blind Hunter). */}
+          <Panel
+            position="bottom-right"
+            className="code-map__signal-toggle-panel"
+            role="group"
+            aria-label="Risk signal layer controls"
+          >
+            <label className="code-map__signal-toggle">
+              <input
+                type="checkbox"
+                checked={showDeterministicSignals}
+                onChange={(event) => setShowDeterministicSignals(event.target.checked)}
+              />
+              Risk signals
+            </label>
+          </Panel>
         </ReactFlow>
       )}
 

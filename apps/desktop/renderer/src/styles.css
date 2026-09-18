@@ -672,6 +672,37 @@ code,
   outline-offset: 2px;
 }
 
+/* Deterministic risk-signal strip (Story 2.1 Phase 3): one chip per
+   `riskSignals` entry with `family === 'deterministic'`, distinct icon per
+   type — never color alone (Accessibility Floor). Same flex-row/gap/
+   margin-top convention as `.code-map__node-affordances` above — a second,
+   independent row on the card, not a variant of the affordances row. Never
+   rendered at all for a Node with zero deterministic signals (CodeMap.tsx
+   gates this at the JSX level, not with `display: none` here). */
+.code-map__node-signal-strip {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.15rem;
+  flex-wrap: wrap;
+}
+
+/* Same compact-pill padding/border/font-size convention as
+   `.code-map__node-affordance` above — a chip, not a button, so no
+   hover/focus-visible states of its own. */
+.code-map__signal-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
 /* Back/Forward traversal history toolbar (Story 1.4): lightweight chrome
    floated over the map, matching the source panel's close button and the
    Retry button's plain bordered style rather than introducing a new visual
@@ -705,6 +736,35 @@ code,
 }
 
 .code-map__history-toolbar button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Deterministic signal-layer toggle (Story 2.1 Phase 3): driller's first
+   custom `@xyflow/react` `Panel` control — a renderer-local checkbox, no
+   persistence/IPC (Boundaries & Constraints). `@xyflow/react` positions the
+   `Panel` itself (`position="bottom-right"` in CodeMap.tsx — the one corner
+   not already claimed by `.code-map__history-toolbar`/`.code-map__path-trace`/
+   `<Controls>`'s own default, see that Panel's own comment); this only
+   styles its contents, matching the history toolbar's own floated-chrome
+   look (bordered surface, no new visual language). */
+.code-map__signal-toggle-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+}
+
+.code-map__signal-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.code-map__signal-toggle:focus-within {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
