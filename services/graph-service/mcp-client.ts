@@ -58,8 +58,28 @@ export interface IndexRepositoryResult {
 
 /** Result of `fetchCodeMap`'s two `query_graph` calls. */
 export interface CodeMapFetchResult {
-  nodes: CodeMapNode[];
+  nodes: CodeMapNodeWithSignalSources[];
   edges: CodeMapEdge[];
+}
+
+/**
+ * Story 2.1 (Phase 1): `CodeMapNode` plus the raw FR7 complexity/cognitive/
+ * hotspot numbers straight off `CODE_MAP_NODES_QUERY`'s extended `RETURN`
+ * clause — this module's own per-node shape, never the public wire
+ * `RiskSignal` shape itself. This module only ever sources structural graph
+ * data from the backend (same discipline as `summaryStatus: 'pending'`
+ * below); it is `index.ts`'s `handleGetCodeMapRequest` that turns these raw
+ * numbers into `RiskSignal`s (and adds blast radius) and attaches the result
+ * as `CodeMapNode.riskSignals` — `riskSignals` itself is always `[]` here,
+ * a placeholder for the same reason `summaryStatus` is.
+ */
+export interface CodeMapNodeWithSignalSources extends CodeMapNode {
+  /** `n.complexity`, when the backend reported one for this Node's language/grammar. */
+  complexity?: number;
+  /** `n.cognitive`, when the backend reported one for this Node's language/grammar. */
+  cognitiveComplexity?: number;
+  /** `f.change_count` off the Node's own File (via the query's `OPTIONAL MATCH`), when present. */
+  hotspotChangeCount?: number;
 }
 
 const CLIENT_INFO = { name: 'driller-graph-service', version: '0.1.0' };
@@ -259,7 +279,33 @@ const CODE_MAP_EDGE_KINDS: readonly CodeMapEdgeKind[] = ['CALLS', 'IMPORTS', 'US
 // also switched to this same pattern-based form for consistency, even
 // though its single-variable WHERE form already worked — so neither query
 // depends on the WHERE-based label test's positional limitation.
-const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind`;
+// Story 2.1 (Phase 1), AD-9 corrected: extended with two more RETURN
+// columns — `n.complexity`/`n.cognitive` (per-Function/Interface/Type/Module
+// properties the backend's own indexing pass already computes). No new
+// tree-sitter parsing pass (Boundaries & Constraints) — these are
+// exclusively `codebase-memory-mcp`'s own already-computed properties.
+//
+// Review round (patch): an earlier version of this query also tried to pull
+// `File.change_count` (hotspot) in the same call via
+// `OPTIONAL MATCH (f:File {file_path: n.file_path})`. Live-verified against
+// a real codebase-memory-mcp instance (this review round) that this fails
+// outright — `expected token type 86, got 85 at pos 76` — and the
+// WHERE-based equivalent (`OPTIONAL MATCH (f:File) WHERE f.file_path =
+// n.file_path`) also fails (`expected value at pos 85`): this engine's
+// property-map/WHERE evaluator accepts only literal values, never another
+// bound variable's property, so a same-query cross-entity join can never
+// work here. `f.change_count` is fetched via its own standalone
+// `CODE_MAP_FILES_QUERY` below instead and joined in TypeScript by
+// `file_path` (`runFetchCodeMap`) — the same "separate query, join in code"
+// shape this function already uses for nodes+edges, not a new pattern.
+const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind, n.complexity AS complexity, n.cognitive AS cognitive`;
+
+// Story 2.1 (Phase 1), review round: hotspot data, fetched standalone (see
+// `CODE_MAP_NODES_QUERY`'s comment for why it can't be joined in one Cypher
+// call on this engine). No `WHERE`/label-alternation quirk applies — this is
+// a single-label, no-join match, live-verified to return real per-file
+// counts (e.g. a file with 3 recorded changes: `f.change_count` = `"3"`).
+const CODE_MAP_FILES_QUERY = `MATCH (f:File) RETURN f.file_path AS file, f.change_count AS changeCount`;
 
 // Both endpoints are filtered to the same Function/Interface/Type/Module
 // label set as the nodes query (review finding #7): without this, the
@@ -333,7 +379,33 @@ async function runFetchCodeMap(
   }
   const edges = parseCodeMapRows(edgesResult, parseCodeMapEdgeRow, 'Code Map edges');
 
-  return { nodes, edges };
+  // Story 2.1 (Phase 1), review round: hotspot data fetched as its own
+  // third `query_graph` call (see `CODE_MAP_FILES_QUERY`'s comment) and
+  // joined onto `nodes` here in TypeScript by `file_path` — never a same-
+  // query Cypher join, which this engine can't evaluate. A File this query
+  // doesn't return (e.g. no git history) simply leaves every Node in that
+  // file without a `hotspotChangeCount` — never an error, matches this
+  // query's own "malformed/absent row is dropped" discipline.
+  const filesResult = await client.callTool({
+    name: 'query_graph',
+    arguments: { project, query: CODE_MAP_FILES_QUERY },
+  });
+  if (filesResult.isError) {
+    throw new Error(`query_graph (Code Map files) reported an error: ${extractErrorText(filesResult)}`);
+  }
+  const fileRows = parseCodeMapRows(filesResult, parseCodeMapFileRow, 'Code Map files');
+  const hotspotChangeCountByFile = new Map<string, number>();
+  for (const row of fileRows) {
+    if (row.changeCount !== undefined) {
+      hotspotChangeCountByFile.set(row.file, row.changeCount);
+    }
+  }
+  const nodesWithHotspot = nodes.map((node) => ({
+    ...node,
+    hotspotChangeCount: hotspotChangeCountByFile.get(node.file),
+  }));
+
+  return { nodes: nodesWithHotspot, edges };
 }
 
 /**
@@ -578,7 +650,27 @@ function toLineNumber(value: unknown): number | undefined {
   return parsed !== undefined && isFiniteNonNegative(parsed) && parsed >= 1 ? parsed : undefined;
 }
 
-function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNode | undefined {
+/**
+ * Story 2.1 (Phase 1): parses one of the extended query's FR7 signal-source
+ * columns (`complexity`/`cognitive`/`hotspotChangeCount`) — unlike
+ * `toLineNumber`, these are never required: a present-but-unparseable value
+ * (missing, non-numeric, negative, non-finite) is dropped for that
+ * Node/signal only (Boundaries & Constraints — "never crashes the row"),
+ * distinct from a bad `startLine`/`endLine`, which drops the whole row.
+ * Same numeric-looking-string tolerance as `toLineNumber` (this engine's
+ * `query_graph` returns numeric columns as quoted strings).
+ */
+function toOptionalSignalValue(value: unknown): number | undefined {
+  let parsed: number | undefined;
+  if (typeof value === 'number') {
+    parsed = value;
+  } else if (typeof value === 'string' && value.trim().length > 0) {
+    parsed = Number(value);
+  }
+  return parsed !== undefined && isFiniteNonNegative(parsed) ? parsed : undefined;
+}
+
+function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNodeWithSignalSources | undefined {
   const { id, name, file, kind } = row;
   const startLine = toLineNumber(row.startLine);
   const endLine = toLineNumber(row.endLine);
@@ -602,8 +694,23 @@ function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNode | undefin
   // re-derives the real per-Node status (coverage-gap/ready/pending) from
   // the coverage-gap set and the Node record store before this ever reaches
   // main/the renderer — see `annotateNodesWithSummaryState` in
-  // `summary-generator.ts`.
-  return { id, name, file, startLine, endLine, kind: kind as CodeMapNodeKind, summaryStatus: 'pending' };
+  // `summary-generator.ts`. `riskSignals: []` is the equivalent placeholder
+  // for Story 2.1 (Phase 1) — see `CodeMapNodeWithSignalSources`'s doc
+  // comment. `hotspotChangeCount` is not set here — it's not one of this
+  // query's own columns (review round: see `CODE_MAP_FILES_QUERY`'s
+  // comment) — `runFetchCodeMap` joins it on afterward by `file`.
+  return {
+    id,
+    name,
+    file,
+    startLine,
+    endLine,
+    kind: kind as CodeMapNodeKind,
+    summaryStatus: 'pending',
+    riskSignals: [],
+    complexity: toOptionalSignalValue(row.complexity),
+    cognitiveComplexity: toOptionalSignalValue(row.cognitive),
+  };
 }
 
 function parseCodeMapEdgeRow(row: Record<string, string>): CodeMapEdge | undefined {
@@ -621,6 +728,20 @@ function parseCodeMapEdgeRow(row: Record<string, string>): CodeMapEdge | undefin
   }
 
   return { source, target, kind: kind as CodeMapEdgeKind };
+}
+
+/**
+ * Story 2.1 (Phase 1), review round: parses `CODE_MAP_FILES_QUERY`'s rows —
+ * `file` is required (an unnamed file is useless for the join), `changeCount`
+ * is optional (a File with no recorded git history reports none) via the
+ * same tolerant `toOptionalSignalValue` every other FR7 signal column uses.
+ */
+function parseCodeMapFileRow(row: Record<string, string>): { file: string; changeCount?: number } | undefined {
+  const { file } = row;
+  if (typeof file !== 'string' || file.length === 0) {
+    return undefined;
+  }
+  return { file, changeCount: toOptionalSignalValue(row.changeCount) };
 }
 
 /**

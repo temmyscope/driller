@@ -225,6 +225,112 @@ function resolveEntryNode(nodes: PathTraceNode[], query: string): EntryResolutio
   return { kind: 'not-found' };
 }
 
+// ---------------------------------------------------------------------------
+// Story 2.1 (Phase 1): blast radius (FR7, AD-9 corrected).
+//
+// `computeBlastRadius` mirrors `traceCallPath`'s BFS shape (same `visited`
+// Set keyed by Node id, same dangling-edge exclusion via a `validNodeIds`
+// check) but differs in exactly the ways the PRD's "reachable from, or
+// dependent on" framing requires: both edge directions are unioned (never
+// outgoing-only), every edge kind counts (never filtered to `CALLS` only),
+// and the result is a plain reachable-Node count rather than an ordered id
+// path — Phase 3's UI only needs a magnitude, never the route.
+// ---------------------------------------------------------------------------
+
+/** Reusable adjacency built once by `buildBidirectionalAdjacency`, consumed by `computeBlastRadiusFromAdjacency`. */
+export interface BidirectionalAdjacency {
+  validNodeIds: Set<string>;
+  neighborsById: Map<string, string[]>;
+}
+
+/**
+ * Builds the bidirectional adjacency `computeBlastRadiusFromAdjacency` walks
+ * — both edge directions unioned (PRD: "reachable from, or dependent on"),
+ * unlike `traceCallPath`'s single-direction outgoing-`CALLS`-only walk.
+ * Dangling-edge-safe: an edge endpoint with no corresponding entry in
+ * `nodes` is never added.
+ *
+ * Review round (patch): extracted out of what was `computeBlastRadius` so a
+ * caller computing blast radius for every Node in a Code Map (its only
+ * caller today, `graph-service/index.ts`) builds this once — O(V+E) — and
+ * reuses it across all N `computeBlastRadiusFromAdjacency` calls, instead of
+ * the O(N·(V+E)) that rebuilding it inside a per-Node call produced.
+ */
+export function buildBidirectionalAdjacency(nodes: PathTraceNode[], edges: PathTraceEdge[]): BidirectionalAdjacency {
+  const validNodeIds = new Set(nodes.map((node) => node.id));
+  const neighborsById = new Map<string, string[]>();
+  const addDirectedNeighbor = (from: string, to: string): void => {
+    if (!validNodeIds.has(from) || !validNodeIds.has(to)) {
+      return;
+    }
+    const existing = neighborsById.get(from);
+    if (existing) {
+      existing.push(to);
+    } else {
+      neighborsById.set(from, [to]);
+    }
+  };
+  for (const edge of edges) {
+    addDirectedNeighbor(edge.source, edge.target);
+    addDirectedNeighbor(edge.target, edge.source);
+  }
+  return { validNodeIds, neighborsById };
+}
+
+/**
+ * Computes `nodeId`'s blast radius against a pre-built `adjacency`: the
+ * count of other Nodes reachable from it, or that depend on it.
+ *
+ * Cycle-safe (Always): a `visited` Set-keyed-by-id dedup, mirroring
+ * `traceCallPath`'s own, so a circular edge (A -> B -> A) terminates instead
+ * of looping, and every Node is counted at most once. The origin `nodeId`
+ * itself is excluded from its own count (Always) — an isolated Node with no
+ * edges at all, or a `nodeId` not present in `adjacency.validNodeIds`, both
+ * correctly return `0`.
+ *
+ * Pure (Always, mirrors `traceCallPath`): no I/O, no dependency on
+ * `@driller/ipc-contracts` or any other package.
+ */
+export function computeBlastRadiusFromAdjacency(adjacency: BidirectionalAdjacency, nodeId: string): number {
+  if (!adjacency.validNodeIds.has(nodeId)) {
+    return 0;
+  }
+
+  const visited = new Set<string>([nodeId]);
+  const queue: string[] = [nodeId];
+  while (queue.length > 0) {
+    // Non-null: `queue.length > 0` just guarded this shift.
+    const current = queue.shift()!;
+    const neighbors = adjacency.neighborsById.get(current);
+    if (!neighbors) {
+      continue;
+    }
+    for (const neighbor of neighbors) {
+      if (visited.has(neighbor)) {
+        // Dedup — cycle safety, mirrors `traceCallPath`'s own dedup.
+        continue;
+      }
+      visited.add(neighbor);
+      queue.push(neighbor);
+    }
+  }
+
+  // Origin excluded from its own count (Always).
+  return visited.size - 1;
+}
+
+/**
+ * Single-shot convenience wrapper (`buildBidirectionalAdjacency` +
+ * `computeBlastRadiusFromAdjacency`) for a caller computing blast radius for
+ * just one Node — e.g. ad hoc/test use. A caller computing it for many
+ * Nodes against the same `nodes`/`edges` (the Code Map fetch path) should
+ * call the two underlying functions directly and reuse one adjacency build,
+ * not call this once per Node.
+ */
+export function computeBlastRadius(nodes: PathTraceNode[], edges: PathTraceEdge[], nodeId: string): number {
+  return computeBlastRadiusFromAdjacency(buildBidirectionalAdjacency(nodes, edges), nodeId);
+}
+
 /**
  * Deterministic sort order for a multi-match candidate set (Always) —
  * ascending by `id`. Generalized from Phase 1/2's `firstBySortedId`

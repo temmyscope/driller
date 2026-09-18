@@ -119,7 +119,12 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import { traceCallPath } from '@driller/graph-contracts';
+import {
+  buildBidirectionalAdjacency,
+  computeBlastRadiusFromAdjacency,
+  traceCallPath,
+  type BidirectionalAdjacency,
+} from '@driller/graph-contracts';
 import type {
   CloudBackend,
   CodeMapNode,
@@ -137,6 +142,7 @@ import type {
   HardwareAdvisoryReason,
   ModelStatusMessage,
   RegenerateNodeResult,
+  RiskSignal,
   SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 // Type-only import: pulls in Electron's ambient `process.parentPort`
@@ -145,7 +151,7 @@ import type {
 import type {} from 'electron';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
-import { fetchCodeMap, indexRepository } from './mcp-client';
+import { fetchCodeMap, indexRepository, type CodeMapNodeWithSignalSources } from './mcp-client';
 import {
   flushNodeRecordStore,
   getAllNodeRecords,
@@ -816,8 +822,53 @@ async function handleGetCodeMapRequest(): Promise<void> {
       file: toProjectRelativePosixPath(projectRoot, node.file, 'Code Map node file'),
     }));
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
-    postCodeMapMessage({ type: 'graphService:codeMap', nodes: annotatedNodes, edges });
-    void startSummaryGenerationForProject(normalizedNodes);
+    // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
+    // live on every fetch — never persisted to `node-record-store.ts`
+    // (Boundaries & Constraints; unlike `summary` there's no expensive state
+    // here to protect from re-index). Adjacency for blast radius is built
+    // once here (review round, patch) and reused across every Node's BFS —
+    // `computeBlastRadius` used to be called per-Node, rebuilding it from
+    // scratch every time (O(N·(V+E)) instead of O(V+E)).
+    const blastRadiusAdjacency = buildBidirectionalAdjacency(normalizedNodes, edges);
+    // Built off `normalizedNodes` (not `annotatedNodes`, whose declared
+    // return type is plain `CodeMapNode[]` and has therefore lost the raw
+    // complexity/cognitive/hotspot fields `annotateNodesWithSummaryState`'s
+    // `{...node, ...}` spread carries through at runtime but not in its
+    // static type) — both `.map()` calls preserve order/length 1:1 off the
+    // same `nodes`, so a parallel index lookup here is safe and avoids
+    // building an id-keyed Map for no reason.
+    const nodesWithRiskSignals: CodeMapNode[] = annotatedNodes.map((node, i) => {
+      // Review round (patch): `node` is runtime-shaped
+      // `CodeMapNodeWithSignalSources` (the spread above preserves the raw
+      // complexity/cognitiveComplexity/hotspotChangeCount fields even though
+      // `annotateNodesWithSummaryState`'s declared return type doesn't carry
+      // them) — destructured out explicitly so they never leak onto the wire
+      // `CodeMapNode` alongside the `riskSignals` array that now represents
+      // them properly.
+      const {
+        complexity: _complexity,
+        cognitiveComplexity: _cognitiveComplexity,
+        hotspotChangeCount: _hotspotChangeCount,
+        ...cleanNode
+      } = node as CodeMapNodeWithSignalSources;
+      return {
+        ...cleanNode,
+        riskSignals: buildRiskSignals(normalizedNodes[i]!, blastRadiusAdjacency),
+      };
+    });
+    postCodeMapMessage({ type: 'graphService:codeMap', nodes: nodesWithRiskSignals, edges });
+    // Review round (patch): passes `nodesWithRiskSignals`, not
+    // `normalizedNodes` — `startSummaryGenerationForProject` caches its
+    // argument into the module-level `activeCodeMapNodes` (its own doc
+    // comment), which `regenerateNode`'s handler later reads and returns
+    // as-is for any Node it doesn't regenerate fields on. Passing the
+    // pre-signal `normalizedNodes` left `activeCodeMapNodes` — and therefore
+    // every `regenerateNode` response — carrying `riskSignals: []` forever,
+    // silently reverting a Node's real signals the moment its summary was
+    // regenerated. `nodesWithRiskSignals` is a strict superset of
+    // `normalizedNodes`'s fields (via `annotatedNodes`), so this is safe for
+    // every existing consumer of `activeCodeMapNodes`.
+    void startSummaryGenerationForProject(nodesWithRiskSignals);
     // Story 1.8 Phase 2: staleness detection runs on every Code Map fetch
     // (Design Notes — this app has no separate incremental-refresh
     // mechanism, so this *is* "the next index refresh"), fire-and-forget
@@ -830,6 +881,63 @@ async function handleGetCodeMapRequest(): Promise<void> {
       message: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/**
+ * Story 2.1 (Phase 1): builds one Node's `riskSignals` array (FR7, AD-9
+ * corrected). `complexity`/`cognitive-complexity`/`hotspot` are surfaced only
+ * when the backend actually reported a value for this Node/File (Boundaries
+ * & Constraints — "no complexity data for a Node... not an error", I/O
+ * matrix) — each is simply omitted from the array rather than included with
+ * a placeholder value. `blast-radius` is the one signal always present, even
+ * at value `0` for an isolated Node with no edges at all (I/O matrix),
+ * computed via `@driller/graph-contracts`'s cycle-safe
+ * `computeBlastRadiusFromAdjacency` against a pre-built `adjacency` — the
+ * Code Map's already-fetched edges, never a second graph fetch.
+ *
+ * `location` duplicates `node`'s own `{file, startLine, endLine}` on every
+ * signal (Design Notes) — degenerate here, but required by the Consistency
+ * Conventions table since later signal families may report a narrower
+ * location than their owning Node's full range.
+ *
+ * Pushed in a fixed field order (complexity, cognitive-complexity, hotspot,
+ * blast-radius) so `riskSignals` is byte-identical across repeated fetches
+ * of unchanged repo state (FR7 reproducibility) — no wall-clock, random, or
+ * non-deterministic ordering input anywhere in this function. (Live-verified
+ * this review round: `query_graph`'s row order is stable across repeated
+ * identical calls against an unchanged index, so this ordering claim holds
+ * in practice, not just by construction.)
+ *
+ * `adjacency` is built once per `getCodeMap` fetch by the caller (review
+ * round, patch — see `handleGetCodeMapRequest`) and passed in rather than
+ * rebuilt per Node.
+ */
+function buildRiskSignals(node: CodeMapNodeWithSignalSources, adjacency: BidirectionalAdjacency): RiskSignal[] {
+  const location = { file: node.file, startLine: node.startLine, endLine: node.endLine };
+  const signals: RiskSignal[] = [];
+
+  if (node.complexity !== undefined) {
+    signals.push({ family: 'deterministic', type: 'complexity', value: node.complexity, location });
+  }
+  if (node.cognitiveComplexity !== undefined) {
+    signals.push({
+      family: 'deterministic',
+      type: 'cognitive-complexity',
+      value: node.cognitiveComplexity,
+      location,
+    });
+  }
+  if (node.hotspotChangeCount !== undefined) {
+    signals.push({ family: 'deterministic', type: 'hotspot', value: node.hotspotChangeCount, location });
+  }
+  signals.push({
+    family: 'deterministic',
+    type: 'blast-radius',
+    value: computeBlastRadiusFromAdjacency(adjacency, node.id),
+    location,
+  });
+
+  return signals;
 }
 
 /**

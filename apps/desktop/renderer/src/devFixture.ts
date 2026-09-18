@@ -113,6 +113,14 @@ export function generateSyntheticCodeMap(nodeCount: number, edgeFanout: number):
       // covers the real/ready and coverage-gap rendering paths too (review
       // finding, Low — see `pickSummaryState`).
       ...pickSummaryState(index),
+      // Story 2.1 (Phase 1): always `[]` here — matches
+      // `CodeMapNode.riskSignals`'s required-array contract (never
+      // omitted/undefined). This phase has no rendering consumer yet (Phase
+      // 3 does); populating this fixture's synthetic edges into a real
+      // blast-radius signal so 10k-Node profiling exercises the signal-strip
+      // path too is deferred to Phase 3, once that path exists to profile
+      // (`deferred-work.md`).
+      riskSignals: [],
     });
   }
 

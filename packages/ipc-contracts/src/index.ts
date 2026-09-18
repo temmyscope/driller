@@ -333,6 +333,58 @@ export type CodeMapEdgeKind = 'CALLS' | 'IMPORTS' | 'USAGE';
  */
 export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
 
+// ---------------------------------------------------------------------------
+// Story 2.1 (Phase 1): deterministic risk signals (FR7, AD-9 corrected).
+//
+// `RiskSignalFamily` is deliberately its own (currently single-member) union
+// rather than a bare string literal inlined on `RiskSignal` — Epic 2's other
+// two families (`llm-judgment`, Story 2.2; `ingested`, Story 2.3) extend this
+// union as sibling members later, never redefine/compete with it (Consistency
+// Conventions). `DeterministicRiskSignalType` is likewise extensible: Phase 2
+// adds `'test-coverage-gap'` as a fifth sibling member.
+//
+// Every `RiskSignal` carries its own `location` — for this phase, always the
+// owning Node's own `{file, startLine, endLine}` range (a duplicate of the
+// Node's own fields, degenerate here but required by the Consistency
+// Conventions table, since later families may report a narrower location
+// than their owning Node's full range).
+//
+// Complexity/cognitive-complexity and hotspot values are sourced only from
+// `codebase-memory-mcp`'s own already-computed per-Node/per-File properties
+// (see mcp-client.ts's extended `CODE_MAP_NODES_QUERY`) — never a new
+// tree-sitter parsing pass or `git log` shell-out. Blast radius is computed
+// live via `@driller/graph-contracts`'s `computeBlastRadius`, a cycle-safe
+// BFS over the Code Map's already-fetched edges. All four are recomputed on
+// every `getCodeMap` fetch — none persisted to `node-record-store.ts`
+// (Boundaries & Constraints), and reproducible: re-fetching against
+// unchanged repo state yields byte-identical `riskSignals` (FR7).
+// ---------------------------------------------------------------------------
+
+/** The Risk Overlay's three signal families (Epic 2) — this phase implements only `'deterministic'`. */
+export type RiskSignalFamily = 'deterministic';
+
+/** Deterministic risk signal types (Story 2.1 Phase 1) — Phase 2 adds `'test-coverage-gap'` as a sibling member, never a competing type. */
+export type DeterministicRiskSignalType =
+  | 'complexity'
+  | 'cognitive-complexity'
+  | 'hotspot'
+  | 'blast-radius';
+
+/**
+ * One deterministic risk signal attached to a `CodeMapNode`. A Node with no
+ * data for a given signal (e.g. zero complexity data for an unsupported
+ * grammar) simply omits that entry from `riskSignals` — never a signal with
+ * an undefined/null `value` standing in for "absent" (AD-13's explicit-
+ * result-state pattern applied at the array level: absence is expressed by
+ * omission from the array, not by a placeholder entry).
+ */
+export interface RiskSignal {
+  family: RiskSignalFamily;
+  type: DeterministicRiskSignalType;
+  value: number;
+  location: { file: string; startLine: number; endLine: number };
+}
+
 export interface CodeMapNode {
   /** `qualified_name` — stable node identity, shown verbatim/monospace (Always: no summary content yet). */
   id: string;
@@ -362,6 +414,13 @@ export interface CodeMapNode {
    * tri-state contract).
    */
   stale?: boolean;
+  /**
+   * FR7's deterministic complexity/cognitive-complexity/hotspot/blast-radius
+   * signals (Story 2.1, Phase 1), recomputed live on every `getCodeMap`
+   * fetch. Never omitted/undefined (AD-13's explicit-result-state pattern) —
+   * a Node with zero risk signals is `riskSignals: []`, not a missing field.
+   */
+  riskSignals: RiskSignal[];
 }
 
 export interface CodeMapEdge {
