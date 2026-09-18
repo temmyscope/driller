@@ -232,7 +232,18 @@ let modelContextPromise:
   | Promise<{ model: LlamaModel; context: LlamaContext; sequence: LlamaContextSequence }>
   | undefined;
 
-async function ensureModelContext(
+/**
+ * Exported (Story 2.2, Phase 2) so `judgment-generator.ts`'s
+ * `createLocalJudge` can share this exact memoized model context rather than
+ * loading a second local model instance — the same "one shared model, many
+ * callers" reasoning `sharedSummaryQueue` already establishes for the job
+ * pool itself. Never called with a different `modelPath` than the one
+ * `startSummaryGenerationForProject`/`startJudgmentGenerationForProject`
+ * already resolve from the same `localModelReady` (index.ts), so this stays
+ * a true once-per-process-lifetime load regardless of which caller triggers
+ * it first.
+ */
+export async function ensureModelContext(
   modelPath: string,
 ): Promise<{ model: LlamaModel; context: LlamaContext; sequence: LlamaContextSequence }> {
   modelContextPromise ??= (async () => {

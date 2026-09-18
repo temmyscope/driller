@@ -662,6 +662,33 @@ export interface SummaryProgressMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 2.2 (Phase 2): LLM-judgment generation progress (FR8, AD-8).
+//
+// A message stream distinct from `SummaryProgressMessage` — never repurposing
+// its `summary`-shaped field for a judgment (Boundaries & Constraints) — but
+// otherwise structurally identical: batched (never one message per Node),
+// carrying the same `path` correlation field for the same reason
+// `SummaryProgressMessage.path` exists (a renderer can reject a stale batch
+// for a project it's since navigated away from). No renderer subscription
+// consumes this yet (Phase 3's job) — `onLlmJudgmentProgress` exists on the
+// preload bridge below but is unused until then.
+// ---------------------------------------------------------------------------
+
+export interface LlmJudgmentProgressUpdate {
+  /** The completed Node's `id` (`qualified_name`). */
+  id: string;
+  /** The generated one-sentence risk judgment. */
+  judgment: string;
+}
+
+export interface LlmJudgmentProgressMessage {
+  type: 'graphService:llmJudgmentProgress';
+  /** Absolute, OS-native path of the project this progress batch is for. */
+  path: string;
+  updated: LlmJudgmentProgressUpdate[];
+}
+
+// ---------------------------------------------------------------------------
 // Story 1.5 (Phase 3): hardware-adequacy advisory (Intent, Boundaries &
 // Constraints).
 //
@@ -922,6 +949,7 @@ export const IpcChannels = {
   shellOpenInEditor: 'shell:openInEditor',
   modelStatus: 'model:status',
   summaryProgress: 'summary:progress',
+  llmJudgmentProgress: 'llmJudgment:progress',
   hardwareAdvisory: 'hardware:advisory',
   settingsGetBackendConfig: 'settings:getBackendConfig',
   settingsSetActiveBackend: 'settings:setActiveBackend',
@@ -967,6 +995,13 @@ export interface DrillerApi {
    * Map is already showing. Returns an unsubscribe function.
    */
   onSummaryProgress: (callback: (message: SummaryProgressMessage) => void) => () => void;
+  /**
+   * Subscribes to batched LLM-judgment generation progress (Story 2.2 Phase
+   * 2, FR8, AD-8) — a stream distinct from `onSummaryProgress`, mirroring it
+   * structurally. No renderer subscriber consumes this yet (Phase 3's job).
+   * Returns an unsubscribe function.
+   */
+  onLlmJudgmentProgress: (callback: (message: LlmJudgmentProgressMessage) => void) => () => void;
   /**
    * Subscribes to the hardware-adequacy advisory stream (Story 1.5 Phase 3)
    * — a non-blocking, informational-only nudge toward the cloud path

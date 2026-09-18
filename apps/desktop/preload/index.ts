@@ -18,6 +18,7 @@ import {
   type EditorPreference,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
+  type LlmJudgmentProgressMessage,
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
@@ -64,6 +65,17 @@ const drillerApi: DrillerApi = {
     ipcRenderer.on(IpcChannels.summaryProgress, listener);
     return () => {
       ipcRenderer.removeListener(IpcChannels.summaryProgress, listener);
+    };
+  },
+
+  // Story 2.2 (Phase 2): forwards batched LLM-judgment generation progress —
+  // one-line subscription mirroring `onSummaryProgress` above. No renderer
+  // consumer subscribes to this yet (Phase 3's job).
+  onLlmJudgmentProgress: (callback: (message: LlmJudgmentProgressMessage) => void) => {
+    const listener = (_event: IpcRendererEvent, message: LlmJudgmentProgressMessage) => callback(message);
+    ipcRenderer.on(IpcChannels.llmJudgmentProgress, listener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.llmJudgmentProgress, listener);
     };
   },
 

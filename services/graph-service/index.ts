@@ -128,7 +128,6 @@ import {
 import type {
   CloudBackend,
   CodeMapNode,
-  DeterministicRiskSignal,
   GraphServiceBackendSwitchedRequest,
   GraphServiceCodeMapMessage,
   GraphServiceGetCodeMapRequest,
@@ -141,8 +140,10 @@ import type {
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   HardwareAdvisoryReason,
+  LlmJudgmentProgressMessage,
   ModelStatusMessage,
   RegenerateNodeResult,
+  RiskSignal,
   SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 // Type-only import: pulls in Electron's ambient `process.parentPort`
@@ -150,12 +151,14 @@ import type {
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
+import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
 import { fetchCodeMap, indexRepository, type CodeMapNodeWithSignalSources } from './mcp-client';
 import {
   flushNodeRecordStore,
   getAllNodeRecords,
+  getNodeRecord,
   initNodeRecordStore,
   mergeNodeRecord,
   setActiveProject,
@@ -256,6 +259,19 @@ let activeSummaryGenerationId = 0;
 // the first one yields at its first await point, guaranteeing it observes
 // this flag already set.
 let activeGenerationRunId: number | null = null;
+
+// The `activeSummaryGenerationId` a `generateJudgments` run is currently in
+// flight for, or `null` when none is (Story 2.2, Phase 2) — the exact same
+// overlapping-call guard shape as `activeGenerationRunId` above, for the same
+// reason: two overlapping `graphService:getCodeMap` requests for the same
+// project must never both reach `generateJudgments`, since both would drive
+// the same shared, memoized model sequence (`sharedSummaryQueue`) at once.
+// Deliberately keyed off the same `activeSummaryGenerationId` counter
+// `activeGenerationRunId` uses, not a separate one — a project switch or
+// re-index must invalidate an in-flight judgment run exactly as readily as
+// an in-flight summary run, and reusing the one counter both already bump on
+// guarantees the two can never disagree about what counts as "superseded."
+let activeJudgmentGenerationRunId: number | null = null;
 
 // The `activeSummaryGenerationId` a `detectStaleness` pass is currently in
 // flight for, or `null` when none is (Story 1.8 Phase 2 review finding,
@@ -372,6 +388,16 @@ function postModelStatus(status: ModelStatusMessage): void {
  * `postModelStatus`.
  */
 function postSummaryProgress(message: SummaryProgressMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/**
+ * Relays batched LLM-judgment generation progress (Story 2.2, Phase 2, AD-8)
+ * — own `type`/channel, same disambiguation convention as
+ * `postSummaryProgress`; never repurposes `SummaryProgressMessage`'s own
+ * `summary`-shaped field (Always).
+ */
+function postLlmJudgmentProgress(message: LlmJudgmentProgressMessage): void {
   process.parentPort?.postMessage(message);
 }
 
@@ -878,6 +904,12 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // `normalizedNodes`'s fields (via `annotatedNodes`), so this is safe for
     // every existing consumer of `activeCodeMapNodes`.
     void startSummaryGenerationForProject(nodesWithRiskSignals);
+    // Story 2.2 Phase 2: judgment generation kicked off the same
+    // fire-and-forget way, alongside the summary/staleness kick-offs — never
+    // delays this response (AD-8). Same `nodesWithRiskSignals` set (not
+    // `normalizedNodes`) for the identical reasoning the comment above
+    // documents for `startSummaryGenerationForProject`.
+    void startJudgmentGenerationForProject(nodesWithRiskSignals);
     // Story 1.8 Phase 2: staleness detection runs on every Code Map fetch
     // (Design Notes — this app has no separate incremental-refresh
     // mechanism, so this *is* "the next index refresh"), fire-and-forget
@@ -928,14 +960,25 @@ async function handleGetCodeMapRequest(): Promise<void> {
  * parsed) `&&` `hasCoverageGap` finds zero covered lines in this Node's
  * range — omitted entirely otherwise, same omission-means-absent convention
  * as the other optional signals above, never a placeholder/zero entry.
+ *
+ * Story 2.2 (Phase 2): reads `getNodeRecord(node.id)?.llmJudgment` — the
+ * Node record store's persisted state, not anything recomputed live — and
+ * pushes one `LlmJudgmentRiskSignal` when present (FR8). Unlike the four
+ * deterministic signals above, this one is NOT recomputed/reproducible by
+ * construction (Epic 2 Context: reproducibility is a deterministic-signal
+ * requirement only) — it reflects whatever `generateJudgments` has
+ * persisted so far, which can differ fetch-to-fetch while generation is
+ * still catching up on a large project. Return type widens from
+ * `DeterministicRiskSignal[]` to the full `RiskSignal[]` union to
+ * accommodate it.
  */
 function buildRiskSignals(
   node: CodeMapNodeWithSignalSources,
   adjacency: BidirectionalAdjacency,
   coverage: LcovCoverage | undefined,
-): DeterministicRiskSignal[] {
+): RiskSignal[] {
   const location = { file: node.file, startLine: node.startLine, endLine: node.endLine };
-  const signals: DeterministicRiskSignal[] = [];
+  const signals: RiskSignal[] = [];
 
   if (node.complexity !== undefined) {
     signals.push({ family: 'deterministic', type: 'complexity', value: node.complexity, location });
@@ -959,6 +1002,11 @@ function buildRiskSignals(
   });
   if (coverage !== undefined && hasCoverageGap(coverage, node.file, node.startLine, node.endLine)) {
     signals.push({ family: 'deterministic', type: 'test-coverage-gap', value: 1, location });
+  }
+
+  const judgment = getNodeRecord(node.id)?.llmJudgment;
+  if (judgment !== undefined) {
+    signals.push({ family: 'llm-judgment', judgment: judgment.text, location });
   }
 
   return signals;
@@ -1286,6 +1334,112 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<v
     // an earlier, now-finishing run's cleanup.
     if (activeGenerationRunId === generationId) {
       activeGenerationRunId = null;
+    }
+  }
+}
+
+/**
+ * Kicks off `generateJudgments` for the Nodes just posted in a
+ * `graphService:codeMap` response (Story 2.2, Phase 2), relaying its batched
+ * progress as `graphService:llmJudgmentProgress` posts. Fire-and-forget from
+ * the caller's perspective (`handleGetCodeMapRequest` never awaits this) —
+ * mirrors `startSummaryGenerationForProject` immediately above in every
+ * structural respect: the same backend-resolution branches (cloud with no
+ * key, or local with a failed/still-loading model attempt, both skip
+ * generation outright — never a silent partial/mixed result), the same
+ * `activeSummaryGenerationId`-keyed supersession checks, and the same
+ * `activeJudgmentGenerationRunId` overlapping-call guard `activeGenerationRunId`
+ * provides for summaries.
+ *
+ * Deliberately does NOT cache `nodes` into `activeCodeMapNodes` itself —
+ * `startSummaryGenerationForProject` already does that from the same call
+ * site (`handleGetCodeMapRequest`), and caching it twice would be redundant;
+ * both are called with the identical `nodesWithRiskSignals` argument.
+ *
+ * No `onHardwareAdvisory` wiring (Never constraint — that reactive nudge is
+ * summary-specific, Story 1.5 Phase 3) and no `detectStaleness` counterpart
+ * (Never constraint — no staleness tracking for judgments this phase).
+ */
+async function startJudgmentGenerationForProject(nodes: CodeMapNode[]): Promise<void> {
+  const generationId = activeSummaryGenerationId;
+  const projectRoot = activeProjectPath;
+  const gapFiles = coverageGapFileSet;
+  const backendConfig = activeBackendConfig;
+
+  if (activeJudgmentGenerationRunId === generationId) {
+    // Already generating judgments for this exact index generation — see
+    // `activeJudgmentGenerationRunId`'s doc comment. Not an error/superseded
+    // case, just a redundant second trigger that must not start a second run.
+    return;
+  }
+  activeJudgmentGenerationRunId = generationId;
+
+  try {
+    let judge: SummarizeFn;
+    let modelName: string;
+
+    if (backendConfig.activeBackend === 'cloud') {
+      if (!backendConfig.cloudApiKey) {
+        // Blocked, not a silent local fallback — mirrors
+        // `startSummaryGenerationForProject`'s own reasoning (this story's
+        // Boundaries & Constraints: "a cloud backend with no key blocks
+        // judgment generation silently, mirroring summary generation's own
+        // established behavior").
+        return;
+      }
+      judge = createCloudJudge(backendConfig.cloudApiKey);
+      // Review round (patch): was `CLOUD_SUMMARY_MODEL` — the wrong constant
+      // (harmless today, since both name the same model, but `judgment-
+      // generator.ts` has its own `CLOUD_JUDGMENT_MODEL` for exactly this
+      // purpose; using the summary one risked silently misreporting
+      // provenance if the two ever diverge).
+      modelName = CLOUD_JUDGMENT_MODEL;
+    } else {
+      if (modelAttempt) {
+        try {
+          await modelAttempt;
+        } catch {
+          // Already reported via `graphService:modelStatus` 'error' — nothing
+          // more to do; there is no model to generate with this session.
+          return;
+        }
+      }
+      if (generationId !== activeSummaryGenerationId || !localModelReady) {
+        return;
+      }
+      judge = createLocalJudge(localModelReady);
+      modelName = localModelReady.model;
+    }
+
+    if (generationId !== activeSummaryGenerationId || !projectRoot) {
+      return;
+    }
+
+    await generateJudgments({
+      projectRoot,
+      nodes,
+      coverageGapFiles: gapFiles,
+      judge,
+      modelName,
+      onProgress: (updated) => {
+        if (generationId === activeSummaryGenerationId) {
+          // `path` lets the renderer filter stale progress by the currently-
+          // open project — same reasoning as `startSummaryGenerationForProject`'s
+          // own `postSummaryProgress` call.
+          postLlmJudgmentProgress({ type: 'graphService:llmJudgmentProgress', path: projectRoot, updated });
+        }
+      },
+      isSuperseded: () => generationId !== activeSummaryGenerationId,
+    });
+  } catch (error) {
+    console.error(
+      `[graph-service] judgment generation failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    // Only clears this run's own slot — same reasoning as
+    // `startSummaryGenerationForProject`'s own `finally`.
+    if (activeJudgmentGenerationRunId === generationId) {
+      activeJudgmentGenerationRunId = null;
     }
   }
 }

@@ -41,6 +41,7 @@ import {
   type GraphServiceRegenerateNodeResultMessage,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
+  type LlmJudgmentProgressMessage,
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
@@ -233,6 +234,18 @@ function sendSummaryProgress(message: SummaryProgressMessage): void {
 }
 
 /**
+ * Relays batched LLM-judgment generation progress (Story 2.2, Phase 2, AD-8)
+ * to the renderer — same destroyed-webContents guard and "own channel,
+ * distinguished by `type`" pattern as `sendModelStatus`/`sendSummaryProgress`.
+ * No renderer subscriber consumes this yet (Phase 3's job).
+ */
+function sendLlmJudgmentProgress(message: LlmJudgmentProgressMessage): void {
+  if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(IpcChannels.llmJudgmentProgress, message);
+  }
+}
+
+/**
  * Relays the hardware-adequacy advisory (Story 1.5 Phase 3) to the renderer
  * — same destroyed-webContents guard and "own channel" pattern as
  * `sendModelStatus`/`sendSummaryProgress`.
@@ -302,6 +315,18 @@ function isSummaryProgressMessage(message: unknown): message is SummaryProgressM
     return false;
   }
   return (message as { type?: unknown }).type === 'graphService:summaryProgress';
+}
+
+/**
+ * True for a `graphService:llmJudgmentProgress` post (Story 2.2, Phase 2) —
+ * distinguished from the other message shapes on this same `parentPort`
+ * channel by `type`, same convention as `isSummaryProgressMessage`.
+ */
+function isLlmJudgmentProgressMessage(message: unknown): message is LlmJudgmentProgressMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:llmJudgmentProgress';
 }
 
 /**
@@ -451,6 +476,7 @@ function spawnGraphService(): void {
         | GraphServicePathTraceResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
+        | LlmJudgmentProgressMessage
         | HardwareAdvisoryMessage,
     ) => {
       if (isCodeMapMessage(message)) {
@@ -475,6 +501,10 @@ function spawnGraphService(): void {
       }
       if (isSummaryProgressMessage(message)) {
         sendSummaryProgress(message);
+        return;
+      }
+      if (isLlmJudgmentProgressMessage(message)) {
+        sendLlmJudgmentProgress(message);
         return;
       }
       if (isHardwareAdvisoryMessage(message)) {
