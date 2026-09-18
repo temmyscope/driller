@@ -363,12 +363,23 @@ export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
 /** The Risk Overlay's three signal families (Epic 2) — this phase implements only `'deterministic'`. */
 export type RiskSignalFamily = 'deterministic';
 
-/** Deterministic risk signal types (Story 2.1 Phase 1) — Phase 2 adds `'test-coverage-gap'` as a sibling member, never a competing type. */
+/**
+ * Deterministic risk signal types (Story 2.1 Phase 1; Phase 2 adds
+ * `'test-coverage-gap'` as a fifth sibling member, never a competing type).
+ *
+ * `'test-coverage-gap'` (Story 2.1 Phase 2, FR7) — a Node whose `[startLine,
+ * endLine]` range has zero covered lines per a hand-parsed
+ * `coverage/lcov.info` (see `services/graph-service/lcov.ts`). This is
+ * distinct from `SummaryStatus`'s unrelated `'coverage-gap'` member, which
+ * means indexing/parse coverage (FR-2/FR-5) — the two are unrelated
+ * concepts that happen to share the word "coverage"; never conflate them.
+ */
 export type DeterministicRiskSignalType =
   | 'complexity'
   | 'cognitive-complexity'
   | 'hotspot'
-  | 'blast-radius';
+  | 'blast-radius'
+  | 'test-coverage-gap';
 
 /**
  * One deterministic risk signal attached to a `CodeMapNode`. A Node with no

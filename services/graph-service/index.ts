@@ -151,6 +151,7 @@ import type {
 import type {} from 'electron';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
+import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
 import { fetchCodeMap, indexRepository, type CodeMapNodeWithSignalSources } from './mcp-client';
 import {
   flushNodeRecordStore,
@@ -830,6 +831,14 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // `computeBlastRadius` used to be called per-Node, rebuilding it from
     // scratch every time (O(N·(V+E)) instead of O(V+E)).
     const blastRadiusAdjacency = buildBidirectionalAdjacency(normalizedNodes, edges);
+    // Story 2.1 (Phase 2): loaded once per fetch (not per-Node) — a
+    // wholly independent data source from the backend-query-derived
+    // signals above (Intent), read fresh every fetch for the same
+    // never-persisted, always-recomputed reasoning as the rest of
+    // `riskSignals` (FR7 reproducibility). `undefined` when
+    // `coverage/lcov.info` doesn't exist or doesn't parse — never thrown,
+    // so it can never fail this fetch (Boundaries & Constraints).
+    const coverage = await loadLcovCoverage(projectRoot);
     // Built off `normalizedNodes` (not `annotatedNodes`, whose declared
     // return type is plain `CodeMapNode[]` and has therefore lost the raw
     // complexity/cognitive/hotspot fields `annotateNodesWithSummaryState`'s
@@ -853,7 +862,7 @@ async function handleGetCodeMapRequest(): Promise<void> {
       } = node as CodeMapNodeWithSignalSources;
       return {
         ...cleanNode,
-        riskSignals: buildRiskSignals(normalizedNodes[i]!, blastRadiusAdjacency),
+        riskSignals: buildRiskSignals(normalizedNodes[i]!, blastRadiusAdjacency, coverage),
       };
     });
     postCodeMapMessage({ type: 'graphService:codeMap', nodes: nodesWithRiskSignals, edges });
@@ -911,8 +920,20 @@ async function handleGetCodeMapRequest(): Promise<void> {
  * `adjacency` is built once per `getCodeMap` fetch by the caller (review
  * round, patch — see `handleGetCodeMapRequest`) and passed in rather than
  * rebuilt per Node.
+ *
+ * Story 2.1 (Phase 2): `coverage` is likewise loaded once per fetch by the
+ * caller and passed in rather than re-read per Node. A `'test-coverage-gap'`
+ * signal (distinct from `SummaryStatus`'s unrelated `'coverage-gap'`) is
+ * pushed only when `coverage !== undefined` (the LCOV file existed and
+ * parsed) `&&` `hasCoverageGap` finds zero covered lines in this Node's
+ * range — omitted entirely otherwise, same omission-means-absent convention
+ * as the other optional signals above, never a placeholder/zero entry.
  */
-function buildRiskSignals(node: CodeMapNodeWithSignalSources, adjacency: BidirectionalAdjacency): RiskSignal[] {
+function buildRiskSignals(
+  node: CodeMapNodeWithSignalSources,
+  adjacency: BidirectionalAdjacency,
+  coverage: LcovCoverage | undefined,
+): RiskSignal[] {
   const location = { file: node.file, startLine: node.startLine, endLine: node.endLine };
   const signals: RiskSignal[] = [];
 
@@ -936,6 +957,9 @@ function buildRiskSignals(node: CodeMapNodeWithSignalSources, adjacency: Bidirec
     value: computeBlastRadiusFromAdjacency(adjacency, node.id),
     location,
   });
+  if (coverage !== undefined && hasCoverageGap(coverage, node.file, node.startLine, node.endLine)) {
+    signals.push({ family: 'deterministic', type: 'test-coverage-gap', value: 1, location });
+  }
 
   return signals;
 }
