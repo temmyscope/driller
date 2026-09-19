@@ -29,6 +29,7 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import type { IngestedRiskSignal } from '@driller/ipc-contracts';
 
 /**
  * One Node's accumulated signals, keyed by content-stable Node ID (AD-19).
@@ -91,6 +92,26 @@ export interface NodeRecord {
     model: string;
     generatedAt: string;
   };
+  /**
+   * Story 2.3 (Phase 2): findings ingested from external PR-review bots
+   * (CodeRabbit, and Phase 3's Qodo) — its own top-level signal family
+   * (AD-20), never nested inside `summary`/`llmJudgment`. Unlike those two
+   * (at most one current value each), this is an array: multiple bots (or
+   * multiple findings from the same bot) can legitimately coexist on one
+   * Node, distinguished by each entry's own `sourceTool` field.
+   *
+   * A write here always replaces every entry for one `sourceTool` across
+   * every Node first, then adds that tool's freshly-ingested findings back
+   * (Always: "each pass for `sourceTool: 'CodeRabbit'` replaces that tool's
+   * prior findings across every Node first" — `services/graph-service/
+   * index.ts`'s `computeIngestionResult` is what implements this two-step
+   * clear-then-write; this field itself enforces nothing about `sourceTool`
+   * uniqueness, exactly like `mergeNodeRecord`'s own shallow top-level merge
+   * enforces nothing about a family's internal shape). Entries from a
+   * different `sourceTool` (e.g. Qodo, once Phase 3 exists) are left
+   * untouched by a CodeRabbit-only pass.
+   */
+  ingestedFindings?: IngestedRiskSignal[];
 }
 
 const WRITE_DEBOUNCE_MS = 500;

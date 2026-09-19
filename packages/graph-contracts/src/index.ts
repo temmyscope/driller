@@ -331,6 +331,65 @@ export function computeBlastRadius(nodes: PathTraceNode[], edges: PathTraceEdge[
   return computeBlastRadiusFromAdjacency(buildBidirectionalAdjacency(nodes, edges), nodeId);
 }
 
+// ---------------------------------------------------------------------------
+// Story 2.3 (Phase 2): file+line-to-enclosing-Node lookup (Design Notes).
+//
+// Lives here, not `services/graph-service` (Design Notes: "transport-
+// agnostic, pure... since Phase 3's Qodo adapter needs the identical
+// lookup — same reasoning as Story 2.1's `buildBidirectionalAdjacency`
+// extraction"). A minimal structural shape, deliberately not
+// `CodeMapNode` (same "no dependency on @driller/ipc-contracts" stance
+// `PathTraceNode`/`PathTraceEdge` already take above) — any caller with
+// compatible `{id, file, startLine, endLine}` values can use it.
+// ---------------------------------------------------------------------------
+
+/** Minimal structural Node shape `findEnclosingNode` needs — see this section's doc comment. */
+export interface EnclosingNodeCandidate {
+  id: string;
+  file: string;
+  startLine: number;
+  endLine: number;
+}
+
+/**
+ * Finds the Node whose `[startLine, endLine]` range on `file` encloses
+ * `line`, returning its `id` — or `undefined` when no Node's range contains
+ * it (a finding on an import line, a blank line, or a file outside the
+ * graph entirely; the I/O matrix: "that finding is dropped, others still
+ * persisted").
+ *
+ * `file` is matched by exact string equality — both `nodes[].file` and the
+ * `file` argument are expected to already be in the same normalized,
+ * POSIX-relative-to-project-root form (AD-19); this function does no path
+ * normalization of its own (pure, no I/O), matching `traceCallPath`'s own
+ * "caller already has compatible data in hand" stance.
+ *
+ * Smallest-range-wins when nested Nodes both contain `line` (Code Map: "a
+ * Node id or undefined... smallest-range-wins when nested Nodes both
+ * contain line") — e.g. an inner arrow function nested inside its outer
+ * function both span the same line; the inner (narrower) one is the more
+ * specific/useful attribution. Ties (equal range width) resolve to whichever
+ * candidate was encountered first in `nodes` — deterministic given a
+ * deterministic input order, though this function applies no ordering
+ * guarantee of its own beyond that.
+ */
+export function findEnclosingNode(
+  nodes: EnclosingNodeCandidate[],
+  file: string,
+  line: number,
+): string | undefined {
+  let best: EnclosingNodeCandidate | undefined;
+  for (const node of nodes) {
+    if (node.file !== file || line < node.startLine || line > node.endLine) {
+      continue;
+    }
+    if (!best || node.endLine - node.startLine < best.endLine - best.startLine) {
+      best = node;
+    }
+  }
+  return best?.id;
+}
+
 /**
  * Deterministic sort order for a multi-match candidate set (Always) —
  * ascending by `id`. Generalized from Phase 1/2's `firstBySortedId`

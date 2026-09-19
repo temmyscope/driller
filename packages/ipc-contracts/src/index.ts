@@ -1000,6 +1000,68 @@ export interface PrBotConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Story 2.3 (Phase 2): ingest CodeRabbit findings via the CodeRabbit CLI.
+//
+// `PrBotIngestionResult` is an explicit result-state union (AD-13's broader
+// pattern), mirroring `RegenerateNodeResult`/`PathTraceResult`'s own shape:
+//  - `'ok'`: the pass completed; `findingCount` is the total number of
+//    findings persisted across every Node this pass (0 is a valid, distinct
+//    outcome from every other state — the tool ran and found nothing).
+//  - `'tool-not-found'`: `cr` isn't on PATH (`ENOENT`) — distinct from
+//    `'error'` (edge-case sweep finding, 2026-09-05).
+//  - `'no-base-ref-resolvable'`: `git-base-ref.ts`'s `resolveDefaultBranch`
+//    found nothing (no upstream, no local `main`/`master`) — `cr` is never
+//    invoked in this case.
+//  - `'error'`: any other failure (a non-`ENOENT` subprocess failure, or
+//    CodeRabbit's JSON not matching the assumed shape) — `message` is safe,
+//    user-facing text; nothing is persisted.
+//
+// `bot` is narrowed to the literal `'codeRabbit'` (not the broader `PrBotId`
+// union) on both the request/reply types and `DrillerApi.runPrBotIngestion`
+// below — this phase only implements the CodeRabbit adapter (Never: "The
+// Qodo/PR-Agent adapter (Phase 3)"); widening to `PrBotId` is that phase's
+// job, not a speculative addition here.
+// ---------------------------------------------------------------------------
+
+/** Result of a PR-bot ingestion pass (Story 2.3, Phase 2) — see this section's doc comment for each state's meaning. */
+export type PrBotIngestionResult =
+  | { status: 'ok'; findingCount: number }
+  | { status: 'tool-not-found' }
+  | { status: 'no-base-ref-resolvable' }
+  | { status: 'error'; message: string };
+
+/**
+ * Message main sends to ask the Graph Service subprocess to run an
+ * ingestion pass for one PR-bot, against the project it most recently
+ * finished indexing (mirrors `GraphServiceGetCodeMapRequest`/
+ * `GraphServiceRegenerateNodeRequest`'s reliance on the Graph Service's own
+ * `activeProject`/`activeProjectPath` state rather than carrying a path of
+ * its own — main independently validates the renderer-supplied
+ * `projectPath` against the currently-open project before ever sending
+ * this).
+ */
+export interface GraphServiceRunIngestionRequest {
+  type: 'graphService:runIngestion';
+  bot: 'codeRabbit';
+}
+
+/**
+ * Message the Graph Service subprocess posts back in response to a
+ * `GraphServiceRunIngestionRequest`, over the same `parentPort` channel as
+ * every other Graph Service message — distinguished by `type`, same
+ * convention as `GraphServiceRegenerateNodeResultMessage`. `bot` echoes the
+ * request so main can settle the exact pending entry this reply is for
+ * (`pendingIngestionResolvers`, keyed by `bot` — the id-keyed `Map` pattern
+ * `pendingRegenerateResolvers` already established, generalized from
+ * `nodeId` to `bot` since there's no Node id here).
+ */
+export interface GraphServiceRunIngestionResultMessage {
+  type: 'graphService:runIngestionResult';
+  bot: 'codeRabbit';
+  result: PrBotIngestionResult;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -1023,6 +1085,7 @@ export const IpcChannels = {
   settingsSetEditorPreference: 'settings:setEditorPreference',
   settingsGetPrBotConfig: 'settings:getPrBotConfig',
   settingsSetPrBotEnabled: 'settings:setPrBotEnabled',
+  prBotRunIngestion: 'prBot:runIngestion',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
   diagnosticLog: 'diagnostic:log',
@@ -1155,6 +1218,18 @@ export interface DrillerApi {
    * separate refetch.
    */
   setPrBotEnabled: (projectPath: string, bot: PrBotId, enabled: boolean) => Promise<PrBotConfig>;
+  /**
+   * Runs one PR-bot's ingestion pass against `projectPath` (Story 2.3, Phase
+   * 2) — this phase's only entry point (Never: "Any UI trigger, entry
+   * point... this phase"; reachable only by calling this directly, e.g. from
+   * the DevTools console, mirroring Story 1.9 Phase 1's `tracePath`).
+   * `projectPath` must be the currently-open project — main rejects a call
+   * for any other path with an explicit `'error'` result rather than
+   * silently operating on the wrong project. `bot` is narrowed to
+   * `'codeRabbit'` only this phase (Never: "The Qodo/PR-Agent adapter
+   * (Phase 3)").
+   */
+  runPrBotIngestion: (projectPath: string, bot: 'codeRabbit') => Promise<PrBotIngestionResult>;
   /**
    * Regenerates exactly one Node's summary on demand (Story 1.8, Phase 4) —
    * this app's first id-keyed mutating IPC round-trip. Scoped to `nodeId`

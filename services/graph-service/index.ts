@@ -136,12 +136,15 @@ import type {
   GraphServicePathTraceResultMessage,
   GraphServiceRegenerateNodeRequest,
   GraphServiceRegenerateNodeResultMessage,
+  GraphServiceRunIngestionRequest,
+  GraphServiceRunIngestionResultMessage,
   GraphServiceShutdownRequest,
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   HardwareAdvisoryReason,
   LlmJudgmentProgressMessage,
   ModelStatusMessage,
+  PrBotIngestionResult,
   RegenerateNodeResult,
   RiskSignal,
   SummaryProgressMessage,
@@ -151,6 +154,7 @@ import type {
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
+import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
@@ -375,6 +379,15 @@ function postRegenerateNodeResultMessage(message: GraphServiceRegenerateNodeResu
  * `postRegenerateNodeResultMessage`/`postCodeMapMessage`.
  */
 function postPathTraceResultMessage(message: GraphServicePathTraceResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/**
+ * Posts a `graphService:runIngestionResult` reply (Story 2.3, Phase 2) —
+ * own `type`/channel, same disambiguation convention as
+ * `postRegenerateNodeResultMessage`/`postPathTraceResultMessage`.
+ */
+function postRunIngestionResultMessage(message: GraphServiceRunIngestionResultMessage): void {
   process.parentPort?.postMessage(message);
 }
 
@@ -604,6 +617,21 @@ function isRegenerateNodeRequest(data: unknown): data is GraphServiceRegenerateN
   }
   const { type, nodeId } = data as { type?: unknown; nodeId?: unknown };
   return type === 'graphService:regenerateNode' && typeof nodeId === 'string' && nodeId.length > 0;
+}
+
+/**
+ * True for a `graphService:runIngestion` request (Story 2.3, Phase 2) —
+ * mirrors `isRegenerateNodeRequest`'s shape; `bot` is narrowed to the
+ * literal `'codeRabbit'` (Never: "The Qodo/PR-Agent adapter (Phase 3)"),
+ * same untrusted-shape treatment every other guard in this file applies to
+ * values crossing this `parentPort` boundary from main.
+ */
+function isRunIngestionRequest(data: unknown): data is GraphServiceRunIngestionRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, bot } = data as { type?: unknown; bot?: unknown };
+  return type === 'graphService:runIngestion' && bot === 'codeRabbit';
 }
 
 /** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
@@ -1198,6 +1226,146 @@ async function computeRegenerateNodeResult(nodeId: string): Promise<RegenerateNo
 }
 
 /**
+ * Handles a `graphService:runIngestion` request (Story 2.3, Phase 2) — this
+ * app's first external-CLI-shelling-out IPC round-trip. Runs exactly one
+ * PR-bot's ingestion pass (this phase: CodeRabbit only) against the most
+ * recently fetched Code Map's Nodes (`activeCodeMapNodes`, the same cached
+ * set `computeRegenerateNodeResult` reads — never a fresh `fetchCodeMap`,
+ * mirroring that handler's own reasoning) and posts back exactly one
+ * `graphService:runIngestionResult` message. Never throws — every failure
+ * path (no project indexed yet, or an unexpected error from
+ * `runCodeRabbitIngestion` itself) is reported as an explicit
+ * `{status: 'error', ...}` `PrBotIngestionResult`, mirroring
+ * `handleRegenerateNodeRequest`'s own top-level try/catch so main's pending
+ * `pendingIngestionResolvers` entry always settles.
+ */
+async function handleRunIngestionRequest(bot: 'codeRabbit'): Promise<void> {
+  let result: PrBotIngestionResult;
+  try {
+    result = await computeIngestionResult();
+  } catch (error) {
+    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+  postRunIngestionResultMessage({ type: 'graphService:runIngestionResult', bot, result });
+}
+
+/**
+ * Runs the CodeRabbit ingestion pass and persists the result (Story 2.3,
+ * Phase 2), via `coderabbit-adapter.ts`'s `runCodeRabbitIngestion` (Never:
+ * "The Qodo/PR-Agent adapter (Phase 3)" — no branch for any other bot
+ * exists here; `bot` isn't threaded through as a parameter since this
+ * phase's caller, `handleRunIngestionRequest`, already knows it's the only
+ * value `isRunIngestionRequest` accepts).
+ *
+ * On a genuine `'ok'` ingestion, persists via the two-step clear-then-write
+ * `mergeNodeRecord` pattern the Always constraint requires: every Node's
+ * existing `ingestedFindings` entries for `CODERABBIT_SOURCE_TOOL` are
+ * stripped first (across the WHOLE project, not just Nodes this pass found
+ * findings for — this is what makes a finding that no longer reproduces
+ * actually disappear, I/O matrix: "the stale finding is gone from
+ * `NodeRecord.ingestedFindings` after this pass"), then the freshly-grouped
+ * findings are appended back per Node. Any entries from a different
+ * `sourceTool` (Qodo, once Phase 3 exists) are left untouched by either
+ * step — the filter only ever removes `CODERABBIT_SOURCE_TOOL` entries, and
+ * the write-back only ever appends onto whatever remains.
+ */
+async function computeIngestionResult(): Promise<PrBotIngestionResult> {
+  const nodes = activeCodeMapNodes;
+  const projectRoot = activeProjectPath;
+  if (!nodes || !projectRoot) {
+    return { status: 'error', message: 'No project has finished indexing yet.' };
+  }
+  // Captured before the (possibly minutes-long) `cr` invocation below, for
+  // the supersession check after it resolves — see that check's own comment
+  // for why `activeSummaryGenerationId` and not a plain `activeProjectPath`
+  // comparison is what's actually needed here.
+  const generationId = activeSummaryGenerationId;
+
+  const ingestion = await runCodeRabbitIngestion(projectRoot, nodes);
+  if (ingestion.status !== 'ok') {
+    // `'tool-not-found'` / `'no-base-ref-resolvable'` / `'error'` are
+    // structurally identical between `CodeRabbitIngestionResult` and
+    // `PrBotIngestionResult` — returned as-is, no reshaping needed.
+    return ingestion;
+  }
+
+  // Review finding (Edge Case Hunter): `runCodeRabbitIngestion` can run for
+  // minutes (a real `cr` invocation), during which the user can switch
+  // projects or trigger a re-index — both reset `activeCodeMapNodes` and
+  // swap `node-record-store.ts`'s module-level records for the (possibly
+  // same) project. `getAllNodeRecords`/`mergeNodeRecord` below operate on
+  // whatever project is CURRENTLY active, not `projectRoot` — without this
+  // check, a stale ingestion pass would silently clear the current
+  // project's own CodeRabbit findings (step 1) and write findings keyed by
+  // the OLD Node ids into the current project's persisted record file
+  // (step 2).
+  //
+  // A plain `activeProjectPath !== projectRoot` check would catch a switch
+  // to a *different* project but not a re-index of the *same* one —
+  // `handleIndexRequest` sets `activeProjectPath = projectPath` on every
+  // successful index, including same-project re-indexes (see
+  // `startStalenessDetectionForProject`'s own doc comment on this exact
+  // bug class, which this reuses rather than re-deriving). `
+  // activeSummaryGenerationId`, by contrast, is unconditionally bumped at
+  // the top of every `handleIndexRequest` call — a different project OR a
+  // re-index of the same one both bump it — so comparing against it catches
+  // both supersession shapes. Abort rather than persist anything once
+  // either has happened underneath this pass.
+  if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
+    return {
+      status: 'error',
+      message: 'The project changed while the ingestion pass was running; discarding its results.',
+    };
+  }
+
+  // Step 1: clear this sourceTool's prior findings across EVERY Node first
+  // (Always) — including Nodes absent from `ingestion.findingsByNodeId`
+  // entirely, since those are exactly the Nodes whose finding no longer
+  // reproduces this pass.
+  const sourceTool = CODERABBIT_SOURCE_TOOL;
+  const allRecords = getAllNodeRecords();
+  for (const [id, record] of Object.entries(allRecords)) {
+    const existing = record.ingestedFindings;
+    if (!existing || existing.length === 0) {
+      continue;
+    }
+    const remaining = existing.filter((finding) => finding.sourceTool !== sourceTool);
+    if (remaining.length === existing.length) {
+      // Nothing from this sourceTool was present — no-op write avoided.
+      continue;
+    }
+    try {
+      mergeNodeRecord(id, { ingestedFindings: remaining });
+    } catch (error) {
+      console.error(
+        `[graph-service] failed to clear prior ${sourceTool} findings for ${id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  // Step 2: write this pass's freshly-grouped findings back, appended onto
+  // whatever remains (another sourceTool's untouched entries) after step 1.
+  let findingCount = 0;
+  for (const [nodeId, signals] of Object.entries(ingestion.findingsByNodeId)) {
+    findingCount += signals.length;
+    const remaining = getNodeRecord(nodeId)?.ingestedFindings ?? [];
+    try {
+      mergeNodeRecord(nodeId, { ingestedFindings: [...remaining, ...signals] });
+    } catch (error) {
+      console.error(
+        `[graph-service] failed to persist ${sourceTool} findings for ${nodeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  return { status: 'ok', findingCount };
+}
+
+/**
  * Kicks off `generateSummaries` for the Nodes just posted in a
  * `graphService:codeMap` response (Story 1.5 Phase 2), relaying its batched
  * progress as `graphService:summaryProgress` posts. Fire-and-forget from the
@@ -1700,6 +1868,14 @@ process.parentPort?.on('message', (event) => {
     // `graphService:regenerateNodeResult` reply asynchronously and never
     // throws (its own top-level try/catch guarantees that).
     void handleRegenerateNodeRequest(event.data.nodeId);
+    return;
+  }
+  if (!isShuttingDown && isRunIngestionRequest(event.data)) {
+    // Fire-and-forget from the message handler's perspective, same as every
+    // other branch here — `handleRunIngestionRequest` posts its own
+    // `graphService:runIngestionResult` reply asynchronously and never
+    // throws (its own top-level try/catch guarantees that).
+    void handleRunIngestionRequest(event.data.bot);
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {

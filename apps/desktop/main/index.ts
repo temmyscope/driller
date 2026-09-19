@@ -39,6 +39,8 @@ import {
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRegenerateNodeResultMessage,
+  type GraphServiceRunIngestionRequest,
+  type GraphServiceRunIngestionResultMessage,
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type LlmJudgmentProgressMessage,
@@ -46,6 +48,7 @@ import {
   type OpenInEditorResult,
   type PathTraceResult,
   type PrBotConfig,
+  type PrBotIngestionResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RegenerateNodeResult,
@@ -150,6 +153,32 @@ const pendingRegenerateResolvers = new Map<
   string,
   { resolve: (result: RegenerateNodeResult) => void; reject: (error: unknown) => void }
 >();
+
+// Story 2.3 (Phase 2): correlates each in-flight `prBot:runIngestion`
+// request to its eventual Graph Service reply — the same id-keyed `Map`
+// shape `pendingRegenerateResolvers` establishes above, keyed by `bot`
+// instead of `nodeId` (there's no Node id here; `bot` plays the identical
+// "what would otherwise collide on a shared single slot" role). Settled by
+// whichever comes first: the 'message' handler below (a genuine
+// `graphService:runIngestionResult` reply for that `bot`), the 'exit'
+// handler (the subprocess died mid-request), or that request's own timeout
+// backstop (`INGESTION_REQUEST_TIMEOUT_MS`).
+const pendingIngestionResolvers = new Map<
+  'codeRabbit',
+  { resolve: (result: PrBotIngestionResult) => void; reject: (error: unknown) => void }
+>();
+
+// An ingestion pass shells out to `cr review --base <branch> --agent`, which
+// itself sends code to CodeRabbit's own vendor cloud to review (Epic 2
+// Context: "transmit diff/code content to their own vendor clouds") — this
+// can genuinely take minutes for a real repo, unlike every other IPC round
+// trip in this file. Sized generously (well past a single-Node regenerate
+// call's own budget) rather than reusing `REGENERATE_NODE_TIMEOUT_MS` or
+// `CODE_MAP_REQUEST_TIMEOUT_MS` outright — `cr`'s real-world latency is
+// unverified in this environment (the CLI isn't installed here; Design
+// Notes), so this value is a reasonable engineering guess pending real-world
+// calibration, not a spec-mandated figure.
+const INGESTION_REQUEST_TIMEOUT_MS = 10 * 60 * 1000 + 10_000;
 
 // Story 1.9 (Phase 1): a single-slot resolver for an in-flight `path:trace`
 // request, mirroring `pendingCodeMapResolve`'s own single-slot shape rather
@@ -296,6 +325,19 @@ function isPathTraceResultMessage(message: unknown): message is GraphServicePath
 }
 
 /**
+ * True for a `graphService:runIngestionResult` reply (Story 2.3, Phase 2) —
+ * distinguished from every other message shape on this same channel by
+ * `type`, same convention as `isRegenerateNodeResultMessage`/
+ * `isPathTraceResultMessage`.
+ */
+function isRunIngestionResultMessage(message: unknown): message is GraphServiceRunIngestionResultMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:runIngestionResult';
+}
+
+/**
  * True for a `graphService:modelStatus` post — distinguished from a
  * `GraphServiceStatusMessage` by `type` the same way `isCodeMapMessage` is,
  * since both status unions use overlapping `state` values (e.g. `'error'`).
@@ -396,6 +438,36 @@ function settleAllPendingRegenerateRequests(message: string): void {
 }
 
 /**
+ * Settles the pending `prBot:runIngestion` request for `bot`, if any (Story
+ * 2.3, Phase 2) — used both by a genuine `graphService:runIngestionResult`
+ * reply and by that request's own timeout backstop, mirroring
+ * `settlePendingRegenerateRequest`'s exact shape (keyed by `bot` instead of
+ * `nodeId`). A no-op if there's no entry for `bot` (already settled by
+ * whichever of those two fired first, or none was ever made).
+ */
+function settlePendingIngestionRequest(bot: 'codeRabbit', result: PrBotIngestionResult): void {
+  const pending = pendingIngestionResolvers.get(bot);
+  if (!pending) {
+    return;
+  }
+  pendingIngestionResolvers.delete(bot);
+  pending.resolve(result);
+}
+
+/**
+ * Settles EVERY still-pending `prBot:runIngestion` request with an explicit
+ * error — used when the Graph Service subprocess exits with one or more
+ * ingestion requests outstanding, mirroring
+ * `settleAllPendingRegenerateRequests`'s exact reasoning.
+ */
+function settleAllPendingIngestionRequests(message: string): void {
+  for (const [bot, pending] of pendingIngestionResolvers) {
+    pendingIngestionResolvers.delete(bot);
+    pending.resolve({ status: 'error', message });
+  }
+}
+
+/**
  * Settles the pending `path:trace` request for `token` (if it's still the
  * one occupying the slot) with an explicit result — used both for a genuine
  * `graphService:pathTraceResult` reply (whose echoed `requestId` becomes
@@ -476,6 +548,7 @@ function spawnGraphService(): void {
         | GraphServiceCodeMapMessage
         | GraphServiceRegenerateNodeResultMessage
         | GraphServicePathTraceResultMessage
+        | GraphServiceRunIngestionResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -495,6 +568,10 @@ function spawnGraphService(): void {
       }
       if (isPathTraceResultMessage(message)) {
         settlePendingPathTraceRequest(message.requestId, message.result);
+        return;
+      }
+      if (isRunIngestionResultMessage(message)) {
+        settlePendingIngestionRequest(message.bot, message.result);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -541,6 +618,11 @@ function spawnGraphService(): void {
       status: 'error',
       message: 'Graph Service exited before the Path Trace could complete.',
     });
+    // Story 2.3 (Phase 2): every still-pending ingestion request is settled
+    // too, same reasoning as the regenerate/Path Trace settle calls above —
+    // the subprocess dying mid-ingestion will never post the
+    // `graphService:runIngestionResult` reply those promises are waiting on.
+    settleAllPendingIngestionRequests('Graph Service exited before the ingestion pass could complete.');
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -711,6 +793,79 @@ function requestRegenerateNode(nodeId: string): Promise<RegenerateNodeResult> {
     settlePendingRegenerateRequest(nodeId, {
       status: 'error',
       message: `Failed to send the regenerate request to the Graph Service: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+
+  return promise;
+}
+
+/**
+ * Relays a PR-bot ingestion request to the Graph Service subprocess (Story
+ * 2.3, Phase 2) and resolves once it replies — mirrors
+ * `requestRegenerateNode`'s overall shape exactly (an id-keyed
+ * `pendingIngestionResolvers` Map, keyed by `bot` instead of `nodeId`; a
+ * second overlapping call for the same `bot` is rejected immediately rather
+ * than queued; its own timeout backstop; a wrapped `postMessage` call).
+ *
+ * `projectPath` must be the currently-open project (`currentProjectPath`,
+ * the same value `sendIndexRequest`'s callers set) — this call is only ever
+ * meaningful against the project the Graph Service actually has indexed and
+ * cached Nodes for (mirrors `requestRegenerateNode`'s implicit reliance on
+ * `activeCodeMapNodes` belonging to whatever project is currently open,
+ * made explicit here since, unlike `regenerateNode`, this IPC call's own
+ * signature carries a `projectPath` the renderer could otherwise pass for a
+ * project that isn't the one actually open).
+ *
+ * Rejects nothing, matching `requestRegenerateNode`'s own framing: every
+ * failure path (no subprocess running or shutting down, a request already
+ * in flight for this `bot`, `projectPath` not the open project, the
+ * subprocess's own error reply, it exiting mid-request, `postMessage` itself
+ * throwing, or the request timing out) resolves to `{status: 'error', ...}`.
+ */
+function requestPrBotIngestion(projectPath: string, bot: 'codeRabbit'): Promise<PrBotIngestionResult> {
+  if (pendingIngestionResolvers.has(bot)) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'An ingestion request for this PR-bot is already in progress.',
+    });
+  }
+  if (!graphService || isGraphServiceShuttingDown) {
+    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+  }
+  if (projectPath !== currentProjectPath) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'The requested project is not the currently open project.',
+    });
+  }
+  const service = graphService;
+
+  const promise = new Promise<PrBotIngestionResult>((resolve, reject) => {
+    pendingIngestionResolvers.set(bot, { resolve, reject });
+  });
+
+  const timeoutTimer = setTimeout(() => {
+    settlePendingIngestionRequest(bot, {
+      status: 'error',
+      message: 'Timed out waiting for the Graph Service to respond to the ingestion request.',
+    });
+  }, INGESTION_REQUEST_TIMEOUT_MS);
+  void promise.finally(() => clearTimeout(timeoutTimer));
+
+  try {
+    service.postMessage({
+      type: 'graphService:runIngestion',
+      bot,
+    } satisfies GraphServiceRunIngestionRequest);
+  } catch (error) {
+    // A synchronous throw here would otherwise leave this bot's resolver set
+    // with nothing left to ever call it, leaking the request forever — same
+    // reasoning as `requestRegenerateNode`'s own matching catch block.
+    settlePendingIngestionRequest(bot, {
+      status: 'error',
+      message: `Failed to send the ingestion request to the Graph Service: ${
         error instanceof Error ? error.message : String(error)
       }`,
     });
@@ -1315,6 +1470,30 @@ function registerIpcHandlers(): void {
         return getPrBotConfig(projectPath);
       }
       return setPrBotEnabled(projectPath, bot, enabled);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Story 2.3 (Phase 2): CodeRabbit ingestion — driller's first external-CLI
+  // subprocess invocation. Reachable only via this direct call this phase
+  // (Never: "Any UI trigger, entry point... this phase" — no renderer
+  // component invokes it yet, mirroring Story 1.9 Phase 1's `path:trace`
+  // being callable only from the DevTools console before its Phase 2 UI).
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.prBotRunIngestion,
+    (_event, projectPath: unknown, bot: unknown): Promise<PrBotIngestionResult> => {
+      // Renderer-supplied values cross the contextBridge boundary untyped at
+      // runtime (same precedent as every other handler's own guard in this
+      // file).
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return Promise.resolve({ status: 'error', message: 'Invalid project path.' });
+      }
+      if (bot !== 'codeRabbit') {
+        return Promise.resolve({ status: 'error', message: 'Unsupported PR-bot.' });
+      }
+      return requestPrBotIngestion(projectPath, bot);
     },
   );
 

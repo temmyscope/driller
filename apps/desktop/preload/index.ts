@@ -24,6 +24,7 @@ import {
   type PathTraceResult,
   type PrBotConfig,
   type PrBotId,
+  type PrBotIngestionResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
@@ -117,6 +118,9 @@ const drillerApi: DrillerApi = {
 
   setPrBotEnabled: (projectPath: string, bot: PrBotId, enabled: boolean): Promise<PrBotConfig> =>
     ipcRenderer.invoke(IpcChannels.settingsSetPrBotEnabled, projectPath, bot, enabled),
+
+  runPrBotIngestion: (projectPath: string, bot: 'codeRabbit'): Promise<PrBotIngestionResult> =>
+    ipcRenderer.invoke(IpcChannels.prBotRunIngestion, projectPath, bot),
 
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),
