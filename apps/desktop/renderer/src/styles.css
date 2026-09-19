@@ -703,6 +703,33 @@ code,
   white-space: nowrap;
 }
 
+/* LLM-judgment risk-signal callout (Story 2.2 Phase 3): the qualitative
+   `family: 'llm-judgment'` signal's own distinct treatment, rendered after
+   `.code-map__node-signal-strip` above. Deliberately never reuses
+   `.code-map__signal-chip`'s rules — dashed border (not solid), a
+   block-level callout box (not an inline pill), icon + full sentence (not
+   icon + bare number) — per this story's own Boundaries & Constraints: "no
+   shared visual language between the two families" (FR8/UX-DR7). Prose,
+   not a short numeric value, so it wraps as a full-width block rather than
+   sitting inline in a chip row. */
+.code-map__llm-judgment {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.3rem;
+  margin: 0.15rem 0 0;
+  padding: 0.25rem 0.45rem;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: transparent;
+  /* Review round (patch): purely protective, no truncation/height policy —
+     an unbroken long token in the model's response (e.g. a leaked
+     identifier) could otherwise overflow the card instead of wrapping. */
+  overflow-wrap: break-word;
+}
+
 /* Back/Forward traversal history toolbar (Story 1.4): lightweight chrome
    floated over the map, matching the source panel's close button and the
    Retry button's plain bordered style rather than introducing a new visual
@@ -749,6 +776,13 @@ code,
    styles its contents, matching the history toolbar's own floated-chrome
    look (bordered surface, no new visual language). */
 .code-map__signal-toggle-panel {
+  display: flex;
+  /* Story 2.2 (Phase 3): a second checkbox (`showLlmJudgment`) joined this
+     Panel — stacked vertically with a small gap rather than the default
+     block-flow zero-gap stacking, so the two independent toggles read as
+     distinct rows, not a single run-on control. */
+  flex-direction: column;
+  gap: 0.3rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;

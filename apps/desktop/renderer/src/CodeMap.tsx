@@ -68,6 +68,7 @@ import type {
   CodeMapNode,
   DeterministicRiskSignal,
   DeterministicRiskSignalType,
+  LlmJudgmentRiskSignal,
 } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
 
@@ -396,6 +397,12 @@ type CodeMapFlowNode = FlowNode<
     // `riskSignals` family's visibility, read by `CodeMapNodeCard` to gate
     // its signal strip.
     showDeterministicSignals: boolean;
+    // Story 2.2 (Phase 3): a second, fully independent renderer-local toggle
+    // for the `'llm-judgment'` family — threaded through identically to
+    // `showDeterministicSignals` above, but never reading/writing it (this
+    // story's own Boundaries & Constraints: "no shared toggle with
+    // showDeterministicSignals").
+    showLlmJudgment: boolean;
   },
   'codeMapNode'
 >;
@@ -412,6 +419,7 @@ function layoutNodes(
   noSummaryBackendAvailable: boolean,
   cloudSelectedNoKey: boolean,
   showDeterministicSignals: boolean,
+  showLlmJudgment: boolean,
 ): CodeMapFlowNode[] {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
   return nodes.map((node, index) => {
@@ -435,6 +443,7 @@ function layoutNodes(
         noSummaryBackendAvailable,
         cloudSelectedNoKey,
         showDeterministicSignals,
+        showLlmJudgment,
       },
     };
   });
@@ -583,6 +592,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     noSummaryBackendAvailable,
     cloudSelectedNoKey,
     showDeterministicSignals,
+    showLlmJudgment,
   } = data;
   // Story 1.8 (Phase 4): the "Details" affordance is shown only on a stale
   // Node (Always) — mirroring the caller/callee affordances' own
@@ -618,6 +628,17 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     seenDeterministicSignalTypes.add(signal.type);
     return true;
   });
+  // Story 2.2 (Phase 3): at most one `'llm-judgment'` signal per Node (Phase
+  // 1/2's own construction invariant — `buildRiskSignals`/the judgment
+  // generator never emit more than one), so `find` (not `filter`) is enough
+  // here — unlike the deterministic strip above, there's no per-type
+  // de-duplication concern since this family carries no `type` discriminant
+  // to de-dupe by. `undefined` when the Node carries none: the callout below
+  // is gated on this being defined, never an empty/placeholder callout
+  // (Boundaries & Constraints).
+  const llmJudgmentSignal = node.riskSignals.find(
+    (signal): signal is LlmJudgmentRiskSignal => signal.family === 'llm-judgment',
+  );
   return (
     <div
       className="code-map__node"
@@ -745,6 +766,34 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
             );
           })}
         </div>
+      )}
+      {/* Story 2.2 (Phase 3): the LLM-judgment risk-signal callout — rendered
+          after the deterministic strip above, gated on its own independent
+          `showLlmJudgment` toggle AND on the Node actually carrying an
+          `'llm-judgment'` signal (never an empty/placeholder callout,
+          Boundaries & Constraints). Deliberately never
+          `.code-map__signal-chip`'s classes — dashed border, icon+full
+          sentence, not a solid-border pill (FR8/UX-DR7: "no shared visual
+          language between the two families"). The visible copy leads with
+          "AI judgment:" so it reads as an inference, never with a
+          deterministic signal's unqualified-measurement confidence (this
+          story's own Intent). Accessibility: the judgment text itself is
+          real, visible text (not an `aria-label`-only summary of icon+number
+          the way the deterministic chips are) — this alone satisfies the
+          "real visible text" branch of the same accessibility treatment
+          those chips established; `title` still mirrors their own convention
+          for sighted mouse users who never see the DOM text node be
+          announced as anything special. Review round (patch): also guards
+          against a blank/whitespace-only `judgment` — Phase 2's own
+          generation logic already treats an empty model response as
+          `'degenerate'` and never persists it, so this can't happen given
+          the current codebase, but the guard is trivial and directly closes
+          the gap between "never an empty/placeholder callout" and what the
+          JSX actually checked (only `!== undefined`, not blank-ness). */}
+      {showLlmJudgment && llmJudgmentSignal !== undefined && llmJudgmentSignal.judgment.trim().length > 0 && (
+        <p className="code-map__llm-judgment" title={`AI judgment: ${llmJudgmentSignal.judgment}`}>
+          <span aria-hidden="true">✦</span> AI judgment: {llmJudgmentSignal.judgment}
+        </p>
       )}
       {/* Caller/callee affordances (Story 1.4): a lightweight alternative to
           precisely clicking a thin edge line — hidden/inert entirely (not
@@ -975,6 +1024,12 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // controlled entirely from within this component (the new `Panel` toggle
   // below).
   const [showDeterministicSignals, setShowDeterministicSignals] = useState(true);
+  // Story 2.2 (Phase 3): the LLM-judgment layer's own toggle — a second,
+  // fully independent renderer-local `useState` (Boundaries & Constraints:
+  // "no shared toggle with showDeterministicSignals"), same no-persistence/
+  // no-IPC treatment and same default-on reasoning as the deterministic
+  // toggle just above.
+  const [showLlmJudgment, setShowLlmJudgment] = useState(true);
   // Review fix: correlates a `tracePath` response back to the search that
   // started it — the same generation-id pattern `sourceRequestIdRef` below
   // already applies to `readSourceRange`, and Phase 1's own
@@ -1541,6 +1596,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             noSummaryBackendAvailable,
             cloudSelectedNoKey,
             showDeterministicSignals,
+            showLlmJudgment,
           )
         : [],
     [
@@ -1552,6 +1608,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       noSummaryBackendAvailable,
       cloudSelectedNoKey,
       showDeterministicSignals,
+      showLlmJudgment,
     ],
   );
   const flowEdges = useMemo(
@@ -2247,6 +2304,24 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                 onChange={(event) => setShowDeterministicSignals(event.target.checked)}
               />
               Risk signals
+            </label>
+            {/* Story 2.2 (Phase 3): the LLM-judgment layer's own checkbox —
+                added to this same Panel rather than a new one (Boundaries &
+                Constraints: "not a second floating Panel" — every remaining
+                map corner is already claimed, per Story 2.1 Phase 3's own
+                review-round finding cited on the Panel above). A fully
+                independent `useState`/handler — never reads or writes
+                `showDeterministicSignals`. Visible label reads "AI
+                judgment", matching the callout's own "AI judgment:" framing
+                (this story's Intent) rather than the internal `'llm-
+                judgment'` family name. */}
+            <label className="code-map__signal-toggle">
+              <input
+                type="checkbox"
+                checked={showLlmJudgment}
+                onChange={(event) => setShowLlmJudgment(event.target.checked)}
+              />
+              AI judgment
             </label>
           </Panel>
         </ReactFlow>
