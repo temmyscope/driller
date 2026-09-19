@@ -45,6 +45,7 @@ import {
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
+  type PrBotConfig,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RegenerateNodeResult,
@@ -60,6 +61,7 @@ import {
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
+import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
@@ -1273,6 +1275,48 @@ function registerIpcHandlers(): void {
     }
     setEditorPreference(value);
   });
+
+  // -------------------------------------------------------------------------
+  // Story 2.3 (Phase 1): per-project PR-bot opt-in settings. Thin delegation
+  // to pr-bot-settings.ts, same "no storage/encryption logic of its own"
+  // shell as every other settings handler above — same untyped-arg
+  // validation discipline as settingsSetEditorPreference's handler
+  // immediately above (Code Map). driller's first per-project settings
+  // channels: both take `projectPath` as their first argument, unlike the
+  // global settingsGet*/settingsSet* channels above.
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.settingsGetPrBotConfig,
+    (_event, projectPath: unknown): PrBotConfig => {
+      // Renderer-supplied value crosses the contextBridge boundary untyped
+      // at runtime (same precedent as every other handler's own guard in
+      // this file) — an invalid projectPath falls back to the same
+      // "nothing enabled" default a project with no persisted entry yet
+      // reads back as, rather than throwing.
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return { codeRabbitEnabled: false, qodoEnabled: false };
+      }
+      return getPrBotConfig(projectPath);
+    },
+  );
+
+  ipcMain.handle(
+    IpcChannels.settingsSetPrBotEnabled,
+    (_event, projectPath: unknown, bot: unknown, enabled: unknown): PrBotConfig => {
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return { codeRabbitEnabled: false, qodoEnabled: false };
+      }
+      if ((bot !== 'codeRabbit' && bot !== 'qodo') || typeof enabled !== 'boolean') {
+        // Malformed bot/enabled value: no-op (same defensive-backstop
+        // precedent as setActiveBackend/setEditorPreference's own guards),
+        // returning the project's current, unchanged config rather than a
+        // stale default.
+        return getPrBotConfig(projectPath);
+      }
+      return setPrBotEnabled(projectPath, bot, enabled);
+    },
+  );
 
   // ---------------------------------------------------------------------------
   // Story 1.8 (Phase 4): on-demand single-Node regeneration — this app's

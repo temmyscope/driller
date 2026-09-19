@@ -231,6 +231,54 @@ code,
   cursor: default;
 }
 
+/* Story 2.3 (Phase 1): the PR-bot opt-in fieldset — mirrors
+   .settings-panel__editor's border/padding/legend styling (own class only
+   so each fieldset's rules stay independently editable), plus a disabled
+   state since this is the first Settings fieldset that can be disabled
+   entirely (no project open). A wider row gap (0.75rem vs 0.5rem) is a
+   deliberate deviation, not a copy-paste miss: each row here can grow a
+   multi-line disclosure notice underneath its checkbox, unlike the
+   editor fieldset's single-line rows. */
+.settings-panel__pr-bots {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.settings-panel__pr-bots:disabled {
+  opacity: 0.6;
+}
+
+.settings-panel__pr-bots legend {
+  padding: 0 0.25rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-panel__pr-bots-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.settings-panel__pr-bot {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.settings-panel__checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
 .settings-panel .notice--warning button {
   margin-top: 0.5rem;
   padding: 0.3rem 0.75rem;

@@ -416,6 +416,7 @@ export function App() {
 
       {isSettingsOpen && (
         <Settings
+          projectPath={currentProjectPath}
           onClose={() => {
             setIsSettingsOpen(false);
             // Story 1.6 (Phase 2): the backend choice/key may have just

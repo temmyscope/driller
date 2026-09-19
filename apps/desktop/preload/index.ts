@@ -22,6 +22,8 @@ import {
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
+  type PrBotConfig,
+  type PrBotId,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
   type RecentProject,
@@ -109,6 +111,12 @@ const drillerApi: DrillerApi = {
 
   setEditorPreference: (value: EditorPreference): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.settingsSetEditorPreference, value),
+
+  getPrBotConfig: (projectPath: string): Promise<PrBotConfig> =>
+    ipcRenderer.invoke(IpcChannels.settingsGetPrBotConfig, projectPath),
+
+  setPrBotEnabled: (projectPath: string, bot: PrBotId, enabled: boolean): Promise<PrBotConfig> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetPrBotEnabled, projectPath, bot, enabled),
 
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),

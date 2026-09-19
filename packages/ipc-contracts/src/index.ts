@@ -365,8 +365,8 @@ export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
 // unchanged repo state yields byte-identical `riskSignals` (FR7).
 // ---------------------------------------------------------------------------
 
-/** The Risk Overlay's three signal families (Epic 2) — this phase adds `'llm-judgment'`; `'ingested'` (Story 2.3) is still to come. */
-export type RiskSignalFamily = 'deterministic' | 'llm-judgment';
+/** The Risk Overlay's three signal families (Epic 2) — Story 2.3 (Phase 1) adds `'ingested'`, the last of the three. */
+export type RiskSignalFamily = 'deterministic' | 'llm-judgment' | 'ingested';
 
 /**
  * Review round (patch): factored out of `DeterministicRiskSignal`/
@@ -447,14 +447,37 @@ export interface LlmJudgmentRiskSignal {
 }
 
 /**
+ * Story 2.3 (Phase 1): a finding ingested from an external PR-review bot
+ * (CodeRabbit, Qodo) — the Risk Overlay's third and final signal family
+ * (FR-per epic-2-context.md). Mirrors `LlmJudgmentRiskSignal`'s shape
+ * (`family` discriminant + `location`), with `severity` and `sourceTool`
+ * added per the Consistency Conventions ("`ingested` signals additionally
+ * carry `severity` and `sourceTool`"): every ingested finding must display
+ * its originating tool and a canonical severity mapped from the source
+ * tool's native scale — never passed through unmapped.
+ *
+ * This phase only defines the shape — no code yet produces one (Story 2.3
+ * Phase 2/3's job, the actual CodeRabbit/Qodo CLI adapters) or renders one
+ * (Phase 4's job). Nothing in this codebase can construct an
+ * `IngestedRiskSignal` yet.
+ */
+export interface IngestedRiskSignal {
+  family: 'ingested';
+  severity: 'blocker' | 'major' | 'minor' | 'info';
+  sourceTool: string;
+  finding: string;
+  location: RiskSignalLocation;
+}
+
+/**
  * The Risk Overlay's per-signal shape (Epic 2) — a discriminated union on
  * `family`, so each family's own fields (a deterministic signal's `value`
- * vs. an LLM-judgment signal's `judgment`) are only ever accessed after
- * narrowing, never assumed present across the whole union. Two families so
- * far; `'ingested'` (Story 2.3) extends this union as a third sibling member
- * later, never redefine/compete with the two here.
+ * vs. an LLM-judgment signal's `judgment` vs. an ingested signal's
+ * `severity`/`sourceTool`/`finding`) are only ever accessed after narrowing,
+ * never assumed present across the whole union. All three families now
+ * exist as of Story 2.3 (Phase 1).
  */
-export type RiskSignal = DeterministicRiskSignal | LlmJudgmentRiskSignal;
+export type RiskSignal = DeterministicRiskSignal | LlmJudgmentRiskSignal | IngestedRiskSignal;
 
 export interface CodeMapNode {
   /** `qualified_name` — stable node identity, shown verbatim/monospace (Always: no summary content yet). */
@@ -935,6 +958,48 @@ export type DiagnosticLogEntry = {
 export type EditorPreference = 'vscode' | 'jetbrains' | 'system-default';
 
 // ---------------------------------------------------------------------------
+// Story 2.3 (Phase 1): PR-bot opt-in settings + privacy disclosure.
+//
+// driller's first PER-PROJECT settings store — every prior Settings field
+// (`BackendConfig`, `EditorPreference`) is global, one value for the whole
+// app; PR-bot opt-in is inherently per-project (a Supervising Engineer may
+// want CodeRabbit ingestion on one repo and not another), so it's keyed by
+// `projectPath` instead (see `PrBotConfig` below and
+// `apps/desktop/main/pr-bot-settings.ts`, this contract's one persistence
+// consumer).
+//
+// Only two bots exist and are named directly in the AC text (Design Notes)
+// — `PrBotConfig` is deliberately flat named fields, not a
+// `Record<PrBotId, boolean>`; a generic map would be premature for exactly
+// two known, named members.
+//
+// No `disclosureAcknowledged` flag anywhere in this shape (Design Notes): a
+// bot's `enabled: true` only ever becomes reachable through the renderer's
+// explicit confirm action (Settings.tsx, mirroring Story 1.6's
+// warning-then-acknowledge pattern for insecure key storage), so a bare
+// boolean can't misrepresent whether the disclosure was actually shown.
+//
+// This phase adds the settings surface and disclosure-then-confirm UI only
+// — no subprocess/CLI invocation (Story 2.3 Phase 2/3's job) and no change
+// to `buildRiskSignals`'s actual signal computation.
+// ---------------------------------------------------------------------------
+
+/** The two PR-review bots a Settings user can opt into, per project. */
+export type PrBotId = 'codeRabbit' | 'qodo';
+
+/**
+ * Per-project PR-bot opt-in state. Keyed by `projectPath` one level up (in
+ * the persisted store and in `settingsGetPrBotConfig`/`settingsSetPrBotEnabled`'s
+ * IPC signatures) — this shape itself carries no project identity of its
+ * own, mirroring `BackendConfig`'s own "the config IS the current value,
+ * not a keyed lookup" shape at the per-project level instead of globally.
+ */
+export interface PrBotConfig {
+  codeRabbitEnabled: boolean;
+  qodoEnabled: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -956,6 +1021,8 @@ export const IpcChannels = {
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
   settingsGetEditorPreference: 'settings:getEditorPreference',
   settingsSetEditorPreference: 'settings:setEditorPreference',
+  settingsGetPrBotConfig: 'settings:getPrBotConfig',
+  settingsSetPrBotEnabled: 'settings:setPrBotEnabled',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
   diagnosticLog: 'diagnostic:log',
@@ -1068,6 +1135,26 @@ export interface DrillerApi {
   getEditorPreference: () => Promise<EditorPreference>;
   /** Sets the external editor preference choice. */
   setEditorPreference: (value: EditorPreference) => Promise<void>;
+  /**
+   * Fetches the current PR-bot opt-in config for one project (Story 2.3,
+   * Phase 1) — driller's first per-project settings read. Returns
+   * `{codeRabbitEnabled: false, qodoEnabled: false}` when the project has no
+   * persisted entry yet (opt-in is disabled by default), never
+   * undefined/unset.
+   */
+  getPrBotConfig: (projectPath: string) => Promise<PrBotConfig>;
+  /**
+   * Sets one bot's opt-in state for one project (Story 2.3, Phase 1).
+   * Turning a bot on is only ever called from the renderer's explicit
+   * confirm action, after that bot's own disclosure notice has been shown —
+   * this call itself carries no such distinction, it's the renderer's
+   * disclosure-then-confirm flow (Settings.tsx) that gates when it's
+   * invoked with `enabled: true`. Turning a bot off is called immediately on
+   * toggle, no disclosure/confirmation gating. Returns the project's full,
+   * updated `PrBotConfig` so the renderer can update its state without a
+   * separate refetch.
+   */
+  setPrBotEnabled: (projectPath: string, bot: PrBotId, enabled: boolean) => Promise<PrBotConfig>;
   /**
    * Regenerates exactly one Node's summary on demand (Story 1.8, Phase 4) —
    * this app's first id-keyed mutating IPC round-trip. Scoped to `nodeId`

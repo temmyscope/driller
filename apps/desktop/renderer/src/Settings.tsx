@@ -23,13 +23,39 @@
  * trip, its own optimistic-update-plus-rollback-on-failure state) — the two
  * groups share only the overall panel shell and the same interaction
  * pattern, not any state.
+ *
+ * Story 2.3 (Phase 1) adds a third, independent group: per-project PR-bot
+ * opt-in (`projectPath` prop, driller's first per-project Settings field —
+ * disabled/hidden entirely when `projectPath === null`, unlike every field
+ * above). Its own interaction shape is new, not a copy of the two above:
+ * toggling a bot's checkbox ON never persists `enabled: true` by itself — it
+ * only reveals that bot's own privacy disclosure notice — and only a second,
+ * explicit confirm action ("Enable CodeRabbit"/"Enable Qodo") actually
+ * persists it, mirroring the cloud-key group's own insecure-storage
+ * warning-then-acknowledge pattern (`keyEntry`'s `'warning'` state /
+ * `handleAcknowledgeInsecureStorage` above) rather than the plain
+ * optimistic-update shape the backend/editor-preference groups use.
+ * Toggling a bot OFF is always immediate, no disclosure/confirmation.
  */
 
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
-import type { BackendConfig, CloudBackend, EditorPreference } from '@driller/ipc-contracts';
+import type {
+  BackendConfig,
+  CloudBackend,
+  EditorPreference,
+  PrBotConfig,
+  PrBotId,
+} from '@driller/ipc-contracts';
 
 interface SettingsProps {
   onClose: () => void;
+  /**
+   * Absolute, OS-native path of the currently open project, or `null` when
+   * none is open (Story 2.3, Phase 1) — PR-bot opt-in is per-project, so
+   * this is the one piece of state this component needs from its caller
+   * that every other Settings field so far has never needed.
+   */
+  projectPath: string | null;
 }
 
 type KeyEntryState =
@@ -38,7 +64,51 @@ type KeyEntryState =
   | { kind: 'warning'; message: string; pendingKey: string }
   | { kind: 'error'; message: string };
 
-export function Settings({ onClose }: SettingsProps) {
+/**
+ * Per-bot disclosure-then-confirm state (Story 2.3, Phase 1) — one entry per
+ * `PrBotId`, independent of the other bot's:
+ *  - `'idle'`: matches persisted state, nothing pending.
+ *  - `'confirming'`: the checkbox was just checked; the disclosure notice is
+ *    showing; nothing persisted yet.
+ *  - `'saving'`: the confirm action (or an immediate off-toggle) is in
+ *    flight.
+ *  - `'error'`: the last save attempt for this bot failed.
+ */
+type PrBotDisclosureState =
+  | { kind: 'idle' }
+  | { kind: 'confirming' }
+  | { kind: 'saving' }
+  | { kind: 'error'; message: string };
+
+const IDLE_PR_BOT_DISCLOSURE: Record<PrBotId, PrBotDisclosureState> = {
+  codeRabbit: { kind: 'idle' },
+  qodo: { kind: 'idle' },
+};
+
+const PR_BOTS: ReadonlyArray<{ id: PrBotId; label: string }> = [
+  { id: 'codeRabbit', label: 'CodeRabbit' },
+  { id: 'qodo', label: 'Qodo' },
+];
+
+/** This bot's own opt-in field on `PrBotConfig` (Design Notes: flat named fields, not a `Record<PrBotId, boolean>`). */
+function isPrBotEnabled(bot: PrBotId, config: PrBotConfig): boolean {
+  return bot === 'codeRabbit' ? config.codeRabbitEnabled : config.qodoEnabled;
+}
+
+/**
+ * Per-bot privacy disclosure text (AC: "explicitly discloses, specific to
+ * [the bot], that its local CLI mode transmits diff/code content to [that
+ * bot]'s own cloud service — outside driller's control, not covered by
+ * driller's own no-server privacy guarantee (AD-12, AD-16)"). Named per bot,
+ * never a generic shared sentence — each bot is its own vendor's cloud
+ * service.
+ */
+function prBotDisclosureText(bot: PrBotId): string {
+  const toolName = bot === 'codeRabbit' ? 'CodeRabbit' : 'Qodo';
+  return `${toolName}'s local CLI mode sends this project's diff/code content to ${toolName}'s own cloud service to generate findings. That transfer is outside driller's control and is not covered by driller's own no-server privacy guarantee.`;
+}
+
+export function Settings({ onClose, projectPath }: SettingsProps) {
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
@@ -98,6 +168,139 @@ export function Settings({ onClose }: SettingsProps) {
     refetchConfig();
     refetchEditorPreference();
   }, [refetchConfig, refetchEditorPreference]);
+
+  // Story 2.3 (Phase 1): the PR-bot opt-in group's own state — its own IPC
+  // round trip, keyed by `projectPath` rather than loaded once at mount like
+  // the two groups above, since a different project's config must never
+  // leak into view (Acceptance: "a second project's Settings never shows
+  // the first project's enabled state"). `null` both before the first fetch
+  // resolves and whenever `projectPath === null` (no project open).
+  const [prBotConfig, setPrBotConfig] = useState<PrBotConfig | null>(null);
+  const [prBotConfigLoadError, setPrBotConfigLoadError] = useState<string | null>(null);
+  const [prBotDisclosure, setPrBotDisclosure] =
+    useState<Record<PrBotId, PrBotDisclosureState>>(IDLE_PR_BOT_DISCLOSURE);
+
+  // Review finding (Edge Case Hunter): Settings stays mounted across a
+  // project switch (App.tsx never unmounts it), so a fetch/save promise
+  // started for one `projectPath` can resolve after the prop has already
+  // moved on to another project. Without this ref, that late response would
+  // overwrite the newly-switched-to project's state with the stale
+  // project's data — a direct violation of "a second project's Settings
+  // never shows the first project's enabled state" (Acceptance Criteria).
+  const projectPathRef = useRef<string | null>(projectPath);
+  useEffect(() => {
+    projectPathRef.current = projectPath;
+  }, [projectPath]);
+
+  const refetchPrBotConfig = useCallback(() => {
+    if (projectPath === null) {
+      // No project open: nothing to fetch — the fieldset renders
+      // disabled/hidden below rather than showing stale or empty state.
+      setPrBotConfig(null);
+      setPrBotConfigLoadError(null);
+      return;
+    }
+    window.driller
+      .getPrBotConfig(projectPath)
+      .then((next) => {
+        if (projectPathRef.current !== projectPath) {
+          // Stale response: projectPath has since changed. Discard rather
+          // than clobber the current project's already-loaded/loading state.
+          return;
+        }
+        setPrBotConfig(next);
+        setPrBotConfigLoadError(null);
+      })
+      .catch((error) => {
+        if (projectPathRef.current !== projectPath) {
+          return;
+        }
+        setPrBotConfigLoadError(error instanceof Error ? error.message : String(error));
+      });
+  }, [projectPath]);
+
+  useEffect(() => {
+    // Re-fetches whenever `projectPath` changes (including the mount fetch,
+    // since `refetchPrBotConfig`'s identity depends on it) — and resets any
+    // in-flight per-bot disclosure state back to idle, so a disclosure
+    // notice left open for one project can never linger and be mistaken for
+    // another project's state.
+    refetchPrBotConfig();
+    setPrBotDisclosure(IDLE_PR_BOT_DISCLOSURE);
+  }, [projectPath, refetchPrBotConfig]);
+
+  const persistPrBotEnabled = useCallback(
+    (bot: PrBotId, enabled: boolean) => {
+      if (projectPath === null) {
+        return;
+      }
+      setPrBotDisclosure((current) => ({ ...current, [bot]: { kind: 'saving' } }));
+      window.driller
+        .setPrBotEnabled(projectPath, bot, enabled)
+        .then((next) => {
+          if (projectPathRef.current !== projectPath) {
+            // Stale response: the user has since switched projects. This
+            // project's own write already succeeded on disk, so nothing to
+            // retry — just don't let it overwrite the now-different
+            // project's displayed state (see projectPathRef above).
+            return;
+          }
+          setPrBotConfig(next);
+          setPrBotDisclosure((current) => ({ ...current, [bot]: { kind: 'idle' } }));
+        })
+        .catch((error) => {
+          if (projectPathRef.current !== projectPath) {
+            return;
+          }
+          setPrBotDisclosure((current) => ({
+            ...current,
+            [bot]: { kind: 'error', message: error instanceof Error ? error.message : String(error) },
+          }));
+        });
+    },
+    [projectPath],
+  );
+
+  /**
+   * The PR-bot checkbox's onChange handler (Always: "toggling a bot's
+   * checkbox to 'on' never persists `enabled: true` by itself"). Checking a
+   * currently-disabled bot only opens its disclosure notice — no IPC call.
+   * Unchecking an already-*persisted*-enabled bot persists immediately, no
+   * disclosure. Unchecking a bot that's merely pending confirmation (never
+   * actually persisted) just cancels the disclosure back to idle.
+   */
+  const handlePrBotToggle = useCallback(
+    (bot: PrBotId, event: ChangeEvent<HTMLInputElement>) => {
+      const wantsOn = event.target.checked;
+      const persistedOn = prBotConfig ? isPrBotEnabled(bot, prBotConfig) : false;
+
+      if (wantsOn) {
+        if (persistedOn) {
+          // Already enabled — the checkbox should already read checked;
+          // nothing to do.
+          return;
+        }
+        setPrBotDisclosure((current) => ({ ...current, [bot]: { kind: 'confirming' } }));
+        return;
+      }
+
+      if (persistedOn) {
+        persistPrBotEnabled(bot, false);
+        return;
+      }
+
+      setPrBotDisclosure((current) => ({ ...current, [bot]: { kind: 'idle' } }));
+    },
+    [prBotConfig, persistPrBotEnabled],
+  );
+
+  /** The disclosure notice's own confirm button — the one path that can ever persist `enabled: true`. */
+  const handlePrBotConfirm = useCallback(
+    (bot: PrBotId) => {
+      persistPrBotEnabled(bot, true);
+    },
+    [persistPrBotEnabled],
+  );
 
   // Escape closes the Settings overlay — same keyboard-dismissal pattern
   // already established for Story 1.3 Phase 1's source-view overlay
@@ -413,6 +616,67 @@ export function Settings({ onClose }: SettingsProps) {
             )}
           </fieldset>
         )}
+
+        {/* Story 2.3 (Phase 1): PR-bot opt-in + privacy disclosure — the
+            fieldset itself is disabled (Always: "disabled ... when no
+            project is open") via the native `disabled` attribute below,
+            which also disables every descendant checkbox/button for free;
+            this is inherently per-project, unlike every field above. */}
+        <fieldset className="settings-panel__pr-bots" disabled={projectPath === null}>
+          <legend>PR-bot ingestion</legend>
+
+          {projectPath === null && (
+            <p className="settings-panel__pr-bots-hint">
+              Open a project to configure PR-bot ingestion.
+            </p>
+          )}
+
+          {projectPath !== null && prBotConfigLoadError && (
+            <div className="notice notice--error" role="alert">
+              <p>{prBotConfigLoadError}</p>
+              <button type="button" onClick={refetchPrBotConfig}>
+                Retry
+              </button>
+            </div>
+          )}
+
+          {projectPath !== null &&
+            prBotConfig &&
+            PR_BOTS.map(({ id, label }) => {
+              const persistedOn = isPrBotEnabled(id, prBotConfig);
+              const disclosure = prBotDisclosure[id];
+              const checked = persistedOn || disclosure.kind === 'confirming' || disclosure.kind === 'saving';
+
+              return (
+                <div className="settings-panel__pr-bot" key={id}>
+                  <label className="settings-panel__checkbox">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={disclosure.kind === 'saving'}
+                      onChange={(event) => handlePrBotToggle(id, event)}
+                    />
+                    {label}
+                  </label>
+
+                  {disclosure.kind === 'confirming' && (
+                    <div className="notice notice--warning" role="alert">
+                      <p>{prBotDisclosureText(id)}</p>
+                      <button type="button" onClick={() => handlePrBotConfirm(id)}>
+                        Enable {label}
+                      </button>
+                    </div>
+                  )}
+
+                  {disclosure.kind === 'error' && (
+                    <p className="notice notice--error" role="alert">
+                      {disclosure.message}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+        </fieldset>
       </div>
     </div>
   );
