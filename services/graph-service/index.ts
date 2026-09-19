@@ -1058,6 +1058,22 @@ function buildRiskSignals(
     signals.push({ family: 'llm-judgment', judgment: judgment.text, location });
   }
 
+  // Story 2.3 (Phase 4): reads `getNodeRecord(node.id)?.ingestedFindings` —
+  // Phase 2/3's persisted PR-bot findings, unchanged field-for-field — and
+  // pushes each straight into the `'ingested'` family. This is the only
+  // change to this function this phase makes (Boundaries & Constraints):
+  // no re-normalization, re-sorting, or capping here — the severity-sort
+  // and 3-finding cap are this phase's render-layer concern
+  // (CodeMap.tsx's `CodeMapNodeCard`), not this data-assembly step. A Node
+  // with no ingested findings (no bot has run, or this Node had none) gets
+  // no entries here at all — `ingestedFindings` stays `undefined` and
+  // nothing is pushed, so the family is absent entirely rather than an
+  // empty placeholder (Boundaries & Constraints, FR9/UX-DR7).
+  const ingested = getNodeRecord(node.id)?.ingestedFindings;
+  if (ingested) {
+    signals.push(...ingested);
+  }
+
   return signals;
 }
 

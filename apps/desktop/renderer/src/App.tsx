@@ -5,6 +5,8 @@ import type {
   HardwareAdvisoryMessage,
   IndexCoverageSummary,
   ModelStatusMessage,
+  PrBotId,
+  PrBotIngestionResult,
   ProjectOpenResult,
   RecentProject,
 } from '@driller/ipc-contracts';
@@ -50,6 +52,19 @@ export function App() {
   const [hardwareAdvisories, setHardwareAdvisories] = useState<Set<HardwareAdvisoryMessage['reason']>>(
     () => new Set(),
   );
+  // Story 2.3 (Phase 4): which PR-bots' CLIs were last reported not found on
+  // this machine — a `Set`, mirroring `hardwareAdvisories`' own shape,
+  // since both bots' tool-not-found state is independent and can be
+  // simultaneously true. Deliberately NOT reset per-project the way
+  // `hardwareAdvisories` is (see `applyOpenResult` below, which never
+  // touches this Set): whether a bot's CLI is on PATH is a genuine
+  // machine-level fact, not a per-project one, so switching projects must
+  // never make an accurate "not found" notice disappear just because a
+  // different project is now open. Cleared per-bot only once that bot's own
+  // next ingestion attempt (from any project) returns anything other than
+  // `'tool-not-found'` (Boundaries & Constraints), via `handleIngestionResult`
+  // below.
+  const [prBotToolNotFound, setPrBotToolNotFound] = useState<Set<PrBotId>>(() => new Set());
   // The currently-open project's path, so a status correlated to a
   // different (superseded) project can be told apart from one about the
   // project actually on screen. Mirrored into a ref because the status
@@ -237,6 +252,57 @@ export function App() {
     window.driller.restartGraphService().catch(reportUnexpectedError);
   }, [reportUnexpectedError]);
 
+  // Review finding (Edge Case Hunter, major): Settings' own request-id-ref
+  // resets every time it remounts (e.g. across a project switch), so it
+  // can't order replies for App.tsx's benefit — two overlapping
+  // `runPrBotIngestion` calls for the SAME bot from two different Settings
+  // sessions (start one, switch projects, start another before the first
+  // resolves) could resolve out of order and leave this state reflecting
+  // the OLDER reply. Tracks the `requestedAt` (wall-clock, never resets)
+  // of the last reply actually applied per bot, so an out-of-order stale
+  // reply can be detected and ignored regardless of Settings' own
+  // mount/unmount history.
+  const lastAppliedIngestionAt = useRef<Record<PrBotId, number>>({ codeRabbit: 0, qodo: 0 });
+
+  /**
+   * Passed to `<Settings onIngestionResult>` (Story 2.3, Phase 4) — fired
+   * on every settled `runPrBotIngestion` result Settings observes (Settings'
+   * own `handleRunIngestion`), regardless of whether Settings' own local
+   * request-id-ref treats that particular reply as stale: whether a bot's
+   * CLI is actually on PATH is real, current, machine-level information
+   * this notice needs to reflect either way. Adds `bot` to
+   * `prBotToolNotFound` on `'tool-not-found'`; removes it on every other
+   * status (Boundaries & Constraints: "cleared once that bot's next
+   * ingestion attempt returns anything other than 'tool-not-found'") — an
+   * `'ok'`/`'no-base-ref-resolvable'`/`'error'` result all equally prove the
+   * tool itself was found and ran, so all three clear it the same way.
+   *
+   * Discards a reply older than the last one already applied for this bot
+   * (`requestedAt < lastAppliedIngestionAt.current[bot]`) — see
+   * `lastAppliedIngestionAt`'s own doc comment for why this can't be Settings'
+   * own request-id-ref.
+   */
+  const handleIngestionResult = useCallback((bot: PrBotId, result: PrBotIngestionResult, requestedAt: number) => {
+    if (requestedAt < lastAppliedIngestionAt.current[bot]) {
+      return;
+    }
+    lastAppliedIngestionAt.current[bot] = requestedAt;
+    setPrBotToolNotFound((current) => {
+      const shouldHave = result.status === 'tool-not-found';
+      const alreadyHas = current.has(bot);
+      if (shouldHave === alreadyHas) {
+        return current;
+      }
+      const next = new Set(current);
+      if (shouldHave) {
+        next.add(bot);
+      } else {
+        next.delete(bot);
+      }
+      return next;
+    });
+  }, []);
+
   const isLoadingRecents = recentProjects === null;
   const hasRecentProjects = (recentProjects?.length ?? 0) > 0;
   // Once `indexed`, the Code Map replaces the open-folder/Recent Projects
@@ -414,9 +480,29 @@ export function App() {
         ))}
       </footer>
 
+      {/* Story 2.3 (Phase 4): the PR-bot "tool not found" Actionable Notice
+          — same always-mounted `role="status"`/collapses-to-nothing-while-
+          empty shape as `hardware-advisory` above (this footer's own doc
+          comment explains why: a live region only reliably announces a
+          change if it already existed in the DOM before that change), one
+          `<p>` per `PrBotId` currently in `prBotToolNotFound`. Rendered as
+          its own footer, not folded into `hardware-advisory` (Design Notes:
+          "not buried inside Settings alone, since it affects what the user
+          sees on the map" — this is a distinct condition from the hardware/
+          model-backend advisories above, so it gets its own row rather than
+          being conflated with either). */}
+      <footer className="app__pr-bot-tool-notice" role="status">
+        {[...prBotToolNotFound].map((bot) => (
+          <p key={bot} className="app__pr-bot-tool-notice-item">
+            <span aria-hidden="true">⚠</span> {formatPrBotToolNotFound(bot)}
+          </p>
+        ))}
+      </footer>
+
       {isSettingsOpen && (
         <Settings
           projectPath={currentProjectPath}
+          onIngestionResult={handleIngestionResult}
           onClose={() => {
             setIsSettingsOpen(false);
             // Story 1.6 (Phase 2): the backend choice/key may have just
@@ -446,6 +532,34 @@ function formatHardwareAdvisory(reason: HardwareAdvisoryMessage['reason']): stri
     case 'degenerate-results':
       return 'Local summaries are returning empty or slow results — switching to the cloud backend in Settings would likely help.';
   }
+}
+
+/** This bot's own display name — matches Settings.tsx's `PR_BOTS` labels verbatim, distinct per bot (Always: "distinct per bot"). */
+function prBotDisplayName(bot: PrBotId): string {
+  return bot === 'codeRabbit' ? 'CodeRabbit' : 'Qodo';
+}
+
+/**
+ * The PR-bot "tool not found" notice text (Boundaries & Constraints: "icon +
+ * one sentence + install guidance") — names the bot and gives one concrete
+ * next action, mirroring `formatHardwareAdvisory`'s own "name the condition,
+ * point at the fix" shape but for an actually-missing local CLI rather than
+ * a switchable backend choice.
+ */
+function formatPrBotToolNotFound(bot: PrBotId): string {
+  const name = prBotDisplayName(bot);
+  // Named per the exact binary/module each adapter actually invokes
+  // (coderabbit-adapter.ts's "cr review --base <branch> --agent";
+  // qodo-adapter.ts's "python3 -m pr_agent.cli") — honest about which
+  // command driller looked for, without asserting an unverified install
+  // command of its own (neither adapter's own doc comments confirm one).
+  //
+  // Review finding (Blind Hunter, minor): no markdown backticks here — this
+  // string is interpolated directly into a plain <p> (below), which React
+  // renders as a literal text node, not parsed markdown; backticks would
+  // show up as literal characters in the UI instead of styled code.
+  const cliHint = bot === 'codeRabbit' ? 'the CodeRabbit CLI ("cr")' : "PR-Agent's pr_agent Python package";
+  return `${name}'s CLI wasn't found on this machine — install ${cliHint} and make sure it's on PATH, then run ingestion again from Settings.`;
 }
 
 /**

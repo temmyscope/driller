@@ -45,6 +45,7 @@ import type {
   EditorPreference,
   PrBotConfig,
   PrBotId,
+  PrBotIngestionResult,
 } from '@driller/ipc-contracts';
 
 interface SettingsProps {
@@ -56,6 +57,31 @@ interface SettingsProps {
    * that every other Settings field so far has never needed.
    */
   projectPath: string | null;
+  /**
+   * Story 2.3 (Phase 4): notified with every settled `runPrBotIngestion`
+   * result (not just success) — App.tsx's own `prBotToolNotFound` Set state
+   * is derived from this stream, so it needs `'tool-not-found'` AND every
+   * other status (to clear a bot's notice once a later attempt returns
+   * anything else), not merely the failures. Fired on the real IPC result
+   * unconditionally, even for a reply this component's own
+   * `ingestionRequestIdRef` supersession would otherwise treat as stale for
+   * *local* display purposes (see `handleRunIngestion` below) — whether a
+   * given bot's CLI is actually on this machine's PATH is a genuine,
+   * still-current fact regardless of which click produced this particular
+   * reply, so App.tsx's notice state should still learn it. Optional since
+   * not every caller (there is currently only one, App.tsx) necessarily
+   * needs this notification.
+   *
+   * `requestedAt` (review finding, Edge Case Hunter, major): the wall-clock
+   * `Date.now()` this specific request was initiated at — `Settings`'
+   * own `ingestionRequestIdRef` resets on every remount (e.g. across a
+   * project switch), so it can't tell a caller which of two overlapping
+   * requests for the same bot, from two different Settings sessions, was
+   * actually initiated more recently. `requestedAt` can, since it never
+   * resets — a caller that receives replies out of order should apply only
+   * the one with the larger `requestedAt`.
+   */
+  onIngestionResult?: (bot: PrBotId, result: PrBotIngestionResult, requestedAt: number) => void;
 }
 
 type KeyEntryState =
@@ -85,6 +111,50 @@ const IDLE_PR_BOT_DISCLOSURE: Record<PrBotId, PrBotDisclosureState> = {
   qodo: { kind: 'idle' },
 };
 
+/**
+ * "Run ingestion now" button's own per-bot state (Story 2.3, Phase 4) —
+ * independent of `PrBotDisclosureState` above (that one gates
+ * enable/disable persistence; this one is the whole-project ingestion pass
+ * itself, only ever reachable once a bot is already `enabled`):
+ *  - `'idle'`: nothing run yet this session, or the last run's result has
+ *    already been superseded by a fresh click.
+ *  - `'running'`: the pass is in flight.
+ *  - `'ok'`: completed; `count` is `PrBotIngestionResult`'s own
+ *    `findingCount` (0 is a valid, distinct "ran, found nothing" outcome).
+ *  - `'tool-not-found'` / `'no-base-ref-resolvable'` / `'error'`: mirror
+ *    `PrBotIngestionResult`'s own remaining states verbatim.
+ */
+type IngestionRunState =
+  | { kind: 'idle' }
+  | { kind: 'running' }
+  | { kind: 'ok'; count: number }
+  | { kind: 'tool-not-found' }
+  | { kind: 'no-base-ref-resolvable' }
+  | { kind: 'error'; message: string };
+
+const IDLE_INGESTION_RUN: Record<PrBotId, IngestionRunState> = {
+  codeRabbit: { kind: 'idle' },
+  qodo: { kind: 'idle' },
+};
+
+/** Inline-status copy for `IngestionRunState` — `'idle'` renders nothing (handled by the caller). */
+function formatIngestionRunState(state: IngestionRunState): string | null {
+  switch (state.kind) {
+    case 'idle':
+      return null;
+    case 'running':
+      return 'Running…';
+    case 'ok':
+      return state.count === 0 ? 'Ran — no findings.' : `Ran — ${state.count} finding${state.count === 1 ? '' : 's'} ingested.`;
+    case 'tool-not-found':
+      return 'Tool not found on this machine — see the notice below.';
+    case 'no-base-ref-resolvable':
+      return "Couldn't resolve a base branch to diff against.";
+    case 'error':
+      return state.message;
+  }
+}
+
 const PR_BOTS: ReadonlyArray<{ id: PrBotId; label: string }> = [
   { id: 'codeRabbit', label: 'CodeRabbit' },
   { id: 'qodo', label: 'Qodo' },
@@ -108,7 +178,7 @@ function prBotDisclosureText(bot: PrBotId): string {
   return `${toolName}'s local CLI mode sends this project's diff/code content to ${toolName}'s own cloud service to generate findings. That transfer is outside driller's control and is not covered by driller's own no-server privacy guarantee.`;
 }
 
-export function Settings({ onClose, projectPath }: SettingsProps) {
+export function Settings({ onClose, projectPath, onIngestionResult }: SettingsProps) {
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
@@ -180,6 +250,17 @@ export function Settings({ onClose, projectPath }: SettingsProps) {
   const [prBotDisclosure, setPrBotDisclosure] =
     useState<Record<PrBotId, PrBotDisclosureState>>(IDLE_PR_BOT_DISCLOSURE);
 
+  // Story 2.3 (Phase 4): the "Run ingestion now" button's own per-bot state
+  // — independent of `prBotDisclosure` above (enable/disable persistence
+  // vs. an actual ingestion pass). `ingestionRequestIdRef` is the same
+  // per-call supersession pattern `CodeMap.tsx`'s `handleOpenInEditor`
+  // already established (Boundaries & Constraints: "a stale reply ...
+  // never clobbers a newer one") — keyed by `PrBotId` since both bots' runs
+  // are independent and a reply for one must never gate the other's local
+  // display state.
+  const [ingestionRun, setIngestionRun] = useState<Record<PrBotId, IngestionRunState>>(IDLE_INGESTION_RUN);
+  const ingestionRequestIdRef = useRef<Record<PrBotId, number>>({ codeRabbit: 0, qodo: 0 });
+
   // Review finding (Edge Case Hunter): Settings stays mounted across a
   // project switch (App.tsx never unmounts it), so a fetch/save promise
   // started for one `projectPath` can resolve after the prop has already
@@ -227,7 +308,93 @@ export function Settings({ onClose, projectPath }: SettingsProps) {
     // another project's state.
     refetchPrBotConfig();
     setPrBotDisclosure(IDLE_PR_BOT_DISCLOSURE);
+    // Story 2.3 (Phase 4): same reasoning applied to the ingestion-run
+    // display state — a "Running…"/result line left over from a previous
+    // project must never linger and be mistaken for the newly-switched-to
+    // project's own state. Bumping both bots' request ids also invalidates
+    // any still-in-flight `runPrBotIngestion` call from the prior project,
+    // so its eventual reply can't clobber this fresh idle state back to
+    // something stale (the same supersession check `handleRunIngestion`
+    // below applies on every settle).
+    setIngestionRun(IDLE_INGESTION_RUN);
+    ingestionRequestIdRef.current = {
+      codeRabbit: ingestionRequestIdRef.current.codeRabbit + 1,
+      qodo: ingestionRequestIdRef.current.qodo + 1,
+    };
   }, [projectPath, refetchPrBotConfig]);
+
+  /**
+   * Wires "Run ingestion now" to `window.driller.runPrBotIngestion` (Story
+   * 2.3, Phase 4) — only ever called for a bot whose `enabled` is currently
+   * persisted `true` (gated in the JSX below, Boundaries & Constraints).
+   * `onIngestionResult` fires unconditionally on every real settled result
+   * (SettingsProps' own doc comment: "not just success"), even one this
+   * call's own `requestId` check would otherwise treat as stale for local
+   * display — whether a bot's CLI is on PATH is a genuine machine-level
+   * fact App.tsx's notice state needs regardless of which click produced
+   * this particular reply. The local `ingestionRun` display, by contrast,
+   * only ever reflects the LATEST call for that bot (the request-id-ref
+   * supersession pattern `CodeMap.tsx`'s `handleOpenInEditor` already
+   * established) — a stale reply from Settings being closed/reopened, or a
+   * second click before the first resolves, never clobbers a newer one.
+   *
+   * Review finding (Edge Case Hunter, major): `ingestionRequestIdRef` is
+   * local to THIS mount of Settings — it resets whenever Settings closes
+   * and reopens (e.g. across a project switch), so it can't order replies
+   * across mounts. That's fine for the local `ingestionRun` display (which
+   * itself resets on every mount/project-change), but `onIngestionResult`
+   * feeds App.tsx's `prBotToolNotFound`, which is NOT scoped to one mount —
+   * two overlapping requests for the same bot from two different project
+   * sessions could resolve out of order and leave App.tsx applying the
+   * older reply after the newer one, misrepresenting the current state.
+   * `requestedAt` (wall-clock `Date.now()`, captured once per request) is
+   * passed through instead — unlike `ingestionRequestIdRef`, it never
+   * resets on remount, so App.tsx can always tell which of two replies for
+   * the same bot was actually initiated more recently, regardless of
+   * mount/unmount in between.
+   */
+  const handleRunIngestion = useCallback(
+    (bot: PrBotId) => {
+      if (projectPath === null) {
+        return;
+      }
+      const requestId = (ingestionRequestIdRef.current[bot] += 1);
+      const requestedAt = Date.now();
+      setIngestionRun((current) => ({ ...current, [bot]: { kind: 'running' } }));
+      window.driller
+        .runPrBotIngestion(projectPath, bot)
+        .then((result) => {
+          onIngestionResult?.(bot, result, requestedAt);
+          if (ingestionRequestIdRef.current[bot] !== requestId) {
+            return;
+          }
+          switch (result.status) {
+            case 'ok':
+              setIngestionRun((current) => ({ ...current, [bot]: { kind: 'ok', count: result.findingCount } }));
+              break;
+            case 'tool-not-found':
+              setIngestionRun((current) => ({ ...current, [bot]: { kind: 'tool-not-found' } }));
+              break;
+            case 'no-base-ref-resolvable':
+              setIngestionRun((current) => ({ ...current, [bot]: { kind: 'no-base-ref-resolvable' } }));
+              break;
+            case 'error':
+              setIngestionRun((current) => ({ ...current, [bot]: { kind: 'error', message: result.message } }));
+              break;
+          }
+        })
+        .catch((error: unknown) => {
+          if (ingestionRequestIdRef.current[bot] !== requestId) {
+            return;
+          }
+          setIngestionRun((current) => ({
+            ...current,
+            [bot]: { kind: 'error', message: error instanceof Error ? error.message : String(error) },
+          }));
+        });
+    },
+    [projectPath, onIngestionResult],
+  );
 
   const persistPrBotEnabled = useCallback(
     (bot: PrBotId, enabled: boolean) => {
@@ -672,6 +839,35 @@ export function Settings({ onClose, projectPath }: SettingsProps) {
                     <p className="notice notice--error" role="alert">
                       {disclosure.message}
                     </p>
+                  )}
+
+                  {/* Story 2.3 (Phase 4): "Run ingestion now" — only ever
+                      shown next to a bot whose `enabled` is currently
+                      PERSISTED true (Boundaries & Constraints: "never for a
+                      disabled/unconfirmed bot"), so gated on `persistedOn`
+                      itself, not `checked` above (which also covers the
+                      transient confirming/saving states before enablement
+                      is actually persisted). */}
+                  {persistedOn && (
+                    <div className="settings-panel__pr-bot-ingestion">
+                      <button
+                        type="button"
+                        onClick={() => handleRunIngestion(id)}
+                        disabled={ingestionRun[id].kind === 'running'}
+                      >
+                        {ingestionRun[id].kind === 'running' ? 'Running…' : 'Run ingestion now'}
+                      </button>
+                      {formatIngestionRunState(ingestionRun[id]) !== null && (
+                        <p
+                          className={`settings-panel__pr-bot-ingestion-status${
+                            ingestionRun[id].kind === 'error' ? ' notice notice--error' : ''
+                          }`}
+                          role={ingestionRun[id].kind === 'error' ? 'alert' : 'status'}
+                        >
+                          {formatIngestionRunState(ingestionRun[id])}
+                        </p>
+                      )}
+                    </div>
                   )}
                 </div>
               );

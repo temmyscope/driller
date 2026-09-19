@@ -279,6 +279,44 @@ code,
   cursor: pointer;
 }
 
+/* Story 2.3 (Phase 4): "Run ingestion now" — a secondary (bordered, not
+   filled) action, deliberately less visually loud than the primary
+   `.settings-panel__save` above, since this is a per-bot, repeatable,
+   non-destructive trigger, not a form-submit action. */
+.settings-panel__pr-bot-ingestion {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.settings-panel__pr-bot-ingestion button {
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.settings-panel__pr-bot-ingestion button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.settings-panel__pr-bot-ingestion button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* The error variant (`ingestionRun[id].kind === 'error'`) instead composes
+   the existing `.notice.notice--error` classes (Settings.tsx applies both
+   alongside this one) for its background/border/color — this rule only
+   covers the plain, non-error status text's own size/color. */
+.settings-panel__pr-bot-ingestion-status {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
 .settings-panel .notice--warning button {
   margin-top: 0.5rem;
   padding: 0.3rem 0.75rem;
@@ -504,6 +542,36 @@ code,
 }
 
 /*
+ * Story 2.3 (Phase 4): the PR-bot "tool not found" Actionable Notice —
+ * mirrors `.hardware-advisory`'s own layout/always-mounted-collapses-when-
+ * empty shape one rule up (App.tsx's own doc comment on this element
+ * explains why), rendered as its own footer rather than sharing
+ * `.hardware-advisory`'s class (Design Notes: a distinct condition, kept
+ * visually/structurally separate from the hardware/model-backend advisories
+ * rather than conflated with either).
+ */
+.app__pr-bot-tool-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.app__pr-bot-tool-notice:empty {
+  padding-top: 0;
+  gap: 0;
+}
+
+.app__pr-bot-tool-notice-item {
+  margin: 0;
+  color: var(--error);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/*
  * Story 1.3 (Phase 1): once indexed, the Code Map is the only landing view
  * (FR3) — the shell drops its narrow centered-column layout in favor of a
  * full-bleed map, with the status badge demoted to a slim persistent footer
@@ -538,6 +606,14 @@ code,
 }
 
 .app--map .hardware-advisory:empty {
+  padding: 0;
+}
+
+.app--map .app__pr-bot-tool-notice {
+  padding: 0 1.5rem 0.5rem;
+}
+
+.app--map .app__pr-bot-tool-notice:empty {
   padding: 0;
 }
 
@@ -776,6 +852,62 @@ code,
      an unbroken long token in the model's response (e.g. a leaked
      identifier) could otherwise overflow the card instead of wrapping. */
   overflow-wrap: break-word;
+}
+
+/* Ingested-PR-bot-findings callout (Story 2.3 Phase 4): the `family:
+   'ingested'` signal's own distinct treatment, rendered after
+   `.code-map__llm-judgment` above. Deliberately never reuses
+   `.code-map__signal-chip`'s inline-pill rules or `.code-map__llm-judgment`'s
+   dashed-single-sentence rules — a solid-border list block, one row per
+   finding, per this story's own Boundaries & Constraints ("own visual
+   treatment, never .code-map__signal-chip's classes, never llm-judgment's
+   callout classes"). */
+.code-map__ingested-findings {
+  list-style: none;
+  margin: 0.15rem 0 0;
+  padding: 0.3rem 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+}
+
+.code-map__ingested-finding {
+  display: flex;
+  align-items: baseline;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  /* Same protective wrap `.code-map__llm-judgment` already applies to a
+     model/tool-supplied sentence of unbounded length. */
+  overflow-wrap: break-word;
+}
+
+/* Severity is real visible text, not color/icon alone (Accessibility
+   Floor) — this uppercase/letter-spacing/bold treatment is a purely
+   cosmetic emphasis on top of that text, never the sole carrier of the
+   distinction. */
+.code-map__ingested-finding-severity {
+  flex-shrink: 0;
+  text-transform: uppercase;
+  font-weight: 600;
+  font-size: 0.6rem;
+  letter-spacing: 0.03em;
+  color: var(--text);
+}
+
+.code-map__ingested-finding-tool {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.code-map__ingested-findings-more {
+  font-size: 0.65rem;
+  color: var(--text-muted);
 }
 
 /* Back/Forward traversal history toolbar (Story 1.4): lightweight chrome

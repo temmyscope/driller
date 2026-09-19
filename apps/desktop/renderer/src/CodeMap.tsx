@@ -68,6 +68,7 @@ import type {
   CodeMapNode,
   DeterministicRiskSignal,
   DeterministicRiskSignalType,
+  IngestedRiskSignal,
   LlmJudgmentRiskSignal,
 } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
@@ -403,6 +404,12 @@ type CodeMapFlowNode = FlowNode<
     // story's own Boundaries & Constraints: "no shared toggle with
     // showDeterministicSignals").
     showLlmJudgment: boolean;
+    // Story 2.3 (Phase 4): a third, fully independent renderer-local toggle
+    // for the `'ingested'` family — threaded through identically to
+    // `showDeterministicSignals`/`showLlmJudgment` above, but never reading
+    // or writing either of them (this story's own Boundaries & Constraints:
+    // "never reads/writes showDeterministicSignals/showLlmJudgment").
+    showIngestedFindings: boolean;
   },
   'codeMapNode'
 >;
@@ -420,6 +427,7 @@ function layoutNodes(
   cloudSelectedNoKey: boolean,
   showDeterministicSignals: boolean,
   showLlmJudgment: boolean,
+  showIngestedFindings: boolean,
 ): CodeMapFlowNode[] {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
   return nodes.map((node, index) => {
@@ -444,6 +452,7 @@ function layoutNodes(
         cloudSelectedNoKey,
         showDeterministicSignals,
         showLlmJudgment,
+        showIngestedFindings,
       },
     };
   });
@@ -556,6 +565,31 @@ const DETERMINISTIC_SIGNAL_LABELS: Record<DeterministicRiskSignalType, string> =
 };
 
 /**
+ * Story 2.3 (Phase 4): severity ordering for the ingested-findings callout
+ * — `blocker` > `major` > `minor` > `info` (Boundaries & Constraints,
+ * lower rank number sorts first). `Array.prototype.sort` is stable per spec
+ * (ES2019+), so sorting `node.riskSignals`' own filtered-in-order entries by
+ * this rank alone already satisfies "ties by array order" — no secondary
+ * comparator/index tracking needed.
+ */
+const INGESTED_SEVERITY_RANK: Record<IngestedRiskSignal['severity'], number> = {
+  blocker: 0,
+  major: 1,
+  minor: 2,
+  info: 3,
+};
+
+/**
+ * Cap on rendered ingested findings per Node (Boundaries & Constraints: "A
+ * Node with more than 3 findings shows the 3 highest-severity ones ... plus
+ * a '+N more' line — never renders every finding unbounded"). Ingested
+ * findings are genuinely unbounded in count/length (Design Notes), unlike
+ * the fixed five-member deterministic family above — this is this phase's
+ * own resolution of UX-DR27's "never a wall of inline comments" warning.
+ */
+const MAX_RENDERED_INGESTED_FINDINGS = 3;
+
+/**
  * The custom Node component: identifier verbatim, monospace (Always),
  * plus its one-line summary/pending/coverage-gap state (Story 1.5 Phase 2 —
  * see this file's module doc comment). `tabIndex`/`role="button"`/
@@ -593,6 +627,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     cloudSelectedNoKey,
     showDeterministicSignals,
     showLlmJudgment,
+    showIngestedFindings,
   } = data;
   // Story 1.8 (Phase 4): the "Details" affordance is shown only on a stale
   // Node (Always) — mirroring the caller/callee affordances' own
@@ -639,6 +674,24 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
   const llmJudgmentSignal = node.riskSignals.find(
     (signal): signal is LlmJudgmentRiskSignal => signal.family === 'llm-judgment',
   );
+  // Story 2.3 (Phase 4): the ingested-PR-bot-findings callout — filtered
+  // the same explicit-type-predicate way `deterministicSignals` is above
+  // (unlike `llmJudgmentSignal`, this family is genuinely multi-valued per
+  // Node — `NodeRecord.ingestedFindings`' own doc comment: "multiple bots
+  // ... can legitimately coexist on one Node"), no de-duplication (unlike
+  // the deterministic strip, this family carries no `type` discriminant to
+  // de-dupe by — two distinct findings from the same tool at the same
+  // location are both real). Sorted by severity (`blocker` > `major` >
+  // `minor` > `info`, ties by array order — `Array.prototype.sort`'s own
+  // stability guarantee, see `INGESTED_SEVERITY_RANK`'s doc comment) before
+  // capping, so the 3 findings actually rendered are always the highest-
+  // severity ones, never just the first 3 in whatever order
+  // `buildRiskSignals` happened to push them.
+  const ingestedSignals = node.riskSignals
+    .filter((signal): signal is IngestedRiskSignal => signal.family === 'ingested')
+    .sort((a, b) => INGESTED_SEVERITY_RANK[a.severity] - INGESTED_SEVERITY_RANK[b.severity]);
+  const visibleIngestedSignals = ingestedSignals.slice(0, MAX_RENDERED_INGESTED_FINDINGS);
+  const hiddenIngestedSignalCount = ingestedSignals.length - visibleIngestedSignals.length;
   return (
     <div
       className="code-map__node"
@@ -794,6 +847,44 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
         <p className="code-map__llm-judgment" title={`AI judgment: ${llmJudgmentSignal.judgment}`}>
           <span aria-hidden="true">✦</span> AI judgment: {llmJudgmentSignal.judgment}
         </p>
+      )}
+      {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings callout — its own
+          distinct visual treatment (Boundaries & Constraints: "never
+          `.code-map__signal-chip`'s classes, never llm-judgment's callout
+          classes" — a solid-border list block, not deterministic's inline
+          pills or llm-judgment's dashed single-sentence box), gated on its
+          own independent `showIngestedFindings` toggle AND on the Node
+          actually carrying at least one `'ingested'` signal (never an
+          empty/placeholder callout — mirrors llm-judgment's own
+          Boundaries). Each finding is its own row, always naming its
+          severity as real visible text — never color/icon alone
+          (Accessibility Floor) — plus the originating tool and finding
+          text (FR9, AD-12). `visibleIngestedSignals`/
+          `hiddenIngestedSignalCount` (computed above, already sorted
+          highest-severity-first) cap the rendered rows at
+          `MAX_RENDERED_INGESTED_FINDINGS` plus an explicit "+N more" line
+          when more exist — never an unbounded wall of inline comments
+          (UX-DR27, Design Notes). `key={index}` (review-pattern
+          precedent: `toFlowEdges` above keys on index too) since a raw
+          ingested finding carries no identifier of its own to key by. */}
+      {showIngestedFindings && ingestedSignals.length > 0 && (
+        <ul className="code-map__ingested-findings">
+          {visibleIngestedSignals.map((signal, index) => (
+            <li
+              key={index}
+              className="code-map__ingested-finding"
+              title={`${signal.sourceTool} (${signal.severity}): ${signal.finding}`}
+            >
+              <span aria-hidden="true">⚑</span>
+              <span className="code-map__ingested-finding-severity">{signal.severity}</span>
+              <span className="code-map__ingested-finding-tool">{signal.sourceTool}:</span>
+              <span className="code-map__ingested-finding-text">{signal.finding}</span>
+            </li>
+          ))}
+          {hiddenIngestedSignalCount > 0 && (
+            <li className="code-map__ingested-findings-more">+{hiddenIngestedSignalCount} more</li>
+          )}
+        </ul>
       )}
       {/* Caller/callee affordances (Story 1.4): a lightweight alternative to
           precisely clicking a thin edge line — hidden/inert entirely (not
@@ -1030,6 +1121,12 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // no-IPC treatment and same default-on reasoning as the deterministic
   // toggle just above.
   const [showLlmJudgment, setShowLlmJudgment] = useState(true);
+  // Story 2.3 (Phase 4): the ingested-PR-bot-findings layer's own toggle —
+  // a third, fully independent renderer-local `useState` (Boundaries &
+  // Constraints: "never reads/writes showDeterministicSignals/
+  // showLlmJudgment"), same no-persistence/no-IPC treatment and same
+  // default-on reasoning as the two toggles above.
+  const [showIngestedFindings, setShowIngestedFindings] = useState(true);
   // Review fix: correlates a `tracePath` response back to the search that
   // started it — the same generation-id pattern `sourceRequestIdRef` below
   // already applies to `readSourceRange`, and Phase 1's own
@@ -1597,6 +1694,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             cloudSelectedNoKey,
             showDeterministicSignals,
             showLlmJudgment,
+            showIngestedFindings,
           )
         : [],
     [
@@ -1609,6 +1707,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       cloudSelectedNoKey,
       showDeterministicSignals,
       showLlmJudgment,
+      showIngestedFindings,
     ],
   );
   const flowEdges = useMemo(
@@ -2322,6 +2421,25 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                 onChange={(event) => setShowLlmJudgment(event.target.checked)}
               />
               AI judgment
+            </label>
+            {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings layer's own
+                checkbox — added to this same Panel rather than a new one
+                (same "not a second floating Panel" reasoning Story 2.2
+                Phase 3's own comment above already cites), a fully
+                independent `useState`/handler that never reads or writes
+                `showDeterministicSignals`/`showLlmJudgment`. Visible label
+                reads "PR-bot findings" — a user with no visibility into the
+                internal `'ingested'` family name couldn't infer what the
+                checkbox does from that term alone (same reasoning the
+                Panel's own doc comment above applies to "Risk signals"/"AI
+                judgment"). */}
+            <label className="code-map__signal-toggle">
+              <input
+                type="checkbox"
+                checked={showIngestedFindings}
+                onChange={(event) => setShowIngestedFindings(event.target.checked)}
+              />
+              PR-bot findings
             </label>
           </Panel>
         </ReactFlow>
