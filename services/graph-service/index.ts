@@ -144,6 +144,7 @@ import type {
   HardwareAdvisoryReason,
   LlmJudgmentProgressMessage,
   ModelStatusMessage,
+  PrBotId,
   PrBotIngestionResult,
   RegenerateNodeResult,
   RiskSignal,
@@ -159,6 +160,7 @@ import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgm
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
 import { fetchCodeMap, indexRepository, type CodeMapNodeWithSignalSources } from './mcp-client';
+import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
 import {
   flushNodeRecordStore,
   getAllNodeRecords,
@@ -293,6 +295,24 @@ let activeJudgmentGenerationRunId: number | null = null;
 // prologue can only run after the first one yields, guaranteeing it
 // observes this flag already set.
 let activeStalenessRunId: number | null = null;
+
+// Story 2.3 (Phase 3, review finding — Edge Case Hunter, major): which
+// PR-bots currently have an ingestion pass actually running in THIS process.
+// main's own `pendingIngestionResolvers` guard (apps/desktop/main/index.ts)
+// is cleared by its own timeout, which can fire well before a real, slow
+// `runCodeRabbitIngestion`/`runQodoIngestion` call actually finishes (the
+// margin between `INGESTION_REQUEST_TIMEOUT_MS` and this module's own
+// `SUBPROCESS_TIMEOUT_MS`+`SIGKILL_GRACE_MS` is only ~5s) — once that
+// happens, a user retry for the SAME bot is accepted by main and reaches
+// `handleRunIngestionRequest` again while the first pass is still mid-flight
+// (this handler is invoked fire-and-forget; nothing here previously stopped
+// it running to completion in the background). Two concurrent passes for
+// the same bot would both read/write the same `review.md` (Qodo) or race
+// each other's clear-then-write persistence — this guard, independent of
+// main's own Map and never cleared by any timeout, refuses a second
+// concurrent request for a bot that's already running here, closing that
+// window at its actual source rather than trying to fix it in main.
+const activeIngestionBots = new Set<PrBotId>();
 
 // Story 1.5 Phase 3: which hardware-advisory signal source(s) have already
 // been posted this project session (Boundaries & Constraints: "sent at most
@@ -620,10 +640,11 @@ function isRegenerateNodeRequest(data: unknown): data is GraphServiceRegenerateN
 }
 
 /**
- * True for a `graphService:runIngestion` request (Story 2.3, Phase 2) —
- * mirrors `isRegenerateNodeRequest`'s shape; `bot` is narrowed to the
- * literal `'codeRabbit'` (Never: "The Qodo/PR-Agent adapter (Phase 3)"),
- * same untrusted-shape treatment every other guard in this file applies to
+ * True for a `graphService:runIngestion` request — mirrors
+ * `isRegenerateNodeRequest`'s shape; `bot` widens from the literal
+ * `'codeRabbit'` to the full `PrBotId` union as of Story 2.3 (Phase 3), now
+ * that the Qodo/PR-Agent adapter exists alongside Phase 2's CodeRabbit one.
+ * Same untrusted-shape treatment every other guard in this file applies to
  * values crossing this `parentPort` boundary from main.
  */
 function isRunIngestionRequest(data: unknown): data is GraphServiceRunIngestionRequest {
@@ -631,7 +652,7 @@ function isRunIngestionRequest(data: unknown): data is GraphServiceRunIngestionR
     return false;
   }
   const { type, bot } = data as { type?: unknown; bot?: unknown };
-  return type === 'graphService:runIngestion' && bot === 'codeRabbit';
+  return type === 'graphService:runIngestion' && (bot === 'codeRabbit' || bot === 'qodo');
 }
 
 /** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
@@ -1226,66 +1247,92 @@ async function computeRegenerateNodeResult(nodeId: string): Promise<RegenerateNo
 }
 
 /**
- * Handles a `graphService:runIngestion` request (Story 2.3, Phase 2) — this
- * app's first external-CLI-shelling-out IPC round-trip. Runs exactly one
- * PR-bot's ingestion pass (this phase: CodeRabbit only) against the most
- * recently fetched Code Map's Nodes (`activeCodeMapNodes`, the same cached
- * set `computeRegenerateNodeResult` reads — never a fresh `fetchCodeMap`,
- * mirroring that handler's own reasoning) and posts back exactly one
- * `graphService:runIngestionResult` message. Never throws — every failure
- * path (no project indexed yet, or an unexpected error from
- * `runCodeRabbitIngestion` itself) is reported as an explicit
+ * Handles a `graphService:runIngestion` request — this app's first
+ * external-CLI-shelling-out IPC round-trip. Runs exactly one PR-bot's
+ * ingestion pass (Story 2.3, Phase 2: CodeRabbit; Phase 3 adds Qodo/
+ * PR-Agent) against the most recently fetched Code Map's Nodes
+ * (`activeCodeMapNodes`, the same cached set `computeRegenerateNodeResult`
+ * reads — never a fresh `fetchCodeMap`, mirroring that handler's own
+ * reasoning) and posts back exactly one `graphService:runIngestionResult`
+ * message. Never throws — every failure path (no project indexed yet, or an
+ * unexpected error from either adapter) is reported as an explicit
  * `{status: 'error', ...}` `PrBotIngestionResult`, mirroring
  * `handleRegenerateNodeRequest`'s own top-level try/catch so main's pending
  * `pendingIngestionResolvers` entry always settles.
  */
-async function handleRunIngestionRequest(bot: 'codeRabbit'): Promise<void> {
+async function handleRunIngestionRequest(bot: PrBotId): Promise<void> {
+  if (activeIngestionBots.has(bot)) {
+    // Review finding (Edge Case Hunter, major) — see `activeIngestionBots`'s
+    // own doc comment: main's timeout can outrace this process's real
+    // subprocess work, letting a retry reach here while the original pass
+    // for this bot is still genuinely in flight. Refuse rather than start a
+    // second concurrent pass that would race the first over the same
+    // `review.md`/persisted records.
+    postRunIngestionResultMessage({
+      type: 'graphService:runIngestionResult',
+      bot,
+      result: { status: 'error', message: 'An ingestion pass for this PR-bot is already running.' },
+    });
+    return;
+  }
+
+  activeIngestionBots.add(bot);
   let result: PrBotIngestionResult;
   try {
-    result = await computeIngestionResult();
+    result = await computeIngestionResult(bot);
   } catch (error) {
     result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    activeIngestionBots.delete(bot);
   }
   postRunIngestionResultMessage({ type: 'graphService:runIngestionResult', bot, result });
 }
 
 /**
- * Runs the CodeRabbit ingestion pass and persists the result (Story 2.3,
- * Phase 2), via `coderabbit-adapter.ts`'s `runCodeRabbitIngestion` (Never:
- * "The Qodo/PR-Agent adapter (Phase 3)" — no branch for any other bot
- * exists here; `bot` isn't threaded through as a parameter since this
- * phase's caller, `handleRunIngestionRequest`, already knows it's the only
- * value `isRunIngestionRequest` accepts).
+ * Runs `bot`'s ingestion pass and persists the result — branches on `bot`
+ * (Story 2.3, Phase 3) between `coderabbit-adapter.ts`'s
+ * `runCodeRabbitIngestion` and `qodo-adapter.ts`'s `runQodoIngestion`, both
+ * of which share the same `{status, findingsByNodeId}`-shaped `'ok'` variant
+ * (and identical `'tool-not-found'`/`'no-base-ref-resolvable'`/`'error'`
+ * states), so the clear-then-write persistence logic below is written once
+ * and reused for either bot rather than duplicated per branch.
  *
  * On a genuine `'ok'` ingestion, persists via the two-step clear-then-write
  * `mergeNodeRecord` pattern the Always constraint requires: every Node's
- * existing `ingestedFindings` entries for `CODERABBIT_SOURCE_TOOL` are
+ * existing `ingestedFindings` entries for this pass's own `sourceTool`
+ * (`CODERABBIT_SOURCE_TOOL` or `QODO_SOURCE_TOOL`, selected by `bot`) are
  * stripped first (across the WHOLE project, not just Nodes this pass found
  * findings for — this is what makes a finding that no longer reproduces
  * actually disappear, I/O matrix: "the stale finding is gone from
  * `NodeRecord.ingestedFindings` after this pass"), then the freshly-grouped
- * findings are appended back per Node. Any entries from a different
- * `sourceTool` (Qodo, once Phase 3 exists) are left untouched by either
- * step — the filter only ever removes `CODERABBIT_SOURCE_TOOL` entries, and
- * the write-back only ever appends onto whatever remains.
+ * findings are appended back per Node. Entries from the OTHER bot's
+ * `sourceTool` are left untouched by either step — the filter only ever
+ * removes this pass's own `sourceTool` entries, and the write-back only
+ * ever appends onto whatever remains (Always: "CodeRabbit's own entries are
+ * never touched by a Qodo pass, and vice versa").
  */
-async function computeIngestionResult(): Promise<PrBotIngestionResult> {
+async function computeIngestionResult(bot: PrBotId): Promise<PrBotIngestionResult> {
   const nodes = activeCodeMapNodes;
   const projectRoot = activeProjectPath;
   if (!nodes || !projectRoot) {
     return { status: 'error', message: 'No project has finished indexing yet.' };
   }
-  // Captured before the (possibly minutes-long) `cr` invocation below, for
-  // the supersession check after it resolves — see that check's own comment
-  // for why `activeSummaryGenerationId` and not a plain `activeProjectPath`
-  // comparison is what's actually needed here.
+  // Captured before the (possibly minutes-long) `cr`/`python` invocation
+  // below, for the supersession check after it resolves — see that check's
+  // own comment for why `activeSummaryGenerationId` and not a plain
+  // `activeProjectPath` comparison is what's actually needed here.
   const generationId = activeSummaryGenerationId;
 
-  const ingestion = await runCodeRabbitIngestion(projectRoot, nodes);
+  const sourceTool = bot === 'codeRabbit' ? CODERABBIT_SOURCE_TOOL : QODO_SOURCE_TOOL;
+  const ingestion =
+    bot === 'codeRabbit'
+      ? await runCodeRabbitIngestion(projectRoot, nodes)
+      : await runQodoIngestion(projectRoot, nodes);
   if (ingestion.status !== 'ok') {
     // `'tool-not-found'` / `'no-base-ref-resolvable'` / `'error'` are
-    // structurally identical between `CodeRabbitIngestionResult` and
-    // `PrBotIngestionResult` — returned as-is, no reshaping needed.
+    // structurally identical between `CodeRabbitIngestionResult`/
+    // `QodoIngestionResult` and `PrBotIngestionResult` — returned as-is, no
+    // reshaping needed.
     return ingestion;
   }
 
@@ -1321,8 +1368,7 @@ async function computeIngestionResult(): Promise<PrBotIngestionResult> {
   // Step 1: clear this sourceTool's prior findings across EVERY Node first
   // (Always) — including Nodes absent from `ingestion.findingsByNodeId`
   // entirely, since those are exactly the Nodes whose finding no longer
-  // reproduces this pass.
-  const sourceTool = CODERABBIT_SOURCE_TOOL;
+  // reproduces this pass. `sourceTool` was derived from `bot` above.
   const allRecords = getAllNodeRecords();
   for (const [id, record] of Object.entries(allRecords)) {
     const existing = record.ingestedFindings;

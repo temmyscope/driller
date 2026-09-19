@@ -33,6 +33,18 @@
  * is part of this function's documented `{cwd}` options parameter (the spec's
  * Code Map only calls for `{cwd}`), so both are fixed internal constants
  * rather than caller-configurable knobs.
+ *
+ * Story 2.3 (Phase 3) widens `options` with an optional `env` — additive
+ * only: Phase 2's call sites (`coderabbit-adapter.ts`, `git-base-ref.ts`),
+ * which never pass it, are unaffected, and `execFile` itself already treats
+ * an omitted `env` option as "inherit `process.env`" (Node's own default),
+ * so leaving it `undefined` here preserves the exact behavior every existing
+ * caller already depends on. When present, it's passed straight through to
+ * `execFile`'s own `env` option — never merged/mutated here — so a caller
+ * that wants `process.env` plus one extra var (Phase 3's `qodo-adapter.ts`,
+ * for `CONFIG__GIT_PROVIDER`) builds that merged object itself and passes it
+ * whole, keeping this module's only responsibility "run this command safely,"
+ * never "decide what a caller's environment should look like."
  */
 
 import { execFile } from 'node:child_process';
@@ -68,13 +80,18 @@ const SIGKILL_GRACE_MS = 5 * 1000;
 export function runSafeSubprocess(
   command: string,
   args: string[],
-  options: { cwd: string },
+  options: { cwd: string; env?: NodeJS.ProcessEnv },
 ): Promise<SubprocessResult> {
   return new Promise((resolve) => {
     const child = execFile(
       command,
       args,
-      { cwd: options.cwd, maxBuffer: MAX_BUFFER_BYTES, timeout: SUBPROCESS_TIMEOUT_MS },
+      {
+        cwd: options.cwd,
+        maxBuffer: MAX_BUFFER_BYTES,
+        timeout: SUBPROCESS_TIMEOUT_MS,
+        ...(options.env ? { env: options.env } : {}),
+      },
       (error, stdout, stderr) => {
         clearTimeout(escalateToSigkillTimer);
         if (error) {

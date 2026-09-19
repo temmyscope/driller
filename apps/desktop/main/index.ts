@@ -48,6 +48,7 @@ import {
   type OpenInEditorResult,
   type PathTraceResult,
   type PrBotConfig,
+  type PrBotId,
   type PrBotIngestionResult,
   type ProjectOpenResult,
   type ReadSourceRangeResult,
@@ -162,9 +163,11 @@ const pendingRegenerateResolvers = new Map<
 // whichever comes first: the 'message' handler below (a genuine
 // `graphService:runIngestionResult` reply for that `bot`), the 'exit'
 // handler (the subprocess died mid-request), or that request's own timeout
-// backstop (`INGESTION_REQUEST_TIMEOUT_MS`).
+// backstop (`INGESTION_REQUEST_TIMEOUT_MS`). Key type widens from the
+// literal `'codeRabbit'` to the full `PrBotId` union in Story 2.3 (Phase 3),
+// now that Qodo/PR-Agent ingestion exists alongside CodeRabbit's.
 const pendingIngestionResolvers = new Map<
-  'codeRabbit',
+  PrBotId,
   { resolve: (result: PrBotIngestionResult) => void; reject: (error: unknown) => void }
 >();
 
@@ -445,7 +448,7 @@ function settleAllPendingRegenerateRequests(message: string): void {
  * `nodeId`). A no-op if there's no entry for `bot` (already settled by
  * whichever of those two fired first, or none was ever made).
  */
-function settlePendingIngestionRequest(bot: 'codeRabbit', result: PrBotIngestionResult): void {
+function settlePendingIngestionRequest(bot: PrBotId, result: PrBotIngestionResult): void {
   const pending = pendingIngestionResolvers.get(bot);
   if (!pending) {
     return;
@@ -824,7 +827,7 @@ function requestRegenerateNode(nodeId: string): Promise<RegenerateNodeResult> {
  * subprocess's own error reply, it exiting mid-request, `postMessage` itself
  * throwing, or the request timing out) resolves to `{status: 'error', ...}`.
  */
-function requestPrBotIngestion(projectPath: string, bot: 'codeRabbit'): Promise<PrBotIngestionResult> {
+function requestPrBotIngestion(projectPath: string, bot: PrBotId): Promise<PrBotIngestionResult> {
   if (pendingIngestionResolvers.has(bot)) {
     return Promise.resolve({
       status: 'error',
@@ -1475,10 +1478,11 @@ function registerIpcHandlers(): void {
 
   // ---------------------------------------------------------------------------
   // Story 2.3 (Phase 2): CodeRabbit ingestion — driller's first external-CLI
-  // subprocess invocation. Reachable only via this direct call this phase
-  // (Never: "Any UI trigger, entry point... this phase" — no renderer
-  // component invokes it yet, mirroring Story 1.9 Phase 1's `path:trace`
-  // being callable only from the DevTools console before its Phase 2 UI).
+  // subprocess invocation; Phase 3 adds Qodo/PR-Agent alongside it, same
+  // `bot`-keyed round trip. Reachable only via this direct call so far (no UI
+  // trigger/rendering yet — that's Phase 4's job — no renderer component
+  // invokes it yet, mirroring Story 1.9 Phase 1's `path:trace` being callable
+  // only from the DevTools console before its Phase 2 UI).
   // ---------------------------------------------------------------------------
 
   ipcMain.handle(
@@ -1490,7 +1494,7 @@ function registerIpcHandlers(): void {
       if (typeof projectPath !== 'string' || projectPath.length === 0) {
         return Promise.resolve({ status: 'error', message: 'Invalid project path.' });
       }
-      if (bot !== 'codeRabbit') {
+      if (bot !== 'codeRabbit' && bot !== 'qodo') {
         return Promise.resolve({ status: 'error', message: 'Unsupported PR-bot.' });
       }
       return requestPrBotIngestion(projectPath, bot);

@@ -1016,11 +1016,13 @@ export interface PrBotConfig {
 //    CodeRabbit's JSON not matching the assumed shape) — `message` is safe,
 //    user-facing text; nothing is persisted.
 //
-// `bot` is narrowed to the literal `'codeRabbit'` (not the broader `PrBotId`
-// union) on both the request/reply types and `DrillerApi.runPrBotIngestion`
-// below — this phase only implements the CodeRabbit adapter (Never: "The
-// Qodo/PR-Agent adapter (Phase 3)"); widening to `PrBotId` is that phase's
-// job, not a speculative addition here.
+// Story 2.3 (Phase 3): `bot` widens from the literal `'codeRabbit'` to the
+// full `PrBotId` union on `GraphServiceRunIngestionRequest`/
+// `GraphServiceRunIngestionResultMessage` and `DrillerApi.runPrBotIngestion`
+// below, now that the Qodo/PR-Agent adapter (`services/graph-service/
+// qodo-adapter.ts`) exists alongside Phase 2's CodeRabbit one — both bots
+// share this same result-state shape (`PrBotIngestionResult` itself is
+// unchanged by this phase).
 // ---------------------------------------------------------------------------
 
 /** Result of a PR-bot ingestion pass (Story 2.3, Phase 2) — see this section's doc comment for each state's meaning. */
@@ -1042,7 +1044,7 @@ export type PrBotIngestionResult =
  */
 export interface GraphServiceRunIngestionRequest {
   type: 'graphService:runIngestion';
-  bot: 'codeRabbit';
+  bot: PrBotId;
 }
 
 /**
@@ -1057,7 +1059,7 @@ export interface GraphServiceRunIngestionRequest {
  */
 export interface GraphServiceRunIngestionResultMessage {
   type: 'graphService:runIngestionResult';
-  bot: 'codeRabbit';
+  bot: PrBotId;
   result: PrBotIngestionResult;
 }
 
@@ -1225,11 +1227,11 @@ export interface DrillerApi {
    * the DevTools console, mirroring Story 1.9 Phase 1's `tracePath`).
    * `projectPath` must be the currently-open project — main rejects a call
    * for any other path with an explicit `'error'` result rather than
-   * silently operating on the wrong project. `bot` is narrowed to
-   * `'codeRabbit'` only this phase (Never: "The Qodo/PR-Agent adapter
-   * (Phase 3)").
+   * silently operating on the wrong project. `bot` widens to the full
+   * `PrBotId` union as of Story 2.3 (Phase 3), now that both the CodeRabbit
+   * and Qodo/PR-Agent adapters exist.
    */
-  runPrBotIngestion: (projectPath: string, bot: 'codeRabbit') => Promise<PrBotIngestionResult>;
+  runPrBotIngestion: (projectPath: string, bot: PrBotId) => Promise<PrBotIngestionResult>;
   /**
    * Regenerates exactly one Node's summary on demand (Story 1.8, Phase 4) —
    * this app's first id-keyed mutating IPC round-trip. Scoped to `nodeId`
