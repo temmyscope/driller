@@ -64,6 +64,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type {
+  BlastRadiusExpansionResult,
   CodeMapEdge,
   CodeMapNode,
   DeterministicRiskSignal,
@@ -190,6 +191,38 @@ function formatDiffScopeNotice(status: DiffScopeNoticeStatus): string {
       return 'No base ref could be resolved automatically (no upstream tracking branch or local main/master found) — enter one explicitly above.';
   }
 }
+
+/**
+ * Story 3.2 (Phase 2): the combined blast-radius expansion's own state —
+ * mirrors `DiffScopeState`'s shape (idle/in-flight/explicit-result-states),
+ * carrying `BlastRadiusExpansionResult`'s `'resolved'`/`'error'` states
+ * nearly as-is (`@driller/ipc-contracts`, `window.driller.expandBlastRadius`'s
+ * resolved value) rather than collapsing them into one generic error, same
+ * reasoning as `DiffScopeState`'s own doc comment.
+ *
+ * Two deliberate departures from the raw IPC result:
+ * - `hopDistances` is stored as a `Map<string, number>` here, not the wire
+ *   `Record<string, number>` — every consumer below (`blastRadiusNodeIds`)
+ *   only ever iterates entries, and a `Map` is the natural shape for that.
+ * - `maxDepth` is derived once here (the maximum hop distance actually
+ *   present in the result — "its own 'further'", Always) rather than
+ *   re-scanned on every stepper render.
+ *
+ * Reset to `'idle'` at the same three points `DiffScopeState` itself resets
+ * at (Always: "mirrors the three existing `diffScopeState` reset points
+ * exactly") — see the project-change effect, `loadCodeMap`, and
+ * `handleComputeDiffScope`. The last of these resets synchronously the
+ * instant a new diff-scope computation *starts* (review fix, Edge Case
+ * Hunter + Verification Gap: resetting only once it settles left a window
+ * where the map kept showing the previous diff scope's blast radius while
+ * the toolbar already said "Computing…" for the new one), not once it
+ * resolves/rejects.
+ */
+type BlastRadiusState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'resolved'; hopDistances: Map<string, number>; maxDepth: number }
+  | { status: 'error'; message: string };
 
 // No LOD/layout library yet (Design Notes: acceptable at this phase's real
 // scale) — a plain deterministic grid, roughly square, is enough to lay the
@@ -1241,6 +1274,21 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // a project switch (or superseded by a second trigger click) can never
   // apply its late reply over whatever the user is now looking at.
   const diffScopeRequestIdRef = useRef(0);
+  // Story 3.2 (Phase 2): the combined blast-radius expansion's own result
+  // state and the stepper's current depth — CodeMap-owned, same division-of-
+  // responsibility reasoning as `baseRefInput`/`diffScopeState` just above.
+  // `blastRadiusDepth` defaults to 1 (Design Notes: "Default depth = 1-hop"),
+  // reset to 1 alongside `blastRadiusState` at each of its own three reset
+  // points (never left stale at a deeper depth from a previous diff scope).
+  const [blastRadiusState, setBlastRadiusState] = useState<BlastRadiusState>({ status: 'idle' });
+  const [blastRadiusDepth, setBlastRadiusDepth] = useState(1);
+  // Correlates an `expandBlastRadius` response back to the auto-trigger (or
+  // reset) that started/invalidated it — same stale-response guard shape as
+  // `diffScopeRequestIdRef` just above: bumped on every reset point (project
+  // change, `loadCodeMap`, and the instant `handleComputeDiffScope` starts a
+  // new computation) so a request abandoned by one of those can never apply
+  // its late reply over whatever the user is now looking at.
+  const blastRadiusRequestIdRef = useRef(0);
   // Review fix: correlates a `tracePath` response back to the search that
   // started it — the same generation-id pattern `sourceRequestIdRef` below
   // already applies to `readSourceRange`, and Phase 1's own
@@ -1407,6 +1455,17 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     setBaseRefInput('');
     setDiffScopeState({ status: 'idle' });
     diffScopeRequestIdRef.current += 1;
+    // Story 3.2 (Phase 2, Always): "Resets to idle whenever the diff scope
+    // changes ... or the project changes/reindexes — mirrors the three
+    // existing `diffScopeState` reset points exactly" — a Retry/reindex swaps
+    // in a fresh Node/edge set (and, via the reset just above, a fresh
+    // `diffScopeState`), so a previously-resolved blast radius keyed off the
+    // now-gone map's Node ids must not survive either. Bumping the request id
+    // invalidates any still-in-flight `expandBlastRadius` call from before
+    // this reload the same way `diffScopeRequestIdRef` just above does.
+    setBlastRadiusState({ status: 'idle' });
+    setBlastRadiusDepth(1);
+    blastRadiusRequestIdRef.current += 1;
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
       // `import.meta.env.DEV` — not just the runtime-derived
@@ -1513,6 +1572,15 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     setBaseRefInput('');
     setDiffScopeState({ status: 'idle' });
     diffScopeRequestIdRef.current += 1;
+    // Story 3.2 (Phase 2, Always): same "resets whenever ... the project
+    // changes" reasoning as the `diffScopeState` reset just above — a project
+    // switch swaps in an entirely different Node set, so a blast radius
+    // computed against the previous project's Node ids must not survive
+    // into the new one. Also deliberately does NOT depend on `mode`, same
+    // reasoning as the reset above.
+    setBlastRadiusState({ status: 'idle' });
+    setBlastRadiusDepth(1);
+    blastRadiusRequestIdRef.current += 1;
   }, [projectPath]);
 
   /**
@@ -1544,6 +1612,26 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     // `"main"` (trimmed) was what was actually diffed against.
     setBaseRefInput(trimmedBaseRef);
     setDiffScopeState({ status: 'loading' });
+    // Review fix (Edge Case Hunter + Verification Gap, High): resetting
+    // `blastRadiusState` only once the new `computeDiffScope` call *settles*
+    // (in `.then`/`.catch` below) left a window — for the whole duration of
+    // this new request — where `blastRadiusNodeIds` (gated on `mode`/
+    // `blastRadiusState.status` alone, never on `diffScopeState.status`)
+    // kept rendering the *previous* diff scope's blast-radius highlight
+    // while the toolbar already said "Computing…" for the new one; a late
+    // reply from a still-in-flight previous `expandBlastRadius` call could
+    // also still apply during that window. Resetting synchronously here,
+    // the instant a genuinely new diff-scope computation starts (mirrors
+    // `diffScopeState` itself moving to `'loading'` on the very same line),
+    // closes that window entirely instead of only closing it once the new
+    // diff scope resolves. The auto-trigger effect below (guarded on
+    // `blastRadiusState.status === 'idle'`) picks this back up and re-fires
+    // on its own once `diffScopeState` lands on a `'resolved'` status with a
+    // non-empty `nodeIds` set — no separate reset is needed in `.then`/
+    // `.catch` below anymore, since this one already covers both outcomes.
+    setBlastRadiusState({ status: 'idle' });
+    setBlastRadiusDepth(1);
+    blastRadiusRequestIdRef.current += 1;
     window.driller
       .computeDiffScope(projectPath, trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined)
       .then((result: DiffScopeResult) => {
@@ -1576,6 +1664,9 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         if (diffScopeRequestIdRef.current !== requestId) {
           return;
         }
+        // `blastRadiusState` was already reset synchronously above, the
+        // instant this request started — nothing further to reset here for
+        // a rejected `computeDiffScope` call either.
         setDiffScopeState({
           status: 'error',
           message: error instanceof Error ? error.message : String(error),
@@ -1590,6 +1681,92 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     },
     [handleComputeDiffScope],
   );
+
+  /**
+   * Story 3.2 (Phase 2): the auto-trigger — `expandBlastRadius` fires on its
+   * own once the diff scope resolves with a non-empty changed-Node set
+   * (combined/unioned across every changed Node), the one deliberate
+   * exception to this codebase's "no auto-trigger" convention (Always: "a
+   * downstream call off an already-explicit diff-scope trigger, not a second
+   * unprompted git-adjacent call" — epic-3-context.md Technical Decision).
+   *
+   * Every guard condition is independent and all are required (Always: "one
+   * `expandBlastRadius` call ... auto-triggers once per resolved diff scope
+   * with a non-empty changed-Node set"):
+   * - `mode === 'prReview'` — never fires while looking at the ordinary Code
+   *   Map, mirroring `changedNodeIds`'s own mode gate just below.
+   * - `diffScopeState.status === 'resolved'` — nothing to seed this with
+   *   otherwise (no changed Nodes yet, or an explicit non-happy-path state).
+   * - `diffScopeState.nodeIds.size > 0` — an empty changed-Node set (I/O
+   *   Matrix: "Diff scope resolves with zero changed Nodes") has nothing to
+   *   seed `expandBlastRadius` with either, even though `status` itself is
+   *   `'resolved'`.
+   * - `projectPath !== null` — mirrors every other IPC-calling callback in
+   *   this file (`handleComputeDiffScope` etc.).
+   * - `blastRadiusState.status === 'idle'` — the load-bearing "don't
+   *   re-trigger" guard (Never: "No re-triggering `expandBlastRadius` on a
+   *   bare `mode` toggle once already resolved for the current diff scope —
+   *   guard on the blast-radius state itself, not just `mode`"): once this
+   *   effect has moved `blastRadiusState` past `'idle'` for the current
+   *   `diffScopeState`, toggling `mode` away and back re-runs this effect
+   *   (its dependency list includes `mode`) but this condition alone blocks
+   *   a second call — the *only* way back to `'idle'` is one of the three
+   *   explicit reset points above, each of which represents the diff scope
+   *   genuinely changing.
+   *
+   * Seeded with every changed-Node id from the resolved diff scope — never a
+   * per-Node call (Always: "never per-Node").
+   */
+  useEffect(() => {
+    if (
+      mode !== 'prReview' ||
+      projectPath === null ||
+      diffScopeState.status !== 'resolved' ||
+      diffScopeState.nodeIds.size === 0 ||
+      blastRadiusState.status !== 'idle'
+    ) {
+      return;
+    }
+    const requestId = ++blastRadiusRequestIdRef.current;
+    const seedNodeIds = Array.from(diffScopeState.nodeIds);
+    setBlastRadiusState({ status: 'loading' });
+    window.driller
+      .expandBlastRadius(projectPath, seedNodeIds)
+      .then((result: BlastRadiusExpansionResult) => {
+        if (blastRadiusRequestIdRef.current !== requestId) {
+          // Superseded by a later reset/trigger (a project switch, a
+          // Retry/reload, or a fresh diff-scope resolution) — discard rather
+          // than let a stale reply apply a blast radius keyed to a Node set
+          // that may no longer even be on screen.
+          return;
+        }
+        if (result.status === 'resolved') {
+          const hopDistances = new Map(Object.entries(result.hopDistances));
+          // The stepper's own upper bound — "its own 'further'" (Always) —
+          // is the maximum hop distance actually present, not an arbitrary
+          // constant.
+          let maxDepth = 0;
+          for (const distance of hopDistances.values()) {
+            if (distance > maxDepth) {
+              maxDepth = distance;
+            }
+          }
+          setBlastRadiusState({ status: 'resolved', hopDistances, maxDepth });
+          setBlastRadiusDepth(1);
+        } else {
+          setBlastRadiusState({ status: 'error', message: result.message });
+        }
+      })
+      .catch((error: unknown) => {
+        if (blastRadiusRequestIdRef.current !== requestId) {
+          return;
+        }
+        setBlastRadiusState({
+          status: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [mode, projectPath, diffScopeState, blastRadiusState.status]);
 
   const openSourceForNode = useCallback((node: CodeMapNode) => {
     const requestId = ++sourceRequestIdRef.current;
@@ -2029,6 +2206,28 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     return keys;
   }, [pathTrace]);
 
+  // Story 3.2 (Phase 2): the combined blast radius's own highlight Set —
+  // mirrors `pathHighlightNodeIds`'s own Set-typed, `EMPTY_ID_SET`-outside-
+  // its-happy-path precedent just above, sliced locally from the whole
+  // already-fetched `hopDistances` at the stepper's current depth
+  // (`nodeId → distance <= currentDepth`, Always) rather than a fresh IPC
+  // call per step. Gated on `mode === 'prReview'` too, same reasoning as
+  // `changedNodeIds` above — a resolved blast radius persists across a mode
+  // toggle (Never: "no re-triggering ... on a bare mode toggle"), but only
+  // PR Review Mode itself ever renders it.
+  const blastRadiusNodeIds = useMemo<ReadonlySet<string>>(() => {
+    if (mode !== 'prReview' || blastRadiusState.status !== 'resolved') {
+      return EMPTY_ID_SET;
+    }
+    const ids = new Set<string>();
+    for (const [nodeId, distance] of blastRadiusState.hopDistances) {
+      if (distance <= blastRadiusDepth) {
+        ids.add(nodeId);
+      }
+    }
+    return ids;
+  }, [mode, blastRadiusState, blastRadiusDepth]);
+
   const { renderedNodes, renderedEdges } = useMemo(() => {
     const visibleNodeIds = new Set(lodResult.fullNodeIds);
     const nodes: CodeMapAnyFlowNode[] = [];
@@ -2046,15 +2245,33 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     // numbers above, and fitting to a small path subset only zooms in
     // further); the 10,000-Node dev fixture is the only case where a path
     // Node could plausibly still be clustered post-fit.
-    const withPathHighlight = (flowNode: CodeMapFlowNode): CodeMapFlowNode =>
-      pathHighlightNodeIds.has(flowNode.id)
-        ? { ...flowNode, className: 'code-map__path-highlight' }
-        : flowNode;
+    //
+    // Story 3.2 (Phase 2): renamed from `withPathHighlight` and extended to
+    // also thread the blast-radius highlight's own `className` onto the same
+    // wrapper — both classes can legitimately land on the same Node at once
+    // (Boundaries & Constraints: "A Node CAN be both path-highlighted and
+    // blast-radius-highlighted at once; that combination must stay visually
+    // distinguishable ... via an explicit combined selector"), so this joins
+    // whichever of the two apply into one space-separated `className` rather
+    // than the two highlights fighting over a single value (only one branch
+    // of a ternary could ever win). `styles.css`'s own
+    // `.code-map__path-highlight.code-map__blast-radius-highlight` selector
+    // is what resolves that combination once both classes are present here.
+    const withHighlight = (flowNode: CodeMapFlowNode): CodeMapFlowNode => {
+      const classNames: string[] = [];
+      if (pathHighlightNodeIds.has(flowNode.id)) {
+        classNames.push('code-map__path-highlight');
+      }
+      if (blastRadiusNodeIds.has(flowNode.id)) {
+        classNames.push('code-map__blast-radius-highlight');
+      }
+      return classNames.length > 0 ? { ...flowNode, className: classNames.join(' ') } : flowNode;
+    };
 
     for (const id of lodResult.fullNodeIds) {
       const flowNode = flowNodesById.get(id);
       if (flowNode) {
-        nodes.push(withPathHighlight(flowNode));
+        nodes.push(withHighlight(flowNode));
       }
     }
 
@@ -2066,7 +2283,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         for (const nodeId of cluster.nodeIds) {
           const flowNode = flowNodesById.get(nodeId);
           if (flowNode) {
-            nodes.push(withPathHighlight(flowNode));
+            nodes.push(withHighlight(flowNode));
             visibleNodeIds.add(nodeId);
           }
         }
@@ -2102,7 +2319,16 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       });
 
     return { renderedNodes: nodes, renderedEdges: edges };
-  }, [lodResult, flowNodesById, expandedClusterIds, expandCluster, flowEdges, pathHighlightNodeIds, pathHighlightEdgeKeys]);
+  }, [
+    lodResult,
+    flowNodesById,
+    expandedClusterIds,
+    expandCluster,
+    flowEdges,
+    pathHighlightNodeIds,
+    pathHighlightEdgeKeys,
+    blastRadiusNodeIds,
+  ]);
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(
     (_event, flowNode) => {
@@ -2567,6 +2793,15 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   const mapIsRenderable =
     fetchState.status === 'ready' && fetchState.nodes.length > 0 && prReviewNoticeStatus === null;
 
+  // Story 3.2 (Phase 2): the stepper's own upper bound — "its own 'further'"
+  // (Always: "the stepper's upper bound is the maximum hop distance actually
+  // present in the result"), `0` whenever there's no resolved blast radius to
+  // bound at all. Hoisted here (mirrors `mapIsRenderable`'s own
+  // hoist-before-return reasoning) as a plain number so the "+" button's
+  // `disabled` check and its `onClick` handler below can both close over it
+  // without re-narrowing `blastRadiusState.status` inside a nested callback.
+  const blastRadiusMaxDepth = blastRadiusState.status === 'resolved' ? blastRadiusState.maxDepth : 0;
+
   return (
     <div className="code-map" ref={containerRef}>
       {/* Story 3.1 (Phase 2): the base-ref input + trigger — rendered
@@ -2634,6 +2869,93 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
               {diffScopeState.nodeIds.size} changed Node{diffScopeState.nodeIds.size === 1 ? '' : 's'}.
             </p>
           )}
+
+          {/* Story 3.2 (Phase 2): the combined blast radius's own status
+              line + stepper — only ever relevant once a diff scope is
+              actually `'resolved'` (nothing to expand otherwise), so every
+              branch here is additionally gated on that. Mirrors the
+              diff-scope status line's own idle/loading/resolved/error
+              rendering convention immediately above rather than introducing
+              a new pattern. */}
+          {diffScopeState.status === 'resolved' && blastRadiusState.status === 'loading' && (
+            <p className="code-map__pr-review-resolved" role="status">
+              Computing blast radius…
+            </p>
+          )}
+          {/* Review fix (Blind Hunter + Edge Case Hunter, Medium): a
+              `'resolved'` result with an empty `hopDistances` (nothing
+              reachable from any changed Node) previously still rendered the
+              full stepper block — "Blast radius: 0 Nodes within 1-hop."
+              with both `+`/`−` permanently disabled — indistinguishable in
+              shape from a working, steppable result. `blastRadiusMaxDepth`
+              is `0` exactly in this case (hoisted above), so it doubles as
+              the "nothing reachable" check here — a distinct short message
+              instead, mirroring this toolbar's own diff-scope notice tone,
+              rather than a stepper with nothing to step through. */}
+          {diffScopeState.status === 'resolved' &&
+            blastRadiusState.status === 'resolved' &&
+            blastRadiusMaxDepth === 0 && (
+              <p className="code-map__pr-review-resolved" role="status">
+                No Nodes found in the blast radius.
+              </p>
+            )}
+          {diffScopeState.status === 'resolved' &&
+            blastRadiusState.status === 'resolved' &&
+            blastRadiusMaxDepth > 0 && (
+              <div className="code-map__blast-radius-stepper">
+                <p className="code-map__pr-review-resolved" role="status">
+                  Blast radius: {blastRadiusNodeIds.size} Node{blastRadiusNodeIds.size === 1 ? '' : 's'} within{' '}
+                  {blastRadiusDepth}-hop{blastRadiusDepth === 1 ? '' : 's'}.
+                </p>
+                {/* Always: "one shared depth stepper for the whole combined
+                    result — never per-Node" — a single control pair, not
+                    repeated per Node. Slices the already-fetched
+                    `hopDistances` locally via `blastRadiusNodeIds` above —
+                    never a new IPC call per click (Never: "No per-hop-depth
+                    IPC re-request"). */}
+                <div
+                  className="code-map__blast-radius-stepper-controls"
+                  role="group"
+                  aria-label="Blast radius depth"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setBlastRadiusDepth((depth) => Math.max(1, depth - 1))}
+                    disabled={blastRadiusDepth <= 1}
+                    aria-label="Show a shallower blast radius"
+                  >
+                    −
+                  </button>
+                  <span className="code-map__blast-radius-stepper-depth">
+                    {blastRadiusDepth}-hop{blastRadiusDepth === 1 ? '' : 's'}
+                  </span>
+                  {/* I/O Matrix: "Stepper '+' at the result's max hop ...
+                      '+' control disabled; no-op" — `blastRadiusMaxDepth` is
+                      the maximum hop distance actually present in this
+                      result (hoisted above, Always: "its own 'further'"),
+                      not an arbitrary cap. */}
+                  <button
+                    type="button"
+                    onClick={() => setBlastRadiusDepth((depth) => Math.min(blastRadiusMaxDepth, depth + 1))}
+                    disabled={blastRadiusDepth >= blastRadiusMaxDepth}
+                    aria-label="Expand the blast radius further"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            )}
+          {/* `BlastRadiusExpansionResult['error']` reuses the same inline
+              `notice notice--error` convention `DiffScopeResult['error']`
+              just above already uses (I/O Matrix: "`expandBlastRadius`
+              fails ... inline error notice in the PR Review toolbar, mirrors
+              `diffScopeState`'s own error notice"). */}
+          {diffScopeState.status === 'resolved' && blastRadiusState.status === 'error' && (
+            <p className="notice notice--error" role="alert">
+              {blastRadiusState.message}
+            </p>
+          )}
+
           {/* `DiffScopeResult['error']` reuses the same inline
               `notice notice--error` convention `pathTrace.status ===
               'error'` already uses just below in this file, rather than the

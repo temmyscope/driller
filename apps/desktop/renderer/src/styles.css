@@ -1424,14 +1424,98 @@ code,
   overflow-wrap: break-word;
 }
 
+/* Story 3.2 (Phase 2): the combined blast radius's own status/stepper block
+   — same floated-toolbar-child treatment as `.code-map__pr-review-toolbar`/
+   `.code-map__pr-review-resolved` just above, laid out as a column so the
+   status line and the +/- controls stack rather than compete for width in
+   the already-narrow `.code-map__pr-review` container. */
+.code-map__blast-radius-stepper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  width: 100%;
+}
+
+.code-map__blast-radius-stepper-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.code-map__blast-radius-stepper-controls button {
+  padding: 0.3rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+.code-map__blast-radius-stepper-controls button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.code-map__blast-radius-stepper-controls button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.code-map__blast-radius-stepper-controls button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.code-map__blast-radius-stepper-depth {
+  min-width: 3.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+/* Story 3.2 (Phase 2): PR Review Mode's combined blast-radius highlight —
+   applied as a `className` directly on the `@xyflow/react` node wrapper
+   (`renderedNodes`'s own `withHighlight` helper, CodeMap.tsx), same
+   descendant-selector-over-the-existing-card pattern
+   `.code-map__path-highlight .code-map__node` below already established.
+   Never color-only (Accessibility Floor): a distinct border STYLE (dashed),
+   not a color swap alone. Deliberately reuses the existing `--accent` token
+   dimmed via `color-mix` rather than a new token (Design Notes: a full
+   visual-token overhaul targeting the terminal-native UX direction is
+   planned separately and will likely replace this whole palette — this
+   phase's styling budget is deliberately minimal). Set via non-shorthand
+   `border-style`/`border-width`/`border-color` properties, not the `border`
+   shorthand `.code-map__path-highlight .code-map__node` below uses (Design
+   Notes) — declared BEFORE that rule specifically so equal-specificity
+   source order lets path-highlight's later shorthand win the intersection
+   by default (see that rule's own comment for why), which is exactly the
+   "would otherwise reset it back to solid" the combined selector further
+   below exists to undo. */
+.code-map__blast-radius-highlight .code-map__node {
+  border-style: dashed;
+  border-width: 2px;
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
 /* A `found` path's own Node/edge highlight (Code Map: "no existing highlight
    mechanism to extend, this is new"). Never color-only (Accessibility
    Floor): a thicker solid border + glow ring is a shape/weight cue on its
    own, not just a color swap, and every highlighted Node also carries its
    step number via the step list above. Applied as a `className` directly on
-   the `@xyflow/react` node wrapper (`renderedNodes`'s own `withPathHighlight`
-   helper), which wraps this file's own `.code-map__node` card — styled here
-   as a descendant so the existing card markup/component needs no change. */
+   the `@xyflow/react` node wrapper (`renderedNodes`'s own `withHighlight`
+   helper, Story 3.2 Phase 2: renamed from `withPathHighlight` when it was
+   extended to also thread the blast-radius highlight above), which wraps
+   this file's own `.code-map__node` card — styled here as a descendant so
+   the existing card markup/component needs no change. Declared AFTER
+   `.code-map__blast-radius-highlight .code-map__node` above (same
+   specificity, 0,2,0, two classes each) so this rule's `border` shorthand
+   wins the intersection by source order for a Node carrying both classes —
+   `.code-map__path-highlight.code-map__blast-radius-highlight
+   .code-map__node` further below re-asserts just `border-style` on top of
+   that outcome. */
 .code-map__path-highlight .code-map__node {
   border: 2px solid var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
@@ -1449,9 +1533,34 @@ code,
    Node changed" is PR Review Mode's organizing fact (FR11) — the
    path-highlight's own `box-shadow` above is a different property and is
    untouched here, so a traced, changed Node still visibly carries both
-   signals. */
+   signals. (A changed Node is never also blast-radius-highlighted — Story
+   3.2's own Boundaries & Constraints: seed Nodes are excluded from the
+   blast-radius set by construction — so no three-way changed/path/
+   blast-radius intersection can arise here.) */
 .code-map__path-highlight .code-map__node--changed {
   border: 2px solid var(--warning);
+}
+
+/* A Node that is both path-highlighted AND blast-radius-highlighted at once
+   (Boundaries & Constraints: "that combination must stay visually
+   distinguishable ... via an explicit combined selector, never a
+   silently-overridden single property, the exact bug class Phase 2 of Story
+   3.1 already had to fix once for changed+path-highlight" — see
+   `.code-map__path-highlight .code-map__node--changed` above, the precedent
+   this mirrors). Both classes land on the same `@xyflow/react` node wrapper
+   (`withHighlight`), so this is a same-element compound selector
+   (`.a.b`), not a descendant one (`.a .b`) — deliberately: `.code-map__path-
+   highlight .code-map__node`'s own solid `border` shorthand above wins the
+   two base rules' intersection by source order (see its own comment), which
+   would otherwise reset `border-style` back to `solid` for a doubly-
+   highlighted Node. This one-line rule's higher specificity (0,3,0) re-
+   asserts dashed on top regardless of order, leaving path-highlight's own
+   accent color/glow (a different property, `box-shadow`, plus its own
+   `border-color`) untouched — so a Node that is both traced and in the
+   blast radius still visibly carries both signals at once: path-highlight's
+   solid accent color/glow, with a dashed (not solid) outline. */
+.code-map__path-highlight.code-map__blast-radius-highlight .code-map__node {
+  border-style: dashed;
 }
 
 /* The route's own consecutive-pair `CALLS` edges — thicker + solid accent
