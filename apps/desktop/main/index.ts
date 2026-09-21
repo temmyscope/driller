@@ -29,10 +29,13 @@ import {
   type BackendConfig,
   type CodeMapResult,
   type DiagnosticLogEntry,
+  type DiffScopeResult,
   type EditorPreference,
   type GitDetectionResult,
   type GraphServiceBackendSwitchedRequest,
   type GraphServiceCodeMapMessage,
+  type GraphServiceComputeDiffScopeRequest,
+  type GraphServiceComputeDiffScopeResultMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
   type GraphServicePathTraceRequest,
@@ -182,6 +185,47 @@ const pendingIngestionResolvers = new Map<
 // Notes), so this value is a reasonable engineering guess pending real-world
 // calibration, not a spec-mandated figure.
 const INGESTION_REQUEST_TIMEOUT_MS = 10 * 60 * 1000 + 10_000;
+
+// Story 3.1 (Phase 1): correlates each in-flight `diffScope:compute` request
+// to its eventual Graph Service reply — the same id-keyed `Map` shape
+// `pendingIngestionResolvers` establishes above, keyed by `projectPath`
+// instead of `bot` (there's no bot/nodeId equivalent here; `projectPath` is
+// the one natural id `computeDiffScope`'s own `(projectPath, baseRef)`
+// signature carries, and is what the spec's "single-flight guard... for the
+// same project" wording keys on). Settled by whichever comes first: the
+// 'message' handler below (a genuine `graphService:computeDiffScopeResult`
+// reply for that `projectPath`), the 'exit' handler (the subprocess died
+// mid-request), or that request's own timeout backstop
+// (`DIFF_SCOPE_REQUEST_TIMEOUT_MS`).
+//
+// Each entry also carries the `requestId` that was sent with it (review
+// finding, Blind Hunter): keying by `projectPath` alone leaves a genuine
+// stale-reply window — if a request times out and its entry is cleared, a
+// *new* request for the same `projectPath` can be issued before the
+// abandoned request's late reply finally arrives. `settlePendingDiffScopeRequest`
+// checks the reply's own `requestId` against the current entry's before
+// applying it, so a late reply from an abandoned request is discarded
+// rather than incorrectly settling a newer one.
+const pendingDiffScopeResolvers = new Map<
+  string,
+  { requestId: number; resolve: (result: DiffScopeResult) => void; reject: (error: unknown) => void }
+>();
+
+// Minted fresh for every `requestComputeDiffScope` call — see
+// `pendingDiffScopeResolvers`'s own doc comment for the stale-reply race it
+// closes.
+let nextDiffScopeRequestId = 0;
+
+// Unlike `cr`'s own PR-bot ingestion (which shells out to a vendor cloud and
+// can genuinely take minutes), `computeDiffScope` only ever runs local `git
+// merge-base`/`git diff` subprocess calls, now bounded to
+// `GIT_SUBPROCESS_TIMEOUT_MS` each (20s, `services/graph-service/
+// git-diff-scope.ts` — review finding, Blind Hunter + Edge Case Hunter) —
+// sized generously past this outer, now-properly-bounded worst case (well
+// under `INGESTION_REQUEST_TIMEOUT_MS`'s cloud-call sizing) so a genuine
+// hang is still caught promptly rather than leaving the caller waiting
+// minutes for what should be a sub-second local operation.
+const DIFF_SCOPE_REQUEST_TIMEOUT_MS = 60 * 1000 + 10_000;
 
 // Story 1.9 (Phase 1): a single-slot resolver for an in-flight `path:trace`
 // request, mirroring `pendingCodeMapResolve`'s own single-slot shape rather
@@ -341,6 +385,20 @@ function isRunIngestionResultMessage(message: unknown): message is GraphServiceR
 }
 
 /**
+ * True for a `graphService:computeDiffScopeResult` reply (Story 3.1, Phase
+ * 1) — distinguished from every other message shape on this same channel by
+ * `type`, same convention as `isRunIngestionResultMessage`.
+ */
+function isComputeDiffScopeResultMessage(
+  message: unknown,
+): message is GraphServiceComputeDiffScopeResultMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:computeDiffScopeResult';
+}
+
+/**
  * True for a `graphService:modelStatus` post — distinguished from a
  * `GraphServiceStatusMessage` by `type` the same way `isCodeMapMessage` is,
  * since both status unions use overlapping `state` values (e.g. `'error'`).
@@ -471,6 +529,53 @@ function settleAllPendingIngestionRequests(message: string): void {
 }
 
 /**
+ * Settles the pending `diffScope:compute` request for `projectPath`, if any
+ * (Story 3.1, Phase 1) — used both by a genuine
+ * `graphService:computeDiffScopeResult` reply and by that request's own
+ * timeout backstop, mirroring `settlePendingIngestionRequest`'s exact shape
+ * (keyed by `projectPath` instead of `bot`). A no-op if there's no entry for
+ * `projectPath` (already settled by whichever of those two fired first, or
+ * none was ever made).
+ *
+ * `requestId` (review finding, Blind Hunter): when provided (the message
+ * handler's own call, for a genuine reply), only settles if it matches the
+ * CURRENT entry's own `requestId` — a mismatch means this is a stale reply
+ * from an already-abandoned request (its own entry was already cleared by
+ * its timeout, and a newer request has since taken this `projectPath`'s
+ * slot), discarded rather than incorrectly settling the newer request's
+ * promise. Omitted by the timeout backstop and the exit-handler's
+ * settle-all (`settleAllPendingDiffScopeRequests`) — both are unconditional
+ * "give up on whatever's here" callers, not reacting to a specific reply,
+ * and are never reachable concurrently with a second request for the same
+ * `projectPath` in the first place (`requestComputeDiffScope`'s own
+ * single-flight guard).
+ */
+function settlePendingDiffScopeRequest(projectPath: string, result: DiffScopeResult, requestId?: number): void {
+  const pending = pendingDiffScopeResolvers.get(projectPath);
+  if (!pending) {
+    return;
+  }
+  if (requestId !== undefined && pending.requestId !== requestId) {
+    return;
+  }
+  pendingDiffScopeResolvers.delete(projectPath);
+  pending.resolve(result);
+}
+
+/**
+ * Settles EVERY still-pending `diffScope:compute` request with an explicit
+ * error — used when the Graph Service subprocess exits with one or more
+ * diff-scope requests outstanding, mirroring
+ * `settleAllPendingIngestionRequests`'s exact reasoning.
+ */
+function settleAllPendingDiffScopeRequests(message: string): void {
+  for (const [projectPath, pending] of pendingDiffScopeResolvers) {
+    pendingDiffScopeResolvers.delete(projectPath);
+    pending.resolve({ status: 'error', message });
+  }
+}
+
+/**
  * Settles the pending `path:trace` request for `token` (if it's still the
  * one occupying the slot) with an explicit result — used both for a genuine
  * `graphService:pathTraceResult` reply (whose echoed `requestId` becomes
@@ -552,6 +657,7 @@ function spawnGraphService(): void {
         | GraphServiceRegenerateNodeResultMessage
         | GraphServicePathTraceResultMessage
         | GraphServiceRunIngestionResultMessage
+        | GraphServiceComputeDiffScopeResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -575,6 +681,10 @@ function spawnGraphService(): void {
       }
       if (isRunIngestionResultMessage(message)) {
         settlePendingIngestionRequest(message.bot, message.result);
+        return;
+      }
+      if (isComputeDiffScopeResultMessage(message)) {
+        settlePendingDiffScopeRequest(message.projectPath, message.result, message.requestId);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -626,6 +736,12 @@ function spawnGraphService(): void {
     // the subprocess dying mid-ingestion will never post the
     // `graphService:runIngestionResult` reply those promises are waiting on.
     settleAllPendingIngestionRequests('Graph Service exited before the ingestion pass could complete.');
+    // Story 3.1 (Phase 1): every still-pending diff-scope request is settled
+    // too, same reasoning as the settle calls above it — the subprocess
+    // dying mid-computation will never post the
+    // `graphService:computeDiffScopeResult` reply those promises are waiting
+    // on.
+    settleAllPendingDiffScopeRequests('Graph Service exited before the diff scope could be computed.');
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -869,6 +985,80 @@ function requestPrBotIngestion(projectPath: string, bot: PrBotId): Promise<PrBot
     settlePendingIngestionRequest(bot, {
       status: 'error',
       message: `Failed to send the ingestion request to the Graph Service: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+
+  return promise;
+}
+
+/**
+ * Relays a diff-scope computation request to the Graph Service subprocess
+ * (Story 3.1, Phase 1) and resolves once it replies — mirrors
+ * `requestPrBotIngestion`'s overall shape exactly (an id-keyed
+ * `pendingDiffScopeResolvers` Map, keyed by `projectPath` instead of `bot`;
+ * a second overlapping call for the same project is rejected immediately
+ * rather than queued; its own timeout backstop; a wrapped `postMessage`
+ * call).
+ *
+ * `projectPath` must be the currently-open project (`currentProjectPath`) —
+ * same validation `requestPrBotIngestion` already applies, for the same
+ * reason: this call is only ever meaningful against the project the Graph
+ * Service actually has indexed and cached Nodes for.
+ *
+ * Rejects nothing, matching `requestPrBotIngestion`'s own framing: every
+ * failure path (no subprocess running or shutting down, a request already
+ * in flight for this project, `projectPath` not the open project, the
+ * subprocess's own error reply, it exiting mid-request, `postMessage` itself
+ * throwing, or the request timing out) resolves to `{status: 'error', ...}`.
+ */
+function requestComputeDiffScope(projectPath: string, baseRef: string | undefined): Promise<DiffScopeResult> {
+  if (pendingDiffScopeResolvers.has(projectPath)) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'A diff-scope computation for this project is already in progress.',
+    });
+  }
+  if (!graphService || isGraphServiceShuttingDown) {
+    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+  }
+  if (projectPath !== currentProjectPath) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'The requested project is not the currently open project.',
+    });
+  }
+  const service = graphService;
+  const requestId = ++nextDiffScopeRequestId;
+
+  const promise = new Promise<DiffScopeResult>((resolve, reject) => {
+    pendingDiffScopeResolvers.set(projectPath, { requestId, resolve, reject });
+  });
+
+  const timeoutTimer = setTimeout(() => {
+    settlePendingDiffScopeRequest(projectPath, {
+      status: 'error',
+      message: 'Timed out waiting for the Graph Service to respond to the diff-scope request.',
+    });
+  }, DIFF_SCOPE_REQUEST_TIMEOUT_MS);
+  void promise.finally(() => clearTimeout(timeoutTimer));
+
+  try {
+    service.postMessage({
+      type: 'graphService:computeDiffScope',
+      projectPath,
+      requestId,
+      ...(baseRef !== undefined ? { baseRef } : {}),
+    } satisfies GraphServiceComputeDiffScopeRequest);
+  } catch (error) {
+    // A synchronous throw here would otherwise leave this projectPath's
+    // resolver set with nothing left to ever call it, leaking the request
+    // forever — same reasoning as `requestPrBotIngestion`'s own matching
+    // catch block.
+    settlePendingDiffScopeRequest(projectPath, {
+      status: 'error',
+      message: `Failed to send the diff-scope request to the Graph Service: ${
         error instanceof Error ? error.message : String(error)
       }`,
     });
@@ -1498,6 +1688,39 @@ function registerIpcHandlers(): void {
         return Promise.resolve({ status: 'error', message: 'Unsupported PR-bot.' });
       }
       return requestPrBotIngestion(projectPath, bot);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Story 3.1 (Phase 1): compute a diff-scoped Node set from local git —
+  // driller's first `git diff`/`git merge-base` subprocess computation. No
+  // renderer entry point yet (Never: "no UI trigger, mode switcher... this
+  // phase") — reachable only via this direct call, mirroring Story 2.3
+  // Phase 2's `prBot:runIngestion` being callable only from the DevTools
+  // console before its own UI phase.
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.diffScopeCompute,
+    (_event, projectPath: unknown, baseRefInput: unknown): Promise<DiffScopeResult> => {
+      // Renderer-supplied values cross the contextBridge boundary untyped at
+      // runtime (same precedent as `prBotRunIngestion`'s own guard above).
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return Promise.resolve({ status: 'error', message: 'Invalid project path.' });
+      }
+      // Review finding (Blind Hunter + Edge Case Hunter, independently):
+      // `null` (a plausible default form value crossing the untyped
+      // contextBridge) and a whitespace-only string were both previously
+      // rejected as `'Invalid base ref.'` instead of being treated the same
+      // as an omitted `baseRef` — both mean "no explicit ref, resolve a
+      // default." Only a genuinely wrong type (not `undefined`/`null`/a
+      // string) is actually invalid.
+      if (baseRefInput !== undefined && baseRefInput !== null && typeof baseRefInput !== 'string') {
+        return Promise.resolve({ status: 'error', message: 'Invalid base ref.' });
+      }
+      const trimmedBaseRef = typeof baseRefInput === 'string' ? baseRefInput.trim() : '';
+      const baseRef = trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined;
+      return requestComputeDiffScope(projectPath, baseRef);
     },
   );
 

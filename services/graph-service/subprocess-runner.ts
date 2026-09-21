@@ -45,6 +45,16 @@
  * for `CONFIG__GIT_PROVIDER`) builds that merged object itself and passes it
  * whole, keeping this module's only responsibility "run this command safely,"
  * never "decide what a caller's environment should look like."
+ *
+ * Story 3.1 (Phase 1) widens `options` with an optional `timeoutMs` —
+ * additive only, defaulting to `SUBPROCESS_TIMEOUT_MS` (10 minutes,
+ * correctly sized for Phase 2/3's vendor-cloud CLI calls) when omitted, so
+ * existing callers are unaffected. `git-diff-scope.ts`'s local `git
+ * merge-base`/`git diff` calls pass a much shorter override (review finding,
+ * Blind Hunter + Edge Case Hunter, independently: the shared 10-minute
+ * default left `activeDiffScopeComputationInFlight` stuck for up to ~20
+ * minutes if a local git call ever hung, wildly oversized for a read-only,
+ * no-network local operation that should complete in milliseconds).
  */
 
 import { execFile } from 'node:child_process';
@@ -80,8 +90,9 @@ const SIGKILL_GRACE_MS = 5 * 1000;
 export function runSafeSubprocess(
   command: string,
   args: string[],
-  options: { cwd: string; env?: NodeJS.ProcessEnv },
+  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
 ): Promise<SubprocessResult> {
+  const timeoutMs = options.timeoutMs ?? SUBPROCESS_TIMEOUT_MS;
   return new Promise((resolve) => {
     const child = execFile(
       command,
@@ -89,7 +100,7 @@ export function runSafeSubprocess(
       {
         cwd: options.cwd,
         maxBuffer: MAX_BUFFER_BYTES,
-        timeout: SUBPROCESS_TIMEOUT_MS,
+        timeout: timeoutMs,
         ...(options.env ? { env: options.env } : {}),
       },
       (error, stdout, stderr) => {
@@ -118,6 +129,6 @@ export function runSafeSubprocess(
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL');
       }
-    }, SUBPROCESS_TIMEOUT_MS + SIGKILL_GRACE_MS);
+    }, timeoutMs + SIGKILL_GRACE_MS);
   });
 }

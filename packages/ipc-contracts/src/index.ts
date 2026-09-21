@@ -1064,6 +1064,100 @@ export interface GraphServiceRunIngestionResultMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 3.1 (Phase 1): compute a diff-scoped Node set from local git (FR11,
+// AD-13).
+//
+// driller's first `git diff`/`git merge-base` subprocess computation —
+// reuses Story 2.3's `runSafeSubprocess` (`services/graph-service/
+// subprocess-runner.ts`) and `resolveDefaultBranch`
+// (`services/graph-service/git-base-ref.ts`) unchanged, never a second
+// subprocess mechanism. `findChangedNodeIds` (the actual Node-set matching,
+// `@driller/graph-contracts`) is defined once, transport-agnostically, and
+// reused here for the IPC envelope rather than redefined ad hoc — same
+// precedent as `PathTraceResult`'s import above.
+//
+// `DiffScopeResult` is an explicit, enumerated result-state union (AD-13's
+// broader pattern), never null/empty standing in for "nothing changed" or
+// "couldn't compute":
+//  - `'resolved'`: `resolvedBaseRef` is always the merge-base COMMIT (never
+//    the branch/ref name that was supplied or resolved) — the exact commit
+//    `git diff --name-only` was actually run against, so what's reported and
+//    what was computed can never silently diverge (Design Notes).
+//    `nodeIds` is the diff-scoped Node set, matched via `findChangedNodeIds`.
+//  - `'no-changes'`: the resolved base ref produced an empty changed-file
+//    list — never an empty-but-unexplained `nodeIds`.
+//  - `'not-a-git-repo'`: `.git` was absent at the project root at call time
+//    (checked fresh, not cached from project-open — Design Notes) — no git
+//    subprocess call was made.
+//  - `'no-base-ref-resolvable'`: `baseRef` was omitted and
+//    `resolveDefaultBranch` found nothing (no upstream, no local
+//    `main`/`master`) — no git diff/merge-base call was made.
+//  - `'error'`: any other failure (a non-`ENOENT` subprocess failure, or an
+//    unexpected `merge-base`/`diff` result) — `message` is safe, user-facing
+//    text.
+// ---------------------------------------------------------------------------
+
+export type DiffScopeResult =
+  | { status: 'resolved'; resolvedBaseRef: string; nodeIds: string[] }
+  | { status: 'no-changes' }
+  | { status: 'not-a-git-repo' }
+  | { status: 'no-base-ref-resolvable' }
+  | { status: 'error'; message: string };
+
+/**
+ * Message main sends to ask the Graph Service subprocess to compute a
+ * diff-scoped Node set. `baseRef` is the caller-supplied branch/commit name
+ * — optional, mirroring `computeDiffScope`'s own `(projectRoot, baseRef)`
+ * signature (`services/graph-service/git-diff-scope.ts`); omitted, the Graph
+ * Service resolves one via `resolveDefaultBranch` before ever calling git.
+ *
+ * Carries `projectPath` even though the Graph Service itself always computes
+ * against its own `activeProjectPath`/`activeCodeMapNodes` state (mirrors
+ * `handleRunIngestionRequest`'s shape, Code Map) — needed to settle the right
+ * pending entry in main's own single-flight guard (`pendingDiffScopeResolvers`,
+ * keyed by project path), including across a project switch that races an
+ * in-flight request.
+ *
+ * `requestId` (review finding, Blind Hunter — a real correlation bug, not
+ * just a defensive nicety): unlike `GraphServiceRunIngestionRequest`
+ * (correlated via the natural `bot` id, which can't collide across two
+ * *different* requests for the same bot since only one is ever in flight per
+ * bot), a `projectPath`-only key here has a genuine stale-reply window — if a
+ * request times out and its `pendingDiffScopeResolvers` entry is cleared, a
+ * *new* request for the same `projectPath` can be issued before the
+ * abandoned request's late reply finally arrives; without a way to tell them
+ * apart, that late reply would incorrectly settle the new request's promise.
+ * `requestId` is a monotonically increasing counter minted by main
+ * (`nextDiffScopeRequestId`) per call, echoed back verbatim in the reply, and
+ * checked before settling — a reply whose `requestId` doesn't match the
+ * current pending entry's is a stale reply from an abandoned request and is
+ * discarded rather than applied.
+ */
+export interface GraphServiceComputeDiffScopeRequest {
+  type: 'graphService:computeDiffScope';
+  projectPath: string;
+  baseRef?: string;
+  requestId: number;
+}
+
+/**
+ * Message the Graph Service subprocess posts back in response to a
+ * `GraphServiceComputeDiffScopeRequest`, over the same `parentPort` channel
+ * as every other Graph Service message — distinguished by `type`, same
+ * convention as `GraphServiceRunIngestionResultMessage`. `projectPath` and
+ * `requestId` both echo the request's own fields verbatim (never re-derived
+ * from the Graph Service's own possibly-since-changed `activeProjectPath`) —
+ * see those fields' own doc comments on `GraphServiceComputeDiffScopeRequest`
+ * for the correlation they exist for.
+ */
+export interface GraphServiceComputeDiffScopeResultMessage {
+  type: 'graphService:computeDiffScopeResult';
+  projectPath: string;
+  requestId: number;
+  result: DiffScopeResult;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -1091,6 +1185,7 @@ export const IpcChannels = {
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
   diagnosticLog: 'diagnostic:log',
+  diffScopeCompute: 'diffScope:compute',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -1256,4 +1351,16 @@ export interface DrillerApi {
    * allowed to block whatever UI action triggered it.
    */
   logDiagnosticEvent: (entry: DiagnosticLogEntry) => Promise<void>;
+  /**
+   * Computes a diff-scoped Node set from local git for `projectPath` (Story
+   * 3.1, Phase 1, FR11, AD-13) — driller's first `git diff`/`git merge-base`
+   * round trip. `baseRef` is an optional branch/commit name; omitted, the
+   * Graph Service resolves a default via `resolveDefaultBranch`. `projectPath`
+   * must be the currently-open project — main rejects a call for any other
+   * path with an explicit `'error'` result, mirroring `runPrBotIngestion`'s
+   * own validation. No renderer entry point calls this yet this phase (Never:
+   * "no UI trigger, mode switcher... this phase") — reachable only by calling
+   * this directly, e.g. from the DevTools console.
+   */
+  computeDiffScope: (projectPath: string, baseRef?: string) => Promise<DiffScopeResult>;
 }

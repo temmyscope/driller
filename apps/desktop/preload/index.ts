@@ -14,6 +14,7 @@ import {
   type CloudBackend,
   type CodeMapResult,
   type DiagnosticLogEntry,
+  type DiffScopeResult,
   type DrillerApi,
   type EditorPreference,
   type GraphServiceStatusMessage,
@@ -134,6 +135,9 @@ const drillerApi: DrillerApi = {
   // current caller (CodeMap.tsx) adding its own `.catch`.
   logDiagnosticEvent: (entry: DiagnosticLogEntry): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.diagnosticLog, entry).catch(() => undefined),
+
+  computeDiffScope: (projectPath: string, baseRef?: string): Promise<DiffScopeResult> =>
+    ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

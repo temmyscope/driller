@@ -400,3 +400,54 @@ export function findEnclosingNode(
 function sortBySortedId(matches: PathTraceNode[]): PathTraceNode[] {
   return [...matches].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
+
+// ---------------------------------------------------------------------------
+// Story 3.1 (Phase 1): diff-scoped Node-set matching (FR11, AD-13).
+//
+// Lives here, not `services/graph-service` — same "transport-agnostic,
+// pure, reused identically by IPC now and a future agent-facing surface"
+// reasoning `findEnclosingNode`'s own section header already states, since
+// AD-13 requires the diff-scoped Node-set operation be "defined once...
+// exposed identically to the renderer and (later) the Agent-Facing Query
+// Surface." A minimal structural shape, deliberately not `CodeMapNode` (same
+// "no dependency on @driller/ipc-contracts" stance every other shape in this
+// file already takes) — any caller with compatible `{id, file}` values can
+// use it.
+// ---------------------------------------------------------------------------
+
+/** Minimal structural Node shape `findChangedNodeIds` needs — see this section's doc comment. */
+export interface ChangedFileNodeCandidate {
+  id: string;
+  file: string;
+}
+
+/**
+ * Matches `changedFiles` (a diff's changed-file list) against `nodes`,
+ * returning the `id` of every Node whose `file` appears in that list.
+ *
+ * `file` is matched by exact string equality — both `nodes[].file` and each
+ * entry of `changedFiles` are expected to already be in the same normalized,
+ * POSIX-relative-to-project-root form (AD-19); this function does no path
+ * normalization of its own (pure, no I/O), mirroring `findEnclosingNode`'s
+ * own "caller already has compatible data in hand" contract exactly.
+ *
+ * A changed file that matches no Node (a config file, a non-source file, a
+ * file outside the graph entirely) simply contributes no id to the result —
+ * never an error, never a placeholder entry (I/O matrix: "that file
+ * contributes no Node to the result set; others still included").
+ *
+ * Result order follows `nodes`' own input order (not `changedFiles`'
+ * order, and not re-sorted) — deterministic given a deterministic `nodes`
+ * order, the same "no ordering guarantee beyond the input's own" stance
+ * `findEnclosingNode` takes for its own iteration.
+ */
+export function findChangedNodeIds(nodes: ChangedFileNodeCandidate[], changedFiles: string[]): string[] {
+  const changedFileSet = new Set(changedFiles);
+  const nodeIds: string[] = [];
+  for (const node of nodes) {
+    if (changedFileSet.has(node.file)) {
+      nodeIds.push(node.id);
+    }
+  }
+  return nodeIds;
+}

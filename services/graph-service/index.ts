@@ -122,14 +122,18 @@ import path from 'node:path';
 import {
   buildBidirectionalAdjacency,
   computeBlastRadiusFromAdjacency,
+  findChangedNodeIds,
   traceCallPath,
   type BidirectionalAdjacency,
 } from '@driller/graph-contracts';
 import type {
   CloudBackend,
   CodeMapNode,
+  DiffScopeResult,
   GraphServiceBackendSwitchedRequest,
   GraphServiceCodeMapMessage,
+  GraphServiceComputeDiffScopeRequest,
+  GraphServiceComputeDiffScopeResultMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
   GraphServicePathTraceRequest,
@@ -156,6 +160,7 @@ import type {
 import type {} from 'electron';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
+import { computeDiffScope } from './git-diff-scope';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
@@ -314,6 +319,16 @@ let activeStalenessRunId: number | null = null;
 // window at its actual source rather than trying to fix it in main.
 const activeIngestionBots = new Set<PrBotId>();
 
+// Story 3.1 (Phase 1): whether a `graphService:computeDiffScope` request is
+// currently running in THIS process — a plain boolean, not a `Set` like
+// `activeIngestionBots`, since there's no per-key dimension here analogous
+// to `PrBotId` (only one diff-scope computation is ever meaningful at a
+// time, against this process's single `activeProjectPath`). Mirrors
+// `activeIngestionBots`'s own reasoning: refuses a second concurrent request
+// outright rather than letting two overlapping git subprocess sequences race
+// each other.
+let activeDiffScopeComputationInFlight = false;
+
 // Story 1.5 Phase 3: which hardware-advisory signal source(s) have already
 // been posted this project session (Boundaries & Constraints: "sent at most
 // once per signal source per project session (no repeat spam)"). Reset at
@@ -408,6 +423,15 @@ function postPathTraceResultMessage(message: GraphServicePathTraceResultMessage)
  * `postRegenerateNodeResultMessage`/`postPathTraceResultMessage`.
  */
 function postRunIngestionResultMessage(message: GraphServiceRunIngestionResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/**
+ * Posts a `graphService:computeDiffScopeResult` reply (Story 3.1, Phase 1) —
+ * own `type`/channel, same disambiguation convention as
+ * `postRunIngestionResultMessage`/`postPathTraceResultMessage`.
+ */
+function postComputeDiffScopeResultMessage(message: GraphServiceComputeDiffScopeResultMessage): void {
   process.parentPort?.postMessage(message);
 }
 
@@ -653,6 +677,40 @@ function isRunIngestionRequest(data: unknown): data is GraphServiceRunIngestionR
   }
   const { type, bot } = data as { type?: unknown; bot?: unknown };
   return type === 'graphService:runIngestion' && (bot === 'codeRabbit' || bot === 'qodo');
+}
+
+/**
+ * True for a `graphService:computeDiffScope` request (Story 3.1, Phase 1) —
+ * mirrors `isRunIngestionRequest`'s shape, plus the same defensive
+ * non-empty-string check `isIndexRequest` already applies to `projectPath`.
+ * `baseRef`, when present, must be a non-empty string (review finding, Edge
+ * Case Hunter: an empty string previously passed this guard and reached
+ * `git merge-base` as a literal empty ref, producing an opaque generic
+ * subprocess error instead of `resolveDefaultBranch`'s own resolution path)
+ * — `undefined` (omitted) is still valid and means "resolve a default".
+ * `requestId` must be a `number` — echoed back verbatim in the reply so
+ * main can discard a stale reply from an abandoned request (see
+ * `GraphServiceComputeDiffScopeRequest`'s own doc comment). Same untrusted-
+ * shape treatment every other guard in this file applies to values crossing
+ * this `parentPort` boundary from main.
+ */
+function isComputeDiffScopeRequest(data: unknown): data is GraphServiceComputeDiffScopeRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, projectPath, baseRef, requestId } = data as {
+    type?: unknown;
+    projectPath?: unknown;
+    baseRef?: unknown;
+    requestId?: unknown;
+  };
+  return (
+    type === 'graphService:computeDiffScope' &&
+    typeof projectPath === 'string' &&
+    projectPath.length > 0 &&
+    (baseRef === undefined || (typeof baseRef === 'string' && baseRef.length > 0)) &&
+    typeof requestId === 'number'
+  );
 }
 
 /** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
@@ -1428,6 +1486,104 @@ async function computeIngestionResult(bot: PrBotId): Promise<PrBotIngestionResul
 }
 
 /**
+ * Handles a `graphService:computeDiffScope` request (Story 3.1, Phase 1) —
+ * this app's first `git diff`/`git merge-base` subprocess computation. Runs
+ * `git-diff-scope.ts`'s `computeDiffScope` against the most recently fetched
+ * Code Map's Nodes (`activeCodeMapNodes`/`activeProjectPath`, the same
+ * cached state `computeIngestionResult` reads — never a fresh fetch,
+ * mirroring `handleRunIngestionRequest`'s own reasoning) and posts back
+ * exactly one `graphService:computeDiffScopeResult` message. Never throws —
+ * every failure path is reported as an explicit `{status: 'error', ...}`
+ * `DiffScopeResult`, mirroring `handleRunIngestionRequest`'s own top-level
+ * try/catch so main's pending `pendingDiffScopeResolvers` entry always
+ * settles.
+ */
+async function handleComputeDiffScopeRequest(
+  projectPath: string,
+  baseRef: string | undefined,
+  requestId: number,
+): Promise<void> {
+  if (activeDiffScopeComputationInFlight) {
+    // Refuses a second concurrent request outright rather than letting two
+    // overlapping git subprocess sequences race each other — same reasoning
+    // as `handleRunIngestionRequest`'s own `activeIngestionBots` guard.
+    postComputeDiffScopeResultMessage({
+      type: 'graphService:computeDiffScopeResult',
+      projectPath,
+      requestId,
+      result: { status: 'error', message: 'A diff-scope computation is already running.' },
+    });
+    return;
+  }
+
+  activeDiffScopeComputationInFlight = true;
+  let result: DiffScopeResult;
+  try {
+    result = await computeDiffScopeResult(projectPath, baseRef);
+  } catch (error) {
+    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    activeDiffScopeComputationInFlight = false;
+  }
+  postComputeDiffScopeResultMessage({ type: 'graphService:computeDiffScopeResult', projectPath, requestId, result });
+}
+
+/**
+ * Computes the diff-scoped `DiffScopeResult` for `projectPath` against
+ * `baseRef` — branches on `git-diff-scope.ts`'s `computeDiffScope` result:
+ * every non-`'resolved'` state (`'no-changes'`/`'not-a-git-repo'`/
+ * `'no-base-ref-resolvable'`/`'error'`) is structurally identical to
+ * `DiffScopeResult`'s own variants and returned as-is, no reshaping needed
+ * (same precedent `computeIngestionResult` already established for
+ * `CodeRabbitIngestionResult`'s pass-through states). Only `'resolved'` is
+ * reshaped: `changedFiles` is matched against `nodes` via
+ * `@driller/graph-contracts`'s `findChangedNodeIds` to produce `nodeIds` —
+ * the actual diff-scoped Node set.
+ */
+async function computeDiffScopeResult(projectPath: string, baseRef: string | undefined): Promise<DiffScopeResult> {
+  const nodes = activeCodeMapNodes;
+  const projectRoot = activeProjectPath;
+  if (!nodes || !projectRoot) {
+    return { status: 'error', message: 'No project has finished indexing yet.' };
+  }
+  if (projectRoot !== projectPath) {
+    // Mirrors `computeIngestionResult`'s own stale-project guard: a request
+    // for a project that isn't (or is no longer) this process's active one
+    // must never silently compute against the wrong project's Nodes.
+    return { status: 'error', message: 'The requested project is not the currently active project.' };
+  }
+  // Captured before the git subprocess calls below, for the supersession
+  // check after they resolve — see `computeIngestionResult`'s own identical
+  // guard (Story 2.3 Phase 2 review finding) for why `activeSummaryGenerationId`,
+  // not a plain `activeProjectPath` comparison, is what's actually needed:
+  // a re-index of the SAME project also bumps this counter, unlike
+  // `activeProjectPath`, which is reassigned to the same value on every
+  // re-index and so can't detect one on its own.
+  const generationId = activeSummaryGenerationId;
+
+  const diffScope = await computeDiffScope(projectRoot, baseRef);
+  if (diffScope.status !== 'resolved') {
+    return diffScope;
+  }
+
+  // Review finding (Blind Hunter): `nodes` was captured before the
+  // (possibly slow) git subprocess calls above — if a re-index or project
+  // switch happened during that window, `nodes` no longer reflects this
+  // project's current indexed state, and its Node ids may not even be valid
+  // anymore. Discard rather than return a `nodeIds` set matched against a
+  // now-superseded Node list.
+  if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
+    return {
+      status: 'error',
+      message: 'The project changed while the diff-scope computation was running; discarding its results.',
+    };
+  }
+
+  const nodeIds = findChangedNodeIds(nodes, diffScope.changedFiles);
+  return { status: 'resolved', resolvedBaseRef: diffScope.resolvedBaseRef, nodeIds };
+}
+
+/**
  * Kicks off `generateSummaries` for the Nodes just posted in a
  * `graphService:codeMap` response (Story 1.5 Phase 2), relaying its batched
  * progress as `graphService:summaryProgress` posts. Fire-and-forget from the
@@ -1938,6 +2094,14 @@ process.parentPort?.on('message', (event) => {
     // `graphService:runIngestionResult` reply asynchronously and never
     // throws (its own top-level try/catch guarantees that).
     void handleRunIngestionRequest(event.data.bot);
+    return;
+  }
+  if (!isShuttingDown && isComputeDiffScopeRequest(event.data)) {
+    // Fire-and-forget from the message handler's perspective, same as every
+    // other branch here — `handleComputeDiffScopeRequest` posts its own
+    // `graphService:computeDiffScopeResult` reply asynchronously and never
+    // throws (its own top-level try/catch guarantees that).
+    void handleComputeDiffScopeRequest(event.data.projectPath, event.data.baseRef, event.data.requestId);
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {
