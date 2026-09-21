@@ -92,6 +92,59 @@ code,
 }
 
 /*
+ * Story 3.1 (Phase 2): driller's first mode concept — a persistent 3-way
+ * switcher, always visible in the header (App.tsx) regardless of
+ * `isIndexed` (Always, UX-DR9). Mirrors `.settings-panel__radio`'s own
+ * radio-group precedent (native `<input type="radio">`s, bordered-chrome
+ * labels) rather than inventing a new segmented-control visual language,
+ * but laid out as a flex row rather than that block's own vertical stack —
+ * this lives inline in a header row, not a `<fieldset>` with room for a
+ * vertical legend+options layout.
+ */
+.mode-switcher {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.mode-switcher__option {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mode-switcher__option:has(input:checked) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.mode-switcher__option:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* driller's first disabled/coming-soon UI affordance (Always) — Health
+   Audit Mode isn't just a disabled control with no explanation; the visible
+   "(Coming soon)" text (below) carries that on its own, so this rule is
+   purely the dimmed/non-interactive visual treatment, reinforcement only. */
+.mode-switcher__option--disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.mode-switcher__coming-soon {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+/*
  * Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
  * surface. A right-docked overlay, matching the Code Map's own source panel
  * (`.code-map__source-overlay`/`.code-map__source-panel`) rather than
@@ -673,6 +726,46 @@ code,
   border-color: var(--accent);
 }
 
+/* Story 3.1 (Phase 2): PR Review Mode's changed-Node treatment — the
+   organizing fact of the whole mode (FR11, UX-DR14), so it's a genuinely
+   distinct border treatment, not just a badge. Never color-only
+   (Accessibility Floor): the border here is reinforcement only —
+   `.code-map__node-changed-badge` below is the real, always-visible text
+   carrying the meaning on its own. Deliberately its own solid-accent
+   thicker-border rule (not reusing `.code-map__path-highlight .code-map__node`'s
+   descendant-selector wrapper pattern) — this modifier applies directly on
+   the card root the same way `.code-map__cluster--zoom` does, since
+   `isChanged` is real per-Node data threaded through `layoutNodes`/
+   `CodeMapFlowNode.data`, not a transient traversal-highlight wrapper. Can
+   still legitimately combine with `.code-map__path-highlight` (a changed
+   Node can also be on a traced path). Review finding (Blind Hunter): a
+   plain one-class selector here does NOT automatically coexist with
+   `.code-map__path-highlight .code-map__node`'s own two-class descendant
+   selector on the shared `border` property — CSS specificity, not source
+   order, decides, and the two-class rule wins regardless of which comes
+   first. The explicit `.code-map__path-highlight .code-map__node--changed`
+   rule below resolves that intersection deliberately. */
+.code-map__node--changed {
+  border: 2px solid var(--warning);
+}
+
+/* The "Changed" label itself — same always-visible-text convention as
+   `.code-map__node-staleness`/the Coverage Gap indicator (never color-only,
+   Accessibility Floor), styled as a small pill so it reads as a distinct
+   marker rather than another line of prose. */
+.code-map__node-changed-badge {
+  align-self: flex-start;
+  margin: 0.1rem 0 0;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--warning) 25%, transparent);
+  color: var(--warning);
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
 /* Both `.code-map__node` and `.code-map__cluster` are keyboard-activatable
    (`tabIndex`, `role="button"`, Enter/Space) but had no visible focus state
    at all (review finding) — the accessibility floor requires a keyboard
@@ -1236,6 +1329,101 @@ code,
   outline-offset: 2px;
 }
 
+/* Story 3.1 (Phase 2): the PR Review Mode base-ref toolbar — same floated-
+   chrome treatment (`.code-map__history-toolbar`/`.code-map__path-trace`'s
+   own "absolute, z-index over canvas, non-blocking" convention, Code Map)
+   but positioned top-center, the one corner not already claimed by those
+   two (top-right/top-left) or by `.code-map__signal-toggle-panel`/
+   `<Controls>`'s own default (bottom-right/bottom-left). Stays mounted
+   regardless of `fetchState`/the three PR-Review Actionable Notices below
+   it (Boundaries & Constraints: "the base-ref input/trigger stays visible
+   alongside the notice") — `z-index: 5` (same value the other two floated
+   toolbars use) keeps it visibly above `.code-map__notice`'s own
+   `position: absolute; inset: 0` full-canvas notice block, which sets no
+   `z-index` of its own. */
+.code-map__pr-review {
+  position: absolute;
+  top: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  width: min(360px, calc(100vw - 1.5rem));
+}
+
+.code-map__pr-review-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.code-map__pr-review-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.code-map__pr-review-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.code-map__pr-review-input:disabled {
+  opacity: 0.6;
+}
+
+.code-map__pr-review-toolbar button {
+  flex-shrink: 0;
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.code-map__pr-review-toolbar button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.code-map__pr-review-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.code-map__pr-review-toolbar button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The resolved base-ref/changed-Node-count confirmation (and the idle/
+   loading status lines reusing this same class) — a compact status line,
+   same muted-chrome-surface treatment as the toolbar itself rather than
+   the full `.code-map__notice` (this is a success confirmation, not a
+   "needs attention" state). `overflow-wrap` (review finding, Blind
+   Hunter): a long resolved ref name (e.g. a long remote-tracking branch)
+   had no defined wrapping behavior inside this fixed-width container. */
+.code-map__pr-review-resolved {
+  margin: 0;
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-align: center;
+  overflow-wrap: break-word;
+}
+
 /* A `found` path's own Node/edge highlight (Code Map: "no existing highlight
    mechanism to extend, this is new"). Never color-only (Accessibility
    Floor): a thicker solid border + glow ring is a shape/weight cue on its
@@ -1247,6 +1435,23 @@ code,
 .code-map__path-highlight .code-map__node {
   border: 2px solid var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Review finding (Blind Hunter): a Node that is both changed AND on a
+   traced path previously had its changed-Node border silently overridden
+   by the rule just above (`.code-map__path-highlight .code-map__node`'s
+   two-class descendant selector, specificity 0,2,0, beats
+   `.code-map__node--changed`'s own single-class selector, 0,1,0, regardless
+   of source order) — contradicting that rule's own comment claiming "both
+   apply without conflict". This explicit combined-state selector
+   (specificity 0,3,0, strictly higher than either rule alone) resolves the
+   intersection deliberately: the changed (warning) border wins, since "this
+   Node changed" is PR Review Mode's organizing fact (FR11) — the
+   path-highlight's own `box-shadow` above is a different property and is
+   untouched here, so a traced, changed Node still visibly carries both
+   signals. */
+.code-map__path-highlight .code-map__node--changed {
+  border: 2px solid var(--warning);
 }
 
 /* The route's own consecutive-pair `CALLS` edges — thicker + solid accent

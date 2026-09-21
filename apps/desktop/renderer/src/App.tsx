@@ -17,6 +17,17 @@ type Notice =
   | { kind: 'not-a-git-repo'; path: string }
   | { kind: 'error'; message: string };
 
+/**
+ * Story 3.1 (Phase 2): driller's first mode concept — a persistent 3-way
+ * switcher (Code Map / PR Review Mode / Health Audit Mode). `'healthAudit'`
+ * is never actually reachable yet (its radio input is rendered `disabled` —
+ * Epic 4 doesn't exist), so this type still only needs the two real values;
+ * a third literal isn't added until Health Audit Mode has an actual
+ * implementation to switch into (Never: "Health Audit Mode's actual
+ * implementation").
+ */
+type Mode = 'codeMap' | 'prReview';
+
 export function App() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[] | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -72,6 +83,14 @@ export function App() {
   // close over a stale value.
   const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
   const currentProjectPathRef = useRef<string | null>(null);
+  // Story 3.1 (Phase 2): the active mode — first-class shell state (UX-DR9:
+  // "never a settings toggle"), independent of `isIndexed`, so the switcher
+  // itself always renders regardless of whether a project is even open yet.
+  // Reset to `'codeMap'` on every fresh 'opened' project result (see
+  // `applyOpenResult` below) — a newly-opened project must never silently
+  // land in a stale PR Review state carried over from whatever project was
+  // open before it (Always).
+  const [mode, setMode] = useState<Mode>('codeMap');
   useEffect(() => {
     currentProjectPathRef.current = currentProjectPath;
   }, [currentProjectPath]);
@@ -169,6 +188,25 @@ export function App() {
     switch (result.status) {
       case 'opened':
         setNotice(null);
+        // Story 3.1 (Phase 2, Always): a fresh project open always lands on
+        // Code Map Mode, never silently carrying over a previous project's
+        // PR Review state — `CodeMap.tsx`'s own `projectPath`-keyed reset
+        // effect clears the base-ref input/diff-scope result the moment
+        // `currentProjectPath` below actually changes, but `mode` itself is
+        // App.tsx's own shell state (Design Notes), so it's reset here too.
+        //
+        // Review finding (Edge Case Hunter): guarded on the path actually
+        // differing — `resolveOpenedFolder` (main process) has no
+        // already-open dedup of its own, so re-selecting the SAME
+        // already-open project (the folder picker, or re-clicking its own
+        // Recent Projects entry) reaches this same `'opened'` case with an
+        // unchanged path. Without this guard, that action would silently
+        // discard an in-progress PR Review Mode session even though nothing
+        // about the project actually changed — checked against the ref
+        // before it's overwritten just below.
+        if (result.project.path !== currentProjectPathRef.current) {
+          setMode('codeMap');
+        }
         // Synchronous, not just via the ref-sync effect below: a status
         // push for this project (main sends the index-start request as
         // part of producing this very result) could in principle reach
@@ -345,6 +383,50 @@ export function App() {
             <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
           )}
         </div>
+        {/* Story 3.1 (Phase 2): the mode switcher — always visible in the
+            header regardless of `isIndexed` (Always: "mode is first-class
+            state, never a settings toggle", UX-DR9), mirroring
+            `.settings-panel__radio`'s existing radio-group precedent (a
+            native `<input type="radio">` group, not a custom control) but
+            laid out inline rather than inside a `<fieldset>`'s own
+            block-level legend, which would take visible space this header
+            row doesn't have. `role="radiogroup"`/`aria-label` gives it the
+            same accessible group semantics a `<fieldset>`/`<legend>` pair
+            would, matching the `role="toolbar" aria-label=...` convention
+            `CodeMap.tsx`'s own floated chrome already uses for an inline
+            control group with no room for a visible group label. */}
+        <div className="mode-switcher" role="radiogroup" aria-label="View mode">
+          <label className="mode-switcher__option">
+            <input
+              type="radio"
+              name="mode"
+              value="codeMap"
+              checked={mode === 'codeMap'}
+              onChange={() => setMode('codeMap')}
+            />
+            Code Map
+          </label>
+          <label className="mode-switcher__option">
+            <input
+              type="radio"
+              name="mode"
+              value="prReview"
+              checked={mode === 'prReview'}
+              onChange={() => setMode('prReview')}
+            />
+            PR Review Mode
+          </label>
+          {/* driller's first disabled/coming-soon UI affordance (Always) —
+              Epic 4 doesn't exist yet, so this option is never selectable;
+              the "Coming soon" text is real, visible text (not just a
+              disabled attribute with no explanation, Accessibility Floor —
+              a disabled control alone doesn't say WHY to a screen reader
+              user any more than to a sighted one). */}
+          <label className="mode-switcher__option mode-switcher__option--disabled">
+            <input type="radio" name="mode" value="healthAudit" checked={false} disabled readOnly />
+            Health Audit Mode <span className="mode-switcher__coming-soon">(Coming soon)</span>
+          </label>
+        </div>
         <button
           type="button"
           className="app__settings-button"
@@ -416,6 +498,7 @@ export function App() {
             projectPath={currentProjectPath}
             noSummaryBackendAvailable={noSummaryBackendAvailable}
             cloudSelectedNoKey={cloudSelectedNoKey}
+            mode={mode}
           />
         </section>
       )}

@@ -68,6 +68,7 @@ import type {
   CodeMapNode,
   DeterministicRiskSignal,
   DeterministicRiskSignalType,
+  DiffScopeResult,
   IngestedRiskSignal,
   LlmJudgmentRiskSignal,
 } from '@driller/ipc-contracts';
@@ -135,6 +136,60 @@ type PathTraceState =
   | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
   | { status: 'error'; message: string };
+
+/**
+ * Story 3.1 (Phase 2): PR Review Mode's own base-ref/diff-scope state —
+ * mirrors `PathTraceState`'s shape (idle/in-flight/explicit-result-states),
+ * but carries `DiffScopeResult`'s own enumerated states nearly as-is
+ * (`@driller/ipc-contracts`, `window.driller.computeDiffScope`'s resolved
+ * value) rather than collapsing them into one generic error — Phase 1's own
+ * contract already enumerates `'no-changes'`/`'not-a-git-repo'`/
+ * `'no-base-ref-resolvable'` as distinct, never-silently-guessed states
+ * (epic-3-context.md), and this component's job is to render each one as
+ * its own Actionable Notice, not fold them together.
+ *
+ * The one deliberate departure from `DiffScopeResult['resolved']` itself:
+ * `nodeIds` is stored as a `Set<string>` here, not the raw `string[]` the
+ * IPC result carries — every consumer below only ever needs O(1) membership
+ * checks (`layoutNodes`' new `changedNodeIds` parameter, mirroring
+ * `pathHighlightNodeIds`'s own Set-typed precedent), never the array itself.
+ */
+type DiffScopeState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'resolved'; resolvedBaseRef: string; nodeIds: Set<string> }
+  | { status: 'no-changes' }
+  | { status: 'not-a-git-repo' }
+  | { status: 'no-base-ref-resolvable' }
+  | { status: 'error'; message: string };
+
+/**
+ * The three non-happy-path `DiffScopeState` statuses that each replace the
+ * map with their own distinct Actionable Notice (Boundaries & Constraints) —
+ * named here once so both the notice-gating check and `formatDiffScopeNotice`
+ * below share one literal list rather than risking the two drifting apart.
+ */
+type DiffScopeNoticeStatus = 'no-changes' | 'not-a-git-repo' | 'no-base-ref-resolvable';
+
+/**
+ * One specific, concrete sentence per non-happy-path state (UX & Interaction
+ * Patterns: "Actionable Notice ... one specific concrete sentence") — never
+ * vague reassurance language (epic-3-context.md voice/tone). The base-ref
+ * input/trigger toolbar rendered alongside this (Boundaries & Constraints)
+ * is this notice's "at most one clear next action" — re-enter a ref and
+ * trigger again — so the sentence itself states only what happened, not a
+ * redundant restatement of that action.
+ */
+function formatDiffScopeNotice(status: DiffScopeNoticeStatus): string {
+  switch (status) {
+    case 'no-changes':
+      return 'No changes to review — the resolved base ref has no diff against the current working tree.';
+    case 'not-a-git-repo':
+      return "This project isn't a git repository — PR Review Mode needs local git history to compute a diff.";
+    case 'no-base-ref-resolvable':
+      return 'No base ref could be resolved automatically (no upstream tracking branch or local main/master found) — enter one explicitly above.';
+  }
+}
 
 // No LOD/layout library yet (Design Notes: acceptable at this phase's real
 // scale) — a plain deterministic grid, roughly square, is enough to lay the
@@ -410,6 +465,17 @@ type CodeMapFlowNode = FlowNode<
     // or writing either of them (this story's own Boundaries & Constraints:
     // "never reads/writes showDeterministicSignals/showLlmJudgment").
     showIngestedFindings: boolean;
+    // Story 3.1 (Phase 2): true when this Node's id is in PR Review Mode's
+    // resolved `changedNodeIds` set — threaded through the same way every
+    // other per-Node boolean above is (`layoutNodes` derives it once per
+    // Node from a `Set.has` lookup, never re-derived inside the card
+    // component itself). Already `false` for every Node while `mode !==
+    // 'prReview'`/no `'resolved'` diff scope exists yet (the `changedNodeIds`
+    // this is computed from is the module-level empty Set outside those
+    // conditions — see the `CodeMap` component's own derivation) — Boundaries
+    // & Constraints: "switching back to Code Map Mode ... no changed-Node
+    // treatment ... anywhere".
+    isChanged: boolean;
   },
   'codeMapNode'
 >;
@@ -428,6 +494,11 @@ function layoutNodes(
   showDeterministicSignals: boolean,
   showLlmJudgment: boolean,
   showIngestedFindings: boolean,
+  // Story 3.1 (Phase 2): PR Review Mode's resolved changed-Node id set —
+  // the module-level empty Set (`EMPTY_ID_SET`) outside `mode === 'prReview'`/
+  // a `'resolved'` diff scope, so every Node's `isChanged` below is simply
+  // `false` in every other state (Boundaries & Constraints).
+  changedNodeIds: ReadonlySet<string>,
 ): CodeMapFlowNode[] {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
   return nodes.map((node, index) => {
@@ -453,6 +524,7 @@ function layoutNodes(
         showDeterministicSignals,
         showLlmJudgment,
         showIngestedFindings,
+        isChanged: changedNodeIds.has(node.id),
       },
     };
   });
@@ -628,6 +700,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     showDeterministicSignals,
     showLlmJudgment,
     showIngestedFindings,
+    isChanged,
   } = data;
   // Story 1.8 (Phase 4): the "Details" affordance is shown only on a stale
   // Node (Always) — mirroring the caller/callee affordances' own
@@ -694,11 +767,11 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
   const hiddenIngestedSignalCount = ingestedSignals.length - visibleIngestedSignals.length;
   return (
     <div
-      className="code-map__node"
+      className={`code-map__node${isChanged ? ' code-map__node--changed' : ''}`}
       title={`${node.file}:${node.startLine}-${node.endLine}`}
       tabIndex={0}
       role="button"
-      aria-label={`${node.kind} ${node.name}, open source`}
+      aria-label={`${node.kind} ${node.name}${isChanged ? ', changed' : ''}, open source`}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
@@ -709,6 +782,19 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
       <Handle type="target" position={Position.Left} />
       <span className="code-map__node-kind">{node.kind}</span>
       <code className="code-map__node-id">{node.name}</code>
+      {/* Story 3.1 (Phase 2): PR Review Mode's changed-Node treatment —
+          never color-only (Accessibility Floor): this visible "Changed"
+          text label carries the meaning on its own; `code-map__node--changed`
+          above only adds a border as reinforcement, exactly the same
+          "text label + border reinforcement" split every other non-color-only
+          treatment in this card already uses (Coverage Gap/staleness/the
+          Actionable Notices above). `role="status"` mirrors that same
+          precedent (e.g. `.code-map__node-staleness`). */}
+      {isChanged && (
+        <p className="code-map__node-changed-badge" role="status">
+          Changed
+        </p>
+      )}
       {/* Story 1.5 Phase 2: one-line summary / pending / coverage-gap — a
           Node's file being in the current index's coverage gap set (FR5)
           is a real, distinct signal from an ordinary "not generated yet"
@@ -1082,9 +1168,21 @@ export interface CodeMapProps {
    * App.tsx the same way `noSummaryBackendAvailable` is.
    */
   cloudSelectedNoKey: boolean;
+  /**
+   * Story 3.1 (Phase 2): the active mode (`App.tsx`'s own shell state,
+   * Design Notes: "App.tsx only owns cross-cutting shell state like which
+   * mode is active") — gates whether the base-ref input/trigger toolbar,
+   * PR-Review Actionable Notices, and changed-Node treatment render at all.
+   * `'prReview'`-specific local state (`baseRefInput`/`diffScopeState`) is
+   * NOT reset on a mode switch itself, only on a `projectPath` change (see
+   * the `useEffect` below) — switching away from and back to PR Review Mode
+   * within the same project preserves whatever was already resolved,
+   * matching this story's "no auto-trigger on mode switch" Design Notes.
+   */
+  mode: 'codeMap' | 'prReview';
 }
 
-export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey }: CodeMapProps) {
+export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey, mode }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
   // Story 1.10 (Phase 2): the source overlay's "Open in external editor"
@@ -1127,6 +1225,22 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // showLlmJudgment"), same no-persistence/no-IPC treatment and same
   // default-on reasoning as the two toggles above.
   const [showIngestedFindings, setShowIngestedFindings] = useState(true);
+  // Story 3.1 (Phase 2): PR Review Mode's own base-ref text and its
+  // `computeDiffScope` result state — CodeMap-owned (Design Notes: "matches
+  // this codebase's existing division of responsibility ... App.tsx only
+  // owns cross-cutting shell state like which mode is active"), mirroring
+  // `pathQuery`/`pathTrace`'s own separate-input-vs-result-state split just
+  // above. Neither resets on a `mode` toggle — only on a `projectPath`
+  // change (the effect below) — see `CodeMapProps.mode`'s own doc comment.
+  const [baseRefInput, setBaseRefInput] = useState('');
+  const [diffScopeState, setDiffScopeState] = useState<DiffScopeState>({ status: 'idle' });
+  // Correlates a `computeDiffScope` response back to the trigger click that
+  // started it — the same stale-response guard `pathTraceRequestIdRef`
+  // already establishes for `tracePath`: bumped both on every trigger click
+  // and on the `projectPath`-reset effect below, so a request abandoned by
+  // a project switch (or superseded by a second trigger click) can never
+  // apply its late reply over whatever the user is now looking at.
+  const diffScopeRequestIdRef = useRef(0);
   // Review fix: correlates a `tracePath` response back to the search that
   // started it — the same generation-id pattern `sourceRequestIdRef` below
   // already applies to `readSourceRange`, and Phase 1's own
@@ -1278,6 +1392,21 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     // `pathTraceRequestIdRef`'s own doc comment.
     setPathTrace({ status: 'idle' });
     pathTraceRequestIdRef.current += 1;
+    // Review finding (Edge Case Hunter): a Retry/re-index for the SAME
+    // `projectPath` (e.g. Story 1.8's refresh flow) swaps in a fresh
+    // fetched Node set without `projectPath` itself ever changing — the
+    // `projectPath`-keyed reset effect below therefore never fires, so a
+    // previously-resolved `diffScopeState.nodeIds` would keep referencing
+    // Node ids from the map that's gone, same "stale ids from the previous
+    // map must never survive" reasoning the history/Node-Detail/Path-Trace
+    // resets just above already apply. A stale diff scope is more actively
+    // misleading than an empty one (spurious/missing "Changed" treatment
+    // with no indication it's out of date), so this resets to `'idle'`
+    // rather than trying to preserve it — the user re-triggers explicitly,
+    // consistent with this phase's own no-auto-trigger design.
+    setBaseRefInput('');
+    setDiffScopeState({ status: 'idle' });
+    diffScopeRequestIdRef.current += 1;
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
       // `import.meta.env.DEV` — not just the runtime-derived
@@ -1368,6 +1497,99 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     });
     return unsubscribe;
   }, [projectPath]);
+
+  // Story 3.1 (Phase 2, Always): "PR-Review-specific state ... resets
+  // whenever `projectPath` changes" — mirrors every other per-project
+  // renderer-state reset this session (Settings.tsx's `prBotConfig`/
+  // `ingestionRun`, this same file's own `showLlmJudgment` etc. never
+  // leaking across projects, per this story's own Boundaries &
+  // Constraints). Bumping `diffScopeRequestIdRef` too (same reasoning as
+  // `loadCodeMap`'s own `pathTraceRequestIdRef` bump) invalidates any
+  // still-in-flight `computeDiffScope` call from the project being left,
+  // so its late reply can never resolve into the newly-opened project's
+  // state. Deliberately does NOT depend on `mode` — a mode toggle alone
+  // must never clear this (`CodeMapProps.mode`'s own doc comment).
+  useEffect(() => {
+    setBaseRefInput('');
+    setDiffScopeState({ status: 'idle' });
+    diffScopeRequestIdRef.current += 1;
+  }, [projectPath]);
+
+  /**
+   * Story 3.1 (Phase 2): the base-ref trigger's own click handler — the
+   * explicit "select a base ref" action (Boundaries & Constraints: "does
+   * not auto-trigger `computeDiffScope`"). A blank/whitespace-only input is
+   * passed through as `undefined` (Boundaries & Constraints: "an empty
+   * input on trigger means 'omit,' triggering auto-resolution, exactly
+   * matching Phase 1's own supported path") — `window.driller.
+   * computeDiffScope`'s own `baseRef` parameter is already optional for
+   * exactly this reason.
+   *
+   * Same staleness-guard shape as `runPathTrace` above: a fresh
+   * `requestId` is minted and captured before the async call, then checked
+   * again once it resolves/rejects — a project switch (which bumps this
+   * same ref in the reset effect above) in the meantime must not let a
+   * since-superseded reply apply a changed-Node set that no longer belongs
+   * to the project now on screen.
+   */
+  const handleComputeDiffScope = useCallback(() => {
+    if (projectPath === null || diffScopeState.status === 'loading') {
+      return;
+    }
+    const requestId = ++diffScopeRequestIdRef.current;
+    const trimmedBaseRef = baseRefInput.trim();
+    // Review finding (Blind Hunter): the input's own visible value never
+    // reflected the trimmed text that was actually sent — a `" main "`
+    // submission left the untrimmed string on screen afterward even though
+    // `"main"` (trimmed) was what was actually diffed against.
+    setBaseRefInput(trimmedBaseRef);
+    setDiffScopeState({ status: 'loading' });
+    window.driller
+      .computeDiffScope(projectPath, trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined)
+      .then((result: DiffScopeResult) => {
+        if (diffScopeRequestIdRef.current !== requestId) {
+          return;
+        }
+        switch (result.status) {
+          case 'resolved':
+            setDiffScopeState({
+              status: 'resolved',
+              resolvedBaseRef: result.resolvedBaseRef,
+              nodeIds: new Set(result.nodeIds),
+            });
+            break;
+          case 'no-changes':
+            setDiffScopeState({ status: 'no-changes' });
+            break;
+          case 'not-a-git-repo':
+            setDiffScopeState({ status: 'not-a-git-repo' });
+            break;
+          case 'no-base-ref-resolvable':
+            setDiffScopeState({ status: 'no-base-ref-resolvable' });
+            break;
+          case 'error':
+            setDiffScopeState({ status: 'error', message: result.message });
+            break;
+        }
+      })
+      .catch((error: unknown) => {
+        if (diffScopeRequestIdRef.current !== requestId) {
+          return;
+        }
+        setDiffScopeState({
+          status: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [projectPath, baseRefInput, diffScopeState.status]);
+
+  const handleDiffScopeSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      handleComputeDiffScope();
+    },
+    [handleComputeDiffScope],
+  );
 
   const openSourceForNode = useCallback((node: CodeMapNode) => {
     const requestId = ++sourceRequestIdRef.current;
@@ -1681,6 +1903,18 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     return map;
   }, [fetchState]);
 
+  // Story 3.1 (Phase 2): the changed-Node id set threaded into `layoutNodes`
+  // below — `EMPTY_ID_SET` (never a fresh `new Set()`, so this doesn't
+  // defeat `flowNodes`' own memoization on every render) whenever the mode
+  // isn't `'prReview'` or no `'resolved'` diff scope exists yet (Boundaries
+  // & Constraints: "switching back to Code Map Mode ... no changed-Node
+  // treatment ... anywhere" — gated on `mode` here rather than in
+  // `layoutNodes` itself, so the underlying `diffScopeState.nodeIds` can
+  // keep existing across a mode toggle per `CodeMapProps.mode`'s own doc
+  // comment, while only its *rendering* is mode-gated).
+  const changedNodeIds: ReadonlySet<string> =
+    mode === 'prReview' && diffScopeState.status === 'resolved' ? diffScopeState.nodeIds : EMPTY_ID_SET;
+
   const flowNodes = useMemo(
     () =>
       fetchState.status === 'ready'
@@ -1695,6 +1929,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             showDeterministicSignals,
             showLlmJudgment,
             showIngestedFindings,
+            changedNodeIds,
           )
         : [],
     [
@@ -1708,6 +1943,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       showDeterministicSignals,
       showLlmJudgment,
       showIngestedFindings,
+      changedNodeIds,
     ],
   );
   const flowEdges = useMemo(
@@ -2304,8 +2540,118 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // unmounts it), same defense-in-depth reasoning as those two.
   const pathTraceIsSearching = pathTrace.status === 'searching';
 
+  // Story 3.1 (Phase 2): which (if any) of the three non-happy-path
+  // Actionable Notice states currently applies — `null` whenever the map
+  // itself should render normally (not in PR Review Mode at all, or a
+  // `'resolved'`/`'idle'`/`'loading'`/`'error'` diff scope, none of which
+  // replace the map: `'error'` renders inline in the toolbar instead, same
+  // convention `pathTrace.status === 'error'` already uses just above).
+  // Hoisted here (mirrors `pathTraceIsSearching`'s own hoist-before-return
+  // reasoning) so both the notice-gating and the `<ReactFlow>`-gating checks
+  // below share one derivation.
+  const prReviewNoticeStatus: DiffScopeNoticeStatus | null =
+    mode === 'prReview' &&
+    (diffScopeState.status === 'no-changes' ||
+      diffScopeState.status === 'not-a-git-repo' ||
+      diffScopeState.status === 'no-base-ref-resolvable')
+      ? diffScopeState.status
+      : null;
+
+  // Review finding (Blind Hunter): `fetchState.status === 'ready' &&
+  // fetchState.nodes.length > 0 && prReviewNoticeStatus === null` was
+  // repeated verbatim across three separate gates (the `<ReactFlow>` canvas
+  // itself, the history toolbar, the Path Trace toolbar) — a future edit to
+  // one copy could silently drift from the other two. Named once here,
+  // mirroring `pathTraceIsSearching`/`prReviewNoticeStatus`'s own
+  // hoist-before-return convention just above.
+  const mapIsRenderable =
+    fetchState.status === 'ready' && fetchState.nodes.length > 0 && prReviewNoticeStatus === null;
+
   return (
     <div className="code-map" ref={containerRef}>
+      {/* Story 3.1 (Phase 2): the base-ref input + trigger — rendered
+          whenever `mode === 'prReview'`, independent of `fetchState`
+          entirely (Boundaries & Constraints: "the base-ref input/trigger
+          stays visible alongside the notice"), so it survives every
+          notice/map state below it, including the three Actionable Notices
+          that replace the map further down. Positioned top-center (its own
+          `.code-map__pr-review`, absolute + `z-index: 5`, styles.css) —
+          every other corner is already claimed (`.code-map__history-
+          toolbar` top-right, `.code-map__path-trace` top-left,
+          `.code-map__signal-toggle-panel` bottom-right via `@xyflow/react`'s
+          own `Panel`, `<Controls>`'s default bottom-left) — and rendered as
+          a plain absolutely-positioned sibling here, not inside `<ReactFlow>`
+          via its own `Panel` the way the signal toggles are: a `Panel` only
+          exists while `<ReactFlow>` itself is mounted, which the three
+          failure-state notices below deliberately replace instead of
+          rendering alongside. */}
+      {mode === 'prReview' && (
+        <div className="code-map__pr-review">
+          <form
+            className="code-map__pr-review-toolbar"
+            role="toolbar"
+            aria-label="PR Review base ref"
+            onSubmit={handleDiffScopeSubmit}
+          >
+            <input
+              type="text"
+              className="code-map__pr-review-input"
+              placeholder="Base ref (leave blank to auto-resolve)…"
+              aria-label="Base ref"
+              value={baseRefInput}
+              onChange={(event) => setBaseRefInput(event.target.value)}
+              disabled={projectPath === null || diffScopeState.status === 'loading'}
+            />
+            <button type="submit" disabled={projectPath === null || diffScopeState.status === 'loading'}>
+              {diffScopeState.status === 'loading' ? 'Computing…' : 'Compute diff scope'}
+            </button>
+          </form>
+
+          {/* Review finding (Blind Hunter): the `'idle'` state (before the
+              user's first trigger click) previously rendered nothing at
+              all — the ordinary map, no hint that a diff hasn't been
+              computed yet. One concrete next action, matching this file's
+              own Actionable Notice convention. */}
+          {diffScopeState.status === 'idle' && (
+            <p className="code-map__pr-review-resolved" role="status">
+              Enter a base ref (or leave it blank to auto-resolve) and compute the diff scope to see changed Nodes.
+            </p>
+          )}
+          {/* Review finding (Blind Hunter): the button's own text changing
+              to "Computing…" isn't reliably announced by assistive tech on
+              its own — a dedicated `role="status"` (implicit `aria-live`)
+              announcement, same convention as the resolved/idle messages
+              here. */}
+          {diffScopeState.status === 'loading' && (
+            <p className="code-map__pr-review-resolved" role="status">
+              Computing diff scope…
+            </p>
+          )}
+
+          {diffScopeState.status === 'resolved' && (
+            <p className="code-map__pr-review-resolved" role="status">
+              Diffed against <code>{diffScopeState.resolvedBaseRef}</code> —{' '}
+              {diffScopeState.nodeIds.size} changed Node{diffScopeState.nodeIds.size === 1 ? '' : 's'}.
+            </p>
+          )}
+          {/* `DiffScopeResult['error']` reuses the same inline
+              `notice notice--error` convention `pathTrace.status ===
+              'error'` already uses just below in this file, rather than the
+              full-canvas `.code-map__notice` reserved for the three
+              enumerated non-happy-path states above (Boundaries &
+              Constraints only names those three as map-replacing) — a
+              genuine subprocess/`git` failure here still needs to surface
+              somewhere (NFR4: no silent failure), but never blocks the
+              still-otherwise-interactive map the way the three explicit
+              result states do. */}
+          {diffScopeState.status === 'error' && (
+            <p className="notice notice--error" role="alert">
+              {diffScopeState.message}
+            </p>
+          )}
+        </div>
+      )}
+
       {fetchState.status === 'loading' && (
         <div className="code-map__notice" role="status">
           Loading Code Map…
@@ -2327,7 +2673,22 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         </div>
       )}
 
-      {fetchState.status === 'ready' && fetchState.nodes.length > 0 && (
+      {/* Story 3.1 (Phase 2): the three non-happy-path diff-scope Actionable
+          Notices — each its own distinct sentence (`formatDiffScopeNotice`),
+          replacing the map in place (Boundaries & Constraints: "never an
+          empty map with no explanation", UX-DR15) exactly the way the
+          empty-map notice just above already does for its own condition.
+          Gated on `fetchState.status === 'ready' && ... > 0` too — an
+          underlying fetch failure/empty map already has its own, more
+          fundamental notice above; this one only applies once there's a
+          real map that PR Review Mode is choosing not to show. */}
+      {mode === 'prReview' && fetchState.status === 'ready' && fetchState.nodes.length > 0 && prReviewNoticeStatus !== null && (
+        <div className="code-map__notice" role="status">
+          <p>{formatDiffScopeNotice(prReviewNoticeStatus)}</p>
+        </div>
+      )}
+
+      {mapIsRenderable && (
         // React Flow does not size itself from CSS alone — the parent
         // `.code-map` div is sized via `position: absolute; inset: 0`
         // (styles.css), but `<ReactFlow>`'s own root element still needs an
@@ -2445,11 +2806,15 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         </ReactFlow>
       )}
 
-      {fetchState.status === 'ready' && fetchState.nodes.length > 0 && (
+      {mapIsRenderable && (
         // Story 1.4 Code Map: "New lightweight Back/Forward toolbar ...
         // disabled at either end of history" — renderer-local chrome over
         // the ephemeral `history` state, never persisted/IPC'd (AD-2
-        // restated).
+        // restated). Story 3.1 (Phase 2): also gated on `prReviewNoticeStatus
+        // === null` — this floats over the canvas `<ReactFlow>` itself
+        // renders, which one of the three PR-Review Actionable Notices above
+        // replaces entirely; without this gate, Back/Forward would float
+        // over a notice with no map underneath it to traverse.
         <div className="code-map__history-toolbar" role="toolbar" aria-label="Map traversal history">
           <button type="button" onClick={goBack} disabled={history.index <= 0} aria-label="Back">
             ← Back
@@ -2465,14 +2830,16 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         </div>
       )}
 
-      {fetchState.status === 'ready' && fetchState.nodes.length > 0 && (
+      {mapIsRenderable && (
         // Story 1.9 (Phase 2): the always-reachable Path Trace search
         // affordance — persistent/non-modal, mirroring the history
         // toolbar's own `role="toolbar"`/absolute-over-canvas pattern just
         // above (Boundaries & Constraints: "never a `role="dialog"`
         // overlay ... must stay usable while the map is still interacted
         // with"). Positioned opposite the history toolbar (top-left vs.
-        // top-right) so the two never overlap.
+        // top-right) so the two never overlap. Story 3.1 (Phase 2): also
+        // gated on `prReviewNoticeStatus === null`, same reasoning as the
+        // history toolbar's own matching gate just above.
         <div className="code-map__path-trace">
           <form
             className="code-map__path-trace-toolbar"
