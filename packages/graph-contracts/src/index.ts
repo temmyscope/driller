@@ -331,6 +331,89 @@ export function computeBlastRadius(nodes: PathTraceNode[], edges: PathTraceEdge[
   return computeBlastRadiusFromAdjacency(buildBidirectionalAdjacency(nodes, edges), nodeId);
 }
 
+/**
+ * Story 3.2 (Phase 1): multi-source, hop-distance-tracking BFS sibling to
+ * `computeBlastRadiusFromAdjacency` (FR12, AD-13) — instead of a single
+ * reachable-count, computes every reachable Node's minimum hop distance from
+ * the nearest of `nodeIds`. PR Review Mode needs this to render a combined
+ * Blast Radius highlight across every changed Node in a diff, with an
+ * interactive 1-hop/2-hop/further stepper (Phase 2).
+ *
+ * Multi-source (Always): a reachable Node's distance is the minimum hop
+ * count from *any* seed in `nodeIds`, never summed or averaged — this is a
+ * standard multi-source BFS, all seeds enqueued at distance 0 together, so
+ * the first (and therefore minimum) distance a Node is discovered at is its
+ * final one.
+ *
+ * Unbounded (Always: no `maxHops` parameter) — returns hop distances for the
+ * entire reachable set in one call; Phase 2 slices this locally per stepper
+ * click rather than re-requesting per hop depth (Design Notes).
+ *
+ * Cycle-safe (Always), mirrors `computeBlastRadiusFromAdjacency`'s own
+ * `visited` Set dedup: a Node already visited (whether a seed or already
+ * discovered at a smaller-or-equal distance) is never re-visited or
+ * re-enqueued, so a circular edge terminates instead of looping.
+ *
+ * Seed Nodes are excluded from the returned map (Always), mirroring
+ * `computeBlastRadiusFromAdjacency`'s own origin-exclusion — they're seeded
+ * into `visited` up front but never given a map entry. A seed `nodeId`
+ * absent from `adjacency.validNodeIds` is skipped, never an error (Always);
+ * an empty or entirely-stale `nodeIds` simply produces an empty map.
+ * Duplicate ids in `nodeIds` are deduplicated via `Set` before seeding — the
+ * `visited` check alone would have made a duplicate harmless anyway, but
+ * de-duping up front skips the wasted duplicate distance-0 queue entries.
+ *
+ * O(V+E) (review finding, Medium): the queue is dequeued via an incrementing
+ * `head` index, never `Array.prototype.shift()` (which is itself O(n),
+ * making a naive shift-based BFS O(n²) overall) — the array is only ever
+ * appended to, never spliced. This is what `BLAST_RADIUS_REQUEST_TIMEOUT_MS`
+ * (`apps/desktop/main/index.ts`) assumes when it sizes its timeout for "a
+ * very large graph."
+ *
+ * Pure (Always, mirrors `computeBlastRadiusFromAdjacency`): no I/O, no
+ * dependency on `@driller/ipc-contracts` or any other package.
+ */
+export function computeBlastRadiusHopDistances(
+  adjacency: BidirectionalAdjacency,
+  nodeIds: string[],
+): Map<string, number> {
+  const seedIds = [...new Set(nodeIds)].filter((nodeId) => adjacency.validNodeIds.has(nodeId));
+
+  const visited = new Set<string>(seedIds);
+  const hopDistances = new Map<string, number>();
+  const queue: Array<{ id: string; distance: number }> = seedIds.map((id) => ({ id, distance: 0 }));
+
+  // `head` is an index cursor into `queue`, never spliced/shifted — O(1) per
+  // dequeue, keeping the whole traversal O(V+E) instead of the O(n²) a
+  // `queue.shift()`-based loop would produce (see this function's own doc
+  // comment).
+  let head = 0;
+  while (head < queue.length) {
+    // Non-null: `head < queue.length` just guarded this index.
+    const { id: current, distance } = queue[head]!;
+    head += 1;
+    const neighbors = adjacency.neighborsById.get(current);
+    if (!neighbors) {
+      continue;
+    }
+    for (const neighbor of neighbors) {
+      if (visited.has(neighbor)) {
+        // Dedup — cycle safety, mirrors `computeBlastRadiusFromAdjacency`'s
+        // own dedup. Also what makes this a correct minimum: BFS processes
+        // Nodes in non-decreasing distance order (all seeds start at 0, and
+        // this queue is FIFO), so the first time a Node is reached is
+        // necessarily its shortest path from any seed.
+        continue;
+      }
+      visited.add(neighbor);
+      hopDistances.set(neighbor, distance + 1);
+      queue.push({ id: neighbor, distance: distance + 1 });
+    }
+  }
+
+  return hopDistances;
+}
+
 // ---------------------------------------------------------------------------
 // Story 2.3 (Phase 2): file+line-to-enclosing-Node lookup (Design Notes).
 //

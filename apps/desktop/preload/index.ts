@@ -11,6 +11,7 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import {
   IpcChannels,
   type BackendConfig,
+  type BlastRadiusExpansionResult,
   type CloudBackend,
   type CodeMapResult,
   type DiagnosticLogEntry,
@@ -138,6 +139,9 @@ const drillerApi: DrillerApi = {
 
   computeDiffScope: (projectPath: string, baseRef?: string): Promise<DiffScopeResult> =>
     ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef),
+
+  expandBlastRadius: (projectPath: string, nodeIds: string[]): Promise<BlastRadiusExpansionResult> =>
+    ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

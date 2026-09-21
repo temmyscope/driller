@@ -27,6 +27,7 @@ import started from 'electron-squirrel-startup';
 import {
   IpcChannels,
   type BackendConfig,
+  type BlastRadiusExpansionResult,
   type CodeMapResult,
   type DiagnosticLogEntry,
   type DiffScopeResult,
@@ -36,6 +37,8 @@ import {
   type GraphServiceCodeMapMessage,
   type GraphServiceComputeDiffScopeRequest,
   type GraphServiceComputeDiffScopeResultMessage,
+  type GraphServiceExpandBlastRadiusRequest,
+  type GraphServiceExpandBlastRadiusResultMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServiceIndexRequest,
   type GraphServicePathTraceRequest,
@@ -227,6 +230,36 @@ let nextDiffScopeRequestId = 0;
 // minutes for what should be a sub-second local operation.
 const DIFF_SCOPE_REQUEST_TIMEOUT_MS = 60 * 1000 + 10_000;
 
+// Story 3.2 (Phase 1): correlates each in-flight `blastRadius:expand`
+// request to its eventual Graph Service reply — mirrors
+// `pendingDiffScopeResolvers`'s exact shape (an id-keyed `Map`, keyed by
+// `projectPath` for the same "no bot/nodeId-equivalent id" reasoning, plus
+// the same `requestId` stale-reply-window fix). Settled by whichever comes
+// first: the 'message' handler below (a genuine
+// `graphService:expandBlastRadiusResult` reply for that `projectPath`), the
+// 'exit' handler (the subprocess died mid-request), or that request's own
+// timeout backstop (`BLAST_RADIUS_REQUEST_TIMEOUT_MS`).
+const pendingBlastRadiusResolvers = new Map<
+  string,
+  { requestId: number; resolve: (result: BlastRadiusExpansionResult) => void; reject: (error: unknown) => void }
+>();
+
+// Minted fresh for every `requestExpandBlastRadius` call — see
+// `pendingBlastRadiusResolvers`'s own doc comment for the stale-reply race
+// it closes.
+let nextBlastRadiusRequestId = 0;
+
+// The blast-radius expansion computation itself is a synchronous, no-I/O
+// BFS in the Graph Service subprocess (`@driller/graph-contracts`'s
+// `computeBlastRadiusHopDistances`) over data it already has cached — no
+// git/vendor-cloud subprocess call like `computeDiffScope`'s own timeout
+// sizing has to account for. Still sized generously past a genuine worst
+// case (a very large graph, plus normal IPC/scheduling latency) rather than
+// tightly, so a real hang is still caught promptly without risking a false
+// timeout under load — same sizing philosophy `DIFF_SCOPE_REQUEST_TIMEOUT_MS`
+// documents for its own (larger) worst case.
+const BLAST_RADIUS_REQUEST_TIMEOUT_MS = 30 * 1000 + 10_000;
+
 // Story 1.9 (Phase 1): a single-slot resolver for an in-flight `path:trace`
 // request, mirroring `pendingCodeMapResolve`'s own single-slot shape rather
 // than `pendingRegenerateResolvers`'s id-keyed Map — `requestPathTrace` has
@@ -396,6 +429,20 @@ function isComputeDiffScopeResultMessage(
     return false;
   }
   return (message as { type?: unknown }).type === 'graphService:computeDiffScopeResult';
+}
+
+/**
+ * True for a `graphService:expandBlastRadiusResult` reply (Story 3.2, Phase
+ * 1) — distinguished from every other message shape on this same channel by
+ * `type`, same convention as `isComputeDiffScopeResultMessage`.
+ */
+function isExpandBlastRadiusResultMessage(
+  message: unknown,
+): message is GraphServiceExpandBlastRadiusResultMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:expandBlastRadiusResult';
 }
 
 /**
@@ -576,6 +623,45 @@ function settleAllPendingDiffScopeRequests(message: string): void {
 }
 
 /**
+ * Settles the pending `blastRadius:expand` request for `projectPath`, if any
+ * (Story 3.2, Phase 1) — mirrors `settlePendingDiffScopeRequest`'s exact
+ * shape and the same `requestId` stale-reply-window reasoning (a mismatch
+ * means this is a stale reply from an already-abandoned request, discarded
+ * rather than incorrectly settling a newer request's promise). Omitted by
+ * the timeout backstop and the exit-handler's settle-all
+ * (`settleAllPendingBlastRadiusRequests`), same reasoning as
+ * `settlePendingDiffScopeRequest`'s own omitted-`requestId` callers.
+ */
+function settlePendingBlastRadiusRequest(
+  projectPath: string,
+  result: BlastRadiusExpansionResult,
+  requestId?: number,
+): void {
+  const pending = pendingBlastRadiusResolvers.get(projectPath);
+  if (!pending) {
+    return;
+  }
+  if (requestId !== undefined && pending.requestId !== requestId) {
+    return;
+  }
+  pendingBlastRadiusResolvers.delete(projectPath);
+  pending.resolve(result);
+}
+
+/**
+ * Settles EVERY still-pending `blastRadius:expand` request with an explicit
+ * error — used when the Graph Service subprocess exits with one or more
+ * blast-radius requests outstanding, mirroring
+ * `settleAllPendingDiffScopeRequests`'s exact reasoning.
+ */
+function settleAllPendingBlastRadiusRequests(message: string): void {
+  for (const [projectPath, pending] of pendingBlastRadiusResolvers) {
+    pendingBlastRadiusResolvers.delete(projectPath);
+    pending.resolve({ status: 'error', message });
+  }
+}
+
+/**
  * Settles the pending `path:trace` request for `token` (if it's still the
  * one occupying the slot) with an explicit result — used both for a genuine
  * `graphService:pathTraceResult` reply (whose echoed `requestId` becomes
@@ -658,6 +744,7 @@ function spawnGraphService(): void {
         | GraphServicePathTraceResultMessage
         | GraphServiceRunIngestionResultMessage
         | GraphServiceComputeDiffScopeResultMessage
+        | GraphServiceExpandBlastRadiusResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -685,6 +772,10 @@ function spawnGraphService(): void {
       }
       if (isComputeDiffScopeResultMessage(message)) {
         settlePendingDiffScopeRequest(message.projectPath, message.result, message.requestId);
+        return;
+      }
+      if (isExpandBlastRadiusResultMessage(message)) {
+        settlePendingBlastRadiusRequest(message.projectPath, message.result, message.requestId);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -742,6 +833,12 @@ function spawnGraphService(): void {
     // `graphService:computeDiffScopeResult` reply those promises are waiting
     // on.
     settleAllPendingDiffScopeRequests('Graph Service exited before the diff scope could be computed.');
+    // Story 3.2 (Phase 1): every still-pending blast-radius expansion
+    // request is settled too, same reasoning as the settle calls above it —
+    // the subprocess dying mid-computation will never post the
+    // `graphService:expandBlastRadiusResult` reply those promises are
+    // waiting on.
+    settleAllPendingBlastRadiusRequests('Graph Service exited before the blast radius could be expanded.');
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -1059,6 +1156,79 @@ function requestComputeDiffScope(projectPath: string, baseRef: string | undefine
     settlePendingDiffScopeRequest(projectPath, {
       status: 'error',
       message: `Failed to send the diff-scope request to the Graph Service: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+
+  return promise;
+}
+
+/**
+ * Relays a blast-radius expansion request to the Graph Service subprocess
+ * (Story 3.2, Phase 1) and resolves once it replies — mirrors
+ * `requestComputeDiffScope`'s overall shape exactly (an id-keyed
+ * `pendingBlastRadiusResolvers` Map keyed by `projectPath`; a second
+ * overlapping call for the same project is rejected immediately rather than
+ * queued; its own timeout backstop; a wrapped `postMessage` call).
+ *
+ * `projectPath` must be the currently-open project (`currentProjectPath`) —
+ * same validation `requestComputeDiffScope` already applies, for the same
+ * reason: this call is only ever meaningful against the project the Graph
+ * Service actually has indexed and cached Nodes/Edges for.
+ *
+ * Rejects nothing, matching `requestComputeDiffScope`'s own framing: every
+ * failure path (no subprocess running or shutting down, a request already
+ * in flight for this project, `projectPath` not the open project, the
+ * subprocess's own error reply, it exiting mid-request, `postMessage` itself
+ * throwing, or the request timing out) resolves to `{status: 'error', ...}`.
+ */
+function requestExpandBlastRadius(projectPath: string, nodeIds: string[]): Promise<BlastRadiusExpansionResult> {
+  if (pendingBlastRadiusResolvers.has(projectPath)) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'A blast radius expansion for this project is already in progress.',
+    });
+  }
+  if (!graphService || isGraphServiceShuttingDown) {
+    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+  }
+  if (projectPath !== currentProjectPath) {
+    return Promise.resolve({
+      status: 'error',
+      message: 'The requested project is not the currently open project.',
+    });
+  }
+  const service = graphService;
+  const requestId = ++nextBlastRadiusRequestId;
+
+  const promise = new Promise<BlastRadiusExpansionResult>((resolve, reject) => {
+    pendingBlastRadiusResolvers.set(projectPath, { requestId, resolve, reject });
+  });
+
+  const timeoutTimer = setTimeout(() => {
+    settlePendingBlastRadiusRequest(projectPath, {
+      status: 'error',
+      message: 'Timed out waiting for the Graph Service to respond to the blast-radius request.',
+    });
+  }, BLAST_RADIUS_REQUEST_TIMEOUT_MS);
+  void promise.finally(() => clearTimeout(timeoutTimer));
+
+  try {
+    service.postMessage({
+      type: 'graphService:expandBlastRadius',
+      projectPath,
+      nodeIds,
+      requestId,
+    } satisfies GraphServiceExpandBlastRadiusRequest);
+  } catch (error) {
+    // A synchronous throw here would otherwise leave this projectPath's
+    // resolver set with nothing left to ever call it, leaking the request
+    // forever — same reasoning as `requestComputeDiffScope`'s own matching
+    // catch block.
+    settlePendingBlastRadiusRequest(projectPath, {
+      status: 'error',
+      message: `Failed to send the blast-radius request to the Graph Service: ${
         error instanceof Error ? error.message : String(error)
       }`,
     });
@@ -1721,6 +1891,29 @@ function registerIpcHandlers(): void {
       const trimmedBaseRef = typeof baseRefInput === 'string' ? baseRefInput.trim() : '';
       const baseRef = trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined;
       return requestComputeDiffScope(projectPath, baseRef);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Story 3.2 (Phase 1): compute multi-Node blast radius hop distances — a
+  // full IPC/graph-service round trip mirroring Story 3.1 Phase 1's
+  // `diffScope:compute` shape layer-for-layer. No renderer entry point yet
+  // (Never: "no renderer/UI changes in this phase") — reachable only via
+  // this direct call, mirroring `diffScope:compute`'s own precedent.
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.blastRadiusExpand,
+    (_event, projectPath: unknown, nodeIdsInput: unknown): Promise<BlastRadiusExpansionResult> => {
+      // Renderer-supplied values cross the contextBridge boundary untyped at
+      // runtime (same precedent as `diffScopeCompute`'s own guard above).
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return Promise.resolve({ status: 'error', message: 'Invalid project path.' });
+      }
+      if (!Array.isArray(nodeIdsInput) || !nodeIdsInput.every((nodeId) => typeof nodeId === 'string')) {
+        return Promise.resolve({ status: 'error', message: 'Invalid Node IDs.' });
+      }
+      return requestExpandBlastRadius(projectPath, nodeIdsInput);
     },
   );
 

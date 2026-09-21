@@ -122,18 +122,23 @@ import path from 'node:path';
 import {
   buildBidirectionalAdjacency,
   computeBlastRadiusFromAdjacency,
+  computeBlastRadiusHopDistances,
   findChangedNodeIds,
   traceCallPath,
   type BidirectionalAdjacency,
 } from '@driller/graph-contracts';
 import type {
+  BlastRadiusExpansionResult,
   CloudBackend,
+  CodeMapEdge,
   CodeMapNode,
   DiffScopeResult,
   GraphServiceBackendSwitchedRequest,
   GraphServiceCodeMapMessage,
   GraphServiceComputeDiffScopeRequest,
   GraphServiceComputeDiffScopeResultMessage,
+  GraphServiceExpandBlastRadiusRequest,
+  GraphServiceExpandBlastRadiusResultMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
   GraphServicePathTraceRequest,
@@ -329,6 +334,15 @@ const activeIngestionBots = new Set<PrBotId>();
 // each other.
 let activeDiffScopeComputationInFlight = false;
 
+// Story 3.2 (Phase 1): whether a `graphService:expandBlastRadius` request is
+// currently running in THIS process — mirrors
+// `activeDiffScopeComputationInFlight`'s exact reasoning (a plain boolean,
+// not a `Set`: only one blast-radius expansion is ever meaningful at a time,
+// against this process's single `activeProjectPath`). Refuses a second
+// concurrent request outright rather than letting two overlapping
+// computations race each other.
+let activeBlastRadiusExpansionInFlight = false;
+
 // Story 1.5 Phase 3: which hardware-advisory signal source(s) have already
 // been posted this project session (Boundaries & Constraints: "sent at most
 // once per signal source per project session (no repeat spam)"). Reset at
@@ -361,6 +375,24 @@ let activeBackendConfig: { activeBackend: CloudBackend; cloudApiKey?: string } =
 // request — a Node set from a since-superseded project must never be reused
 // for a later backend switch belonging to a different project.
 let activeCodeMapNodes: CodeMapNode[] | undefined;
+
+// Story 3.2 (Phase 1): the most recently fetched Code Map's Edges, cached
+// alongside `activeCodeMapNodes` — same lifecycle (Design Notes), reset to
+// `undefined` alongside `activeCodeMapNodes` in `handleIndexRequest`.
+// Genuinely new cached state: before this, `edges` lived only inside
+// `handleGetCodeMapRequest`'s own local scope and was discarded once the
+// `graphService:codeMap` message posted — `buildBidirectionalAdjacency`
+// (used per-fetch there) needs both `nodes` and `edges`, but only `nodes`
+// was ever cached for a later on-demand call
+// (`computeBlastRadiusExpansionResult`) to reuse.
+//
+// Set exclusively inside `startSummaryGenerationForProject`, in the same
+// synchronous statement as `activeCodeMapNodes` (review finding, High —
+// see that function's own doc comment) — never assigned at its caller's own
+// call site, which is what let a real `await` gap between the two
+// assignments open a window where they briefly disagreed about which fetch
+// they reflected.
+let activeCodeMapEdges: CodeMapEdge[] | undefined;
 
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
@@ -432,6 +464,15 @@ function postRunIngestionResultMessage(message: GraphServiceRunIngestionResultMe
  * `postRunIngestionResultMessage`/`postPathTraceResultMessage`.
  */
 function postComputeDiffScopeResultMessage(message: GraphServiceComputeDiffScopeResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/**
+ * Posts a `graphService:expandBlastRadiusResult` reply (Story 3.2, Phase 1)
+ * — own `type`/channel, same disambiguation convention as
+ * `postComputeDiffScopeResultMessage`.
+ */
+function postExpandBlastRadiusResultMessage(message: GraphServiceExpandBlastRadiusResultMessage): void {
   process.parentPort?.postMessage(message);
 }
 
@@ -713,6 +754,35 @@ function isComputeDiffScopeRequest(data: unknown): data is GraphServiceComputeDi
   );
 }
 
+/**
+ * True for a `graphService:expandBlastRadius` request (Story 3.2, Phase 1) —
+ * mirrors `isComputeDiffScopeRequest`'s shape, plus the same defensive
+ * "every element is actually a string" check `isRunIngestionRequest`/
+ * `isIndexRequest` already apply to values crossing this `parentPort`
+ * boundary from main. `nodeIds` is allowed to be an empty array (the I/O
+ * matrix's "empty seed set" scenario) — only a non-array, or an array
+ * containing a non-string, is rejected.
+ */
+function isExpandBlastRadiusRequest(data: unknown): data is GraphServiceExpandBlastRadiusRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, projectPath, nodeIds, requestId } = data as {
+    type?: unknown;
+    projectPath?: unknown;
+    nodeIds?: unknown;
+    requestId?: unknown;
+  };
+  return (
+    type === 'graphService:expandBlastRadius' &&
+    typeof projectPath === 'string' &&
+    projectPath.length > 0 &&
+    Array.isArray(nodeIds) &&
+    nodeIds.every((nodeId) => typeof nodeId === 'string') &&
+    typeof requestId === 'number'
+  );
+}
+
 /** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
 function isCloudBackendValue(value: unknown): value is CloudBackend {
   return value === 'local' || value === 'cloud';
@@ -806,6 +876,9 @@ async function handleIndexRequest(
   // that's really about this new project.
   activeBackendConfig = backendConfig;
   activeCodeMapNodes = undefined;
+  // Story 3.2 (Phase 1): reset alongside `activeCodeMapNodes` — same
+  // never-reuse-a-since-superseded-project's-Edges reasoning (Design Notes).
+  activeCodeMapEdges = undefined;
   // Story 1.5 Phase 2: a new index attempt (a different project, or a
   // re-index of the same one) immediately invalidates any summary
   // generation still running from a previous index/getCodeMap cycle — see
@@ -1010,7 +1083,21 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // regenerated. `nodesWithRiskSignals` is a strict superset of
     // `normalizedNodes`'s fields (via `annotatedNodes`), so this is safe for
     // every existing consumer of `activeCodeMapNodes`.
-    void startSummaryGenerationForProject(nodesWithRiskSignals);
+    //
+    // Review finding (High — real race condition): `edges` is passed through
+    // here rather than cached separately right after the `fetchCodeMap` call
+    // above — `startSummaryGenerationForProject` now sets
+    // `activeCodeMapNodes`/`activeCodeMapEdges` together, in the same
+    // synchronous tick (its own doc comment). An earlier version cached
+    // `edges` right here, synchronously after `fetchCodeMap`, while
+    // `activeCodeMapNodes` was only (re)assigned later inside
+    // `startSummaryGenerationForProject` — with the real `await
+    // loadLcovCoverage(...)` in between, an `expandBlastRadius` request
+    // landing in that window computed against a mismatched nodes/edges pair
+    // (new edges, stale nodes) with no error, since neither the
+    // `activeProjectPath` nor the `activeSummaryGenerationId` guard changes
+    // on a plain Code Map refetch of the same project.
+    void startSummaryGenerationForProject(nodesWithRiskSignals, edges);
     // Story 2.2 Phase 2: judgment generation kicked off the same
     // fire-and-forget way, alongside the summary/staleness kick-offs — never
     // delays this response (AD-8). Same `nodesWithRiskSignals` set (not
@@ -1584,6 +1671,110 @@ async function computeDiffScopeResult(projectPath: string, baseRef: string | und
 }
 
 /**
+ * Handles a `graphService:expandBlastRadius` request (Story 3.2, Phase 1) —
+ * mirrors `handleComputeDiffScopeRequest`'s exact shape: refuses a second
+ * concurrent request outright (`activeBlastRadiusExpansionInFlight`), and
+ * posts exactly one `graphService:expandBlastRadiusResult` message. Never
+ * throws — every failure path is reported as an explicit
+ * `{status: 'error', ...}` `BlastRadiusExpansionResult`, mirroring
+ * `handleComputeDiffScopeRequest`'s own top-level try/catch so main's
+ * pending `pendingBlastRadiusResolvers` entry always settles.
+ */
+async function handleExpandBlastRadiusRequest(
+  projectPath: string,
+  nodeIds: string[],
+  requestId: number,
+): Promise<void> {
+  if (activeBlastRadiusExpansionInFlight) {
+    // Refuses a second concurrent request outright — same reasoning as
+    // `handleComputeDiffScopeRequest`'s own `activeDiffScopeComputationInFlight`
+    // guard.
+    postExpandBlastRadiusResultMessage({
+      type: 'graphService:expandBlastRadiusResult',
+      projectPath,
+      requestId,
+      result: { status: 'error', message: 'A blast radius expansion is already running.' },
+    });
+    return;
+  }
+
+  activeBlastRadiusExpansionInFlight = true;
+  let result: BlastRadiusExpansionResult;
+  try {
+    result = computeBlastRadiusExpansionResult(projectPath, nodeIds);
+  } catch (error) {
+    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    activeBlastRadiusExpansionInFlight = false;
+  }
+  postExpandBlastRadiusResultMessage({
+    type: 'graphService:expandBlastRadiusResult',
+    projectPath,
+    requestId,
+    result,
+  });
+}
+
+/**
+ * Computes the `BlastRadiusExpansionResult` for `projectPath` against
+ * `nodeIds` — against the cached `activeCodeMapNodes`/`activeCodeMapEdges`
+ * (the same Code Map state `computeDiffScopeResult` reads its own
+ * `activeCodeMapNodes` from), never a fresh fetch.
+ *
+ * Unlike `computeDiffScopeResult` (which awaits slow git subprocess calls),
+ * this is a plain synchronous computation — `buildBidirectionalAdjacency`
+ * and `computeBlastRadiusHopDistances` are both pure, no-I/O functions
+ * (`@driller/graph-contracts`) over data already cached in this process.
+ * Still applies the same `activeSummaryGenerationId`/`activeProjectPath`
+ * staleness check `computeDiffScopeResult` does after its own await, for
+ * structural parity with that mirrored shape (Always) and so a future
+ * change to this function's own timing (e.g. a genuinely async BFS over a
+ * very large graph) can't silently reintroduce the same supersession bug
+ * class `computeDiffScopeResult`'s own guard was added to close.
+ *
+ * `hopDistances` converts `computeBlastRadiusHopDistances`'s `Map` return
+ * value to a plain `Record<string, number>` — see `BlastRadiusExpansionResult`'s
+ * own doc comment (`@driller/ipc-contracts`) for why: this result travels
+ * over `parentPort`/IPC and should stay JSON-shaped like every other result
+ * in this file, not carry a `Map` across that boundary.
+ */
+function computeBlastRadiusExpansionResult(projectPath: string, nodeIds: string[]): BlastRadiusExpansionResult {
+  const nodes = activeCodeMapNodes;
+  const edges = activeCodeMapEdges;
+  const projectRoot = activeProjectPath;
+  if (!nodes || !edges || !projectRoot) {
+    return { status: 'error', message: 'No project has finished indexing yet.' };
+  }
+  if (projectRoot !== projectPath) {
+    // Mirrors `computeDiffScopeResult`'s own stale-project guard: a request
+    // for a project that isn't (or is no longer) this process's active one
+    // must never silently compute against the wrong project's Nodes/Edges.
+    return { status: 'error', message: 'The requested project is not the currently active project.' };
+  }
+  // Captured before the computation below, for the supersession check after
+  // it — see `computeDiffScopeResult`'s own identical guard and this
+  // function's own doc comment for why this is kept even though the
+  // computation itself has no `await` today.
+  const generationId = activeSummaryGenerationId;
+
+  const adjacency = buildBidirectionalAdjacency(nodes, edges);
+  const hopDistancesById = computeBlastRadiusHopDistances(adjacency, nodeIds);
+
+  if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
+    return {
+      status: 'error',
+      message: 'The project changed while the blast radius expansion was running; discarding its results.',
+    };
+  }
+
+  const hopDistances: Record<string, number> = {};
+  for (const [nodeId, distance] of hopDistancesById) {
+    hopDistances[nodeId] = distance;
+  }
+  return { status: 'resolved', hopDistances };
+}
+
+/**
  * Kicks off `generateSummaries` for the Nodes just posted in a
  * `graphService:codeMap` response (Story 1.5 Phase 2), relaying its batched
  * progress as `graphService:summaryProgress` posts. Fire-and-forget from the
@@ -1591,6 +1782,23 @@ async function computeDiffScopeResult(projectPath: string, baseRef: string | und
  * Caches `nodes` into `activeCodeMapNodes` (Story 1.6, Phase 2) so a later
  * `graphService:backendSwitched` request can re-kick generation for the same
  * Node set without a fresh `fetchCodeMap` call (AD-18: never a re-index).
+ *
+ * Also caches `edges` into `activeCodeMapEdges` (Story 3.2, Phase 1),
+ * assigned in the very same synchronous statement as `activeCodeMapNodes`
+ * right below — deliberately, not two separate assignments at two different
+ * call sites (review finding, High): `handleGetCodeMapRequest` used to
+ * assign `activeCodeMapEdges` synchronously right after its own
+ * `fetchCodeMap` call, while `activeCodeMapNodes` was only ever (re)assigned
+ * here, after that caller's own `await loadLcovCoverage(...)`. That gap was
+ * a real window — same project, so neither the `activeProjectPath` guard nor
+ * a plain refetch's unchanged `activeSummaryGenerationId` would catch it —
+ * during which `activeCodeMapEdges` reflected a fresh fetch while
+ * `activeCodeMapNodes` still reflected the previous one; an
+ * `expandBlastRadius` request landing in that window would silently compute
+ * against a mismatched nodes/edges pair. Setting both fields in this one
+ * function, back to back with no `await` between them, closes that window
+ * entirely — see `activeCodeMapEdges`'s own doc comment for the "mirrors
+ * `activeCodeMapNodes`'s exact lifecycle" invariant this restores.
  *
  * Resolves which summarizer to build from `activeBackendConfig` (Story 1.6,
  * Phase 2), read fresh at the moment this function runs rather than a value
@@ -1628,13 +1836,16 @@ async function computeDiffScopeResult(projectPath: string, baseRef: string | und
  * model sequence concurrently. The second call returns immediately; only
  * the first proceeds.
  */
-async function startSummaryGenerationForProject(nodes: CodeMapNode[]): Promise<void> {
+async function startSummaryGenerationForProject(nodes: CodeMapNode[], edges: CodeMapEdge[]): Promise<void> {
   const generationId = activeSummaryGenerationId;
   const projectRoot = activeProjectPath;
   const gapFiles = coverageGapFileSet;
   const backendConfig = activeBackendConfig;
 
+  // Set together, same synchronous tick, no `await` between them — see this
+  // function's own doc comment for the race condition this atomicity fixes.
   activeCodeMapNodes = nodes;
+  activeCodeMapEdges = edges;
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
@@ -1936,7 +2147,14 @@ async function handleBackendSwitchedRequest(backendConfig: {
   const previousBackend = activeBackendConfig.activeBackend;
   activeBackendConfig = backendConfig;
   const nodes = activeCodeMapNodes;
-  if (!nodes || nodes.length === 0) {
+  // Story 3.2 (Phase 1): `activeCodeMapEdges` is captured alongside
+  // `activeCodeMapNodes` here too — the two are always set together (see
+  // `startSummaryGenerationForProject`'s own doc comment), so `edges` is
+  // guaranteed defined whenever `nodes` is; the explicit `!edges` check
+  // below only makes that existing invariant visible to the type checker,
+  // same as `handleGetCodeMapRequest`'s own combined-guard precedent.
+  const edges = activeCodeMapEdges;
+  if (!nodes || nodes.length === 0 || !edges) {
     return;
   }
 
@@ -1951,7 +2169,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
     // genuinely-blocked/pending Nodes (e.g. blocked on a missing key that
     // now exists) are retried.
     activeSummaryGenerationId += 1;
-    void startSummaryGenerationForProject(nodes);
+    void startSummaryGenerationForProject(nodes, edges);
     return;
   }
 
@@ -1991,7 +2209,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
   }
 
   activeSummaryGenerationId += 1;
-  void startSummaryGenerationForProject(nodes);
+  void startSummaryGenerationForProject(nodes, edges);
 }
 
 /**
@@ -2102,6 +2320,14 @@ process.parentPort?.on('message', (event) => {
     // `graphService:computeDiffScopeResult` reply asynchronously and never
     // throws (its own top-level try/catch guarantees that).
     void handleComputeDiffScopeRequest(event.data.projectPath, event.data.baseRef, event.data.requestId);
+    return;
+  }
+  if (!isShuttingDown && isExpandBlastRadiusRequest(event.data)) {
+    // Fire-and-forget from the message handler's perspective, same as every
+    // other branch here — `handleExpandBlastRadiusRequest` posts its own
+    // `graphService:expandBlastRadiusResult` reply asynchronously and never
+    // throws (its own top-level try/catch guarantees that).
+    void handleExpandBlastRadiusRequest(event.data.projectPath, event.data.nodeIds, event.data.requestId);
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {

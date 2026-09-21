@@ -1158,6 +1158,82 @@ export interface GraphServiceComputeDiffScopeResultMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 3.2 (Phase 1): compute multi-Node blast radius hop distances (FR12,
+// AD-13).
+//
+// Mirrors Story 3.1 (Phase 1)'s `DiffScopeResult`/`GraphServiceComputeDiffScope
+// Request`/`GraphServiceComputeDiffScopeResultMessage` shape layer-for-layer
+// — same `requestId` correlation (stale-reply safety), same
+// `projectPath`-keyed single-flight guard, same never-rejects/every-failure-
+// is-an-explicit-result contract. `computeBlastRadiusHopDistances`
+// (`@driller/graph-contracts`) is the actual multi-source BFS, reused here
+// for the IPC envelope rather than redefined ad hoc — same precedent
+// `findChangedNodeIds`/`DiffScopeResult` already established.
+//
+// `BlastRadiusExpansionResult` is an explicit, enumerated result-state union
+// (AD-13's broader pattern), never null/empty standing in for "nothing
+// reachable" or "couldn't compute":
+//  - `'resolved'`: `hopDistances` maps every reachable Node's id to its
+//    minimum hop distance from the nearest seed in the request's `nodeIds`
+//    (seed Nodes themselves excluded — Always). A plain
+//    `Record<string, number>`, not a `Map`, to keep this result JSON-shaped
+//    like every other IPC result in this file — the Graph Service converts
+//    `computeBlastRadiusHopDistances`'s `Map` return value to this shape
+//    before posting it back. An empty `nodeIds` request (or one whose every
+//    seed id is stale) resolves with an empty `hopDistances` object, not an
+//    error.
+//  - `'error'`: the expansion couldn't even be attempted (no project indexed
+//    yet, the requested project isn't the currently active one, or it
+//    changed mid-computation) — `message` is safe, user-facing text, mirrors
+//    `DiffScopeResult`'s own `'error'` variant.
+// ---------------------------------------------------------------------------
+
+export type BlastRadiusExpansionResult =
+  | { status: 'resolved'; hopDistances: Record<string, number> }
+  | { status: 'error'; message: string };
+
+/**
+ * Message main sends to ask the Graph Service subprocess to expand blast
+ * radius from `nodeIds` — mirrors `GraphServiceComputeDiffScopeRequest`'s
+ * shape exactly, except `nodeIds: string[]` (the changed-Node seed set) in
+ * place of `baseRef`.
+ *
+ * Carries `projectPath` for the same reason `GraphServiceComputeDiffScope
+ * Request` does — the Graph Service always computes against its own
+ * `activeProjectPath`/`activeCodeMapNodes`/`activeCodeMapEdges` state, but
+ * main needs `projectPath` to settle the right pending entry in its own
+ * single-flight guard (`pendingBlastRadiusResolvers`, keyed by project path),
+ * including across a project switch that races an in-flight request.
+ *
+ * `requestId`: same stale-reply correlation reasoning as
+ * `GraphServiceComputeDiffScopeRequest.requestId` — a monotonically
+ * increasing counter minted by main per call, echoed back verbatim in the
+ * reply, checked before settling so a late reply from an abandoned request
+ * can never incorrectly settle a newer one for the same `projectPath`.
+ */
+export interface GraphServiceExpandBlastRadiusRequest {
+  type: 'graphService:expandBlastRadius';
+  projectPath: string;
+  nodeIds: string[];
+  requestId: number;
+}
+
+/**
+ * Message the Graph Service subprocess posts back in response to a
+ * `GraphServiceExpandBlastRadiusRequest`, over the same `parentPort` channel
+ * as every other Graph Service message — distinguished by `type`, same
+ * convention as `GraphServiceComputeDiffScopeResultMessage`. `projectPath`
+ * and `requestId` both echo the request's own fields verbatim, same
+ * correlation reasoning.
+ */
+export interface GraphServiceExpandBlastRadiusResultMessage {
+  type: 'graphService:expandBlastRadiusResult';
+  projectPath: string;
+  requestId: number;
+  result: BlastRadiusExpansionResult;
+}
+
+// ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
 
@@ -1186,6 +1262,7 @@ export const IpcChannels = {
   pathTrace: 'path:trace',
   diagnosticLog: 'diagnostic:log',
   diffScopeCompute: 'diffScope:compute',
+  blastRadiusExpand: 'blastRadius:expand',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -1363,4 +1440,19 @@ export interface DrillerApi {
    * this directly, e.g. from the DevTools console.
    */
   computeDiffScope: (projectPath: string, baseRef?: string) => Promise<DiffScopeResult>;
+  /**
+   * Computes combined blast radius hop distances from `nodeIds` for
+   * `projectPath` (Story 3.2, Phase 1, FR12, AD-13) — a full IPC/graph-
+   * service round trip mirroring `computeDiffScope`'s shape layer-for-layer,
+   * over `@driller/graph-contracts`'s `computeBlastRadiusHopDistances`.
+   * `projectPath` must be the currently-open project — main rejects a call
+   * for any other path with an explicit `'error'` result, mirroring
+   * `computeDiffScope`'s own validation. Unbounded: returns hop distances
+   * for every reachable Node in one call, no `maxHops` parameter (Phase 2's
+   * stepper slices this locally per hop step, zero additional round trips).
+   * No renderer entry point calls this yet this phase (Never: "no UI
+   * changes in this phase") — reachable only by calling this directly, e.g.
+   * from the DevTools console.
+   */
+  expandBlastRadius: (projectPath: string, nodeIds: string[]) => Promise<BlastRadiusExpansionResult>;
 }
