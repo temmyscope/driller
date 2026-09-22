@@ -11,8 +11,11 @@
     "@driller/graph-contracts": "*",
     "@driller/ipc-contracts": "*",
     "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "codebase-memory-mcp": "^0.10.8",
-    "p-queue": "^9.3.3"
+    "p-queue": "^9.3.3",
+    "zod": "^4.2.0"
   },
   "devDependencies": {
     "electron": "43.6.0",

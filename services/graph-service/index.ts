@@ -170,6 +170,7 @@ import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgm
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
 import { fetchCodeMap, indexRepository, type CodeMapNodeWithSignalSources } from './mcp-client';
+import { startMcpServer } from './mcp-server';
 import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
 import {
   flushNodeRecordStore,
@@ -412,6 +413,29 @@ function fallbackUserDataPath(): string {
 }
 
 initNodeRecordStore(userDataPath);
+
+// Story 5.1 (Phase 1): starts the secured Agent-Facing Query Surface as soon
+// as this subprocess is ready to accept connections — never gated on a
+// project finishing indexing first (Always); a Node-lookup query made before
+// that returns its own explicit `{status: 'error', ...}` (mcp-server.ts's
+// `lookupNode`), never a hang. `() => activeCodeMapNodes` is a live getter,
+// not a value captured once here — `activeCodeMapNodes` is still `undefined`
+// at this point in module init and is only ever (re)assigned later, once a
+// `graphService:index` request actually completes.
+//
+// `startMcpServer` can throw synchronously (a malformed tool registration,
+// transport construction failure, etc.) — caught here (review round 1, Low)
+// so a construction-time failure in the Agent-Facing Query Surface degrades
+// to "this surface isn't available" rather than taking down the whole
+// subprocess (and with it every other Graph Service capability). Its return
+// value is stashed so `finishShutdown` can release the listener on a clean
+// shutdown (review round 1, Medium).
+let closeMcpServer: (() => Promise<void>) | undefined;
+try {
+  closeMcpServer = startMcpServer(() => activeCodeMapNodes);
+} catch (error) {
+  console.error('[graph-service] failed to start the Agent-Facing Query Surface (mcp-server.ts):', error);
+}
 
 // Memoizes the local-model download/verify attempt for this subprocess's
 // whole lifetime — see the module doc comment above for why this is
@@ -845,6 +869,17 @@ async function finishShutdown(): Promise<void> {
       activeIndexRequest.catch(() => {}),
       new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS)),
     ]);
+  }
+  // Story 5.1 (Phase 1, review round 1): releases the Agent-Facing Query
+  // Surface's HTTP listener/MCP transport on a clean subprocess shutdown —
+  // the same resource-release discipline `disposeModelContext` below already
+  // established for this file (its own doc comment: "previously never
+  // disposed, leaking... rather than releasing them on a clean subprocess
+  // shutdown"). `closeMcpServer` itself already logs and swallows its own
+  // errors, so this is best-effort/never throws; not worth racing against
+  // SHUTDOWN_GRACE_MS either, same reasoning as the two steps below.
+  if (closeMcpServer) {
+    await closeMcpServer();
   }
   // Flushes any debounced-but-not-yet-written Node record merge (AD-20) —
   // without this, a merge that landed just before shutdown could be lost to
