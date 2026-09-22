@@ -1,11 +1,17 @@
 /**
- * The Agent-Facing Query Surface (Epic 5, Story 5.1 Phase 1): a secured MCP
- * server, hosted inside this subprocess (AD-1's `utilityProcess.fork`), that
- * lets other agents/tools query driller's Code Map the same way the
- * renderer does — starting with Node lookup, the one operation this phase
- * proves the whole pipe with. Phase 2 wires the remaining four operations
- * (Path Trace, Blast Radius expansion, diff-scoped Node-set, coverage-check
- * retrieval) onto this same transport/security baseline.
+ * The Agent-Facing Query Surface (Epic 5, Story 5.1): a secured MCP server,
+ * hosted inside this subprocess (AD-1's `utilityProcess.fork`), that lets
+ * other agents/tools query driller's Code Map the same way the renderer
+ * does. Phase 1 proved the transport/security baseline with one operation,
+ * Node lookup. Phase 2 wires the remaining four operations onto that same
+ * baseline — Path Trace (`trace_path`), Blast Radius expansion
+ * (`expand_blast_radius`), diff-scoped Node-set computation
+ * (`compute_diff_scope`), and coverage-check retrieval
+ * (`get_coverage_summary`) — each a thin `registerTool` wrapper over its
+ * already-exported, already-reviewed compute function from `index.ts`
+ * (AD-13: defined once, never re-implemented for this surface). No changes
+ * to Phase 1's transport/security middleware in this phase (Boundaries &
+ * Constraints, spec-5-1-phase-2).
  *
  * Security model (Boundaries & Constraints, epic-5-context.md's Technical
  * Decisions):
@@ -56,6 +62,12 @@ import {
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { CodeMapNode } from '@driller/ipc-contracts';
+import {
+  computeBlastRadiusExpansionResult,
+  computeDiffScopeResult,
+  computePathTraceResult,
+  getCoverageSummaryResult,
+} from './index';
 
 /**
  * A distinctive, uncommon port (confirmed with the human) outside typical
@@ -171,9 +183,23 @@ function writeRequestTooLarge(res: http.ServerResponse): void {
 }
 
 /**
- * Builds the `McpServer`, registers the Node-lookup tool, and starts the
- * `127.0.0.1`-bound HTTP listener — called once at subprocess boot
- * (`index.ts`), never gated on a project being indexed first (Always).
+ * Shared response shape for every `registerTool` handler below (review
+ * finding, Low): all five tools JSON-stringify their explicit result state
+ * into a single text content block — extracted once now that there are 5
+ * near-identical call sites instead of 1 (this phase's own AD-13
+ * no-duplication stance, applied to the response-wrapping code too, not
+ * just the compute layer).
+ */
+function jsonToolResult(result: unknown): { content: [{ type: 'text'; text: string }] } {
+  return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+}
+
+/**
+ * Builds the `McpServer`, registers all five tools (`lookup_node` plus
+ * Phase 2's `trace_path`/`expand_blast_radius`/`compute_diff_scope`/
+ * `get_coverage_summary`), and starts the `127.0.0.1`-bound HTTP listener —
+ * called once at subprocess boot (`index.ts`), never gated on a project
+ * being indexed first (Always).
  *
  * `getActiveCodeMapNodes` is a closure over `index.ts`'s own module-level
  * `activeCodeMapNodes`, not a value captured once at call time: that `let`
@@ -182,7 +208,11 @@ function writeRequestTooLarge(res: http.ServerResponse): void {
  * constructed long before the first one ever completes. A captured value
  * would freeze at whatever it was during this call (always `undefined`,
  * since indexing hasn't happened yet) and never observe a later index
- * finishing — a live getter is the only correct shape here.
+ * finishing — a live getter is the only correct shape here. The four Phase 2
+ * tools need no equivalent getter parameter: their compute functions
+ * (`computePathTraceResult`/`computeBlastRadiusExpansionResult`/
+ * `computeDiffScopeResult`/`getCoverageSummaryResult`) live in `index.ts`
+ * itself and already close over that module's own live state directly.
  *
  * `registerTool`/`new WebStandardStreamableHTTPServerTransport(...)` below
  * can throw synchronously (a malformed tool config, etc.) — deliberately
@@ -201,7 +231,12 @@ function writeRequestTooLarge(res: http.ServerResponse): void {
  * `disposeModelContext` already established for this file.
  */
 export function startMcpServer(getActiveCodeMapNodes: () => CodeMapNode[] | undefined): () => Promise<void> {
-  const server = new McpServer({ name: 'driller-code-map', version: '1.0.0' });
+  // Phase 1 shipped '1.0.0' as the documented v1 contract covering
+  // `lookup_node` alone. Phase 2 bumps the MINOR version (semver:
+  // backward-compatible addition, no existing tool's shape changed) to
+  // reflect the four newly added tools — the v1 contract is extended, never
+  // replaced (Acceptance Criteria).
+  const server = new McpServer({ name: 'driller-code-map', version: '1.1.0' });
 
   server.registerTool(
     'lookup_node',
@@ -213,18 +248,103 @@ export function startMcpServer(getActiveCodeMapNodes: () => CodeMapNode[] | unde
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),
     },
-    async ({ nodeId }) => {
-      const result = lookupNode(nodeId, getActiveCodeMapNodes());
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-      };
+    async ({ nodeId }) => jsonToolResult(lookupNode(nodeId, getActiveCodeMapNodes())),
+  );
+
+  // Story 5.1 (Phase 2): the remaining four operations. Each handler calls
+  // straight into its already-exported, already-reviewed compute function
+  // from `index.ts` (AD-13) — never a second copy of any operation's logic —
+  // mirroring `lookup_node`'s own JSON-stringified-result pattern above.
+  // Unlike `lookup_node` (Phase 1, not retrofitted — Design Notes), each of
+  // these three project-scoped tools takes `projectPath` as an explicit
+  // input, mirroring their existing IPC contracts exactly (Always): an
+  // external agent must state which project it's querying, same as the
+  // renderer does.
+
+  server.registerTool(
+    'trace_path',
+    {
+      title: 'Trace a call path',
+      description:
+        "Trace a deterministic call path from a query-resolved entry Node through driller's Code Map, via CALLS edges only. Returns the exact same PathTraceResult the human-facing UI's Path Trace would get for the identical query — an explicit result state (found/ambiguous/no-path-found/error), never collapsed into a generic success/failure.",
+      inputSchema: z.object({
+        query: z
+          .string()
+          .min(1, 'query must not be empty.')
+          .describe('The Path Trace query — matched against Node id first, then name, then a name substring.'),
+      }),
+    },
+    async ({ query }) => jsonToolResult(await computePathTraceResult(query)),
+  );
+
+  server.registerTool(
+    'expand_blast_radius',
+    {
+      title: 'Expand blast radius from a Node set',
+      description:
+        "Compute hop-distance blast radius expansion from a seed set of Node ids through driller's Code Map. Returns the exact same BlastRadiusExpansionResult the human-facing UI would get for the identical seed set — an explicit result state (resolved/error), never collapsed into a generic success/failure.",
+      inputSchema: z.object({
+        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
+        nodeIds: z
+          .array(z.string())
+          .max(1000, 'nodeIds must not exceed 1000 entries.')
+          .describe('The seed Node ids to expand blast radius from. May be empty.'),
+      }),
+    },
+    async ({ projectPath, nodeIds }) => jsonToolResult(computeBlastRadiusExpansionResult(projectPath, nodeIds)),
+  );
+
+  server.registerTool(
+    'compute_diff_scope',
+    {
+      title: 'Compute the diff-scoped Node set',
+      description:
+        "Compute the diff-scoped Node set for a project against a base ref (or an auto-resolved default branch). Returns the exact same DiffScopeResult the human-facing UI would get for the identical request — an explicit result state (resolved/no-changes/not-a-git-repo/no-base-ref-resolvable/error), never collapsed into a generic success/failure.",
+      inputSchema: z.object({
+        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
+        baseRef: z
+          .string()
+          .optional()
+          .describe('The branch/commit to diff against. Omit to auto-resolve a default branch.'),
+      }),
+    },
+    async ({ projectPath, baseRef }) => {
+      // Review finding (Low): mirrors the renderer's own established base-ref
+      // normalization (Story 3.1, Phase 2) — a trimmed-empty string means
+      // "omit," triggering auto-resolution, exactly like the tool's own
+      // description promises. Without this, `baseRef: ''` would pass through
+      // as `''` rather than `undefined`, diverging from that documented
+      // behavior.
+      const trimmedBaseRef = baseRef?.trim();
+      const result = await computeDiffScopeResult(
+        projectPath,
+        trimmedBaseRef && trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined,
+      );
+      return jsonToolResult(result);
+    },
+  );
+
+  server.registerTool(
+    'get_coverage_summary',
+    {
+      title: 'Get the index coverage summary',
+      description:
+        "Retrieve the current index's coverage-check summary (skipped/parse-partial file counts and gap paths) for a project. Returns an explicit result state: 'ok' with the coverage summary, 'unavailable' when the project is indexed but no coverage summary was captured (distinct from an error), or 'error' when the project isn't the currently indexed one.",
+      inputSchema: z.object({
+        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
+      }),
+    },
+    async ({ projectPath }) => {
+      return jsonToolResult(getCoverageSummaryResult(projectPath));
     },
   );
 
   const transport = new WebStandardStreamableHTTPServerTransport({
-    // Stateless mode: no session bookkeeping needed for a single stdio-free
-    // Node-lookup tool call (Phase 1 scope) — matches this transport's own
-    // documented "stateless setup" pattern (`sessionIdGenerator: undefined`).
+    // Stateless mode: no session bookkeeping needed — every tool call above
+    // (Phase 1's `lookup_node` and Phase 2's four additions) is a single
+    // stdio-free request/response with no cross-call state of its own —
+    // matches this transport's own documented "stateless setup" pattern
+    // (`sessionIdGenerator: undefined`).
     sessionIdGenerator: undefined,
   });
 

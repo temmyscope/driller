@@ -126,6 +126,7 @@ import {
   findChangedNodeIds,
   traceCallPath,
   type BidirectionalAdjacency,
+  type PathTraceResult,
 } from '@driller/graph-contracts';
 import type {
   BlastRadiusExpansionResult,
@@ -151,6 +152,7 @@ import type {
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   HardwareAdvisoryReason,
+  IndexCoverageSummary,
   LlmJudgmentProgressMessage,
   ModelStatusMessage,
   PrBotId,
@@ -239,6 +241,22 @@ let activeProjectPath: string | undefined;
 // alongside `activeProject`/`activeProjectPath`, same never-cleared-on-
 // failure reasoning.
 let coverageGapFileSet: ReadonlySet<string> = new Set();
+
+// The current index's full coverage summary (Story 5.1, Phase 2) — unlike
+// `coverageGapFileSet` above (which retains only the derived POSIX-relative
+// gap paths), this caches the whole `IndexCoverageSummary` object
+// (`expectedNodes`/`expectedEdges`/`skippedCount`/`parsePartialCount`/
+// `gapPaths`) exactly as `indexRepository` returned it, so a later on-demand
+// `get_coverage_summary` MCP query can return it in full rather than just the
+// gap-path projection the renderer's own coverage badges need. Same lifecycle
+// as `activeCodeMapEdges` (Code Map): reset to `undefined` at the same point
+// `activeCodeMapEdges` itself resets, at the very start of every new index
+// attempt in `handleIndexRequest` (so a re-index in flight never serves a
+// stale coverage summary from the project's previous index), then set in
+// that same function's success branch alongside `coverageGapFileSet`'s own
+// derivation from `coverage` — left `undefined` on a superseded/failed
+// attempt, same as `coverageGapFileSet` itself.
+let activeCoverageSummary: IndexCoverageSummary | undefined;
 
 // The verified local model (Story 1.5 Phase 1's `ensureLocalModel` result),
 // captured once `modelAttempt` (below) resolves — `summary-generator.ts`
@@ -914,6 +932,9 @@ async function handleIndexRequest(
   // Story 3.2 (Phase 1): reset alongside `activeCodeMapNodes` — same
   // never-reuse-a-since-superseded-project's-Edges reasoning (Design Notes).
   activeCodeMapEdges = undefined;
+  // Story 5.1 (Phase 2): reset alongside `activeCodeMapEdges` — same
+  // never-serve-a-since-superseded-project's-coverage-summary reasoning.
+  activeCoverageSummary = undefined;
   // Story 1.5 Phase 2: a new index attempt (a different project, or a
   // re-index of the same one) immediately invalidates any summary
   // generation still running from a previous index/getCodeMap cycle — see
@@ -977,6 +998,15 @@ async function handleIndexRequest(
         toProjectRelativePosixPath(projectPath, gap.path, 'coverage gap file'),
       ),
     );
+    // Story 5.1 (Phase 2): captured alongside `coverageGapFileSet`'s own
+    // derivation from the same `coverage` value — the full summary object,
+    // not just its derived gap-path projection, so a later on-demand
+    // `get_coverage_summary` MCP query has the whole thing to return.
+    // Deliberately `coverage` verbatim (never reshaped) — `coverage` is
+    // already `IndexCoverageSummary | undefined` exactly as `indexRepository`
+    // returned it, best-effort per that type's own doc comment (omitted, not
+    // an error, when the `index_status` follow-up call fails).
+    activeCoverageSummary = coverage;
     postStatus({
       state: 'indexed',
       pid: process.pid,
@@ -1258,21 +1288,25 @@ function buildRiskSignals(
 }
 
 /**
- * Handles a `graphService:pathTrace` request (Story 1.9, Phase 1) — computes
- * a deterministic call-path trace from a query-resolved entry Node via
- * `@driller/graph-contracts`'s `traceCallPath`, and posts back exactly one
- * `graphService:pathTraceResult` message. Never throws — every failure path
- * (no successful index yet, or `fetchCodeMap` itself failing) is reported as
- * an explicit `{status: 'error', ...}` `PathTraceResult` so main's pending
- * request always settles, same "never a hung request" framing as
- * `handleGetCodeMapRequest`.
+ * Computes a deterministic call-path trace from a query-resolved entry Node
+ * via `@driller/graph-contracts`'s `traceCallPath` (Story 1.9, Phase 1;
+ * extracted into its own exported function in Story 5.1, Phase 2 so the
+ * Agent-Facing Query Surface's `trace_path` MCP tool can call straight into
+ * it — AD-13 — rather than duplicating `handlePathTraceRequest`'s own
+ * guard/fetch/trace sequence). Never throws — every failure path (no
+ * successful index yet, or `fetchCodeMap` itself failing) is reported as an
+ * explicit `{status: 'error', ...}` `PathTraceResult`, mirroring
+ * `computeDiffScopeResult`/`computeBlastRadiusExpansionResult`'s own
+ * never-throws contract.
  *
  * Strictly read-only (Always: "never touches the Node record store,
  * `activeCodeMapNodes`, or generation/staleness state"): re-fetches
- * nodes+edges fresh via `fetchCodeMap(activeProject)` on every call —
- * mirroring `handleGetCodeMapRequest`'s own fetch — rather than reusing
- * `activeCodeMapNodes` (which exists only to support the summary-generation/
- * backend-switch paths) or writing anything to `node-record-store.ts`.
+ * nodes+edges fresh via `fetchCodeMap(activeProject)` on every call — the
+ * renderer's own existing Path Trace behavior, deliberately preserved as-is
+ * (Design Notes: "Why `computePathTraceResult` re-fetches instead of using
+ * the cache") rather than switched to the cheaper `activeCodeMapNodes`/
+ * `activeCodeMapEdges` cache Blast Radius/diff-scope reuse, which would let
+ * agent and human Path Trace results diverge.
  *
  * Guarded on `activeProject` alone (not `activeProjectPath`, unlike
  * `handleGetCodeMapRequest`) — `traceCallPath` only needs `id`/`name` off
@@ -1280,14 +1314,9 @@ function buildRiskSignals(
  * there's no need to normalize `file` via `toProjectRelativePosixPath` here
  * the way the Code Map response does for its own downstream consumers.
  */
-async function handlePathTraceRequest(query: string, requestId: number): Promise<void> {
+export async function computePathTraceResult(query: string): Promise<PathTraceResult> {
   if (activeProject === undefined) {
-    postPathTraceResultMessage({
-      type: 'graphService:pathTraceResult',
-      requestId,
-      result: { status: 'error', message: 'No project has finished indexing yet.' },
-    });
-    return;
+    return { status: 'error', message: 'No project has finished indexing yet.' };
   }
   try {
     const { nodes, edges } = await fetchCodeMap(activeProject);
@@ -1296,15 +1325,24 @@ async function handlePathTraceRequest(query: string, requestId: number): Promise
     // its own boundary (same stance `isPathTraceRequest`'s own doc comment
     // takes) — trimming again here means incidental whitespace can never
     // affect matching regardless of which boundary it slipped past.
-    const result = traceCallPath(nodes, edges, query.trim());
-    postPathTraceResultMessage({ type: 'graphService:pathTraceResult', requestId, result });
+    return traceCallPath(nodes, edges, query.trim());
   } catch (error) {
-    postPathTraceResultMessage({
-      type: 'graphService:pathTraceResult',
-      requestId,
-      result: { status: 'error', message: error instanceof Error ? error.message : String(error) },
-    });
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * Handles a `graphService:pathTrace` request (Story 1.9, Phase 1) — a thin
+ * wrapper (Story 5.1, Phase 2) around `computePathTraceResult` that posts its
+ * result back as exactly one `graphService:pathTraceResult` message, so
+ * main's pending request always settles (same "never a hung request" framing
+ * as `handleGetCodeMapRequest`) — mirrors
+ * `handleComputeDiffScopeRequest`/`handleExpandBlastRadiusRequest`'s own
+ * thin-handler-over-compute-function shape.
+ */
+async function handlePathTraceRequest(query: string, requestId: number): Promise<void> {
+  const result = await computePathTraceResult(query);
+  postPathTraceResultMessage({ type: 'graphService:pathTraceResult', requestId, result });
 }
 
 /**
@@ -1609,44 +1647,18 @@ async function computeIngestionResult(bot: PrBotId): Promise<PrBotIngestionResul
 
 /**
  * Handles a `graphService:computeDiffScope` request (Story 3.1, Phase 1) —
- * this app's first `git diff`/`git merge-base` subprocess computation. Runs
- * `git-diff-scope.ts`'s `computeDiffScope` against the most recently fetched
- * Code Map's Nodes (`activeCodeMapNodes`/`activeProjectPath`, the same
- * cached state `computeIngestionResult` reads — never a fresh fetch,
- * mirroring `handleRunIngestionRequest`'s own reasoning) and posts back
- * exactly one `graphService:computeDiffScopeResult` message. Never throws —
- * every failure path is reported as an explicit `{status: 'error', ...}`
- * `DiffScopeResult`, mirroring `handleRunIngestionRequest`'s own top-level
- * try/catch so main's pending `pendingDiffScopeResolvers` entry always
- * settles.
+ * this app's first `git diff`/`git merge-base` subprocess computation. A
+ * thin wrapper (Story 5.1, Phase 2 review finding: single-flight guard and
+ * never-throws safety net moved into `computeDiffScopeResult` itself, so
+ * every caller gets both, not just this IPC path) that posts exactly one
+ * `graphService:computeDiffScopeResult` message.
  */
 async function handleComputeDiffScopeRequest(
   projectPath: string,
   baseRef: string | undefined,
   requestId: number,
 ): Promise<void> {
-  if (activeDiffScopeComputationInFlight) {
-    // Refuses a second concurrent request outright rather than letting two
-    // overlapping git subprocess sequences race each other — same reasoning
-    // as `handleRunIngestionRequest`'s own `activeIngestionBots` guard.
-    postComputeDiffScopeResultMessage({
-      type: 'graphService:computeDiffScopeResult',
-      projectPath,
-      requestId,
-      result: { status: 'error', message: 'A diff-scope computation is already running.' },
-    });
-    return;
-  }
-
-  activeDiffScopeComputationInFlight = true;
-  let result: DiffScopeResult;
-  try {
-    result = await computeDiffScopeResult(projectPath, baseRef);
-  } catch (error) {
-    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
-  } finally {
-    activeDiffScopeComputationInFlight = false;
-  }
+  const result = await computeDiffScopeResult(projectPath, baseRef);
   postComputeDiffScopeResultMessage({ type: 'graphService:computeDiffScopeResult', projectPath, requestId, result });
 }
 
@@ -1661,87 +1673,93 @@ async function handleComputeDiffScopeRequest(
  * reshaped: `changedFiles` is matched against `nodes` via
  * `@driller/graph-contracts`'s `findChangedNodeIds` to produce `nodeIds` —
  * the actual diff-scoped Node set.
+ *
+ * Exported as-is signature-wise (Story 5.1, Phase 2, Always) — the
+ * Agent-Facing Query Surface's `compute_diff_scope` MCP tool calls straight
+ * into this same function (AD-13), never a second copy of this logic.
+ *
+ * Single-flight guard and never-throws contract now owned here (review
+ * finding, High — moved from `handleComputeDiffScopeRequest`'s own body):
+ * that handler used to be the sole place refusing a second concurrent
+ * request outright (`activeDiffScopeComputationInFlight`, "rather than
+ * letting two overlapping git subprocess sequences race each other" — same
+ * reasoning as `handleRunIngestionRequest`'s own `activeIngestionBots`
+ * guard) and catching an unexpected throw into an explicit
+ * `{status:'error', ...}`. Once `compute_diff_scope` became a second
+ * production caller of this function, either that logic had to be
+ * duplicated in every caller or centralized here — centralizing is what
+ * actually satisfies AD-13's "exposed identically... never re-implemented"
+ * for callers too, not just for the git-diffing logic itself.
  */
-async function computeDiffScopeResult(projectPath: string, baseRef: string | undefined): Promise<DiffScopeResult> {
-  const nodes = activeCodeMapNodes;
-  const projectRoot = activeProjectPath;
-  if (!nodes || !projectRoot) {
-    return { status: 'error', message: 'No project has finished indexing yet.' };
+export async function computeDiffScopeResult(
+  projectPath: string,
+  baseRef: string | undefined,
+): Promise<DiffScopeResult> {
+  if (activeDiffScopeComputationInFlight) {
+    return { status: 'error', message: 'A diff-scope computation is already running.' };
   }
-  if (projectRoot !== projectPath) {
-    // Mirrors `computeIngestionResult`'s own stale-project guard: a request
-    // for a project that isn't (or is no longer) this process's active one
-    // must never silently compute against the wrong project's Nodes.
-    return { status: 'error', message: 'The requested project is not the currently active project.' };
-  }
-  // Captured before the git subprocess calls below, for the supersession
-  // check after they resolve — see `computeIngestionResult`'s own identical
-  // guard (Story 2.3 Phase 2 review finding) for why `activeSummaryGenerationId`,
-  // not a plain `activeProjectPath` comparison, is what's actually needed:
-  // a re-index of the SAME project also bumps this counter, unlike
-  // `activeProjectPath`, which is reassigned to the same value on every
-  // re-index and so can't detect one on its own.
-  const generationId = activeSummaryGenerationId;
+  activeDiffScopeComputationInFlight = true;
+  try {
+    const nodes = activeCodeMapNodes;
+    const projectRoot = activeProjectPath;
+    if (!nodes || !projectRoot) {
+      return { status: 'error', message: 'No project has finished indexing yet.' };
+    }
+    if (projectRoot !== projectPath) {
+      // Mirrors `computeIngestionResult`'s own stale-project guard: a request
+      // for a project that isn't (or is no longer) this process's active one
+      // must never silently compute against the wrong project's Nodes.
+      return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    // Captured before the git subprocess calls below, for the supersession
+    // check after they resolve — see `computeIngestionResult`'s own identical
+    // guard (Story 2.3 Phase 2 review finding) for why `activeSummaryGenerationId`,
+    // not a plain `activeProjectPath` comparison, is what's actually needed:
+    // a re-index of the SAME project also bumps this counter, unlike
+    // `activeProjectPath`, which is reassigned to the same value on every
+    // re-index and so can't detect one on its own.
+    const generationId = activeSummaryGenerationId;
 
-  const diffScope = await computeDiffScope(projectRoot, baseRef);
-  if (diffScope.status !== 'resolved') {
-    return diffScope;
-  }
+    const diffScope = await computeDiffScope(projectRoot, baseRef);
+    if (diffScope.status !== 'resolved') {
+      return diffScope;
+    }
 
-  // Review finding (Blind Hunter): `nodes` was captured before the
-  // (possibly slow) git subprocess calls above — if a re-index or project
-  // switch happened during that window, `nodes` no longer reflects this
-  // project's current indexed state, and its Node ids may not even be valid
-  // anymore. Discard rather than return a `nodeIds` set matched against a
-  // now-superseded Node list.
-  if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
-    return {
-      status: 'error',
-      message: 'The project changed while the diff-scope computation was running; discarding its results.',
-    };
-  }
+    // Review finding (Blind Hunter): `nodes` was captured before the
+    // (possibly slow) git subprocess calls above — if a re-index or project
+    // switch happened during that window, `nodes` no longer reflects this
+    // project's current indexed state, and its Node ids may not even be valid
+    // anymore. Discard rather than return a `nodeIds` set matched against a
+    // now-superseded Node list.
+    if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
+      return {
+        status: 'error',
+        message: 'The project changed while the diff-scope computation was running; discarding its results.',
+      };
+    }
 
-  const nodeIds = findChangedNodeIds(nodes, diffScope.changedFiles);
-  return { status: 'resolved', resolvedBaseRef: diffScope.resolvedBaseRef, nodeIds };
+    const nodeIds = findChangedNodeIds(nodes, diffScope.changedFiles);
+    return { status: 'resolved', resolvedBaseRef: diffScope.resolvedBaseRef, nodeIds };
+  } catch (error) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    activeDiffScopeComputationInFlight = false;
+  }
 }
 
 /**
  * Handles a `graphService:expandBlastRadius` request (Story 3.2, Phase 1) —
- * mirrors `handleComputeDiffScopeRequest`'s exact shape: refuses a second
- * concurrent request outright (`activeBlastRadiusExpansionInFlight`), and
- * posts exactly one `graphService:expandBlastRadiusResult` message. Never
- * throws — every failure path is reported as an explicit
- * `{status: 'error', ...}` `BlastRadiusExpansionResult`, mirroring
- * `handleComputeDiffScopeRequest`'s own top-level try/catch so main's
- * pending `pendingBlastRadiusResolvers` entry always settles.
+ * a thin wrapper (Story 5.1, Phase 2 review finding: single-flight guard and
+ * never-throws safety net moved into `computeBlastRadiusExpansionResult`
+ * itself, so every caller gets both, not just this IPC path) that posts
+ * exactly one `graphService:expandBlastRadiusResult` message.
  */
 async function handleExpandBlastRadiusRequest(
   projectPath: string,
   nodeIds: string[],
   requestId: number,
 ): Promise<void> {
-  if (activeBlastRadiusExpansionInFlight) {
-    // Refuses a second concurrent request outright — same reasoning as
-    // `handleComputeDiffScopeRequest`'s own `activeDiffScopeComputationInFlight`
-    // guard.
-    postExpandBlastRadiusResultMessage({
-      type: 'graphService:expandBlastRadiusResult',
-      projectPath,
-      requestId,
-      result: { status: 'error', message: 'A blast radius expansion is already running.' },
-    });
-    return;
-  }
-
-  activeBlastRadiusExpansionInFlight = true;
-  let result: BlastRadiusExpansionResult;
-  try {
-    result = computeBlastRadiusExpansionResult(projectPath, nodeIds);
-  } catch (error) {
-    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
-  } finally {
-    activeBlastRadiusExpansionInFlight = false;
-  }
+  const result = computeBlastRadiusExpansionResult(projectPath, nodeIds);
   postExpandBlastRadiusResultMessage({
     type: 'graphService:expandBlastRadiusResult',
     projectPath,
@@ -1772,41 +1790,115 @@ async function handleExpandBlastRadiusRequest(
  * own doc comment (`@driller/ipc-contracts`) for why: this result travels
  * over `parentPort`/IPC and should stay JSON-shaped like every other result
  * in this file, not carry a `Map` across that boundary.
+ *
+ * Exported as-is signature-wise (Story 5.1, Phase 2, Always) — the
+ * Agent-Facing Query Surface's `expand_blast_radius` MCP tool calls straight
+ * into this same function (AD-13), never a second copy of this logic.
+ *
+ * Single-flight guard and never-throws contract now owned here (review
+ * finding, High — moved from `handleExpandBlastRadiusRequest`'s own body,
+ * same reasoning as `computeDiffScopeResult`'s own identical move): once
+ * `expand_blast_radius` became a second production caller, centralizing
+ * `activeBlastRadiusExpansionInFlight`'s check/set/reset and the try/catch
+ * here is what actually gives every caller the same guarantee, not just
+ * whichever one happens to remember to wrap it.
  */
-function computeBlastRadiusExpansionResult(projectPath: string, nodeIds: string[]): BlastRadiusExpansionResult {
-  const nodes = activeCodeMapNodes;
-  const edges = activeCodeMapEdges;
+export function computeBlastRadiusExpansionResult(
+  projectPath: string,
+  nodeIds: string[],
+): BlastRadiusExpansionResult {
+  if (activeBlastRadiusExpansionInFlight) {
+    return { status: 'error', message: 'A blast radius expansion is already running.' };
+  }
+  activeBlastRadiusExpansionInFlight = true;
+  try {
+    const nodes = activeCodeMapNodes;
+    const edges = activeCodeMapEdges;
+    const projectRoot = activeProjectPath;
+    if (!nodes || !edges || !projectRoot) {
+      return { status: 'error', message: 'No project has finished indexing yet.' };
+    }
+    if (projectRoot !== projectPath) {
+      // Mirrors `computeDiffScopeResult`'s own stale-project guard: a request
+      // for a project that isn't (or is no longer) this process's active one
+      // must never silently compute against the wrong project's Nodes/Edges.
+      return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    // Captured before the computation below, for the supersession check after
+    // it — see `computeDiffScopeResult`'s own identical guard and this
+    // function's own doc comment for why this is kept even though the
+    // computation itself has no `await` today.
+    const generationId = activeSummaryGenerationId;
+
+    const adjacency = buildBidirectionalAdjacency(nodes, edges);
+    const hopDistancesById = computeBlastRadiusHopDistances(adjacency, nodeIds);
+
+    if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
+      return {
+        status: 'error',
+        message: 'The project changed while the blast radius expansion was running; discarding its results.',
+      };
+    }
+
+    const hopDistances: Record<string, number> = {};
+    for (const [nodeId, distance] of hopDistancesById) {
+      hopDistances[nodeId] = distance;
+    }
+    return { status: 'resolved', hopDistances };
+  } catch (error) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    activeBlastRadiusExpansionInFlight = false;
+  }
+}
+
+/**
+ * Coverage-check retrieval's own explicit result-state union (Story 5.1,
+ * Phase 2, AD-13's broader pattern: `null`/`undefined` must never stand in
+ * for "nothing here"). Not part of `@driller/ipc-contracts` — like
+ * `mcp-server.ts`'s `NodeLookupResult`, this is a new MCP-only operation with
+ * no existing IPC contract of its own to reuse (Code Map: "no IPC-contracts
+ * changes"), so its result shape is defined here instead.
+ *
+ * `'unavailable'` is deliberately distinct from `'error'` (I/O & Edge-Case
+ * Matrix): a successfully indexed project whose best-effort `index_status`
+ * follow-up call failed (`IndexCoverageSummary`'s own doc comment,
+ * `@driller/ipc-contracts`) is "indexed, but no coverage summary" — a real,
+ * different case from "not indexed at all" or "wrong project", never
+ * collapsed into the same generic failure.
+ */
+export type CoverageSummaryResult =
+  | { status: 'ok'; coverage: IndexCoverageSummary }
+  | { status: 'unavailable' }
+  | { status: 'error'; message: string };
+
+/**
+ * Resolves the currently cached `activeCoverageSummary` for `projectPath`
+ * (Story 5.1, Phase 2) — the same guard shape as
+ * `computeBlastRadiusExpansionResult`'s own `!projectRoot`/
+ * `projectRoot !== projectPath` checks (Code Map), since both read
+ * module-level "most recently indexed project" state rather than doing any
+ * I/O of their own.
+ */
+export function getCoverageSummaryResult(projectPath: string): CoverageSummaryResult {
   const projectRoot = activeProjectPath;
-  if (!nodes || !edges || !projectRoot) {
+  if (!projectRoot) {
     return { status: 'error', message: 'No project has finished indexing yet.' };
   }
   if (projectRoot !== projectPath) {
-    // Mirrors `computeDiffScopeResult`'s own stale-project guard: a request
-    // for a project that isn't (or is no longer) this process's active one
-    // must never silently compute against the wrong project's Nodes/Edges.
+    // Mirrors `computeBlastRadiusExpansionResult`'s own stale-project guard:
+    // a request for a project that isn't (or is no longer) this process's
+    // active one must never silently return a different project's coverage.
     return { status: 'error', message: 'The requested project is not the currently active project.' };
   }
-  // Captured before the computation below, for the supersession check after
-  // it — see `computeDiffScopeResult`'s own identical guard and this
-  // function's own doc comment for why this is kept even though the
-  // computation itself has no `await` today.
-  const generationId = activeSummaryGenerationId;
-
-  const adjacency = buildBidirectionalAdjacency(nodes, edges);
-  const hopDistancesById = computeBlastRadiusHopDistances(adjacency, nodeIds);
-
-  if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
-    return {
-      status: 'error',
-      message: 'The project changed while the blast radius expansion was running; discarding its results.',
-    };
+  if (!activeCoverageSummary) {
+    // Indexed, but the best-effort `index_status` follow-up call that would
+    // have populated `activeCoverageSummary` failed — a real, distinct case
+    // from `'error'` (see this function's own `CoverageSummaryResult` doc
+    // comment).
+    return { status: 'unavailable' };
   }
-
-  const hopDistances: Record<string, number> = {};
-  for (const [nodeId, distance] of hopDistancesById) {
-    hopDistances[nodeId] = distance;
-  }
-  return { status: 'resolved', hopDistances };
+  return { status: 'ok', coverage: activeCoverageSummary };
 }
 
 /**
