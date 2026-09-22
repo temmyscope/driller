@@ -130,20 +130,6 @@ code,
   outline-offset: 2px;
 }
 
-/* driller's first disabled/coming-soon UI affordance (Always) — Health
-   Audit Mode isn't just a disabled control with no explanation; the visible
-   "(Coming soon)" text (below) carries that on its own, so this rule is
-   purely the dimmed/non-interactive visual treatment, reinforcement only. */
-.mode-switcher__option--disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.mode-switcher__coming-soon {
-  color: var(--text-muted);
-  font-size: 0.7rem;
-}
-
 /*
  * Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
  * surface. A right-docked overlay, matching the Code Map's own source panel
@@ -1121,6 +1107,33 @@ code,
   border-style: solid;
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* Story 4.1: Health Audit Mode's bucketed heatmap tint on collapsed LOD
+   clusters (Design Notes: "a simple signal-count bucket ... via color-mix,
+   reuses the existing --warning token, no new one" — same formula
+   `.notice--warning`/`.code-map__blast-radius-highlight` already use
+   elsewhere in this file). Never color-only (Accessibility Floor): the
+   count itself is also stated in words in the cluster's own `aria-label`
+   (see `CodeMapClusterCard`) — this tint is reinforcement only. Increasing
+   opacity per bucket (`1-2` low, `3-5` medium, `6+` high) keeps the
+   strongest concentrations visually distinguishable at a glance without a
+   new severity-weighting scheme.
+   Review finding (Medium): `.notice--warning` — this codebase's only other
+   precedent for a tint sitting behind readable text — caps at 15% opacity.
+   Kept all three buckets within that established readability precedent
+   (10%/20%/32%) rather than escalating past it, so the cluster's own
+   count/label text stays legible even at the "high" bucket. */
+.code-map__cluster--risk-low {
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+
+.code-map__cluster--risk-medium {
+  background: color-mix(in srgb, var(--warning) 20%, transparent);
+}
+
+.code-map__cluster--risk-high {
+  background: color-mix(in srgb, var(--warning) 32%, transparent);
 }
 
 /* Story 1.9 (Phase 2): the Path Trace search toolbar + notice + step list —

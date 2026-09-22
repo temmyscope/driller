@@ -590,6 +590,10 @@ function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
 // module scope instead.
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
+// Story 4.1: same stable-empty-reference precedent as `EMPTY_ID_SET` just
+// above, for `clusterRiskCounts` outside `mode === 'healthAudit'`.
+const EMPTY_RISK_COUNT_MAP: ReadonlyMap<string, number> = new Map();
+
 /** Consecutive-pair key for `pathHighlightEdgeKeys` (Story 1.9, Phase 2) — matches `toFlowEdges`'s own `id` separator. */
 function pathEdgeKey(source: string, target: string): string {
   return `${source}→${target}`;
@@ -1092,21 +1096,59 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
  * that a visible cue (review finding: otherwise a click just moves the
  * camera with no explanation of why this one behaved differently from
  * every other cluster).
+ *
+ * Story 4.1: `riskCount` is Health Audit Mode's aggregated deterministic +
+ * LLM-judgment risk-signal count across this cluster's member Nodes
+ * (`clusterRiskCounts`, computed by the parent) — always `0` outside
+ * `mode === 'healthAudit'`, so a plain Code Map cluster renders identically
+ * to before this story.
  */
-type CodeMapClusterFlowNode = FlowNode<{ cluster: Cluster; onExpand: (cluster: Cluster) => void }, 'codeMapCluster'>;
+type CodeMapClusterFlowNode = FlowNode<
+  { cluster: Cluster; onExpand: (cluster: Cluster) => void; riskCount: number },
+  'codeMapCluster'
+>;
+
+/**
+ * Story 4.1's signal-count bucket (Design Notes: "no normalized severity
+ * score exists across signal types ... a simple signal-count bucket, not a
+ * cross-type weighted score"): `0` → no tint, `1-2` → light, `3-5` →
+ * medium, `6+` → strong. Returns `null` for `0` so the caller can render no
+ * modifier class/tint at all rather than a zero-opacity one.
+ */
+function riskCountBucket(riskCount: number): 'low' | 'medium' | 'high' | null {
+  if (riskCount <= 0) {
+    return null;
+  }
+  if (riskCount <= 2) {
+    return 'low';
+  }
+  if (riskCount <= 5) {
+    return 'medium';
+  }
+  return 'high';
+}
 
 function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
-  const { cluster, onExpand } = data;
+  const { cluster, onExpand, riskCount } = data;
   const willZoomInsteadOfExpand = cluster.nodeIds.length > CLUSTER_EXPAND_MAX;
+  // Story 4.1: the bucketed heatmap tint (Always: "never color-only" —
+  // `aria-label` below states the count in words; this class is
+  // reinforcement only). `null` (zero signals) adds no modifier class, so a
+  // plain Code Map cluster (`riskCount` always `0` there) is byte-identical
+  // to its pre-Story-4.1 className.
+  const riskBucket = riskCountBucket(riskCount);
   return (
     <div
-      className={`code-map__cluster${willZoomInsteadOfExpand ? ' code-map__cluster--zoom' : ''}`}
+      className={`code-map__cluster${willZoomInsteadOfExpand ? ' code-map__cluster--zoom' : ''}${
+        riskBucket ? ` code-map__cluster--risk-${riskBucket}` : ''
+      }`}
       tabIndex={0}
       role="button"
       aria-label={
-        willZoomInsteadOfExpand
+        (willZoomInsteadOfExpand
           ? `Cluster of ${cluster.nodeIds.length} nodes, too many to expand — zoom in`
-          : `Cluster of ${cluster.nodeIds.length} nodes, expand`
+          : `Cluster of ${cluster.nodeIds.length} nodes, expand`) +
+        (riskBucket ? `, ${riskCount} risk signal${riskCount === 1 ? '' : 's'}` : '')
       }
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
@@ -1211,8 +1253,13 @@ export interface CodeMapProps {
    * the `useEffect` below) — switching away from and back to PR Review Mode
    * within the same project preserves whatever was already resolved,
    * matching this story's "no auto-trigger on mode switch" Design Notes.
+   *
+   * Story 4.1: widened to include `'healthAudit'` — `App.tsx`'s own `Mode`
+   * type widens together with this one (Always: "both must change
+   * together"). Health Audit Mode gates `clusterRiskCounts` below, the same
+   * way `'prReview'` gates `changedNodeIds`/`blastRadiusNodeIds`.
    */
-  mode: 'codeMap' | 'prReview';
+  mode: 'codeMap' | 'prReview' | 'healthAudit';
 }
 
 export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey, mode }: CodeMapProps) {
@@ -2228,6 +2275,73 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     return ids;
   }, [mode, blastRadiusState, blastRadiusDepth]);
 
+  // Story 4.1: Health Audit Mode's per-Node risk-signal count — split out
+  // from the per-cluster aggregation below (review finding, Medium,
+  // performance) so this O(total Nodes) scan is keyed only on
+  // `[mode, fetchState]`, not on `lodResult` too: `lodResult` recomputes on
+  // every pan/zoom that crosses a quantization boundary (see the `lodResult`
+  // memo above), and this scan's own inputs never change on that cadence.
+  // Counts only `family: 'deterministic'` and `family: 'llm-judgment'` risk
+  // signals (Always: "Epic 2's Risk Overlay applied" — never
+  // `family: 'ingested'`, which is Epic 3's own PR-bot-findings concept, not
+  // part of the Risk Overlay), gated on `mode === 'healthAudit'` only,
+  // mirroring how `changedNodeIds`/`blastRadiusNodeIds` are each gated to
+  // their own mode above.
+  //
+  // Review finding (Medium): deterministic signals are de-duplicated per
+  // `type` before counting, the same established invariant
+  // `deterministicSignals` above already applies per-Node (a Node never
+  // shows more than one signal per distinct `DeterministicRiskSignalType`) —
+  // without this, a cluster's count/tint could report a higher number than
+  // a user would ever actually see by expanding into it. `llmJudgmentSignal`
+  // needs no equivalent dedup: Phase 1/2's own construction invariant never
+  // emits more than one per Node (see its own comment above).
+  const riskCountByNodeId = useMemo<ReadonlyMap<string, number>>(() => {
+    if (mode !== 'healthAudit' || fetchState.status !== 'ready') {
+      return EMPTY_RISK_COUNT_MAP;
+    }
+    const counts = new Map<string, number>();
+    for (const node of fetchState.nodes) {
+      const seenTypes = new Set<DeterministicRiskSignalType>();
+      let count = 0;
+      for (const signal of node.riskSignals) {
+        if (signal.family === 'deterministic') {
+          if (seenTypes.has(signal.type)) {
+            continue;
+          }
+          seenTypes.add(signal.type);
+          count += 1;
+        } else if (signal.family === 'llm-judgment') {
+          count += 1;
+        }
+      }
+      counts.set(node.id, count);
+    }
+    return counts;
+  }, [mode, fetchState]);
+
+  // Story 4.1: the per-cluster aggregation itself — a `useMemo` derived
+  // value keyed off `riskCountByNodeId`/`lodResult.clusters` (Always:
+  // "`computeLOD`/`Cluster` gain zero new fields", AD-2: never a second
+  // parallel LOD implementation). Kept as its own memo (see
+  // `riskCountByNodeId`'s own comment) so a `lodResult` recompute only ever
+  // re-sums already-counted per-Node values, never re-scans every Node's
+  // `riskSignals` from scratch.
+  const clusterRiskCounts = useMemo<ReadonlyMap<string, number>>(() => {
+    if (riskCountByNodeId === EMPTY_RISK_COUNT_MAP) {
+      return EMPTY_RISK_COUNT_MAP;
+    }
+    const counts = new Map<string, number>();
+    for (const cluster of lodResult.clusters) {
+      let total = 0;
+      for (const nodeId of cluster.nodeIds) {
+        total += riskCountByNodeId.get(nodeId) ?? 0;
+      }
+      counts.set(cluster.id, total);
+    }
+    return counts;
+  }, [riskCountByNodeId, lodResult]);
+
   const { renderedNodes, renderedEdges } = useMemo(() => {
     const visibleNodeIds = new Set(lodResult.fullNodeIds);
     const nodes: CodeMapAnyFlowNode[] = [];
@@ -2293,7 +2407,10 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         id: cluster.id,
         type: 'codeMapCluster',
         position: cluster.position,
-        data: { cluster, onExpand: expandCluster },
+        // Story 4.1: `riskCount` defaults to `0` outside Health Audit Mode
+        // (`clusterRiskCounts` returns `EMPTY_RISK_COUNT_MAP` there) — a
+        // plain Code Map cluster always renders with no heatmap tint.
+        data: { cluster, onExpand: expandCluster, riskCount: clusterRiskCounts.get(cluster.id) ?? 0 },
       };
       nodes.push(clusterNode);
     }
@@ -2328,6 +2445,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     pathHighlightNodeIds,
     pathHighlightEdgeKeys,
     blastRadiusNodeIds,
+    clusterRiskCounts,
   ]);
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(

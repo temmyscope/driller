@@ -19,14 +19,27 @@ type Notice =
 
 /**
  * Story 3.1 (Phase 2): driller's first mode concept — a persistent 3-way
- * switcher (Code Map / PR Review Mode / Health Audit Mode). `'healthAudit'`
- * is never actually reachable yet (its radio input is rendered `disabled` —
- * Epic 4 doesn't exist), so this type still only needs the two real values;
- * a third literal isn't added until Health Audit Mode has an actual
- * implementation to switch into (Never: "Health Audit Mode's actual
- * implementation").
+ * switcher (Code Map / PR Review Mode / Health Audit Mode).
+ *
+ * Story 4.1: `'healthAudit'` is now a real, reachable third value — Health
+ * Audit Mode's radio is no longer disabled (Epic 4 exists). `CodeMap.tsx`'s
+ * own independently-declared `mode` prop type widens together with this one
+ * (Always: "both must change together").
  */
-type Mode = 'codeMap' | 'prReview';
+type Mode = 'codeMap' | 'prReview' | 'healthAudit';
+
+/**
+ * Story 4.1 (review finding, Medium): mirrors `apps/desktop/main/settings.ts`'s
+ * own `normalizePathForComparison` exactly (strip a trailing separator,
+ * case-fold) — case-insensitive filesystems would otherwise let a
+ * differently-cased or trailing-slash path variant slip past a raw `===`
+ * comparison as if it were a different project. Duplicated here rather than
+ * imported because the renderer can't reach across the main/renderer
+ * process boundary to that module.
+ */
+function normalizePathForComparisonLocal(projectPath: string): string {
+  return projectPath.replace(/[\\/]+$/, '').toLowerCase();
+}
 
 export function App() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[] | null>(null);
@@ -86,10 +99,13 @@ export function App() {
   // Story 3.1 (Phase 2): the active mode — first-class shell state (UX-DR9:
   // "never a settings toggle"), independent of `isIndexed`, so the switcher
   // itself always renders regardless of whether a project is even open yet.
-  // Reset to `'codeMap'` on every fresh 'opened' project result (see
-  // `applyOpenResult` below) — a newly-opened project must never silently
-  // land in a stale PR Review state carried over from whatever project was
-  // open before it (Always).
+  // Reset on every fresh 'opened' project result (see `applyOpenResult`
+  // below) — a newly-opened project must never silently land in a stale PR
+  // Review state carried over from whatever project was open before it
+  // (Always). Story 4.1: that reset now lands on either `'codeMap'` or
+  // `'healthAudit'` depending on the first-open landing rule, never on a
+  // fixed `'codeMap'` — see `applyOpenResult`'s own comment for the two
+  // outcomes.
   const [mode, setMode] = useState<Mode>('codeMap');
   useEffect(() => {
     currentProjectPathRef.current = currentProjectPath;
@@ -188,12 +204,16 @@ export function App() {
     switch (result.status) {
       case 'opened':
         setNotice(null);
-        // Story 3.1 (Phase 2, Always): a fresh project open always lands on
-        // Code Map Mode, never silently carrying over a previous project's
-        // PR Review state — `CodeMap.tsx`'s own `projectPath`-keyed reset
-        // effect clears the base-ref input/diff-scope result the moment
-        // `currentProjectPath` below actually changes, but `mode` itself is
-        // App.tsx's own shell state (Design Notes), so it's reset here too.
+        // Story 3.1 (Phase 2, Always): a fresh project open always resets
+        // `mode` away from whatever a previous project left it in, never
+        // silently carrying over a previous project's PR Review state —
+        // `CodeMap.tsx`'s own `projectPath`-keyed reset effect clears the
+        // base-ref input/diff-scope result the moment `currentProjectPath`
+        // below actually changes, but `mode` itself is App.tsx's own shell
+        // state (Design Notes), so it's reset here too. Story 4.1: which of
+        // `'codeMap'`/`'healthAudit'` it resets to is decided by the
+        // first-open check just below — no longer unconditionally
+        // `'codeMap'`.
         //
         // Review finding (Edge Case Hunter): guarded on the path actually
         // differing — `resolveOpenedFolder` (main process) has no
@@ -204,8 +224,48 @@ export function App() {
         // discard an in-progress PR Review Mode session even though nothing
         // about the project actually changed — checked against the ref
         // before it's overwritten just below.
+        //
+        // Story 4.1 (UX-DR32): composed with the same guard — a genuinely
+        // new open lands on Health Audit Mode by default when this is the
+        // very first time this installation has ever opened this path,
+        // Code Map Mode otherwise. "First-ever open" is a Recent-Projects-
+        // list proxy (Design Notes: no backend "has this project been
+        // indexed before" signal exists) — `recentProjects` here is the
+        // closed-over snapshot from the render this callback was last
+        // created in, i.e. the state as loaded BEFORE this open, never a
+        // post-open one (which would always already contain the
+        // just-opened project via the `setRecentProjects` call below).
+        //
+        // Review finding (High, confirmed by 3 independent reviewers): the
+        // OS folder picker has no dependency on `listRecentProjects()`
+        // having resolved, so a project can be opened while `recentProjects`
+        // is still `null`. Treating `null` as "empty" would misclassify a
+        // well-known returning project as first-ever-open. Flipped to the
+        // safer assumption instead — `recentProjects === null` reads as
+        // "already known" (`true`), never as "first-ever open": the cost is
+        // a brand-new install's genuine first open occasionally racing into
+        // `'codeMap'` instead of `'healthAudit'` (a one-time cosmetic miss),
+        // which is a far lower-stakes failure than surprising a returning
+        // user with an unfamiliar mode.
+        //
+        // Review finding (Medium, confirmed by 2 independent reviewers):
+        // `RecentProject.path` is stored raw/unnormalized, so a raw `===`
+        // comparison would treat differently-cased or trailing-separator
+        // path variants (common on case-insensitive filesystems) as
+        // distinct paths — the exact bug class `settings.ts`'s
+        // `recordProjectOpened` already patches via its own
+        // `normalizePathForComparison`. Mirrored here as
+        // `normalizePathForComparisonLocal` (see its own doc comment for why
+        // this can't just import that function) and applied to both sides.
         if (result.project.path !== currentProjectPathRef.current) {
-          setMode('codeMap');
+          const normalizedNewPath = normalizePathForComparisonLocal(result.project.path);
+          const wasAlreadyInRecentProjects =
+            recentProjects === null
+              ? true
+              : recentProjects.some(
+                  (project) => normalizePathForComparisonLocal(project.path) === normalizedNewPath,
+                );
+          setMode(wasAlreadyInRecentProjects ? 'codeMap' : 'healthAudit');
         }
         // Synchronous, not just via the ref-sync effect below: a status
         // push for this project (main sends the index-start request as
@@ -232,7 +292,12 @@ export function App() {
         setNotice(null);
         break;
     }
-  }, []);
+    // `recentProjects` is a real dependency (Story 4.1): the first-open
+    // check above reads it, and it must be the value from the render this
+    // closure was created in — not a stale one frozen at mount, which would
+    // permanently read as "always empty" and misclassify every open after
+    // the first as a first-ever open.
+  }, [recentProjects]);
 
   const reportUnexpectedError = useCallback((error: unknown) => {
     setNotice({
@@ -416,15 +481,20 @@ export function App() {
             />
             PR Review Mode
           </label>
-          {/* driller's first disabled/coming-soon UI affordance (Always) —
-              Epic 4 doesn't exist yet, so this option is never selectable;
-              the "Coming soon" text is real, visible text (not just a
-              disabled attribute with no explanation, Accessibility Floor —
-              a disabled control alone doesn't say WHY to a screen reader
-              user any more than to a sighted one). */}
-          <label className="mode-switcher__option mode-switcher__option--disabled">
-            <input type="radio" name="mode" value="healthAudit" checked={false} disabled readOnly />
-            Health Audit Mode <span className="mode-switcher__coming-soon">(Coming soon)</span>
+          {/* Story 4.1: Health Audit Mode is now a real, reachable third
+              option — wired like its `codeMap`/`prReview` siblings above
+              (no more `disabled`/`readOnly`/hardcoded `checked={false}`/
+              "Coming soon" text, since Epic 4 now has an actual
+              implementation to switch into). */}
+          <label className="mode-switcher__option">
+            <input
+              type="radio"
+              name="mode"
+              value="healthAudit"
+              checked={mode === 'healthAudit'}
+              onChange={() => setMode('healthAudit')}
+            />
+            Health Audit Mode
           </label>
         </div>
         <button
