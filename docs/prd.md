@@ -87,7 +87,7 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 - **FR13 — Whole-Repo Audit View.** Full-repo Code Map with the Risk Overlay applied, independent of any single change, reachable without selecting a git ref. Overlay signals aggregate visually (heatmap-style).
 
 ### 4.8 Agent-facing query surface
-- **FR14 — MCP/API Graph Query.** Other agents and tools query driller's Code Map — structure, summaries, Risk Overlay — via an MCP server or API. Minimum surface: Node lookup, Path Trace, Risk Overlay signal retrieval. No data leaves the local machine beyond what the querying agent's own runtime already has. Documented contract ships with v1.
+- **FR14 — MCP/API Graph Query.** Other agents and tools query driller's Code Map — structure, summaries, Risk Overlay — via an MCP server or API. *[Corrected 2026-09-23, analyst-verified against what actually shipped]:* the v1 surface is five distinct operations — Node lookup, Path Trace, Blast Radius expansion, diff-scoped Node-set computation, and coverage-check retrieval — not "Risk Overlay signal retrieval" as its own operation (an earlier planning-draft phrasing that doesn't correspond to anything actually built). Risk Overlay signals travel as fields on a Node-lookup response, per FR15's parity requirement, rather than as a separate query. No data leaves the local machine beyond what the querying agent's own runtime already has. Documented contract ships with v1.
 - **FR15 — Agent Query Parity.** Signals returned via the agent-facing surface match what the human UI displays for the same Node/path at the same point in time, including the Staleness Indicator.
 
 ### 4.9 Trust indicators

@@ -19,7 +19,7 @@ driller is a local-first Electron desktop app that gives a software engineer a b
 
 ## 2. Constraints
 
-- **Technical:** Electron desktop app only in v1 (no web/server variant); must integrate an existing MCP-based code-graph backend rather than build indexing from scratch (see §5); native modules (`node-llama-cpp`, tree-sitter bindings) must build against Electron's bundled Node ABI.
+- **Technical:** Electron desktop app only in v1 (no web/server variant); must integrate an existing MCP-based code-graph backend rather than build indexing from scratch (see §5); the native module (`node-llama-cpp`) must build against Electron's bundled Node ABI. *[Corrected 2026-09-23, architect-verified — see AD-9's own correction note in §8/§9]:* driller has no tree-sitter dependency of its own (`node-llama-cpp` is the only native module in any `package.json`); complexity/cognitive-complexity/hotspot analysis happens inside the external MCP backend, not in driller's own build.
 - **Organizational:** single founder-engineer team; v1 must be dogfoodable on a real ~1,000–1,300-file repo before wider release (NFR1).
 - **Product/legal:** every privacy and non-goal constraint in [prd.md §7](prd.md#7-non-goals-explicit) is a hard architectural constraint, not a suggestion — most concretely, AD-16 (no driller-operated server ever sees code content) and AD-17 (read-only filesystem/git access).
 
@@ -125,17 +125,19 @@ driller/
 
 **Opening a project (FR1, FR2 — Story 1.1/1.2):** user selects a folder → main detects a git repo at the folder root or a parent/child folder and confirms → main spawns the Graph Service via `utilityProcess` → Graph Service connects its MCP client and begins structural indexing → progress events are throttled/batched from Graph Service → main → renderer (AD-8) → structural-indexing-complete unblocks map browsing independently of per-Node summary generation, which continues in the background.
 
-**PR Review flow (UJ-1, FR11/FR12):** renderer requests a diff-scoped Node-set for a base ref → Graph Service resolves the ref (`git merge-base` if omitted), computes the diff via local git only, and returns changed Nodes with an explicit result state (`found` / `no-changes` / `not-a-git-repo` / `no-base-ref-resolvable`) → renderer highlights changed Nodes and their Blast Radius (already computed by AD-9) → user expands the Blast Radius by hop depth on demand, runs a Path Trace, and reads ingested findings, all via the same `graph-contracts` operations.
+**PR Review flow (UJ-1, FR11/FR12):** renderer requests a diff-scoped Node-set for a base ref → Graph Service resolves the ref (`git merge-base` if omitted), computes the diff via local git only, and returns changed Nodes with an explicit result state (*[corrected 2026-09-23]* `resolved` / `no-changes` / `not-a-git-repo` / `no-base-ref-resolvable` — not `found`, which is `Path Trace`'s own distinct result-state name) → renderer highlights changed Nodes and, on demand, their combined Blast Radius (a separate deterministic traversal over `packages/graph-contracts`'s own `BidirectionalAdjacency`, computed in-house — not one of AD-9's backend-sourced signals) at an interactively-expandable hop depth → user runs a Path Trace and reads ingested findings, all via the same `graph-contracts` operations.
 
 **Agent query (FR14/FR15):** an external agent connects to the Agent-Facing Query Surface (127.0.0.1 only) and calls the same Node lookup / Path Trace / Blast Radius / diff-scoped / coverage-check operations the renderer uses — served by the identical `graph-contracts` implementation, so the response is byte-for-byte consistent with what the human UI would show for the same Node at the same moment.
 
-**Graph Service crash recovery (AD-1, NFR2):** on an unexpected Graph Service exit, main surfaces `backend-degraded` to the renderer immediately and may attempt exactly one automatic restart with backoff. A second consecutive crash within a short window stops auto-restarting and requires explicit user action — never a silent infinite-retry loop, and never a crash that takes down the whole app. On restart, pending summary work is re-derived from which Nodes still lack a summary in the current merged record (AD-8, AD-20) — a stale-but-present summary is never treated as missing and never auto-regenerated, since that would silently spend local CPU or a user's paid cloud-API budget without consent (AD-7).
+**Graph Service crash recovery (AD-1, NFR2):** *[Corrected 2026-09-23, architect-verified against the actual code]* on an unexpected Graph Service exit, main surfaces an explicit `'error'`/`'exited'` status to the renderer immediately (`GraphServiceStatusMessage`) and shows a Retry button — recovery is a deliberate, single manual action, not an automatic restart-with-backoff. (No auto-restart/backoff path exists anywhere in `apps/desktop/main`; the original architecture draft's "may attempt exactly one automatic restart with backoff" was aspirational planning language that was never actually built, caught during Story 5.2's own investigation.) Never a silent infinite-retry loop, and never a crash that takes down the whole app. On restart, pending summary work is re-derived from which Nodes still lack a summary in the current merged record (AD-8, AD-20) — a stale-but-present summary is never treated as missing and never auto-regenerated, since that would silently spend local CPU or a user's paid cloud-API budget without consent (AD-7).
+
+**Agent-Facing Query Surface liveness (AD-24, Story 5.2):** the MCP HTTP listener's own health is monitored independently of the Graph Service subprocess's own lifecycle — the subprocess can be genuinely `'alive'`/`'indexed'` while only the listener has failed to bind or crashed (a distinct `McpServerStatusMessage` stream, never folded into `GraphServiceStatusMessage`). Because that degraded state is, by construction, posted from a subprocess that's still running, the *default* Retry flow's "no-op if the subprocess is already alive, just re-index" behavior does nothing for it — a real bug caught in review before this shipped. Its own Retry button instead requests a forced respawn (`restartGraphService(true)`): main tears the subprocess down and waits for it to actually exit before spawning a fresh one, so the new listener doesn't race the old one for the port.
 
 ## 7. Deployment View
 
 Single-machine, single-process-tree deployment: one Electron app packaged and distributed per platform.
 
-- **Packaging:** Electron Forge, with the `auto-unpack-natives` plugin for native modules (`node-llama-cpp`, tree-sitter bindings) — see AD-3, AD-18.
+- **Packaging:** Electron Forge, with the `auto-unpack-natives` plugin for `node-llama-cpp`, the app's one native module — see AD-3, AD-18.
 - **Distribution/updates:** releases publish via `@electron-forge/publisher-github` to GitHub Releases; the app auto-updates via `update-electron-app` against `update.electronjs.org` (wraps Squirrel.Mac/Squirrel.Windows). macOS and Windows builds are code-signed. **Linux has no auto-update path under this mechanism** — an accepted v1 limitation (AD-22).
 - **Runtime processes:** Electron main (orchestration) + one long-lived Graph Service `utilityProcess` per open project + the renderer's `BrowserWindow` process(es), all on one machine, no server component.
 
@@ -168,7 +170,7 @@ Single-machine, single-process-tree deployment: one Electron app packaged and di
 
 **Summary generation orchestration (AD-8).** Concurrency bounded via `p-queue` in-process, no external broker. Retry relies first on each provider SDK's own retry/backoff, with `p-retry` layered only as an outer per-job retry. Job-queue state is never persisted to disk — on restart, pending work is re-derived from which Nodes still lack a summary. Progress events are throttled/batched, never one IPC message per item. Structural-indexing-complete and summary-generation progress are reported as two distinct signals, never conflated into one loading state.
 
-**Deterministic signal computation (AD-9).** Complexity is computed in-house by walking the tree-sitter AST driller already builds, counting decision-point node kinds per language grammar — no external complexity library. Coverage gaps ingest through a single LCOV-based path regardless of source language. Hotspots derive from `git log --numstat` joined against the file→Node map.
+**Deterministic signal computation (AD-9).** *[Corrected 2026-09-23, architect-verified — the original architecture draft assumed driller would walk its own tree-sitter AST for this; that was never built, and the code's own comment at `services/graph-service/mcp-client.ts:282-286` already flagged the correction before this doc caught up]* Complexity and cognitive-complexity are backend-computed properties (`n.complexity`, `n.cognitive`), fetched via a `query_graph` Cypher query against the external MCP backend (`codebase-memory-mcp`) — no AST parsing, and no tree-sitter dependency, exists anywhere in driller's own code. Hotspot counts are likewise a pre-existing backend graph property (`f.change_count`), not derived from a local `git log --numstat` shell-out. Coverage gaps ingest through a single LCOV-based path regardless of source language — this part of AD-9 was accurate as originally written.
 
 ## 9. Architecture Decisions
 
@@ -178,13 +180,13 @@ Full rationale, "prevents" framing, and binding scope for each decision lives in
 | --- | --- |
 | AD-1 | Main is thin orchestration; all Graph Service work runs in a separate `utilityProcess`; renderer never connects to Graph Service directly. |
 | AD-2 | Code Map uses LOD + virtualization; one shared mechanism for Health Audit and PR Review modes. |
-| AD-3 | Renderer: React + TypeScript + `@xyflow/react` + shadcn/ui. Graph Service: Node.js/TypeScript on split `@modelcontextprotocol/server`/`client` v2 (beta, accepted risk). Packaging: Electron Forge with `auto-unpack-natives`. |
+| AD-3 | Renderer: React + TypeScript + `@xyflow/react` + shadcn/ui. Graph Service: Node.js/TypeScript on split `@modelcontextprotocol/server`/`client` v2. Packaging: Electron Forge with `auto-unpack-natives`. |
 | AD-4 | Cloud API keys stored only as `safeStorage` ciphertext; explicit warning on Linux `basic_text` backend; `keytar` prohibited. |
 | AD-5 | Structured settings persist via `electron-store` under `userData`. |
 | AD-6 | driller never writes into or relocates the external MCP backend's own cache; driller's settings store only a project name + path reference. |
 | AD-7 | Staleness via hybrid mtime+size pre-check, falling back to content-hash only on mismatch; display-only, never auto-regenerates. |
 | AD-8 | Summary generation via in-process `p-queue`, SDK-first retry/backoff, no persisted job-queue state, throttled/batched progress events. |
-| AD-9 | Complexity computed in-house from the existing tree-sitter AST; coverage via LCOV; hotspots via `git log --numstat`. |
+| AD-9 | Complexity/cognitive-complexity/hotspot are backend-computed properties surfaced via `query_graph` against the external MCP backend, never computed in-house (corrected 2026-09-23 — see §8); coverage via LCOV. |
 | AD-10 | Agent-Facing Query Surface binds to `127.0.0.1` only, validates `Origin` and `Host` on every request (§8), versioned semver-style. |
 | AD-11 | Every `BrowserWindow`: `contextIsolation: true`, `nodeIntegration: false`, sandbox enabled where compatible; renderer reaches main only via typed `contextBridge`. |
 | AD-12 | PR-bot findings sourced via each bot's local CLI mode only (safe array-argument invocation, §8), normalized to a canonical `severity`/`sourceTool`; per-bot privacy disclosure required before opt-in. |
@@ -199,6 +201,7 @@ Full rationale, "prevents" framing, and binding scope for each decision lives in
 | AD-21 | No crash reporting or telemetry in v1; diagnostic logging is local-only. |
 | AD-22 | Releases via `@electron-forge/publisher-github` + `update-electron-app`; macOS/Windows code-signed; no Linux auto-update path. |
 | AD-23 | `[Added 2026-09-06]` External editor hand-off (FR17/Story 1.10): invoked from main only via a new IPC channel, resolved/escaped path, editor preference defaults to `system-default` (no line-jump), named editors (`vscode`/`jetbrains`) deep-link to the exact line. |
+| AD-24 | `[Added 2026-09-23]` MCP listener liveness (Story 5.2) is monitored independently of Graph Service subprocess health via a dedicated `McpServerStatusMessage` stream — the subprocess can be `'alive'`/`'indexed'` while only the listener has failed. Recovery requires an explicit forced-respawn (`restartGraphService(true)`, tearing down and waiting for exit before respawning), distinct from the default Retry flow, which no-ops whenever the subprocess is still alive. |
 
 ### Stack
 
@@ -206,7 +209,7 @@ Full rationale, "prevents" framing, and binding scope for each decision lives in
 | --- | --- |
 | Electron | v43 |
 | Renderer | React + TypeScript, `@xyflow/react` v12.11.6, shadcn/ui |
-| Graph Service | Node.js/TypeScript, `@modelcontextprotocol/server`/`client` v2 (beta) |
+| Graph Service | Node.js/TypeScript, `@modelcontextprotocol/server`/`client` v2 |
 | Packaging | Electron Forge (`auto-unpack-natives`), `@electron-forge/publisher-github`, `update-electron-app` |
 | Settings/secrets | `electron-store`, Electron `safeStorage` |
 | Job orchestration | `p-queue` v9.x, `p-retry` v8.0.1 |
@@ -225,15 +228,16 @@ See [prd.md §5](prd.md#5-non-functional-requirements) for the source NFRs. Conc
 | Incremental re-index | <~5 seconds | AD-15 |
 | Indexing progress visible | within ~5 seconds of folder selection | AD-15, FR1 |
 
-AD-15's figures are provisional (validated against comparable systems, not driller's own implementation) and must be re-validated by profiling once the indexing pipeline exists.
+AD-15's figures remain provisional (validated against comparable systems, not driller's own implementation). The indexing pipeline now exists end to end (all v1 epics shipped as of 2026-09-23), so this is no longer blocked on "once it exists" — but no real-hardware profiling run against these specific budgets is recorded anywhere in this session's work. Treat these numbers as still unvalidated until someone actually runs the ~1,000–1,300-file benchmark and records the result here.
 
 ## 11. Risks and Technical Debt
 
-- **Inherited backend risk (AD-6).** driller's coverage is only as complete as the underlying MCP-based backend's own language/framework support and release cadence — a risk this architecture fixes the *ownership boundary* for, not the underlying risk itself.
-- **Beta SDK dependency (AD-3).** `@modelcontextprotocol/server`/`client` v2 is beta per its own docs; a pre-stable breaking change may force a Graph Service update independent of driller feature work.
-- **Unresolved keyboard-navigation design.** Keyboard-navigable map traversal is a stated NFR5 floor, but how a keyboard user expands into or selects within an LOD cluster (AD-2) is a real, unsolved interaction-design question, not yet a settled floor.
+- **Inherited backend risk (AD-6).** driller's coverage is only as complete as the underlying MCP-based backend's own language/framework support and release cadence — a risk this architecture fixes the *ownership boundary* for, not the underlying risk itself. AD-9's own correction (§8) is a direct instance of this: complexity/hotspot analysis depth is whatever the backend's own indexing pass computes, not something driller controls or can independently improve.
+- **SDK version corrected 2026-09-23 (architect-verified), no longer a risk as originally framed.** `@modelcontextprotocol/server`/`client` v2 was assumed pre-stable ("beta") during architecture planning; it is in fact the current stable release line (the `2.0.0` release replaces the monolithic v1 `@modelcontextprotocol/sdk` package driller never depended on). Retained here only as a note that this was checked, not as an open risk.
+- **No progressive/partial indexing exists (clarified 2026-09-22, architect-verified during Story 4.1 planning).** A too-large-to-fully-index repo has no partial-map-rendering fallback — `index_repository` is a single all-or-nothing call against the backend (up to a 30-minute timeout), and driller never caches an index between sessions (`persistence: false`, AD-6). Honesty comes entirely from Story 1.2 Phase 2's elapsed-time transparency and an explicit error+Retry on timeout, not from partial results. Building real chunked indexing would be a substantial, separate initiative with real correctness risk (partial-repo similarity/cross-file edge computation could produce systematically wrong signals) — deliberately not attempted for v1.
+- **Keyboard navigation for LOD cluster expand — resolved 2026-09-23 (architect-verified), no longer open.** The original planning draft flagged this as an unsolved interaction-design question. `CodeMapClusterCard` (`apps/desktop/renderer/src/CodeMap.tsx`) already ships `tabIndex`/`role="button"`/an `onKeyDown` handling Enter and Space, plus an `aria-label` stating cluster size and expand action — the same keyboard-path pattern already established for individual Node cards, applied consistently.
 - **Deferred visual synthesis.** DESIGN.md's palette and non-code typography are explicitly deferred to a founder-led pass; do not invent these values ad hoc while building.
-- **Unvalidated Qodo CLI integration (AD-12).** The exact `local` git-provider invocation for Qodo Merge/PR-Agent was not independently corroborable against official docs during architecture review — verify directly before implementing that adapter.
+- **Qodo CLI integration — narrowed 2026-09-23 (architect-verified), not fully open.** The `local` git-provider invocation shape (the `CONFIG__GIT_PROVIDER=local` env var, the `python3 -m pr_agent.cli` module form, the branch-not-PR-URL argument) was independently corroborated against Qodo/PR-Agent's own docs and source during implementation (`services/graph-service/qodo-adapter.ts`'s own doc comment). What remains genuinely unverified against real tool output is narrower: the exact `review.md` markdown formatting `parseQodoReviewMarkdown`/`mapQodoSeverity` parse — already isolated and flagged in that code itself, not a standing architecture-level unknown.
 - **Linux has no auto-update path (AD-22)** — accepted v1 limitation; a distro-package-manager channel is a real future option, not designed here.
 - **Deliberately excluded, not merely deferred** (see also [prd.md §8](prd.md#8-mvp-scope)):
   - *Cross-service API tracing* (connecting a frontend call to a separate backend service's route handler) — a semantic contract-matching problem, not graph traversal; if built, belongs under the LLM-Judgment signal (FR8) as a clearly-labeled inference, never a deterministic one.

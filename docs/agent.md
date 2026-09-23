@@ -48,9 +48,9 @@ Full rationale for this layout: [arc42.md §5](arc42.md#5-building-block-view). 
 
 ## Current build status
 
-driller is early: Epic 1 ("Open a Project and Explore Its Code Map") is in progress. Story-by-story status moves independently of this file — always check `_bmad-output/implementation-artifacts/sprint-status.yaml` for what's actually `done`/`review`/`in-progress`/`backlog` before assuming a feature exists, rather than trusting a specific story number written here. `_bmad-output/implementation-artifacts/` holds the per-story spec driving whatever is currently in flight.
+*[Updated 2026-09-23]* All five v1 epics have shipped: Open a Project and Explore Its Code Map, See Where the Risk Is, Audit a PR Before Merging, Audit an Entire Codebase, and Let Agents Query What Humans See — including the Agent-Facing Query Surface (all 5 operations) and its independent MCP-listener liveness monitoring (AD-24). Story-by-story status still moves independently of this file — always check `_bmad-output/implementation-artifacts/sprint-status.yaml` for what's actually `done`/`review`/`in-progress`/`backlog` before assuming a specific behavior, rather than trusting a status claim written here to stay current forever. `_bmad-output/implementation-artifacts/` holds the per-story spec (including its own review history) for anything already built.
 
-`packages/graph-contracts` and the Graph Service's real query surface are intentionally unimplemented placeholders right now (see the package's own source comment) — that's expected, not a gap to silently fill in ahead of its story.
+Two things worth knowing before extending this codebase further, not gaps to silently fill in without a deliberate decision: there's no progressive/partial-index rendering for an oversized repo (see arc42.md §11) — a too-large-to-index project fails whole, with an honest timeout/error/Retry, not a partial map; and AD-15's performance budgets remain unvalidated by real profiling (the pipeline exists now, but no benchmark run against these specific numbers is recorded anywhere).
 
 ## When requirements or architecture change
 
