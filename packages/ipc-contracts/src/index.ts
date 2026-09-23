@@ -1090,6 +1090,14 @@ export interface ProjectScopeConfig {
 //  - `'no-base-ref-resolvable'`: `git-base-ref.ts`'s `resolveDefaultBranch`
 //    found nothing (no upstream, no local `main`/`master`) — `cr` is never
 //    invoked in this case.
+//  - `'review-md-present'`: P0-6 (2026-09-24) — Qodo/PR-Agent only. A
+//    `review.md` driller did not create was already sitting at the repo
+//    root, which is where PR-Agent writes its own output, so the pass
+//    refused: PR-Agent was never invoked and nothing was deleted.
+//    `reviewMdPath` is the absolute path of that file, so the surface
+//    reporting this can name it. Distinct from `'error'` because nothing
+//    went wrong — driller declined to touch a file that isn't its own
+//    (AD-17), and the user can clear the refusal themselves.
 //  - `'error'`: any other failure (a non-`ENOENT` subprocess failure, or
 //    CodeRabbit's JSON not matching the assumed shape) — `message` is safe,
 //    user-facing text; nothing is persisted.
@@ -1108,6 +1116,7 @@ export type PrBotIngestionResult =
   | { status: 'ok'; findingCount: number }
   | { status: 'tool-not-found' }
   | { status: 'no-base-ref-resolvable' }
+  | { status: 'review-md-present'; reviewMdPath: string }
   | { status: 'error'; message: string };
 
 /**

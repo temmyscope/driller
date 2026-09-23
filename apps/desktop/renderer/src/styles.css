@@ -1021,12 +1021,14 @@ code,
   cursor: pointer;
 }
 
-/* Caller/callee affordances (Story 1.4, FR4): a lightweight alternative to
-   precisely clicking a thin edge line. Nested real <button> elements inside
-   the Node card's own `role="button"` container (review-aware: a card with
-   a primary action plus secondary actions is a common, workable pattern —
-   `stopPropagation` on the buttons themselves keeps them from also
-   triggering the card's own click-to-open-source). */
+/* The Node card's affordance row (Story 1.4, FR4; Source pill added by P0-1
+   on 2026-09-24): a lightweight alternative to precisely clicking a thin
+   edge line, plus the card's one-action route to its source. Nested real
+   <button> elements inside the Node card's own `role="button"` container
+   (review-aware: a card with a primary action plus secondary actions is a
+   common, workable pattern — `stopPropagation` on the buttons themselves
+   keeps them from also triggering the card's own activation, which opens
+   Node Detail). */
 .code-map__node-affordances {
   display: flex;
   gap: 0.35rem;
@@ -2050,28 +2052,27 @@ code,
   line-height: 1.5;
 }
 
-/* Story 1.8 (Phase 4): the "Details" affordance — same base look as the
-   caller/callee affordances (`.code-map__node-affordance`), reinforced with
-   the staleness signal's own `--stale-yellow` tint (never color-only on its
-   own — the "Details" text label carries the meaning; the tint is
-   reinforcement), matching `.code-map__node-staleness`'s color for the
-   entry point into the exact overlay that shows that same staleness note. */
-.code-map__node-affordance--details {
-  border-color: var(--stale-yellow);
-  color: var(--stale-yellow);
+/* P0-1 (2026-09-24): the Source pill — same base look as the caller/callee
+   affordances (`.code-map__node-affordance`), tinted with `--accent` to mark
+   it as the card's one non-traversal action now that activating the card
+   itself opens Node Detail instead of source. Never color-only: the visible
+   "source" text label carries the meaning on its own; the tint is
+   reinforcement.
+
+   Replaces Story 1.8's `.code-map__node-affordance--details` rules, whose
+   pill this change removed. Hover uses the same
+   `color-mix(in srgb, <hue> N%, transparent)` fill formula those rules (and
+   `.notice--warning`) already use, so hover gives real visible feedback
+   rather than repeating the base border/color values. */
+.code-map__node-affordance--source {
+  border-color: var(--accent-dim);
+  color: var(--accent);
 }
 
-/* Review round 2 fix: the base rule above already sets border/color to
-   the staleness hue, so a hover rule repeating those same two values gave
-   no visible feedback at all. A background fill on hover (same
-   `color-mix(in srgb, <hue> N%, transparent)` formula `.notice--warning`
-   already uses elsewhere in this file) keeps the warning-tinted identity
-   while still giving real, visible hover feedback, distinct from every
-   other affordance's own (accent-colored) hover. */
-.code-map__node-affordance--details:hover {
-  border-color: var(--stale-yellow);
-  background: color-mix(in srgb, var(--stale-yellow) 18%, transparent);
-  color: var(--stale-yellow);
+.code-map__node-affordance--source:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
 }
 
 /* The Node Detail panel (Story 1.8, Phase 4): a right-docked overlay
@@ -2175,4 +2176,54 @@ code,
 .code-map__node-detail-regenerate:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* P0-1 (2026-09-24): the Node Detail panel's risk-signals section. A plain
+   labelled stack — the signal rows inside it are rendered by the same
+   `NodeRiskSignalSections` the card uses, so they bring their own
+   (`.code-map__node-signal-strip` / `.code-map__llm-judgment` /
+   `.code-map__ingested-findings`) styling with them and nothing is
+   re-specified here. Only the section's own spacing and its heading need
+   rules, and both reuse existing tokens/sizes — no new visual language.
+   Never rendered at all for a Node with no visible signals (CodeMap.tsx
+   gates this at the JSX level, not with `display: none` here). */
+.code-map__node-detail-signals {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+/* Same `{typography.meta}` size/weight/color as
+   `.code-map__node-detail-location` above — this is a quiet section label,
+   not a document heading, and the two must not compete. */
+.code-map__node-detail-signals-heading {
+  margin: 0;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* The panel's "View source" action: the secondary counterpart to
+   `.code-map__node-detail-regenerate`'s primary filled treatment — same
+   geometry and type, outlined rather than filled, so the panel has one
+   visually primary action, not two. The `--accent` outline matches the
+   card's own Source pill, keeping one colour for "go to source" across both
+   surfaces. */
+.code-map__node-detail-source {
+  align-self: flex-start;
+  padding: 0.5rem 1rem;
+  border-radius: 0;
+  border: 1px solid var(--accent-dim);
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.code-map__node-detail-source:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }

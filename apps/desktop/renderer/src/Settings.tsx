@@ -61,9 +61,18 @@ interface SettingsProps {
   /**
    * Story 2.3 (Phase 4): notified with every settled `runPrBotIngestion`
    * result (not just success) — App.tsx's own `prBotToolNotFound` Set state
-   * is derived from this stream, so it needs `'tool-not-found'` AND every
-   * other status (to clear a bot's notice once a later attempt returns
-   * anything else), not merely the failures. Fired on the real IPC result
+   * is derived from this stream, so it needs the non-failures too, not
+   * merely `'tool-not-found'`: a later attempt returning `'ok'`/
+   * `'no-base-ref-resolvable'`/`'error'` is what clears a bot's notice.
+   *
+   * P0-6 (2026-09-24) broke the old "every other status clears it" phrasing
+   * this doc used to carry: `'review-md-present'` refuses before the bot is
+   * invoked at all, so it is evidence of nothing about that bot's CLI and
+   * App.tsx deliberately leaves the notice untouched for it. This prop
+   * therefore forwards every status, but the receiver decides — it is not a
+   * "anything but tool-not-found clears" contract any more.
+   *
+   * Fired on the real IPC result
    * unconditionally, even for a reply this component's own
    * `ingestionRequestIdRef` supersession would otherwise treat as stale for
    * *local* display purposes (see `handleRunIngestion` below) — whether a
@@ -122,8 +131,12 @@ const IDLE_PR_BOT_DISCLOSURE: Record<PrBotId, PrBotDisclosureState> = {
  *  - `'running'`: the pass is in flight.
  *  - `'ok'`: completed; `count` is `PrBotIngestionResult`'s own
  *    `findingCount` (0 is a valid, distinct "ran, found nothing" outcome).
- *  - `'tool-not-found'` / `'no-base-ref-resolvable'` / `'error'`: mirror
- *    `PrBotIngestionResult`'s own remaining states verbatim.
+ *  - `'tool-not-found'` / `'no-base-ref-resolvable'` /
+ *    `'review-md-present'` / `'error'`: mirror `PrBotIngestionResult`'s own
+ *    remaining states verbatim. `'review-md-present'` (P0-6, 2026-09-24)
+ *    carries the absolute path of the file the pass refused to touch, so
+ *    the inline status can name it rather than leaving the user to guess
+ *    which `review.md` is meant.
  */
 type IngestionRunState =
   | { kind: 'idle' }
@@ -131,6 +144,7 @@ type IngestionRunState =
   | { kind: 'ok'; count: number }
   | { kind: 'tool-not-found' }
   | { kind: 'no-base-ref-resolvable' }
+  | { kind: 'review-md-present'; reviewMdPath: string }
   | { kind: 'error'; message: string };
 
 const IDLE_INGESTION_RUN: Record<PrBotId, IngestionRunState> = {
@@ -151,6 +165,15 @@ function formatIngestionRunState(state: IngestionRunState): string | null {
       return 'Tool not found on this machine — see the notice below.';
     case 'no-base-ref-resolvable':
       return "Couldn't resolve a base branch to diff against.";
+    case 'review-md-present':
+      // P0-6: names the exact file and states only what's verifiable — the
+      // file exists, it wasn't touched, the pass didn't run. Deliberately
+      // makes no claim about whose file it is: driller genuinely cannot
+      // tell, and a leftover from a pass that was killed between PR-Agent's
+      // write and the cleanup delete is in fact driller's own. Asserting
+      // "a file driller didn't create" would be false exactly in that case,
+      // to a user who already has no in-app way forward.
+      return `Didn't run: ${state.reviewMdPath} already exists. That's the exact path PR-Agent writes its output to, and driller won't overwrite or delete what's there — nothing ran and nothing changed. Move or remove that file, then run again.`;
     case 'error':
       return state.message;
   }
@@ -423,6 +446,12 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
               break;
             case 'no-base-ref-resolvable':
               setIngestionRun((current) => ({ ...current, [bot]: { kind: 'no-base-ref-resolvable' } }));
+              break;
+            case 'review-md-present':
+              setIngestionRun((current) => ({
+                ...current,
+                [bot]: { kind: 'review-md-present', reviewMdPath: result.reviewMdPath },
+              }));
               break;
             case 'error':
               setIngestionRun((current) => ({ ...current, [bot]: { kind: 'error', message: result.message } }));

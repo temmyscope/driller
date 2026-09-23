@@ -1692,7 +1692,12 @@ async function handleRunIngestionRequest(bot: PrBotId): Promise<void> {
  * of which share the same `{status, findingsByNodeId}`-shaped `'ok'` variant
  * (and identical `'tool-not-found'`/`'no-base-ref-resolvable'`/`'error'`
  * states), so the clear-then-write persistence logic below is written once
- * and reused for either bot rather than duplicated per branch.
+ * and reused for either bot rather than duplicated per branch. The two
+ * adapter unions are NOT identical to each other: P0-6 (2026-09-24) added
+ * `'review-md-present'` to `QodoIngestionResult` only, since it describes
+ * PR-Agent's own `review.md` output path and `cr` has no equivalent. Each
+ * adapter's non-`'ok'` states are a subset of `PrBotIngestionResult`, which
+ * is all this function's pass-through below actually needs.
  *
  * On a genuine `'ok'` ingestion, persists via the two-step clear-then-write
  * `mergeNodeRecord` pattern the Always constraint requires: every Node's
@@ -1726,10 +1731,13 @@ async function computeIngestionResult(bot: PrBotId): Promise<PrBotIngestionResul
       ? await runCodeRabbitIngestion(projectRoot, nodes)
       : await runQodoIngestion(projectRoot, nodes);
   if (ingestion.status !== 'ok') {
-    // `'tool-not-found'` / `'no-base-ref-resolvable'` / `'error'` are
-    // structurally identical between `CodeRabbitIngestionResult`/
-    // `QodoIngestionResult` and `PrBotIngestionResult` — returned as-is, no
-    // reshaping needed.
+    // Every non-`'ok'` state either adapter can return is also a member of
+    // `PrBotIngestionResult`, with the identical shape — returned as-is, no
+    // reshaping needed. Note this is a widening, not an identity: both
+    // adapters carry `'tool-not-found'`/`'no-base-ref-resolvable'`/
+    // `'error'`, but `'review-md-present'` (P0-6, 2026-09-24) exists only on
+    // `QodoIngestionResult`; `CodeRabbitIngestionResult` does not declare
+    // it, so a CodeRabbit pass simply can never produce it.
     return ingestion;
   }
 

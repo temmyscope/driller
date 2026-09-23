@@ -24,6 +24,25 @@
  *    guarantee, applied to a third-party tool's own filesystem side effect
  *    rather than driller's (see `runQodoIngestion`'s own doc comment).
  *
+ * P0-6 (2026-09-24): that same AD-17 guarantee cuts the other way too.
+ * This adapter used to DELETE any pre-existing `review.md` at the repo root
+ * before invoking PR-Agent, on the reasoning that a stale leftover must
+ * never be misread as this pass's output. But driller cannot tell a stale
+ * leftover from a file the user wrote themselves, and it destroyed both.
+ * The pass now refuses instead: a `review.md` present before invocation
+ * returns `'review-md-present'` having invoked nothing and deleted nothing.
+ * Every post-invocation delete stays exactly as it was.
+ *
+ * Known residual window (deferred as its own item, not fixed here): the
+ * pre-flight check establishes that the path was empty AT THE MOMENT OF THE
+ * `lstat`, and nothing more. A PR-Agent run is not fast, and a file written
+ * to that path by the user or another tool DURING the run is still unlinked
+ * by the post-invocation cleanup below. That is a much narrower window than
+ * the unconditional pre-invocation delete this replaced — it no longer
+ * destroys a file that was simply sitting there beforehand — but it is the
+ * same failure mode, and no comment in this file should be read as claiming
+ * otherwise.
+ *
  * PR-Agent's exact `review.md` markdown structure is unconfirmed against
  * real output (Design Notes: WebFetch against `docs.pr-agent.ai` and the
  * `LocalGitProvider` source confirmed the env-var convention, the
@@ -38,7 +57,7 @@
  * read/delete lifecycle, or Node-lookup/grouping logic around them.
  */
 
-import { readFile, unlink } from 'node:fs/promises';
+import { lstat, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { findEnclosingNode } from '@driller/graph-contracts';
 import type { CodeMapNode, IngestedRiskSignal } from '@driller/ipc-contracts';
@@ -58,6 +77,11 @@ export type QodoIngestionResult =
   | { status: 'ok'; findingsByNodeId: Record<string, IngestedRiskSignal[]> }
   | { status: 'tool-not-found' }
   | { status: 'no-base-ref-resolvable' }
+  // P0-6 (2026-09-24): a `review.md` driller did not create was already at
+  // the repo root, so the pass refused — nothing invoked, nothing deleted.
+  // `reviewMdPath` is the absolute path, so the surface that reports this
+  // can name the exact file rather than leaving the user hunting for it.
+  | { status: 'review-md-present'; reviewMdPath: string }
   | { status: 'error'; message: string };
 
 /**
@@ -70,9 +94,12 @@ export type QodoIngestionResult =
  * Sequence (Always/I-O matrix):
  *  1. Resolve the base branch (`resolveDefaultBranch`) — `python` is never
  *     invoked when this fails (`'no-base-ref-resolvable'`).
- *  2. Delete any pre-existing `review.md` at the expected path before
- *     invocation — a stale leftover from a prior manual run or crashed pass
- *     must never be silently misread as this pass's own output.
+ *  2. Refuse outright if a `review.md` already exists at the expected path
+ *     (`'review-md-present'`) — nothing is invoked and nothing is deleted.
+ *     driller cannot distinguish a stale leftover from the user's own file,
+ *     so it destroys neither (P0-6; AD-17 cuts both ways). This also means
+ *     a stale leftover can still never be misread as this pass's output,
+ *     which is what the old pre-invocation delete was there for.
  *  3. Invoke `python3 -m pr_agent.cli --pr_url <branch> review` with
  *     `CONFIG__GIT_PROVIDER=local` in `env` (falling back to `python` on
  *     `ENOENT`; `ENOENT` on both, or a non-`ENOENT` failure whose message
@@ -93,18 +120,36 @@ export async function runQodoIngestion(
 
   const reviewMdPath = resolveReviewMdPath(projectRoot);
 
-  // Always: "Any pre-existing review.md at the expected path is deleted
-  // before invocation (never read as if it were this pass's output)."
-  // Non-ENOENT failures here are logged, not fatal — a judgment call
-  // (not explicitly a "best-effort" phrase in the spec's Always for THIS
-  // step, unlike the post-invocation delete below, but the alternative —
-  // failing the whole pass because a stray temp markdown file couldn't be
-  // removed — would make a permissions quirk on one leftover file block
-  // ingestion entirely; `python -m pr_agent.cli` is still invoked and, on
-  // success, genuinely overwrites `review.md` with this pass's own content
-  // in the overwhelmingly common case, so this is a defensive best-effort
-  // step, not this pass's sole safeguard against misreading stale content).
-  await deleteReviewMdBestEffort(reviewMdPath, 'stale pre-existing');
+  // P0-6 (2026-09-24): the pre-flight check that replaced an unconditional
+  // delete. This used to be `deleteReviewMdBestEffort(reviewMdPath, 'stale
+  // pre-existing')` — silently destroying a file at the user's own repo
+  // root that driller never created, on the theory that it could only be a
+  // leftover from a crashed pass. Nothing about a file on disk tells driller
+  // which it is, so the pass refuses instead; the refusal is an explicit
+  // result state the user sees, naming the file, not a silent skip.
+  //
+  // Refusing is also strictly stronger than deleting for the thing the old
+  // step actually guaranteed: a stale `review.md` can't be misread as this
+  // pass's output if PR-Agent is never invoked at all.
+  //
+  // What this check does and does not establish: it proves the path held no
+  // entry at the instant of the `lstat`. It says nothing about the path for
+  // the duration of the PR-Agent run that follows — see the module header's
+  // "Known residual window".
+  const presence = await reviewMdPresence(reviewMdPath);
+  if (presence.status === 'present') {
+    return { status: 'review-md-present', reviewMdPath };
+  }
+  if (presence.status === 'undetermined') {
+    // Can't prove absence (a permissions quirk, an EISDIR, a transient
+    // failure). Reporting it honestly is the only safe option: claiming
+    // `'review-md-present'` would name a file that may not exist, and
+    // proceeding would put us right back to deleting something unknown.
+    return {
+      status: 'error',
+      message: `Couldn't check whether ${reviewMdPath} already exists: ${presence.message}`,
+    };
+  }
 
   const invokeResult = await invokePrAgent(projectRoot, branchResult.branch);
   if ('notFound' in invokeResult) {
@@ -123,12 +168,18 @@ export async function runQodoIngestion(
       //
       // Review finding (Verification Gap): a `ModuleNotFoundError` happens
       // at Python import time, before `LocalGitProvider` ever runs, so this
-      // branch could only ever see a review.md this pass's own
-      // pre-invocation delete already cleared — but that safety rested on
-      // an unstated assumption about PR-Agent's import order, not something
-      // this branch enforced itself. Delete unconditionally here too, same
-      // best-effort reasoning as the sibling branch below, so this branch's
-      // own correctness doesn't depend on that assumption staying true.
+      // branch could only ever see a review.md written after invocation —
+      // but that safety rested on an unstated assumption about PR-Agent's
+      // import order, not something this branch enforced itself. Delete
+      // unconditionally here too, same best-effort reasoning as the sibling
+      // branch below, so this branch's own correctness doesn't depend on
+      // that assumption staying true. P0-6 (2026-09-24): kept as an
+      // unconditional delete. The pre-flight check above found the path
+      // empty immediately before invocation, so in the ordinary case
+      // anything here is this pass's own output — but that is a strong
+      // likelihood, not a proof: a file written to the path during the run
+      // would be unlinked here too (module header, "Known residual
+      // window").
       await deleteReviewMdBestEffort(reviewMdPath, "a tool-not-found pass's own");
       return { status: 'tool-not-found' };
     }
@@ -237,13 +288,50 @@ export function resolveReviewMdPath(projectRoot: string): string {
 }
 
 /**
+ * P0-6 (2026-09-24): three-valued on purpose. `'absent'` (an `ENOENT`
+ * `lstat`) is the only state that lets the pass proceed; `'present'`
+ * refuses; and anything else is `'undetermined'` rather than being
+ * collapsed into either — driller must not act on a guess about a file it
+ * did not create. Never throws.
+ *
+ * `lstat`, not `stat`: a dangling symlink at `review.md` reads as `ENOENT`
+ * to `stat`, which would let the pass proceed, let PR-Agent write straight
+ * through the link into whatever it points at, and then "clean up" by
+ * unlinking only the link — leaving a file behind somewhere the user never
+ * asked for one. `lstat` sees the link itself, so any entry at that path at
+ * all, of any kind, refuses.
+ */
+async function reviewMdPresence(
+  reviewMdPath: string,
+): Promise<{ status: 'present' } | { status: 'absent' } | { status: 'undetermined'; message: string }> {
+  try {
+    await lstat(reviewMdPath);
+    return { status: 'present' };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { status: 'absent' };
+    }
+    return {
+      status: 'undetermined',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
  * Deletes `reviewMdPath` if present. `label` only affects the log message on
- * an unexpected (non-`ENOENT`) failure — used both before invocation (a
- * stale leftover) and after reading this pass's own output (AD-17
- * restoration). Never throws: a missing file (the overwhelmingly common
- * pre-invocation case) is silently fine, and any other failure is logged,
- * never propagated — Always: "a deletion failure is logged, never fails the
- * ingestion result."
+ * an unexpected (non-`ENOENT`) failure. Never throws: a missing file is
+ * silently fine, and any other failure is logged, never propagated —
+ * Always: "a deletion failure is logged, never fails the ingestion result."
+ *
+ * P0-6 (2026-09-24): every remaining caller is POST-invocation. The
+ * pre-flight check in `runQodoIngestion` found the path empty immediately
+ * before invocation, so in the ordinary case what this deletes is what
+ * PR-Agent wrote during this pass — which is what the removed
+ * pre-invocation call site could never say, since it ran against whatever
+ * was already sitting there. It is NOT a guarantee: a file written to the
+ * path by anything else during the run is still deleted here (see
+ * `runQodoIngestion`'s module header, "Known residual window").
  */
 async function deleteReviewMdBestEffort(reviewMdPath: string, label: string): Promise<void> {
   try {

@@ -416,6 +416,12 @@ export function App() {
    * `'ok'`/`'no-base-ref-resolvable'`/`'error'` result all equally prove the
    * tool itself was found and ran, so all three clear it the same way.
    *
+   * P0-6 (2026-09-24) adds the one status that proves nothing either way:
+   * `'review-md-present'` means the pass refused before invoking anything,
+   * so it carries no evidence about whether the bot's CLI is on PATH and
+   * must leave an accurate existing notice exactly as it is — see the guard
+   * in the body.
+   *
    * Discards a reply older than the last one already applied for this bot
    * (`requestedAt < lastAppliedIngestionAt.current[bot]`) — see
    * `lastAppliedIngestionAt`'s own doc comment for why this can't be Settings'
@@ -426,6 +432,13 @@ export function App() {
       return;
     }
     lastAppliedIngestionAt.current[bot] = requestedAt;
+    if (result.status === 'review-md-present') {
+      // P0-6: the pass refused before invoking the bot at all, so this reply
+      // says nothing about whether its CLI exists. Neither setting nor
+      // clearing the notice would be honest — leave it untouched. (The
+      // refusal itself is surfaced by Settings, which names the file.)
+      return;
+    }
     setPrBotToolNotFound((current) => {
       const shouldHave = result.status === 'tool-not-found';
       const alreadyHas = current.has(bot);

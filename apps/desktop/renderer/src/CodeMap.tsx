@@ -25,14 +25,32 @@
  * (UX-DR3): no stat tiles, no data-viz divorced from the map's own
  * structure.
  *
- * Story 1.8 (Phase 4) adds the on-demand single-Node regenerate action: a
- * "Details" affordance next to the caller/callee ones, shown only when a
- * Node is `summaryStatus === 'ready' && stale === true`, opening an inline
- * Node Detail overlay (matching the existing source-view overlay's own
- * pattern — no shared Modal component) with a Regenerate button wired to
+ * Story 1.8 (Phase 4) added the inline Node Detail overlay (matching the
+ * existing source-view overlay's own pattern — no shared Modal component)
+ * and the on-demand single-Node regenerate action inside it, wired to
  * `window.driller.regenerateNode` — this app's first id-keyed mutating IPC
- * round-trip. On success, patches `fetchState.nodes` in place by id, the
+ * round-trip. On success, it patches `fetchState.nodes` in place by id, the
  * same idiom `onSummaryProgress` already uses, rather than refetching.
+ *
+ * P0-1 (2026-09-24) made that overlay the Node's primary surface. Story 1.8
+ * reached it only through a "Details" affordance shown when a Node was
+ * `summaryStatus === 'ready' && stale === true` — which is precisely the
+ * condition UJ-1 step 4 excludes, so the panel was unreachable for the
+ * journey that depends on it. Now:
+ *  - Activating a Node card — a mouse click, or Enter/Space on the focused
+ *    card — opens Node Detail, for any Node regardless of staleness or
+ *    summary status (EXPERIENCE.md's IA row, "Node detail | Click/select
+ *    any Node"). The "Details" affordance is gone; activation covers it.
+ *  - Source viewing moved to its own Source pill in the affordance row, so
+ *    it stays exactly one action away and the Interaction Primitives' trust
+ *    mechanism survives in substance.
+ *  - The panel carries what that IA row promises: summary/pending/
+ *    coverage-gap state, staleness, the Node's risk signals (rendered by
+ *    the same `NodeRiskSignalSections` the card uses — one implementation,
+ *    never a fork) and a one-click source action. Regenerate stays, but is
+ *    offered only on a `'ready'` Node: Story 1.8 could rely on "panel
+ *    implies stale implies Regenerate makes sense," and that invariant is
+ *    gone.
  *
  * Story 1.9 (Phase 2) adds the first search affordance: a persistent,
  * non-modal toolbar (never `App.tsx`'s header — Phase 1's frozen boundary)
@@ -72,6 +90,7 @@ import type {
   DiffScopeResult,
   IngestedRiskSignal,
   LlmJudgmentRiskSignal,
+  RiskSignal,
 } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
 
@@ -452,8 +471,10 @@ function readFixtureNodeCount(): number | undefined {
 // `onActivate` is threaded through node `data` (rather than relied on only
 // via `<ReactFlow>`'s own `onNodeClick`) so the custom Node card's keyboard
 // handler (Enter/Space, review finding — see `CodeMapNodeCard`) can trigger
-// the exact same one-click-to-source path a mouse click does, sharing one
-// implementation instead of two.
+// the exact same activation path a mouse click does, sharing one
+// implementation instead of two. P0-1 (2026-09-24) retargeted what that
+// shared path *does* — it opens Node Detail now, not the source viewer —
+// without changing how it's threaded.
 // `onNavigate`/the adjacency-derived counts+first-ids are threaded through
 // node `data` the same way `onActivate` already is (Story 1.4 Code Map:
 // "reused by both edge-click resolution and the affordance's counts/
@@ -465,10 +486,13 @@ type CodeMapFlowNode = FlowNode<
     node: CodeMapNode;
     onActivate: (node: CodeMapNode) => void;
     onNavigate: (id: string) => void;
-    // Story 1.8 (Phase 4): threaded through the same way `onActivate`/
-    // `onNavigate` already are — the "Details" affordance (rendered only on
-    // a stale Node) calls this to open the Node Detail panel.
-    onOpenDetail: (node: CodeMapNode) => void;
+    // P0-1 (2026-09-24): threaded through the same way `onActivate`/
+    // `onNavigate` already are — the Source pill in the affordance row calls
+    // this to open the source viewer. (It replaces Story 1.8's
+    // `onOpenDetail`, whose "Details" pill this change removed: card
+    // activation itself opens Node Detail now, so a pill for it would be
+    // redundant.)
+    onOpenSource: (node: CodeMapNode) => void;
     callerCount: number;
     firstCallerId: string | undefined;
     calleeCount: number;
@@ -520,7 +544,7 @@ function layoutNodes(
   nodes: CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
   onNavigate: (id: string) => void,
-  onOpenDetail: (node: CodeMapNode) => void,
+  onOpenSource: (node: CodeMapNode) => void,
   adjacency: NodeAdjacency,
   noSummaryBackendAvailable: boolean,
   cloudSelectedNoKey: boolean,
@@ -547,7 +571,7 @@ function layoutNodes(
         node,
         onActivate,
         onNavigate,
-        onOpenDetail,
+        onOpenSource,
         callerCount: entry?.callers.length ?? 0,
         firstCallerId: entry?.callers[0],
         calleeCount: entry?.callees.length ?? 0,
@@ -699,14 +723,221 @@ const INGESTED_SEVERITY_RANK: Record<IngestedRiskSignal['severity'], number> = {
 const MAX_RENDERED_INGESTED_FINDINGS = 3;
 
 /**
+ * The three independent, map-level family toggles (`showDeterministicSignals`
+ * / `showLlmJudgment` / `showIngestedFindings`) every risk-signal surface
+ * honors, passed as one object so a second surface can't silently honor a
+ * subset of them.
+ */
+type RiskSignalFamilyToggles = {
+  showDeterministicSignals: boolean;
+  showLlmJudgment: boolean;
+  showIngestedFindings: boolean;
+};
+
+/**
+ * P0-1 (2026-09-24): the deterministic-family selection, lifted verbatim out
+ * of `CodeMapNodeCard` so both the card and the Node Detail panel run the
+ * identical filter rather than forking it.
+ *
+ * Filtered, not assumed — `RiskSignal` is a real discriminated union
+ * (`llm-judgment`/`ingested` are sibling shapes with no `type`/`value`), and
+ * the chip loop below must never render a non-deterministic signal through
+ * this one unfiltered. Written as an explicit type predicate so the result is
+ * actually typed `DeterministicRiskSignal[]`, not still the wider union.
+ * A repeat `type` is dropped defensively: the "at most one signal per
+ * `DeterministicRiskSignalType`" invariant lives in a different module
+ * (`graph-service/index.ts`'s `buildRiskSignals`) this file can't see, and a
+ * future bug there would otherwise produce colliding React keys here. The
+ * `Set` is typed against `DeterministicRiskSignalType` specifically so a
+ * typo/drift against that union fails at compile time.
+ */
+function selectDeterministicSignals(signals: RiskSignal[]): DeterministicRiskSignal[] {
+  const seen = new Set<DeterministicRiskSignalType>();
+  return signals.filter((signal): signal is DeterministicRiskSignal => {
+    if (signal.family !== 'deterministic' || seen.has(signal.type)) {
+      return false;
+    }
+    seen.add(signal.type);
+    return true;
+  });
+}
+
+/**
+ * At most one `'llm-judgment'` signal per Node by construction
+ * (`buildRiskSignals`/the judgment generator never emit more than one), so
+ * `find` (not `filter`) is enough — and unlike the deterministic family
+ * there's no `type` discriminant to de-duplicate by. `undefined` when the
+ * Node carries none: the callout is gated on this being defined, never an
+ * empty/placeholder callout.
+ */
+function selectLlmJudgmentSignal(signals: RiskSignal[]): LlmJudgmentRiskSignal | undefined {
+  return signals.find((signal): signal is LlmJudgmentRiskSignal => signal.family === 'llm-judgment');
+}
+
+/**
+ * The ingested-PR-bot family — genuinely multi-valued per Node (multiple bots
+ * can legitimately coexist on one Node), so no de-duplication: two distinct
+ * findings from the same tool at the same location are both real. Sorted by
+ * severity (`blocker` > `major` > `minor` > `info`, ties by array order via
+ * `Array.prototype.sort`'s own stability guarantee) BEFORE any capping, so
+ * the findings actually rendered are always the highest-severity ones.
+ */
+function selectIngestedSignals(signals: RiskSignal[]): IngestedRiskSignal[] {
+  return signals
+    .filter((signal): signal is IngestedRiskSignal => signal.family === 'ingested')
+    .sort((a, b) => INGESTED_SEVERITY_RANK[a.severity] - INGESTED_SEVERITY_RANK[b.severity]);
+}
+
+/**
+ * Whether `<NodeRiskSignalSections>` would render anything at all for these
+ * signals under these toggles — the same three gates the component itself
+ * applies, answered without rendering, so a caller that wraps it in a
+ * labelled section (the Node Detail panel) can omit that wrapper entirely
+ * rather than emitting an empty container (I/O matrix: "signals section
+ * absent entirely, not an empty container").
+ */
+function hasVisibleRiskSignals(signals: RiskSignal[], toggles: RiskSignalFamilyToggles): boolean {
+  if (toggles.showDeterministicSignals && selectDeterministicSignals(signals).length > 0) {
+    return true;
+  }
+  if (toggles.showLlmJudgment) {
+    const judgment = selectLlmJudgmentSignal(signals);
+    if (judgment !== undefined && judgment.judgment.trim().length > 0) {
+      return true;
+    }
+  }
+  return toggles.showIngestedFindings && selectIngestedSignals(signals).length > 0;
+}
+
+/**
+ * P0-1 (2026-09-24): every risk-signal section a Node can show, in one
+ * shared renderer.
+ *
+ * Lifted verbatim out of `CodeMapNodeCard` (which now calls it) so the Node
+ * Detail panel renders the *same* glyphs, labels, chips, callout and list
+ * rather than a second, drifting copy — the spec's "extracted and shared,
+ * never forked". Both surfaces therefore also honor the same three
+ * map-level family toggles by construction.
+ *
+ * Renders `null` when nothing is visible, so neither surface ever produces
+ * an empty row/container.
+ */
+function NodeRiskSignalSections({
+  signals,
+  toggles,
+}: {
+  signals: RiskSignal[];
+  toggles: RiskSignalFamilyToggles;
+}) {
+  const deterministicSignals = selectDeterministicSignals(signals);
+  const llmJudgmentSignal = selectLlmJudgmentSignal(signals);
+  const ingestedSignals = selectIngestedSignals(signals);
+  const visibleIngestedSignals = ingestedSignals.slice(0, MAX_RENDERED_INGESTED_FINDINGS);
+  const hiddenIngestedSignalCount = ingestedSignals.length - visibleIngestedSignals.length;
+
+  if (!hasVisibleRiskSignals(signals, toggles)) {
+    return null;
+  }
+
+  return (
+    <>
+      {/* Story 2.1 (Phase 3): the deterministic risk-signal strip — one chip
+          per `riskSignals` entry with `family === 'deterministic'`, gated on
+          the map-level toggle AND on actually having at least one such
+          signal (Boundaries & Constraints: "A Node with `riskSignals: []`
+          ... renders no signal strip at all — never an empty row"). Each
+          chip: `role="img"` — `aria-label` alone on a bare, non-interactive
+          `<span>` (implicit role `generic`) is not reliably exposed to
+          assistive technology; `role="img"` is the standard fix for a static
+          icon+label combination. `title` gives sighted mouse users — who
+          never see `aria-label` — the same glyph -> meaning mapping via the
+          native hover tooltip. An unrecognized `signal.type` (e.g. a runtime
+          value from a future backend build that doesn't match this
+          renderer's still-five-member union) falls back to `'?'`/the raw
+          type string rather than rendering a literal "undefined". */}
+      {toggles.showDeterministicSignals && deterministicSignals.length > 0 && (
+        <div className="code-map__node-signal-strip">
+          {deterministicSignals.map((signal) => {
+            const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+            const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
+            return (
+              <span
+                key={signal.type}
+                className="code-map__signal-chip"
+                role="img"
+                aria-label={`${label}: ${signal.value}`}
+                title={`${label}: ${signal.value}`}
+              >
+                <span aria-hidden="true">{icon}</span>
+                {signal.value}
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {/* Story 2.2 (Phase 3): the LLM-judgment risk-signal callout — rendered
+          after the deterministic strip above, gated on its own independent
+          toggle AND on the Node actually carrying an `'llm-judgment'` signal
+          (never an empty/placeholder callout). Deliberately never
+          `.code-map__signal-chip`'s classes — dashed border, icon+full
+          sentence, not a solid-border pill (FR8/UX-DR7: "no shared visual
+          language between the two families"). The visible copy leads with
+          "AI judgment:" so it reads as an inference, never with a
+          deterministic signal's unqualified-measurement confidence. The
+          blank/whitespace-only guard closes the gap between "never an
+          empty/placeholder callout" and what the JSX actually checked. */}
+      {toggles.showLlmJudgment && llmJudgmentSignal !== undefined && llmJudgmentSignal.judgment.trim().length > 0 && (
+        <p className="code-map__llm-judgment" title={`AI judgment: ${llmJudgmentSignal.judgment}`}>
+          <span aria-hidden="true">✦</span> AI judgment: {llmJudgmentSignal.judgment}
+        </p>
+      )}
+      {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings callout — its own
+          distinct visual treatment (Boundaries & Constraints: "never
+          `.code-map__signal-chip`'s classes, never llm-judgment's callout
+          classes"), gated on its own independent toggle AND on the Node
+          actually carrying at least one `'ingested'` signal. Each finding is
+          its own row, always naming its severity as real visible text —
+          never color/icon alone (Accessibility Floor) — plus the originating
+          tool and finding text (FR9, AD-12). Rows are capped at
+          `MAX_RENDERED_INGESTED_FINDINGS` plus an explicit "+N more" line
+          when more exist — never an unbounded wall of inline comments
+          (UX-DR27). `key={index}` (review-pattern precedent: `toFlowEdges`
+          keys on index too) since a raw ingested finding carries no
+          identifier of its own to key by. */}
+      {toggles.showIngestedFindings && ingestedSignals.length > 0 && (
+        <ul className="code-map__ingested-findings">
+          {visibleIngestedSignals.map((signal, index) => (
+            <li
+              key={index}
+              className="code-map__ingested-finding"
+              title={`${signal.sourceTool} (${signal.severity}): ${signal.finding}`}
+            >
+              <span aria-hidden="true">⚑</span>
+              <span className="code-map__ingested-finding-severity">{signal.severity}</span>
+              <span className="code-map__ingested-finding-tool">{signal.sourceTool}:</span>
+              <span className="code-map__ingested-finding-text">{signal.finding}</span>
+            </li>
+          ))}
+          {hiddenIngestedSignalCount > 0 && (
+            <li className="code-map__ingested-findings-more">+{hiddenIngestedSignalCount} more</li>
+          )}
+        </ul>
+      )}
+    </>
+  );
+}
+
+/**
  * The custom Node component: identifier verbatim, monospace (Always),
  * plus its one-line summary/pending/coverage-gap state (Story 1.5 Phase 2 —
  * see this file's module doc comment). `tabIndex`/`role="button"`/
- * `onKeyDown` give one-click-to-source a keyboard path (Enter/Space)
- * alongside the mouse click `<ReactFlow>`'s
- * own `onNodeClick` already handles — the product's stated Accessibility
- * Floor requires map traversal to have one, and this was mouse-only before
- * (review finding).
+ * `onKeyDown` give activation a keyboard path (Enter/Space) alongside the
+ * mouse click `<ReactFlow>`'s own `onNodeClick` already handles — the
+ * product's stated Accessibility Floor requires map traversal to have one,
+ * and this was mouse-only before (review finding). P0-1 (2026-09-24):
+ * activating the card — by either route — now opens the Node Detail panel
+ * (EXPERIENCE.md's IA row, "Node detail | Click/select any Node"); source
+ * viewing moved to its own pill in the affordance row below.
  *
  * No editing surface (Non-Goal): a bare Handle would otherwise render as a
  * live, draggable connection point, implying an editing capability that
@@ -727,7 +958,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     node,
     onActivate,
     onNavigate,
-    onOpenDetail,
+    onOpenSource,
     callerCount,
     firstCallerId,
     calleeCount,
@@ -739,76 +970,13 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     showIngestedFindings,
     isChanged,
   } = data;
-  // Story 1.8 (Phase 4): the "Details" affordance is shown only on a stale
-  // Node (Always) — mirroring the caller/callee affordances' own
-  // shown-only-when-relevant treatment, never on a Node that's merely
-  // `'pending'`/`'coverage-gap'` (staleness is only meaningful once a
-  // summary actually exists).
-  const showDetailsAffordance = node.summaryStatus === 'ready' && node.stale === true;
-  // Story 2.1 (Phase 3): filtered, not assumed — Story 2.2 (Phase 1) turned
-  // `RiskSignal` into a real discriminated union (`llm-judgment` now exists
-  // as a sibling shape with no `type`/`value`; Story 2.3's `ingested` family
-  // still to come), and this same loop must never render a non-deterministic
-  // signal through this one unfiltered (Boundaries & Constraints, epics.md
-  // Phase 3 AC). A Node with none (or every entry filtered out) renders no
-  // strip at all — never an empty row — enforced by the `.length > 0` gate
-  // below, not by this filter alone. Review round (patch): also drops a
-  // repeat `type` defensively — see the signal-strip JSX's own comment below
-  // for why. Written as an explicit type-predicate (rather than a plain
-  // boolean-returning callback) so `deterministicSignals` below is actually
-  // typed as `DeterministicRiskSignal[]`, not still the wider `RiskSignal[]`
-  // union — `Array.prototype.filter` only narrows the element type with a
-  // predicate, and without it `signal.type`/`signal.value` below would no
-  // longer compile now that not every union member has those fields.
-  // Review round (patch): typed against `DeterministicRiskSignalType`
-  // specifically (not a bare `Set<string>`) — this Set exists purely to
-  // guard `signal.type` below, so the narrower type catches a typo/drift
-  // against that union at compile time instead of silently accepting any
-  // string.
-  const seenDeterministicSignalTypes = new Set<DeterministicRiskSignalType>();
-  const deterministicSignals = node.riskSignals.filter((signal): signal is DeterministicRiskSignal => {
-    if (signal.family !== 'deterministic' || seenDeterministicSignalTypes.has(signal.type)) {
-      return false;
-    }
-    seenDeterministicSignalTypes.add(signal.type);
-    return true;
-  });
-  // Story 2.2 (Phase 3): at most one `'llm-judgment'` signal per Node (Phase
-  // 1/2's own construction invariant — `buildRiskSignals`/the judgment
-  // generator never emit more than one), so `find` (not `filter`) is enough
-  // here — unlike the deterministic strip above, there's no per-type
-  // de-duplication concern since this family carries no `type` discriminant
-  // to de-dupe by. `undefined` when the Node carries none: the callout below
-  // is gated on this being defined, never an empty/placeholder callout
-  // (Boundaries & Constraints).
-  const llmJudgmentSignal = node.riskSignals.find(
-    (signal): signal is LlmJudgmentRiskSignal => signal.family === 'llm-judgment',
-  );
-  // Story 2.3 (Phase 4): the ingested-PR-bot-findings callout — filtered
-  // the same explicit-type-predicate way `deterministicSignals` is above
-  // (unlike `llmJudgmentSignal`, this family is genuinely multi-valued per
-  // Node — `NodeRecord.ingestedFindings`' own doc comment: "multiple bots
-  // ... can legitimately coexist on one Node"), no de-duplication (unlike
-  // the deterministic strip, this family carries no `type` discriminant to
-  // de-dupe by — two distinct findings from the same tool at the same
-  // location are both real). Sorted by severity (`blocker` > `major` >
-  // `minor` > `info`, ties by array order — `Array.prototype.sort`'s own
-  // stability guarantee, see `INGESTED_SEVERITY_RANK`'s doc comment) before
-  // capping, so the 3 findings actually rendered are always the highest-
-  // severity ones, never just the first 3 in whatever order
-  // `buildRiskSignals` happened to push them.
-  const ingestedSignals = node.riskSignals
-    .filter((signal): signal is IngestedRiskSignal => signal.family === 'ingested')
-    .sort((a, b) => INGESTED_SEVERITY_RANK[a.severity] - INGESTED_SEVERITY_RANK[b.severity]);
-  const visibleIngestedSignals = ingestedSignals.slice(0, MAX_RENDERED_INGESTED_FINDINGS);
-  const hiddenIngestedSignalCount = ingestedSignals.length - visibleIngestedSignals.length;
   return (
     <div
       className={`code-map__node${isChanged ? ' code-map__node--changed' : ''}`}
       title={`${node.file}:${node.startLine}-${node.endLine}`}
       tabIndex={0}
       role="button"
-      aria-label={`${node.kind} ${node.name}${isChanged ? ', changed' : ''}, open source`}
+      aria-label={`${node.kind} ${node.name}${isChanged ? ', changed' : ''}, open Node detail`}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
@@ -895,188 +1063,90 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           <span aria-hidden="true">⚠</span> Coverage gap — no summary
         </p>
       )}
-      {/* Story 2.1 (Phase 3): the deterministic risk-signal strip — one chip
-          per `riskSignals` entry with `family === 'deterministic'`, gated on
-          the map-level toggle (`showDeterministicSignals`) AND on actually
-          having at least one such signal (Boundaries & Constraints: "A Node
-          with `riskSignals: []` ... renders no signal strip at all — never
-          an empty row"). Keyed by `type` — a Node carries at most one
-          `RiskSignal` per `DeterministicRiskSignalType` by construction
-          (AD-9 corrected), but review round (patch): that invariant lives in
-          a different module (`graph-service/index.ts`'s `buildRiskSignals`)
-          this file can't see, so `deterministicSignals` above additionally
-          drops a repeat `type` defensively rather than trusting the
-          invariant blind — a future bug there would otherwise produce
-          colliding React keys here (Blind Hunter + Edge Case Hunter,
-          independently). Each chip: `role="img"` (review round, patch) —
-          `aria-label` alone on a bare, non-interactive `<span>` (implicit
-          role `generic`) is not reliably exposed to assistive technology,
-          unlike `.code-map__node-affordance`'s own `aria-label` convention
-          this comment originally (incorrectly) claimed to mirror — that
-          convention only holds for a real `<button>`, which is unambiguously
-          interactive; `role="img"` is the standard fix for a static
-          icon+label combination (Verification Gap review, confirmed my own
-          pre-review suspicion). `title` (review round, patch) gives sighted
-          mouse users — who never see `aria-label` — the same glyph→meaning
-          mapping via the native hover tooltip (Blind Hunter). An unrecognized
-          `signal.type` (review round, patch: Edge Case Hunter) — e.g. a
-          runtime value from a future backend build that doesn't match this
-          renderer's still-five-member union — falls back to `'?'`/the raw
-          type string rather than rendering a literal "undefined". */}
-      {showDeterministicSignals && deterministicSignals.length > 0 && (
-        <div className="code-map__node-signal-strip">
-          {deterministicSignals.map((signal) => {
-            const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
-            const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
-            return (
-              <span
-                key={signal.type}
-                className="code-map__signal-chip"
-                role="img"
-                aria-label={`${label}: ${signal.value}`}
-                title={`${label}: ${signal.value}`}
-              >
-                <span aria-hidden="true">{icon}</span>
-                {signal.value}
-              </span>
-            );
-          })}
-        </div>
-      )}
-      {/* Story 2.2 (Phase 3): the LLM-judgment risk-signal callout — rendered
-          after the deterministic strip above, gated on its own independent
-          `showLlmJudgment` toggle AND on the Node actually carrying an
-          `'llm-judgment'` signal (never an empty/placeholder callout,
-          Boundaries & Constraints). Deliberately never
-          `.code-map__signal-chip`'s classes — dashed border, icon+full
-          sentence, not a solid-border pill (FR8/UX-DR7: "no shared visual
-          language between the two families"). The visible copy leads with
-          "AI judgment:" so it reads as an inference, never with a
-          deterministic signal's unqualified-measurement confidence (this
-          story's own Intent). Accessibility: the judgment text itself is
-          real, visible text (not an `aria-label`-only summary of icon+number
-          the way the deterministic chips are) — this alone satisfies the
-          "real visible text" branch of the same accessibility treatment
-          those chips established; `title` still mirrors their own convention
-          for sighted mouse users who never see the DOM text node be
-          announced as anything special. Review round (patch): also guards
-          against a blank/whitespace-only `judgment` — Phase 2's own
-          generation logic already treats an empty model response as
-          `'degenerate'` and never persists it, so this can't happen given
-          the current codebase, but the guard is trivial and directly closes
-          the gap between "never an empty/placeholder callout" and what the
-          JSX actually checked (only `!== undefined`, not blank-ness). */}
-      {showLlmJudgment && llmJudgmentSignal !== undefined && llmJudgmentSignal.judgment.trim().length > 0 && (
-        <p className="code-map__llm-judgment" title={`AI judgment: ${llmJudgmentSignal.judgment}`}>
-          <span aria-hidden="true">✦</span> AI judgment: {llmJudgmentSignal.judgment}
-        </p>
-      )}
-      {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings callout — its own
-          distinct visual treatment (Boundaries & Constraints: "never
-          `.code-map__signal-chip`'s classes, never llm-judgment's callout
-          classes" — a solid-border list block, not deterministic's inline
-          pills or llm-judgment's dashed single-sentence box), gated on its
-          own independent `showIngestedFindings` toggle AND on the Node
-          actually carrying at least one `'ingested'` signal (never an
-          empty/placeholder callout — mirrors llm-judgment's own
-          Boundaries). Each finding is its own row, always naming its
-          severity as real visible text — never color/icon alone
-          (Accessibility Floor) — plus the originating tool and finding
-          text (FR9, AD-12). `visibleIngestedSignals`/
-          `hiddenIngestedSignalCount` (computed above, already sorted
-          highest-severity-first) cap the rendered rows at
-          `MAX_RENDERED_INGESTED_FINDINGS` plus an explicit "+N more" line
-          when more exist — never an unbounded wall of inline comments
-          (UX-DR27, Design Notes). `key={index}` (review-pattern
-          precedent: `toFlowEdges` above keys on index too) since a raw
-          ingested finding carries no identifier of its own to key by. */}
-      {showIngestedFindings && ingestedSignals.length > 0 && (
-        <ul className="code-map__ingested-findings">
-          {visibleIngestedSignals.map((signal, index) => (
-            <li
-              key={index}
-              className="code-map__ingested-finding"
-              title={`${signal.sourceTool} (${signal.severity}): ${signal.finding}`}
-            >
-              <span aria-hidden="true">⚑</span>
-              <span className="code-map__ingested-finding-severity">{signal.severity}</span>
-              <span className="code-map__ingested-finding-tool">{signal.sourceTool}:</span>
-              <span className="code-map__ingested-finding-text">{signal.finding}</span>
-            </li>
-          ))}
-          {hiddenIngestedSignalCount > 0 && (
-            <li className="code-map__ingested-findings-more">+{hiddenIngestedSignalCount} more</li>
-          )}
-        </ul>
-      )}
-      {/* Caller/callee affordances (Story 1.4): a lightweight alternative to
-          precisely clicking a thin edge line — hidden/inert entirely (not
-          just visually) when the count is 0, per this story's Code Map
-          section. `stopPropagation` on mousedown, click, AND keydown keeps
-          this nested control from also being read as an interaction with
-          the Node card itself: without it on keydown too (review finding —
-          a concrete bug, not just a style nit), pressing Enter/Space while
-          a button is focused still bubbles the keydown up to the card's own
-          `onKeyDown` below, firing `onActivate` (open source) at the same
-          time as `onNavigate` — the keydown that activates a native
-          `<button>` propagates regardless of the button's own click
-          response to it. Also initiating React Flow's own node-drag/
-          selection handling is what the mousedown stop guards against. */}
-      {(callerCount > 0 || calleeCount > 0 || showDetailsAffordance) && (
-        <div className="code-map__node-affordances">
-          {callerCount > 0 && firstCallerId !== undefined && (
-            <button
-              type="button"
-              className="code-map__node-affordance"
-              aria-label={`${callerCount} called by, go to a caller`}
-              onMouseDown={(event) => event.stopPropagation()}
-              onKeyDown={(event) => event.stopPropagation()}
-              onClick={(event) => {
-                event.stopPropagation();
-                onNavigate(firstCallerId);
-              }}
-            >
-              ↑{callerCount} called by
-            </button>
-          )}
-          {calleeCount > 0 && firstCalleeId !== undefined && (
-            <button
-              type="button"
-              className="code-map__node-affordance"
-              aria-label={`${calleeCount} calls, go to a callee`}
-              onMouseDown={(event) => event.stopPropagation()}
-              onKeyDown={(event) => event.stopPropagation()}
-              onClick={(event) => {
-                event.stopPropagation();
-                onNavigate(firstCalleeId);
-              }}
-            >
-              ↓{calleeCount} calls
-            </button>
-          )}
-          {/* Story 1.8 (Phase 4): the Regenerate entry point — shown only on
-              a stale Node (Always), same `stopPropagation` discipline
-              (mousedown/click/keydown) as the caller/callee affordances
-              above, so opening the Node Detail panel never also fires the
-              card's own click-to-source (Story 1.7's whole-card click is
-              never altered). */}
-          {showDetailsAffordance && (
-            <button
-              type="button"
-              className="code-map__node-affordance code-map__node-affordance--details"
-              aria-label={`Open Node detail for ${node.name}`}
-              onMouseDown={(event) => event.stopPropagation()}
-              onKeyDown={(event) => event.stopPropagation()}
-              onClick={(event) => {
-                event.stopPropagation();
-                onOpenDetail(node);
-              }}
-            >
-              Details
-            </button>
-          )}
-        </div>
-      )}
+      {/* P0-1 (2026-09-24): every risk-signal section this card can show is
+          now rendered by the shared `NodeRiskSignalSections` the Node Detail
+          panel also uses — extracted, never forked, so the two surfaces
+          cannot drift in glyphs, labels, chip markup, ordering, caps or
+          family-toggle handling. */}
+      <NodeRiskSignalSections
+        signals={node.riskSignals}
+        toggles={{ showDeterministicSignals, showLlmJudgment, showIngestedFindings }}
+      />
+      {/* The affordance row (Story 1.4, + the Source pill added by P0-1 on
+          2026-09-24): lightweight alternatives to precisely clicking a thin
+          edge line, plus the Node's own one-action route to its source.
+          The caller/callee pills stay hidden/inert entirely (not just
+          visually) when the count is 0; the Source pill has no such
+          condition — every Node has source to show — so the row itself is
+          now unconditional rather than gated on any pill being relevant.
+
+          `stopPropagation` on mousedown, click, AND keydown keeps these
+          nested controls from also being read as an interaction with the
+          Node card itself: without it on keydown too (review finding — a
+          concrete bug, not just a style nit), pressing Enter/Space while a
+          button is focused still bubbles the keydown up to the card's own
+          `onKeyDown` above, firing `onActivate` (which since P0-1 opens
+          Node Detail) at the same time as this pill's own action — the
+          keydown that activates a native `<button>` propagates regardless
+          of the button's own click response to it. Also initiating React
+          Flow's own node-drag/selection handling is what the mousedown stop
+          guards against. */}
+      <div className="code-map__node-affordances">
+        {callerCount > 0 && firstCallerId !== undefined && (
+          <button
+            type="button"
+            className="code-map__node-affordance"
+            aria-label={`${callerCount} called by, go to a caller`}
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onNavigate(firstCallerId);
+            }}
+          >
+            ↑{callerCount} called by
+          </button>
+        )}
+        {calleeCount > 0 && firstCalleeId !== undefined && (
+          <button
+            type="button"
+            className="code-map__node-affordance"
+            aria-label={`${calleeCount} calls, go to a callee`}
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onNavigate(firstCalleeId);
+            }}
+          >
+            ↓{calleeCount} calls
+          </button>
+        )}
+        {/* P0-1 (2026-09-24): the Source pill. Activating the card itself
+            now opens Node Detail (the IA row's "Node detail | Click/select
+            any Node"), so source viewing gets its own affordance rather
+            than losing its entry point — it stays exactly one action away,
+            which is what the Interaction Primitives' "zero friction by
+            design" trust mechanism actually rests on. Unconditional: every
+            Node has a source range. Follows the caller/callee pattern
+            above verbatim, all three `stopPropagation` handlers included
+            — the `onKeyDown` one is load-bearing here, since without it
+            Enter/Space on this pill would bubble to the card and open Node
+            Detail at the same time as the source viewer. */}
+        <button
+          type="button"
+          className="code-map__node-affordance code-map__node-affordance--source"
+          aria-label={`Open source for ${node.name}`}
+          onMouseDown={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenSource(node);
+          }}
+        >
+          {'</>'} source
+        </button>
+      </div>
       <Handle type="source" position={Position.Right} />
     </div>
   );
@@ -1305,6 +1375,16 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // showLlmJudgment"), same no-persistence/no-IPC treatment and same
   // default-on reasoning as the two toggles above.
   const [showIngestedFindings, setShowIngestedFindings] = useState(true);
+  // P0-1 (2026-09-24): the three family toggles above, bundled once for the
+  // two surfaces that render risk signals (the Node card, via `layoutNodes`'
+  // own separate scalar props, and the Node Detail panel below). Passing one
+  // object rather than three loose booleans is what makes it impossible for
+  // the second surface to silently honor a subset of them.
+  const riskSignalToggles: RiskSignalFamilyToggles = {
+    showDeterministicSignals,
+    showLlmJudgment,
+    showIngestedFindings,
+  };
   // Story 3.1 (Phase 2): PR Review Mode's own base-ref text and its
   // `computeDiffScope` result state — CodeMap-owned (Design Notes: "matches
   // this codebase's existing division of responsibility ... App.tsx only
@@ -1600,9 +1680,32 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         });
         return changed ? { ...previous, nodes } : previous;
       });
+      // P0-1 (2026-09-24): the open Node Detail panel holds its OWN copied
+      // `CodeMapNode`, so patching `fetchState` alone left it frozen at
+      // whatever the Node looked like when it was opened. Story 1.8 never
+      // hit this — the panel was reachable only for a `'ready' && stale`
+      // Node, which by definition is not still generating. Now that
+      // activation opens it for any Node, a Node opened mid-generation would
+      // otherwise read "Summary pending…" forever while the card behind the
+      // overlay quietly filled in.
+      //
+      // Read through `nodeDetailRef` (kept in sync synchronously by
+      // `updateNodeDetail`), and patch only when this batch actually carries
+      // this Node — the same shape `handleRegenerate`'s own late-reply path
+      // already uses.
+      const openDetail = nodeDetailRef.current;
+      if (openDetail.status === 'open') {
+        const summary = updatesById.get(openDetail.node.id);
+        if (summary !== undefined) {
+          updateNodeDetail({
+            status: 'open',
+            node: { ...openDetail.node, summaryStatus: 'ready' as const, summary },
+          });
+        }
+      }
     });
     return unsubscribe;
-  }, [projectPath]);
+  }, [projectPath, updateNodeDetail]);
 
   // Story 3.1 (Phase 2, Always): "PR-Review-specific state ... resets
   // whenever `projectPath` changes" — mirrors every other per-project
@@ -1849,10 +1952,32 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       });
   }, []);
 
-  // Wraps `openSourceForNode` to start the dev-only selection-to-detail
-  // timer right at the click/activation, before the (async) source read —
-  // this is the "around the click handler" measurement point the Code
-  // Map's Profiling methodology calls for.
+  // Opens the Node Detail panel for a Node — resets any leftover Regenerate
+  // state from a previously-viewed Node so a fresh open never shows a stale
+  // error/"Regenerating…" from a different Node.
+  //
+  // Story 1.8 (Phase 4) reached this only via the stale-only "Details"
+  // affordance. P0-1 (2026-09-24) made it the destination of `activateNode`
+  // below — i.e. of every card click and Enter/Space — and removed that
+  // pill, so it must be declared BEFORE `activateNode`: `activateNode`'s
+  // dependency array is evaluated during render, and a `const` referenced
+  // there before its own initializer has run is a TDZ ReferenceError, not
+  // merely a lint complaint.
+  const openNodeDetail = useCallback((node: CodeMapNode) => {
+    updateNodeDetail({ status: 'open', node });
+    setRegenerateState({ kind: 'idle' });
+  }, []);
+
+  // The shared activation path for a Node card — a mouse click
+  // (`handleNodeClick`) and the card's own Enter/Space handler both land
+  // here.
+  //
+  // P0-1 (2026-09-24): opens Node Detail rather than the source viewer
+  // (EXPERIENCE.md's IA row; source moved to its own pill on the card).
+  // Both of this function's side effects survive that retarget unchanged:
+  // the `focusedNodeIdRef` write, and the dev-fixture selection timer — now
+  // genuinely a selection-to-*detail* measurement, read back by the effect
+  // keyed on `nodeDetail` further below.
   const activateNode = useCallback(
     (node: CodeMapNode) => {
       // Design Notes: a click/keyboard activation counts as "focusing" a
@@ -1861,19 +1986,10 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       if (isDevFixtureMode) {
         selectionStartRef.current = performance.now();
       }
-      openSourceForNode(node);
+      openNodeDetail(node);
     },
-    [openSourceForNode, isDevFixtureMode],
+    [openNodeDetail, isDevFixtureMode],
   );
-
-  // Story 1.8 (Phase 4): opens the Node Detail panel for a stale Node
-  // (the "Details" affordance's own `onClick`) — resets any leftover
-  // Regenerate state from a previously-viewed Node so a fresh open never
-  // shows a stale error/"Regenerating…" from a different Node.
-  const openNodeDetail = useCallback((node: CodeMapNode) => {
-    updateNodeDetail({ status: 'open', node });
-    setRegenerateState({ kind: 'idle' });
-  }, []);
 
   const closeNodeDetail = useCallback(() => {
     updateNodeDetail({ status: 'closed' });
@@ -2055,27 +2171,30 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     return () => cancelAnimationFrame(frameId);
   }, [isDevFixtureMode]);
 
-  // Dev-only selection-to-detail latency: fires once the source view this
-  // activation started reaches either terminal state — `'open'` or
-  // `'error'`, not just `'open'`. The fixture's synthetic `file` paths
-  // (`fixtures/module-N.ts`, from `devFixture.ts`) don't back any real file
-  // on disk, so `readSourceRange` legitimately errors for every fixture
-  // Node — found via this story's live CDP verification, where `'open'`
-  // alone left this array permanently empty in fixture mode. AD-14 cares
-  // about click-to-UI-response latency, not disk I/O success, so both
-  // terminal states count; a real (non-fixture) project always resolves to
-  // `'open'`.
+  // Dev-only selection-to-detail latency: fires once the Node Detail panel
+  // this activation started is actually open.
+  //
+  // P0-1 (2026-09-24) retargeted this from `sourceView` to `nodeDetail`,
+  // following `activateNode`, so the measurement keeps measuring the thing
+  // it names (AD-14: click-to-UI-response latency). It also simplifies:
+  // `nodeDetail` has no async/terminal-state problem to work around. The
+  // old comment here explained that the fixture's synthetic `file` paths
+  // (`fixtures/module-N.ts`, from `devFixture.ts`) back no real file on
+  // disk, so `readSourceRange` errored for every fixture Node and `'open'`
+  // alone left this array permanently empty — that whole hazard is gone now
+  // that what activation opens is rendered from already-fetched Node data
+  // with no disk I/O in the path at all.
   useEffect(() => {
     if (!isDevFixtureMode || selectionStartRef.current === null) {
       return;
     }
-    if (sourceView.status === 'loading' || sourceView.status === 'closed') {
+    if (nodeDetail.status === 'closed') {
       return;
     }
     const elapsed = performance.now() - selectionStartRef.current;
     selectionStartRef.current = null;
     getDevPerfState().selectionToDetailMs.push(elapsed);
-  }, [isDevFixtureMode, sourceView]);
+  }, [isDevFixtureMode, nodeDetail]);
 
   // Story 1.4 Code Map: "build a local adjacency map ... once per
   // `fetchState.status === 'ready'` ... reused by both edge-click
@@ -2146,7 +2265,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             fetchState.nodes,
             activateNode,
             navigateToNode,
-            openNodeDetail,
+            openSourceForNode,
             adjacency,
             noSummaryBackendAvailable,
             cloudSelectedNoKey,
@@ -2160,7 +2279,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       fetchState,
       activateNode,
       navigateToNode,
-      openNodeDetail,
+      openSourceForNode,
       adjacency,
       noSummaryBackendAvailable,
       cloudSelectedNoKey,
@@ -2288,34 +2407,38 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // mirroring how `changedNodeIds`/`blastRadiusNodeIds` are each gated to
   // their own mode above.
   //
-  // Review finding (Medium): deterministic signals are de-duplicated per
-  // `type` before counting, the same established invariant
-  // `deterministicSignals` above already applies per-Node (a Node never
-  // shows more than one signal per distinct `DeterministicRiskSignalType`) —
-  // without this, a cluster's count/tint could report a higher number than
-  // a user would ever actually see by expanding into it. `llmJudgmentSignal`
-  // needs no equivalent dedup: Phase 1/2's own construction invariant never
-  // emits more than one per Node (see its own comment above).
+  // Review finding (Medium): this count must never exceed what a user would
+  // actually see by expanding into the cluster — otherwise a cluster's
+  // count/tint promises signals that aren't there.
+  //
+  // P0-1 (2026-09-24): that invariant is now structural rather than
+  // hand-maintained. This loop used to re-implement the per-`type`
+  // de-duplication itself, and justified doing so by citing
+  // `deterministicSignals` — a local inside `CodeMapNodeCard` that no longer
+  // exists, since the card's selection logic was extracted into the shared
+  // `selectDeterministicSignals`/`selectLlmJudgmentSignal` the renderer now
+  // uses. Two copies had already drifted: this loop counted EVERY
+  // `'llm-judgment'` signal while the renderer shows only the first, so a
+  // Node carrying two judgments tinted its cluster `2` and displayed `1`.
+  // Calling the same selectors the renderer calls makes that impossible by
+  // construction. The blank-judgment guard mirrors the renderer's own for
+  // the same reason — a whitespace-only judgment renders nothing, so
+  // counting it would reopen the identical gap.
+  //
+  // Deliberately NOT gated on the three family toggles: those are Code Map
+  // rendering preferences, while this is Health Audit Mode's own Risk
+  // Overlay reading of what a Node carries (Always: "Epic 2's Risk Overlay
+  // applied"). `family: 'ingested'` stays excluded for the same reason — it
+  // is Epic 3's PR-bot-findings concept, not part of the Risk Overlay.
   const riskCountByNodeId = useMemo<ReadonlyMap<string, number>>(() => {
     if (mode !== 'healthAudit' || fetchState.status !== 'ready') {
       return EMPTY_RISK_COUNT_MAP;
     }
     const counts = new Map<string, number>();
     for (const node of fetchState.nodes) {
-      const seenTypes = new Set<DeterministicRiskSignalType>();
-      let count = 0;
-      for (const signal of node.riskSignals) {
-        if (signal.family === 'deterministic') {
-          if (seenTypes.has(signal.type)) {
-            continue;
-          }
-          seenTypes.add(signal.type);
-          count += 1;
-        } else if (signal.family === 'llm-judgment') {
-          count += 1;
-        }
-      }
-      counts.set(node.id, count);
+      const judgment = selectLlmJudgmentSignal(node.riskSignals);
+      const judgmentCount = judgment !== undefined && judgment.judgment.trim().length > 0 ? 1 : 0;
+      counts.set(node.id, selectDeterministicSignals(node.riskSignals).length + judgmentCount);
     }
     return counts;
   }, [mode, fetchState]);
@@ -3554,12 +3677,30 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
       {/* Story 1.8 (Phase 4): the Node Detail panel — inline overlay JSX
           matching the source overlay's own pattern immediately above
           (Never: no shared Modal/Panel component extracted — no such
-          component exists yet elsewhere in this codebase). Opened only via
-          the "Details" affordance (shown only on a stale Node); Regenerate
+          component exists yet elsewhere in this codebase). Regenerate
           reuses Story 1.5/1.6's existing generation pipeline for this one
-          Node via `window.driller.regenerateNode`. */}
+          Node via `window.driller.regenerateNode`.
+
+          P0-1 (2026-09-24): this is now the Node's primary surface, opened
+          by activating any Node card at all rather than only by a
+          stale-Node-only "Details" pill — so it carries what the IA row
+          promises: summary, staleness, risk signals and a one-click route
+          to source. Its Coverage Gap state is reachable for the first time
+          as a result (a `'coverage-gap'` Node is never stale, so the old
+          entry point could never open it). */}
+      {/* P0-1 (2026-09-24): the overlay's accessible name carries the Node's
+          own identifier. A static "Node detail" was survivable while this
+          opened from a per-Node "Details" pill the user had just aimed at;
+          now that it is what every card click lands on, a screen-reader user
+          would otherwise be told only that *a* detail dialog opened, with
+          nothing saying which Node they hit. */}
       {nodeDetail.status === 'open' && (
-        <div className="code-map__node-detail-overlay" role="dialog" aria-modal="true" aria-label="Node detail">
+        <div
+          className="code-map__node-detail-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Node detail: ${nodeDetail.node.name}`}
+        >
           <div className="code-map__node-detail-panel">
             <div className="code-map__node-detail-header">
               <code>{nodeDetail.node.name}</code>
@@ -3576,6 +3717,35 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
               {nodeDetail.node.summaryStatus === 'ready' && nodeDetail.node.summary !== undefined && (
                 <p className="code-map__node-detail-summary">{nodeDetail.node.summary}</p>
               )}
+              {/* P0-1: the same three non-`'ready'` summary states the card
+                  itself renders — reachable here for the first time now that
+                  activation (not a stale-only pill) is what opens this
+                  panel. Same classes, same icons, same copy as the card: a
+                  Node that reads "Coverage gap — no summary" on the map must
+                  not read as a silent blank when opened. */}
+              {nodeDetail.node.summaryStatus === 'coverage-gap' && (
+                <p className="code-map__node-summary code-map__node-summary--coverage-gap">
+                  <span aria-hidden="true">⚠</span> Coverage gap — no summary
+                </p>
+              )}
+              {nodeDetail.node.summaryStatus === 'pending' && cloudSelectedNoKey && (
+                <p className="code-map__node-summary code-map__node-summary--notice" role="status">
+                  <span aria-hidden="true">☁</span> Cloud is selected but no API key is set — add one in
+                  Settings.
+                </p>
+              )}
+              {nodeDetail.node.summaryStatus === 'pending' && !cloudSelectedNoKey && noSummaryBackendAvailable && (
+                <p className="code-map__node-summary code-map__node-summary--notice" role="status">
+                  <span aria-hidden="true">⚠</span> No summary backend is available — check Settings.
+                </p>
+              )}
+              {nodeDetail.node.summaryStatus === 'pending' &&
+                !cloudSelectedNoKey &&
+                !noSummaryBackendAvailable && (
+                  <p className="code-map__node-summary code-map__node-summary--pending" role="status">
+                    Summary pending…
+                  </p>
+                )}
               {/* Same "never color-only" treatment as the card's own
                   staleness note (Accessibility Floor) — the icon and exact
                   copy carry the signal, not color alone. Disappears the
@@ -3586,14 +3756,57 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                   <span aria-hidden="true">⏳</span> Summary may be stale — source changed since generation
                 </p>
               )}
+              {/* P0-1: the Node's risk signals, rendered by the exact same
+                  `NodeRiskSignalSections` the card uses — one implementation,
+                  so the glyphs, labels, chip markup, severity ordering, cap
+                  and all three map-level family toggles are identical here by
+                  construction rather than by a second copy staying in sync.
+                  The whole section (heading included) is omitted when nothing
+                  would render, never an empty container. */}
+              {hasVisibleRiskSignals(nodeDetail.node.riskSignals, riskSignalToggles) && (
+                <section className="code-map__node-detail-signals" aria-label="Risk signals">
+                  <h3 className="code-map__node-detail-signals-heading">Risk signals</h3>
+                  <NodeRiskSignalSections
+                    signals={nodeDetail.node.riskSignals}
+                    toggles={riskSignalToggles}
+                  />
+                </section>
+              )}
+              {/* P0-1: the one-click source action this panel's IA row
+                  promises — reuses `openSourceForNode` unchanged, at this
+                  Node's exact range. Closes the panel on the way: both
+                  overlays are `z-index: 10` and this one renders after the
+                  source overlay in the DOM, so leaving it open would hide
+                  the very source view the action just opened. */}
               <button
                 type="button"
-                className="code-map__node-detail-regenerate"
-                onClick={handleRegenerate}
-                disabled={regenerateState.kind === 'regenerating'}
+                className="code-map__node-detail-source"
+                onClick={() => {
+                  const target = nodeDetail.node;
+                  closeNodeDetail();
+                  openSourceForNode(target);
+                }}
               >
-                {regenerateState.kind === 'regenerating' ? 'Regenerating…' : 'Regenerate'}
+                View source
               </button>
+              {/* P0-1 (2026-09-24): Regenerate is offered only where it can
+                  succeed. Story 1.8 could leave it unconditional because the
+                  panel was reachable only from a `'ready' && stale` Node;
+                  activation opens it for any Node now, and the service
+                  rejects a `'coverage-gap'` Node outright, so an
+                  unconditional button would be guaranteed to error there.
+                  A `'pending'` Node is already mid-generation, so a manual
+                  regenerate is equally meaningless. */}
+              {nodeDetail.node.summaryStatus === 'ready' && (
+                <button
+                  type="button"
+                  className="code-map__node-detail-regenerate"
+                  onClick={handleRegenerate}
+                  disabled={regenerateState.kind === 'regenerating'}
+                >
+                  {regenerateState.kind === 'regenerating' ? 'Regenerating…' : 'Regenerate'}
+                </button>
+              )}
               {regenerateState.kind === 'error' && (
                 <p className="notice notice--error" role="alert">
                   {regenerateState.message}
