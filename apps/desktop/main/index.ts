@@ -58,6 +58,7 @@ import {
   type PrBotId,
   type PrBotIngestionResult,
   type ProjectOpenResult,
+  type ProjectScopeConfig,
   type ReadSourceRangeResult,
   type RegenerateNodeResult,
   type SetCloudApiKeyResult,
@@ -73,6 +74,7 @@ import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
+import { getProjectScope, setProjectScope } from './project-scope-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
@@ -898,9 +900,16 @@ function spawnGraphService(): void {
  * cloud key — decrypted here, in main, the only process with `safeStorage`
  * access (this story's Design Notes) — is included only when cloud is
  * actually active. The Graph Service never receives a key it can't use.
+ *
+ * Bug fix (2026-09-23) adds `includedPaths`: this project's persisted
+ * indexing-scope allowlist (project-scope-settings.ts), read fresh at the
+ * moment this is called — same "resolved in main, handed over as a plain
+ * value" shape as `activeBackend` above, so a scope change made in Settings
+ * takes effect on the very next index this function sends.
  */
 function sendIndexRequest(projectPath: string): void {
   const backendConfig = getBackendConfig();
+  const { includedPaths } = getProjectScope(projectPath);
   graphService?.postMessage({
     type: 'graphService:index',
     path: projectPath,
@@ -908,6 +917,7 @@ function sendIndexRequest(projectPath: string): void {
     ...(backendConfig.activeBackend === 'cloud'
       ? { cloudApiKey: getDecryptedCloudApiKey() }
       : {}),
+    ...(includedPaths.length > 0 ? { includedPaths } : {}),
   } satisfies GraphServiceIndexRequest);
 }
 
@@ -1626,8 +1636,13 @@ async function resolveRealPathIfExists(candidate: string): Promise<string> {
  * message, or via the 2s fallback kill) — callers that must not proceed
  * until the process is truly gone (e.g. app quit) should wait on it rather
  * than treating this function as synchronous.
+ *
+ * `stopCbmDaemon` (Bug fix, 2026-09-23, default `false`): forwarded as-is on
+ * the shutdown message — see `GraphServiceShutdownRequest.stopCbmDaemon`'s
+ * own doc comment for which callers should pass `true`. Only the actual
+ * app-quit call site does; the `forceRespawn` mid-session restart doesn't.
  */
-function teardownGraphService(onTornDown?: () => void): void {
+function teardownGraphService(onTornDown?: () => void, stopCbmDaemon = false): void {
   if (!graphService) {
     onTornDown?.();
     return;
@@ -1635,7 +1650,7 @@ function teardownGraphService(onTornDown?: () => void): void {
   isGraphServiceShuttingDown = true;
   const child = graphService;
   graphService = null;
-  child.postMessage({ type: 'graphService:shutdown' });
+  child.postMessage({ type: 'graphService:shutdown', stopCbmDaemon });
 
   let settled = false;
   // Fallback in case the subprocess doesn't exit promptly on its own.
@@ -1894,6 +1909,38 @@ function registerIpcHandlers(): void {
     },
   );
 
+  // -------------------------------------------------------------------------
+  // Bug fix (2026-09-23): per-project indexing-scope allowlist. Same thin
+  // delegation shell and untyped-arg validation discipline as the PR-bot
+  // handlers immediately above.
+  // -------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.settingsGetProjectScope,
+    (_event, projectPath: unknown): ProjectScopeConfig => {
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return { includedPaths: [] };
+      }
+      return getProjectScope(projectPath);
+    },
+  );
+
+  ipcMain.handle(
+    IpcChannels.settingsSetProjectScope,
+    (_event, projectPath: unknown, includedPaths: unknown): ProjectScopeConfig => {
+      if (typeof projectPath !== 'string' || projectPath.length === 0) {
+        return { includedPaths: [] };
+      }
+      if (!Array.isArray(includedPaths) || !includedPaths.every((entry) => typeof entry === 'string')) {
+        // Malformed value: no-op, same defensive-backstop precedent as
+        // settingsSetPrBotEnabled's own guard, returning the project's
+        // current, unchanged config rather than a stale default.
+        return getProjectScope(projectPath);
+      }
+      return setProjectScope(projectPath, includedPaths);
+    },
+  );
+
   // ---------------------------------------------------------------------------
   // Story 2.3 (Phase 2): CodeRabbit ingestion — driller's first external-CLI
   // subprocess invocation; Phase 3 adds Qodo/PR-Agent alongside it, same
@@ -2134,7 +2181,10 @@ app.on('before-quit', (event) => {
   // subprocess has exited (or the 2s fallback kill completed), then
   // request quit again.
   event.preventDefault();
+  // Bug fix (2026-09-23): `stopCbmDaemon: true` — this is an actual app
+  // quit (see `GraphServiceShutdownRequest.stopCbmDaemon`'s doc comment),
+  // unlike the `forceRespawn` restart call site below, which omits it.
   teardownGraphService(() => {
     app.quit();
-  });
+  }, true);
 });

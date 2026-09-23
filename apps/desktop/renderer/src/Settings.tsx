@@ -46,6 +46,7 @@ import type {
   PrBotConfig,
   PrBotId,
   PrBotIngestionResult,
+  ProjectScopeConfig,
 } from '@driller/ipc-contracts';
 
 interface SettingsProps {
@@ -261,6 +262,21 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
   const [ingestionRun, setIngestionRun] = useState<Record<PrBotId, IngestionRunState>>(IDLE_INGESTION_RUN);
   const ingestionRequestIdRef = useRef<Record<PrBotId, number>>({ codeRabbit: 0, qodo: 0 });
 
+  // Bug fix (2026-09-23): the indexing-scope allowlist group's own state —
+  // same per-`projectPath` keying/staleness-guard shape as the PR-bot group
+  // above (a different project's scope must never leak into view), but a
+  // plain optimistic-save-with-rollback interaction (mirrors
+  // `editorPreference`'s own group) rather than PR-bot's disclosure-then-
+  // confirm flow — there's no privacy disclosure to show for a plain
+  // indexing filter. `projectScopeInput` is the raw comma-separated text
+  // being edited, independent of `projectScope` (the last-saved value) so
+  // typing doesn't round-trip through an IPC call on every keystroke.
+  const [projectScope, setProjectScope] = useState<ProjectScopeConfig | null>(null);
+  const [projectScopeLoadError, setProjectScopeLoadError] = useState<string | null>(null);
+  const [projectScopeInput, setProjectScopeInput] = useState('');
+  const [projectScopeSaveError, setProjectScopeSaveError] = useState<string | null>(null);
+  const [projectScopeSaving, setProjectScopeSaving] = useState(false);
+
   // Review finding (Edge Case Hunter): Settings stays mounted across a
   // project switch (App.tsx never unmounts it), so a fetch/save promise
   // started for one `projectPath` can resolve after the prop has already
@@ -300,6 +316,31 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
       });
   }, [projectPath]);
 
+  const refetchProjectScope = useCallback(() => {
+    if (projectPath === null) {
+      setProjectScope(null);
+      setProjectScopeLoadError(null);
+      setProjectScopeInput('');
+      return;
+    }
+    window.driller
+      .getProjectScope(projectPath)
+      .then((next) => {
+        if (projectPathRef.current !== projectPath) {
+          return;
+        }
+        setProjectScope(next);
+        setProjectScopeInput(next.includedPaths.join(', '));
+        setProjectScopeLoadError(null);
+      })
+      .catch((error) => {
+        if (projectPathRef.current !== projectPath) {
+          return;
+        }
+        setProjectScopeLoadError(error instanceof Error ? error.message : String(error));
+      });
+  }, [projectPath]);
+
   useEffect(() => {
     // Re-fetches whenever `projectPath` changes (including the mount fetch,
     // since `refetchPrBotConfig`'s identity depends on it) — and resets any
@@ -308,6 +349,11 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
     // another project's state.
     refetchPrBotConfig();
     setPrBotDisclosure(IDLE_PR_BOT_DISCLOSURE);
+    // Bug fix (2026-09-23): same per-project refetch, and same
+    // never-leave-a-stale-error-visible reasoning, for the indexing-scope
+    // allowlist group.
+    refetchProjectScope();
+    setProjectScopeSaveError(null);
     // Story 2.3 (Phase 4): same reasoning applied to the ingestion-run
     // display state — a "Running…"/result line left over from a previous
     // project must never linger and be mistaken for the newly-switched-to
@@ -321,7 +367,7 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
       codeRabbit: ingestionRequestIdRef.current.codeRabbit + 1,
       qodo: ingestionRequestIdRef.current.qodo + 1,
     };
-  }, [projectPath, refetchPrBotConfig]);
+  }, [projectPath, refetchPrBotConfig, refetchProjectScope]);
 
   /**
    * Wires "Run ingestion now" to `window.driller.runPrBotIngestion` (Story
@@ -528,6 +574,50 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
     },
     [refetchEditorPreference],
   );
+
+  /**
+   * Wires the indexing-scope allowlist's "Save" button (Bug fix,
+   * 2026-09-23) — not a keystroke-triggered optimistic update like
+   * `handleEditorPreferenceChange` above (a free-text field, unlike a radio
+   * group, needs an explicit commit point rather than saving every
+   * keystroke). Parses `projectScopeInput`'s raw comma-separated text into
+   * a trimmed, empty-entry-filtered array; the actual normalization
+   * (path-separator cleanup, de-duplication) happens server-side
+   * (project-scope-settings.ts's `coerceIncludedPaths`) and the response is
+   * what both `projectScope` and `projectScopeInput` are set from — so the
+   * displayed text reflects exactly what was persisted, not what was typed.
+   */
+  const handleProjectScopeSave = useCallback(() => {
+    if (projectPath === null) {
+      return;
+    }
+    const includedPaths = projectScopeInput
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    setProjectScopeSaving(true);
+    setProjectScopeSaveError(null);
+    window.driller
+      .setProjectScope(projectPath, includedPaths)
+      .then((next) => {
+        if (projectPathRef.current !== projectPath) {
+          return;
+        }
+        setProjectScope(next);
+        setProjectScopeInput(next.includedPaths.join(', '));
+      })
+      .catch((error) => {
+        if (projectPathRef.current !== projectPath) {
+          return;
+        }
+        setProjectScopeSaveError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (projectPathRef.current === projectPath) {
+          setProjectScopeSaving(false);
+        }
+      });
+  }, [projectPath, projectScopeInput]);
 
   const attemptSaveKey = useCallback(
     (key: string, acknowledgeInsecureStorage: boolean) => {
@@ -872,6 +962,53 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
                 </div>
               );
             })}
+        </fieldset>
+
+        <fieldset className="settings-panel__project-scope" disabled={projectPath === null}>
+          <legend>Indexing scope</legend>
+
+          {projectPath === null && (
+            <p className="settings-panel__project-scope-hint">
+              Open a project to restrict which subfolders are indexed.
+            </p>
+          )}
+
+          {projectPath !== null && projectScopeLoadError && (
+            <div className="notice notice--error" role="alert">
+              <p>{projectScopeLoadError}</p>
+              <button type="button" onClick={refetchProjectScope}>
+                Retry
+              </button>
+            </div>
+          )}
+
+          {projectPath !== null && projectScope && (
+            <>
+              <p className="settings-panel__project-scope-hint">
+                Comma-separated subfolders to index (e.g. <code>web, app, api</code>). Leave
+                empty to index the whole project — the default. Takes effect on the next index
+                (reopen the project, or restart the Graph Service).
+              </p>
+              <label className="settings-panel__project-scope-label">
+                Included subfolders
+                <input
+                  type="text"
+                  value={projectScopeInput}
+                  disabled={projectScopeSaving}
+                  onChange={(event) => setProjectScopeInput(event.target.value)}
+                  placeholder="web, app, api"
+                />
+              </label>
+              <button type="button" onClick={handleProjectScopeSave} disabled={projectScopeSaving}>
+                {projectScopeSaving ? 'Saving…' : 'Save'}
+              </button>
+              {projectScopeSaveError && (
+                <p className="notice notice--error" role="alert">
+                  {projectScopeSaveError}
+                </p>
+              )}
+            </>
+          )}
         </fieldset>
       </div>
     </div>

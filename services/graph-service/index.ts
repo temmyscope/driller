@@ -172,7 +172,7 @@ import { computeDiffScope } from './git-diff-scope';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
-import { fetchCodeMap, indexRepository, type CodeMapNodeWithSignalSources } from './mcp-client';
+import { fetchCodeMap, indexRepository, stopCbmDaemon, type CodeMapNodeWithSignalSources } from './mcp-client';
 import { startMcpServer } from './mcp-server';
 import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
 import {
@@ -212,6 +212,23 @@ const SHUTDOWN_GRACE_MS = 1500;
 // the spawned backend subprocess).
 let activeIndexPath: string | null = null;
 let activeIndexRequest: Promise<void> | null = null;
+// Bug fix (2026-09-23): `activeIndexPath` alone means "the last project an
+// index was *requested* for," not "an index is *currently running* for
+// this project" — it's set once at the top of `handleIndexRequest` and,
+// deliberately, never reset (both the success and failure branches leave it
+// as-is, so a later `getCodeMap`/coverage-check racing a *different*
+// project's index still knows what the last *requested* path was). The
+// `graphService:index` message-handler guard below used to compare only
+// against `activeIndexPath`, which meant a Retry click after a FAILED index
+// attempt for the same project was silently ignored forever — the guard's
+// own comment says "already indexing," but nothing was actually indexing
+// anymore, the flag just never got cleared on failure. This flag is the
+// missing "genuinely still running" half of that check, set alongside
+// `activeIndexPath` and reset unconditionally (success or failure) in
+// `handleIndexRequest`'s own `finally` — the same shape this file already
+// uses for `activeDiffScopeComputationInFlight`/
+// `activeBlastRadiusExpansionInFlight`.
+let activeIndexInFlight = false;
 let isShuttingDown = false;
 
 // The backend's own project identifier for the most recently *successfully*
@@ -233,6 +250,18 @@ let activeProject: string | undefined;
 // disk (AD-16); `activeProject` is the backend's own opaque identifier, not
 // a filesystem path.
 let activeProjectPath: string | undefined;
+
+// This project's indexing-scope allowlist (Bug fix, 2026-09-23; see
+// `ProjectScopeConfig`'s own doc comment in ipc-contracts) — set alongside
+// `activeProjectPath`, same never-cleared-on-failure reasoning. Empty means
+// no restriction. Applied by `filterCodeMapToScope` at every `fetchCodeMap`
+// call site (both `handleGetCodeMapRequest` and the staleness-detection
+// fetch), never inside `mcp-client.ts` itself — CBM's `index_repository`
+// has no subfolder scope parameter of its own to push this into (see
+// `GraphServiceIndexRequest.includedPaths`'s doc comment in ipc-contracts),
+// so this is a query-time filter over the already-fetched, already-full
+// Node/edge set.
+let activeIncludedPaths: readonly string[] = [];
 
 // The current index's coverage-gap files (FR5), as POSIX-relative paths
 // matching `CodeMapNode.file`'s own format — the backend's `index_status`
@@ -864,25 +893,29 @@ function isIndexRequest(data: unknown): data is GraphServiceIndexRequest {
   if (typeof data !== 'object' || data === null) {
     return false;
   }
-  const { type, path: projectPath, activeBackend, cloudApiKey } = data as {
+  const { type, path: projectPath, activeBackend, cloudApiKey, includedPaths } = data as {
     type?: unknown;
     path?: unknown;
     activeBackend?: unknown;
     cloudApiKey?: unknown;
+    includedPaths?: unknown;
   };
   // Mirrors the validation pattern main/index.ts's projectOpenPath handler
   // already uses for a renderer-supplied path: non-empty and absolute, not
   // merely a string, before it reaches the backend uncaught. Story 1.6
   // (Phase 2) adds the same defensive treatment for `activeBackend`/
   // `cloudApiKey`, which cross the same untrusted-shape boundary (even
-  // though this particular sender is main, not the renderer).
+  // though this particular sender is main, not the renderer). Bug fix
+  // (2026-09-23) adds the same treatment for `includedPaths`.
   return (
     type === 'graphService:index' &&
     typeof projectPath === 'string' &&
     projectPath.length > 0 &&
     path.isAbsolute(projectPath) &&
     isCloudBackendValue(activeBackend) &&
-    (cloudApiKey === undefined || typeof cloudApiKey === 'string')
+    (cloudApiKey === undefined || typeof cloudApiKey === 'string') &&
+    (includedPaths === undefined ||
+      (Array.isArray(includedPaths) && includedPaths.every((entry) => typeof entry === 'string')))
   );
 }
 
@@ -902,15 +935,15 @@ function isBackendSwitchedRequest(data: unknown): data is GraphServiceBackendSwi
   );
 }
 
-function shutdown(): void {
+function shutdown(stopCbm: boolean): void {
   if (isShuttingDown) {
     return;
   }
   isShuttingDown = true;
-  void finishShutdown();
+  void finishShutdown(stopCbm);
 }
 
-async function finishShutdown(): Promise<void> {
+async function finishShutdown(stopCbm: boolean): Promise<void> {
   if (activeIndexRequest) {
     // Best-effort only — see SHUTDOWN_GRACE_MS's doc comment.
     await Promise.race([
@@ -941,6 +974,15 @@ async function finishShutdown(): Promise<void> {
   // `disposeModelContext`'s own doc comment; not worth racing against
   // SHUTDOWN_GRACE_MS either, same reasoning as the record-store flush.
   await disposeModelContext();
+  // Bug fix (2026-09-23): fire-and-forget, only on an actual app quit — see
+  // `GraphServiceShutdownRequest.stopCbmDaemon`'s own doc comment for why a
+  // mid-session `forceRespawn` restart deliberately skips this. Placed after
+  // every awaited step above (not before) so this subprocess's own clean
+  // shutdown is never delayed by it — `stopCbmDaemon` doesn't need to be
+  // awaited to take effect (see its own doc comment).
+  if (stopCbm) {
+    stopCbmDaemon();
+  }
   postStatus({ state: 'exited', pid: process.pid, at: now(), code: 0 });
   process.exit(0);
 }
@@ -948,8 +990,13 @@ async function finishShutdown(): Promise<void> {
 async function handleIndexRequest(
   projectPath: string,
   backendConfig: { activeBackend: CloudBackend; cloudApiKey?: string },
+  includedPaths: readonly string[],
 ): Promise<void> {
   activeIndexPath = projectPath;
+  // Bug fix (2026-09-23): see `activeIndexInFlight`'s own declaration
+  // comment — this is the half of the re-entrancy guard that actually means
+  // "still running," reset unconditionally in the `finally` below.
+  activeIndexInFlight = true;
   // Story 1.6 Phase 2: this request's backend choice/decrypted key becomes
   // the one `startSummaryGenerationForProject` resolves a summarizer from,
   // whenever generation for this project actually starts (after the
@@ -1023,6 +1070,10 @@ async function handleIndexRequest(
     // never-on-failure reasoning — `activeProjectPath` is what
     // `summary-generator.ts` reads source off disk relative to.
     activeProjectPath = projectPath;
+    // Bug fix (2026-09-23): captured alongside `activeProjectPath`, same
+    // never-on-failure reasoning — see `activeIncludedPaths`'s own
+    // declaration comment.
+    activeIncludedPaths = includedPaths;
     coverageGapFileSet = new Set(
       (coverage?.gapPaths ?? []).map((gap) =>
         toProjectRelativePosixPath(projectPath, gap.path, 'coverage gap file'),
@@ -1063,6 +1114,15 @@ async function handleIndexRequest(
       elapsedMs: Date.now() - startedAt,
       message: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    // Bug fix (2026-09-23): unconditional, regardless of which branch above
+    // ran (success, the "superseded" early return in either branch, or a
+    // genuine failure) — see `activeIndexInFlight`'s own declaration
+    // comment. Never gated on `activeIndexPath === projectPath` the way the
+    // branches above are: even a superseded/discarded attempt for THIS
+    // path genuinely stopped running, so the flag must clear regardless of
+    // whether its result was applied.
+    activeIndexInFlight = false;
   }
 }
 
@@ -1108,6 +1168,57 @@ async function handleIndexRequest(
  * the combined guard below only makes that existing invariant visible to the
  * type checker, it changes no observable behavior.
  */
+/**
+ * Filters `nodes`/`edges` to only those under one of `includedPaths`'
+ * project-root-relative POSIX subfolder prefixes (Bug fix, 2026-09-23) — see
+ * `ProjectScopeConfig`'s own doc comment in ipc-contracts for why this is a
+ * query-time filter over an already-fully-fetched Node/edge set, rather than
+ * a narrower `index_repository` call (CBM has no such parameter). A no-op
+ * (returns `nodes`/`edges` unchanged, same array references) when
+ * `includedPaths` is empty — the pre-existing, unrestricted default every
+ * project without a persisted scope setting gets.
+ *
+ * `node.file` is normalized for the match test only, via the same
+ * `toProjectRelativePosixPath` every other consumer of a backend-returned
+ * `file` field already normalizes through — never mutates the returned
+ * node's own `file` field, so this works identically whether the caller has
+ * already normalized `nodes` itself (`handleGetCodeMapRequest`, idempotent
+ * on an already-POSIX-relative string) or hasn't (`computePathTraceResult`,
+ * which never normalizes `file` at all since `traceCallPath` doesn't need
+ * it).
+ *
+ * A prefix match respects path boundaries (`"web"` matches `"web/x.ts"` and
+ * a Node whose file IS exactly `"web"`, never `"webapp/x.ts"`) — a plain
+ * `String.startsWith` would false-positive on a sibling folder sharing a
+ * name prefix.
+ *
+ * Edges are filtered to require BOTH endpoints survive the node filter —
+ * same "no dangling edges to entities outside the fetched node set"
+ * reasoning `mcp-client.ts`'s `CODE_MAP_EDGES_QUERY` comment already
+ * establishes for its own label filtering (a dangling edge is harmless —
+ * React Flow silently drops it — but `buildBidirectionalAdjacency`'s blast-
+ * radius BFS has no reason to walk through a Node this filter just
+ * excluded, and `traceCallPath` has no reason to trace through one either).
+ */
+function filterCodeMapToScope<TNode extends { id: string; file: string }, TEdge extends { source: string; target: string }>(
+  projectRoot: string,
+  nodes: TNode[],
+  edges: TEdge[],
+  includedPaths: readonly string[],
+): { nodes: TNode[]; edges: TEdge[] } {
+  if (includedPaths.length === 0) {
+    return { nodes, edges };
+  }
+  const isIncludedFile = (file: string): boolean => {
+    const normalized = toProjectRelativePosixPath(projectRoot, file, 'indexing scope filter');
+    return includedPaths.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
+  };
+  const filteredNodes = nodes.filter((node) => isIncludedFile(node.file));
+  const includedIds = new Set(filteredNodes.map((node) => node.id));
+  const filteredEdges = edges.filter((edge) => includedIds.has(edge.source) && includedIds.has(edge.target));
+  return { nodes: filteredNodes, edges: filteredEdges };
+}
+
 async function handleGetCodeMapRequest(): Promise<void> {
   if (activeProject === undefined || activeProjectPath === undefined) {
     postCodeMapMessage({
@@ -1118,11 +1229,20 @@ async function handleGetCodeMapRequest(): Promise<void> {
   }
   const projectRoot = activeProjectPath;
   try {
-    const { nodes, edges } = await fetchCodeMap(activeProject);
-    const normalizedNodes = nodes.map((node) => ({
+    const { nodes: rawNodes, edges: rawEdges } = await fetchCodeMap(activeProject);
+    const normalizedNodesUnfiltered = rawNodes.map((node) => ({
       ...node,
       file: toProjectRelativePosixPath(projectRoot, node.file, 'Code Map node file'),
     }));
+    // Bug fix (2026-09-23): filtered post-normalization (cheaper — avoids
+    // `filterCodeMapToScope`'s own internal normalize-for-match-test running
+    // twice) — see `filterCodeMapToScope`'s own doc comment.
+    const { nodes: normalizedNodes, edges } = filterCodeMapToScope(
+      projectRoot,
+      normalizedNodesUnfiltered,
+      rawEdges,
+      activeIncludedPaths,
+    );
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
     // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
     // live on every fetch — never persisted to `node-record-store.ts`
@@ -1338,18 +1458,31 @@ function buildRiskSignals(
  * `activeCodeMapEdges` cache Blast Radius/diff-scope reuse, which would let
  * agent and human Path Trace results diverge.
  *
- * Guarded on `activeProject` alone (not `activeProjectPath`, unlike
- * `handleGetCodeMapRequest`) — `traceCallPath` only needs `id`/`name` off
- * each Node and `source`/`target`/`kind` off each edge, never `file`, so
- * there's no need to normalize `file` via `toProjectRelativePosixPath` here
- * the way the Code Map response does for its own downstream consumers.
+ * `traceCallPath` only needs `id`/`name` off each Node and `source`/
+ * `target`/`kind` off each edge, never `file` — so unlike
+ * `handleGetCodeMapRequest`, the returned Nodes' `file` is never normalized
+ * via `toProjectRelativePosixPath` here.
+ *
+ * Bug fix (2026-09-23): now also guarded on `activeProjectPath` (previously
+ * `activeProject` alone) — needed to normalize `file` internally for
+ * `filterCodeMapToScope`'s own match test (see its doc comment), even
+ * though the normalized value itself is never returned. `activeProjectPath`
+ * is always set alongside `activeProject` on the same successful-index
+ * branch (see that variable's own doc comment), so this only makes that
+ * existing invariant visible to the type checker — it changes no observable
+ * behavior for a project scope this call would already have been able to
+ * find.
  */
 export async function computePathTraceResult(query: string): Promise<PathTraceResult> {
-  if (activeProject === undefined) {
+  if (activeProject === undefined || activeProjectPath === undefined) {
     return { status: 'error', message: 'No project has finished indexing yet.' };
   }
   try {
-    const { nodes, edges } = await fetchCodeMap(activeProject);
+    const { nodes: rawNodes, edges: rawEdges } = await fetchCodeMap(activeProject);
+    // Bug fix (2026-09-23): a Path Trace must never trace into/through a
+    // Node this project's indexing-scope allowlist excludes — same filter
+    // `handleGetCodeMapRequest` applies to the Code Map itself.
+    const { nodes, edges } = filterCodeMapToScope(activeProjectPath, rawNodes, rawEdges, activeIncludedPaths);
     // Defense in depth: main already sends a trimmed query (its own
     // `ipcMain.handle` validation), but this process trusts nothing crossing
     // its own boundary (same stance `isPathTraceRequest`'s own doc comment
@@ -2441,7 +2574,7 @@ function toProjectRelativePosixPath(projectRoot: string, rawPath: string, contex
 
 process.parentPort?.on('message', (event) => {
   if (isShutdownRequest(event.data)) {
-    shutdown();
+    shutdown(event.data.stopCbmDaemon === true);
     return;
   }
   if (!isShuttingDown && isGetCodeMapRequest(event.data)) {
@@ -2488,19 +2621,30 @@ process.parentPort?.on('message', (event) => {
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {
-    if (event.data.path === activeIndexPath) {
+    if (event.data.path === activeIndexPath && activeIndexInFlight) {
       // Already indexing this exact project — e.g. a Retry click while the
       // first attempt is still running. A second concurrent call against
       // the same project is pure waste (and, on this backend, would just
       // collide with the first), so ignore it rather than racing it.
+      //
+      // Bug fix (2026-09-23): `activeIndexInFlight` is the load-bearing half
+      // of this check now — `activeIndexPath` alone never resets, so a
+      // Retry click after a FAILED attempt for this same project used to be
+      // silently dropped forever (this comment's own "still running" premise
+      // was false by the time Retry was clicked). See `activeIndexInFlight`'s
+      // own declaration comment.
       return;
     }
     // Fire-and-forget from the message handler's perspective: progress is
     // reported asynchronously via postStatus, not this handler's return.
-    activeIndexRequest = handleIndexRequest(event.data.path, {
-      activeBackend: event.data.activeBackend,
-      cloudApiKey: event.data.cloudApiKey,
-    });
+    activeIndexRequest = handleIndexRequest(
+      event.data.path,
+      {
+        activeBackend: event.data.activeBackend,
+        cloudApiKey: event.data.cloudApiKey,
+      },
+      event.data.includedPaths ?? [],
+    );
     return;
   }
   if (!isShuttingDown && isBackendSwitchedRequest(event.data)) {
@@ -2514,6 +2658,11 @@ process.parentPort?.on('message', (event) => {
   }
 });
 
-process.on('SIGTERM', shutdown);
+// A bare SIGTERM (not the `graphService:shutdown` message above) means this
+// subprocess is being killed directly rather than asked to restart — main
+// never sends SIGTERM for a mid-session `forceRespawn` (it posts a message
+// and waits), so this always corresponds to an app quit/external kill, not
+// a same-session restart. `stopCbm: true` accordingly.
+process.on('SIGTERM', () => shutdown(true));
 
 postStatus({ state: 'alive', pid: process.pid, at: now() });

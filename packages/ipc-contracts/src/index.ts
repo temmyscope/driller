@@ -236,6 +236,18 @@ export type GraphServiceStatusMessage =
 /** Message main sends to ask the Graph Service subprocess to shut down cleanly. */
 export interface GraphServiceShutdownRequest {
   type: 'graphService:shutdown';
+  /**
+   * True only for an actual app quit (Bug fix, 2026-09-23) — main's
+   * `before-quit` handler sets this, its `graphServiceRestart` IPC
+   * handler's `forceRespawn` path (a mid-session subprocess restart while
+   * the app stays open, e.g. the MCP-listener Retry button) does not. Tells
+   * the subprocess whether to also retire CBM's background daemon
+   * (`mcp-client.ts`'s `stopCbmDaemon`) as part of this shutdown — a
+   * mid-session restart has no reason to pay a cold-daemon-restart cost
+   * for the very next call, and CBM staleness/version-conflict issues are
+   * specifically a cross-session concern, not a within-session one.
+   */
+  stopCbmDaemon?: boolean;
 }
 
 /**
@@ -259,6 +271,14 @@ export interface GraphServiceIndexRequest {
   activeBackend: CloudBackend;
   /** The decrypted cloud API key — see `GraphServiceBackendSwitchedRequest.cloudApiKey`'s doc comment. */
   cloudApiKey?: string;
+  /**
+   * This project's `ProjectScopeConfig.includedPaths` (Bug fix,
+   * 2026-09-23), read from the persisted per-project settings at the moment
+   * this request is sent — same "resolved in main, handed over as a plain
+   * value" shape as `activeBackend`/`cloudApiKey` above. Omitted/empty means
+   * no restriction, see `ProjectScopeConfig`'s own doc comment.
+   */
+  includedPaths?: string[];
 }
 
 /**
@@ -1031,6 +1051,32 @@ export interface PrBotConfig {
   qodoEnabled: boolean;
 }
 
+/**
+ * Per-project indexing-scope allowlist (Bug fix, 2026-09-23) — same
+ * per-project keying shape as `PrBotConfig` above (`projectPath` one level
+ * up, in the persisted store and in `settingsGetProjectScope`/
+ * `settingsSetProjectScope`'s IPC signatures).
+ *
+ * Exists because CBM's `index_repository` has no subfolder include/exclude
+ * parameter of its own — only a single whole-root `repo_path` plus its own
+ * gitignore-style exclusions — so a mixed repo (real source alongside
+ * unrelated tooling/docs/scripts, e.g. BMad planning files) has no way to
+ * tell driller which subfolders are actually "the codebase" without this.
+ *
+ * `includedPaths` are POSIX-relative to the project root (e.g. `["web",
+ * "app", "api"]`), matching `CodeMapNode.file`'s own path convention. Empty
+ * means no restriction — the pre-existing default behavior for every
+ * project that hasn't set this: every Node CBM itself doesn't already
+ * exclude (gitignore/skip-list) is included. This is a query-time filter,
+ * not a narrower `index_repository` call (see `services/graph-service/
+ * index.ts`'s `filterCodeMapToScope`) — CBM still walks/parses the whole
+ * repo internally; only the Node/edge set that ever reaches the Code Map,
+ * risk signals, and summary generation is restricted.
+ */
+export interface ProjectScopeConfig {
+  includedPaths: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Story 2.3 (Phase 2): ingest CodeRabbit findings via the CodeRabbit CLI.
 //
@@ -1290,6 +1336,8 @@ export const IpcChannels = {
   settingsSetEditorPreference: 'settings:setEditorPreference',
   settingsGetPrBotConfig: 'settings:getPrBotConfig',
   settingsSetPrBotEnabled: 'settings:setPrBotEnabled',
+  settingsGetProjectScope: 'settings:getProjectScope',
+  settingsSetProjectScope: 'settings:setProjectScope',
   prBotRunIngestion: 'prBot:runIngestion',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
@@ -1451,6 +1499,21 @@ export interface DrillerApi {
    * separate refetch.
    */
   setPrBotEnabled: (projectPath: string, bot: PrBotId, enabled: boolean) => Promise<PrBotConfig>;
+  /**
+   * Fetches the current indexing-scope allowlist for one project (Bug fix,
+   * 2026-09-23) — same per-project shape as `getPrBotConfig`. Returns
+   * `{includedPaths: []}` (no restriction) when the project has no
+   * persisted entry yet, never undefined/unset.
+   */
+  getProjectScope: (projectPath: string) => Promise<ProjectScopeConfig>;
+  /**
+   * Sets one project's indexing-scope allowlist (Bug fix, 2026-09-23).
+   * Takes effect on the next index (a fresh folder open, or a manual
+   * Graph Service restart) — this call itself doesn't trigger a re-index.
+   * Returns the project's updated `ProjectScopeConfig` so the renderer can
+   * update its state without a separate refetch.
+   */
+  setProjectScope: (projectPath: string, includedPaths: string[]) => Promise<ProjectScopeConfig>;
   /**
    * Runs one PR-bot's ingestion pass against `projectPath` (Story 2.3, Phase
    * 2) — this phase's only entry point (Never: "Any UI trigger, entry

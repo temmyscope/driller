@@ -23,6 +23,7 @@
  * state in its own global cache (AD-6), which this module never touches.
  */
 
+import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
@@ -147,6 +148,60 @@ function resolveBackendCommand(): { command: string; args: string[] } {
     command: process.execPath,
     args: [path.join(packageDir, binRelativePath)],
   };
+}
+
+/**
+ * Best-effort, fire-and-forget request for CBM to retire its own background
+ * daemon (Bug fix, 2026-09-23).
+ *
+ * Every other call in this module (`indexRepository`, `fetchCodeMap`, ...)
+ * is deliberately ephemeral per-call and only ever closes its own immediate
+ * MCP transport (`client.close()`) — which, per a live investigation of a
+ * "conflicting CBM process is active" startup failure, SIGTERMs only the
+ * directly-spawned Node wrapper (`resolveBackendCommand`'s `bin.js` shim),
+ * not the native daemon it launches underneath via a blocking `spawnSync`.
+ * That daemon is designed to outlive any single client session — CBM's own
+ * CLI help says as much ("it survives idle periods and session ends; run
+ * `daemon stop` first if you want a permanent one" / "`codebase-memory-mcp
+ * daemon stop` retires it") — so nothing in this module's normal per-call
+ * teardown was ever going to stop it. This is the one call site that
+ * actually asks CBM to retire it, by forwarding `daemon stop` as extra argv
+ * to the same bin shim `resolveBackendCommand` already resolves (confirmed
+ * via that shim's own source: it forwards `process.argv.slice(2)` straight
+ * through to the native binary).
+ *
+ * Deliberately synchronous and detached rather than awaited: this exists to
+ * run from `finishShutdown` (index.ts) during the Graph Service subprocess's
+ * own shutdown, which main's `teardownGraphService` bounds with a 2s
+ * fallback kill — waiting on this spawn could race that kill and either
+ * delay app quit or get killed mid-flight. `detached: true` + `unref()`
+ * means the spawned `daemon stop` process is not part of this subprocess's
+ * process group and keeps running to completion independently even if this
+ * subprocess itself is force-killed a moment later — the app quitting
+ * promptly and the daemon actually stopping are not coupled. Never throws:
+ * a failure here just leaves the daemon running, the pre-existing behavior,
+ * so it's logged and swallowed rather than surfaced as an error anywhere.
+ */
+export function stopCbmDaemon(): void {
+  try {
+    const { command, args } = resolveBackendCommand();
+    const child = spawn(command, [...args, 'daemon', 'stop'], {
+      stdio: 'ignore',
+      detached: true,
+    });
+    child.once('error', (error) => {
+      console.warn(
+        `[graph-service] couldn't stop the CBM daemon on shutdown (it may be left running): ${error.message}`,
+      );
+    });
+    child.unref();
+  } catch (error) {
+    console.warn(
+      `[graph-service] couldn't stop the CBM daemon on shutdown (it may be left running): ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 /**
@@ -298,7 +353,28 @@ const CODE_MAP_EDGE_KINDS: readonly CodeMapEdgeKind[] = ['CALLS', 'IMPORTS', 'US
 // `CODE_MAP_FILES_QUERY` below instead and joined in TypeScript by
 // `file_path` (`runFetchCodeMap`) — the same "separate query, join in code"
 // shape this function already uses for nodes+edges, not a new pattern.
-const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind, n.complexity AS complexity, n.cognitive AS cognitive`;
+//
+// Bug fix (2026-09-23): `WHERE NOT n.file_path STARTS WITH '<'` excludes
+// CBM's own synthetic builtin/stdlib symbol nodes (e.g. Python's
+// `builtins.len`/`builtins.print`, Kotlin's stdlib equivalents), which CBM
+// represents with a bracketed sentinel `file_path` like `<python-builtins>`
+// rather than a real on-disk path — live-verified via `strings` on CBM's
+// binary (`<python-builtins>`, `<kotlin-builtins>`) and confirmed live
+// against an indexed project (`query_graph`, `STARTS WITH` supported by
+// this engine). These aren't part of the user's own codebase, so they don't
+// belong in the Code Map's Node set at all: summary generation was
+// otherwise trying (and failing, every run) to `fs.readFile` this sentinel
+// as a real path, spamming `couldn't read source for ...: ENOENT`
+// indefinitely. Filtering here, at the one source of the Code Map's Node
+// set, means every downstream consumer (summary generation, risk signals,
+// the renderer) simply never sees these Nodes — no new `SummaryStatus`
+// state or renderer change needed. `CODE_MAP_EDGES_QUERY` needs no matching
+// filter: it already requires both endpoints' `qualified_name IS NOT NULL`
+// for the same "no dangling edges to entities outside the fetched node set"
+// reason, and this file's own comment on that query already establishes
+// that a dangling edge to a Node this query drops is harmless (React Flow
+// silently discards it).
+const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) WHERE NOT n.file_path STARTS WITH '<' RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind, n.complexity AS complexity, n.cognitive AS cognitive`;
 
 // Story 2.1 (Phase 1), review round: hotspot data, fetched standalone (see
 // `CODE_MAP_NODES_QUERY`'s comment for why it can't be joined in one Cypher
