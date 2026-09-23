@@ -2432,6 +2432,18 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         if (edge.label === 'CALLS' && pathHighlightEdgeKeys.has(pathEdgeKey(edge.source, edge.target))) {
           return { ...edge, className: `${edge.className ?? ''} code-map__edge--path-highlight`.trim() };
         }
+        // DESIGN.md `canvas-edge-highlighted`: an accent-colored variant for
+        // any edge leaving a changed Node (PR Review Mode) — distinct from
+        // the path-highlight variant just above, which is reserved for a
+        // traced route's own trace-cyan stroke (that token's own `note`
+        // field: "Path Trace routes use path-trace-route instead"). Checked
+        // second, after the path-highlight branch, so the two never both
+        // apply to the same edge — `changedNodeIds` is empty outside PR
+        // Review Mode (see its own declaration above), so this is a no-op
+        // everywhere else.
+        if (changedNodeIds.has(edge.source)) {
+          return { ...edge, className: `${edge.className ?? ''} code-map__edge--changed-source`.trim() };
+        }
         return edge;
       });
 
@@ -2446,6 +2458,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     pathHighlightEdgeKeys,
     blastRadiusNodeIds,
     clusterRiskCounts,
+    changedNodeIds,
   ]);
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(
@@ -3164,7 +3177,13 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
           // editing capability that doesn't exist (review finding).
           proOptions={{ hideAttribution: true }}
         >
-          <Background />
+          {/* DESIGN.md `canvas.grid`: a `{colors.border}` dot grid at the
+              `{spacing.canvas-grid}` (40px) cell size — the "dot-grid canvas
+              like a schematic notebook" Brand & Style calls out. `gap`/
+              `color` are `@xyflow/react`'s own props for this (no CSS hook
+              exists for either); the canvas background itself is set via
+              `.code-map .react-flow` in styles.css, not here. */}
+          <Background gap={40} color="var(--border)" />
           <Controls showInteractive={false} />
           {/* Story 2.1 (Phase 3): driller's first custom map-level control —
               a `Panel`-hosted checkbox toggling the whole deterministic
@@ -3340,11 +3359,16 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             // one sentence plus one next action (pick a candidate), same
             // Actionable Notice shape every other "needs attention" state
             // in the app already uses (Epic 1 context, UX & Interaction
-            // Patterns). Reuses the `code-map__path-trace-steps`/`-step`
-            // list classes from the `found` step list just below rather
-            // than a new shared component (Boundaries & Constraints) — a
-            // clickable named list is the same shape either way, it's just
-            // candidates instead of path steps. Each candidate's click
+            // Patterns). Reuses the `code-map__path-trace-steps` list class
+            // (the `<ol>` wrapper) from the `found` step list just below —
+            // the row button itself no longer shares a class with that
+            // list's own row (renamed to `code-map__path-trace-stack-row`,
+            // this pass's DESIGN.md restyle) since candidates and traced
+            // hops now have genuinely different visual shapes, not because
+            // this list stopped reusing shared structure (Boundaries &
+            // Constraints) — a clickable named list is still the same shape
+            // either way, it's just candidates instead of path steps. Each
+            // candidate's click
             // re-runs the trace pinned to that exact `id` via the shared
             // `runPathTrace` (resolves deterministically through the
             // untouched exact-id tier) — never a new "resume" IPC
@@ -3405,6 +3429,14 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             // highlight/step list visible for further stepping" — clicking
             // an entry only re-centers the map via `navigateToNode`, it
             // never closes/collapses this panel.
+            //
+            // DESIGN.md `path-trace-stack-row` (this pass): dense-profiler's
+            // own indented call-stack visual — hop circle, tree-indent
+            // glyph, identifier, module — replacing the old flat numbered-
+            // pill/name row. Deliberately no duration/timing field (Never:
+            // driller resolves paths statically and never executes code;
+            // dense-profiler's own per-hop duration would be fabricated
+            // data here — see that token's own DESIGN.md comment).
             <div className="code-map__path-trace-steps-panel" role="region" aria-label="Traced path steps">
               <ol className="code-map__path-trace-steps">
                 {pathTrace.path.map((id, index) => {
@@ -3417,13 +3449,42 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
                     <li key={`${id}-${index}`}>
                       <button
                         type="button"
-                        className="code-map__path-trace-step"
+                        className="code-map__path-trace-stack-row"
                         onClick={() => navigateToNode(id)}
                       >
-                        <span className="code-map__path-trace-step-index" aria-hidden="true">
+                        <span className="code-map__path-trace-hop-circle" aria-hidden="true">
                           {index + 1}
                         </span>
-                        <code>{node?.name ?? id}</code>
+                        {/* The entry point (index 0) has nothing to descend
+                            from, so it carries no indent connector — every
+                            hop after it does, indented one further step
+                            than the last (dense-profiler's own "indented
+                            call-stack" visual, Design Notes).
+                            Review fix (Blind Hunter + Edge Case Hunter,
+                            independently): `(index - 1) * 8` put hop 1 (the
+                            first indented row) at 0px, visually flush with
+                            the unindented entry point — off by one. `index *
+                            8` fixes that (hop 1 → 8px, hop 2 → 16px, ...).
+                            Capped at 8 levels (64px) so a very long traced
+                            path can't push the row's text out of this fixed-
+                            width panel — depth beyond that stops being
+                            legible anyway, so no further indent is lost
+                            information, just a plateau. */}
+                        {index > 0 && (
+                          <span
+                            className="code-map__path-trace-indent"
+                            aria-hidden="true"
+                            style={{ marginLeft: `${Math.min(index * 8, 64)}px` }}
+                          >
+                            └─
+                          </span>
+                        )}
+                        <span className="code-map__path-trace-stack-row-text">
+                          <code className="code-map__path-trace-stack-row-name">{node?.name ?? id}</code>
+                          {node?.file && (
+                            <span className="code-map__path-trace-stack-row-module">{node.file}</span>
+                          )}
+                        </span>
                       </button>
                     </li>
                   );

@@ -1,24 +1,51 @@
 /*
- * Minimal styling for the open-folder / Recent Projects screen only.
- * Dark-first per EXPERIENCE.md — a full design-token pass is explicitly
- * deferred (ARCHITECTURE-SPINE.md Deferred: "DESIGN.md visual-token
- * synthesis"). This is not the shadcn/ui chrome the architecture stack
- * calls for eventually — see the story's report for that scope note.
+ * driller's terminal-native visual system (DESIGN.md, resolved 2026-09-23):
+ * sharp corners everywhere except badges, monospace for every piece of
+ * text, a 16-variable dark-first palette. Applied across every surface
+ * this stylesheet owns (Code Map, PR Review Mode, Node detail, Settings,
+ * Path Trace, and the pre-map Recent Projects/Open Folder screen) — this
+ * is still the app's only stylesheet.
+ *
+ * Every color/radius/font value below traces to a named DESIGN.md token
+ * (`_bmad-output/planning-artifacts/ux-designs/ux-driller-2026-09-03/DESIGN.md`).
+ * `--border-strong`/`--accent-dim` are the two new tokens with a real,
+ * narrow call site today (a Node's own card edge, and the blast-radius
+ * "affected" ring, respectively) — every other new token
+ * (`--panel-alt`/`--risk-amber`/`--risk-red`/`--llm-violet`/
+ * `--stale-yellow`/`--trace-cyan`/`--healthy`) replaces one or more of the
+ * old placeholder palette's `--warning`/`--error`/`--ok`/`--accent-contrast`
+ * uses, resolved per call site (DESIGN.md § Design Notes) rather than by
+ * string-similarity: e.g. the "● CHANGED" Node treatment previously
+ * (arbitrarily) borrowed `--warning` amber before this system's own accent
+ * green existed — it's `--accent` now, matching DESIGN.md's own "accent
+ * means changed" definition, not `--risk-amber`.
  */
 
 :root {
   color-scheme: dark;
-  --bg: #14161a;
-  --surface: #1c1f26;
-  --border: #2a2e37;
-  --text: #e6e8eb;
-  --text-muted: #9aa0ab;
-  --accent: #5b8def;
-  --accent-contrast: #0b0d10;
-  --warning: #d9a441;
-  --error: #e05d5d;
-  --ok: #4caf7d;
-  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --bg: #0a0f0d;
+  --panel: #0e1613;
+  --panel-alt: #0c1210;
+  --border: #1e2b26;
+  --border-strong: #2c3f37;
+  --text: #cfe0d4;
+  --text-dim: #7d9488;
+  /* Review fix (Blind Hunter finding, verified via computed contrast, not
+     eyeballed): #4c5f55 was 2.69:1/2.83:1 against --panel/--bg, well under
+     WCAG AA's 4.5:1 normal-text minimum, and a real regression versus the
+     old placeholder palette's equivalent token (6.89:1). #6f8b7c (same
+     hue) is 4.95:1/5.21:1 — still distinctly dimmer than --text-dim's
+     5.95:1, so the three-step hierarchy survives with real AA headroom. */
+  --text-mute: #6f8b7c;
+  --accent: #39d98a;
+  --accent-dim: #1f6b45;
+  --risk-amber: #e8a33d;
+  --risk-red: #ef5350;
+  --llm-violet: #b48ce0;
+  --stale-yellow: #d9c65a;
+  --trace-cyan: #4fd8e0;
+  --healthy: #2f9e6e;
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
 * {
@@ -39,7 +66,7 @@ body {
 
 code,
 .recent-projects__path code {
-  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
 .app {
@@ -54,12 +81,13 @@ code,
 
 .app__title {
   margin: 0;
-  font-size: 1.75rem;
+  font-size: 11px;
 }
 
 .app__subtitle {
   margin: 0.25rem 0 0;
-  color: var(--text-muted);
+  color: var(--text-mute);
+  font-size: 11px;
 }
 
 .app__header {
@@ -72,11 +100,11 @@ code,
 .app__settings-button {
   flex-shrink: 0;
   padding: 0.4rem 0.6rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
-  color: var(--text-muted);
-  font-size: 1rem;
+  color: var(--text-mute);
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
 }
@@ -100,6 +128,12 @@ code,
  * but laid out as a flex row rather than that block's own vertical stack —
  * this lives inline in a header row, not a `<fieldset>` with room for a
  * vertical legend+options layout.
+ *
+ * DESIGN.md `mode-switcher-tab`/`mode-switcher-tab-active`: a tmux-style
+ * tab bar — base padding `9px 18px`, `{typography.ui}` size/color; the
+ * active tab is a solid accent fill with `{colors.bg}`-colored text
+ * (the same "dark ink on solid accent" pairing `mode-switcher-tab-active`
+ * itself specifies), not just a border/text-color swap.
  */
 .mode-switcher {
   display: flex;
@@ -112,17 +146,18 @@ code,
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  padding: 0.3rem 0.6rem;
-  border-radius: 6px;
+  padding: 9px 18px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 0.8rem;
+  color: var(--text-mute);
+  font-size: 11px;
   cursor: pointer;
 }
 
 .mode-switcher__option:has(input:checked) {
-  border-color: var(--accent);
-  color: var(--text);
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
 }
 
 .mode-switcher__option:has(input:focus-visible) {
@@ -148,7 +183,7 @@ code,
 .settings-panel {
   width: min(420px, 90vw);
   height: 100%;
-  background: var(--surface);
+  background: var(--panel);
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -165,14 +200,14 @@ code,
 
 .settings-panel__title {
   margin: 0;
-  font-size: 1.1rem;
+  font-size: 11px;
 }
 
 .settings-panel__close {
   background: transparent;
   border: none;
-  color: var(--text-muted);
-  font-size: 1.25rem;
+  color: var(--text-mute);
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
 }
@@ -183,7 +218,7 @@ code,
 
 .settings-panel__backend {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 0;
   padding: 0.75rem 1rem;
   display: flex;
   flex-direction: column;
@@ -192,8 +227,8 @@ code,
 
 .settings-panel__backend legend {
   padding: 0 0.25rem;
-  color: var(--text-muted);
-  font-size: 0.8rem;
+  color: var(--text-mute);
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -210,7 +245,7 @@ code,
    fieldset's border/legend rules stay independently editable). */
 .settings-panel__editor {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 0;
   padding: 0.75rem 1rem;
   display: flex;
   flex-direction: column;
@@ -219,8 +254,8 @@ code,
 
 .settings-panel__editor legend {
   padding: 0 0.25rem;
-  color: var(--text-muted);
-  font-size: 0.8rem;
+  color: var(--text-mute);
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -235,32 +270,33 @@ code,
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
-  font-size: 0.85rem;
-  color: var(--text-muted);
+  font-size: 11px;
+  color: var(--text-mute);
 }
 
 .settings-panel__key-label input {
   padding: 0.5rem 0.6rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 11px;
 }
 
 .settings-panel__key-saved {
   margin: 0;
-  color: var(--ok);
-  font-size: 0.85rem;
+  color: var(--healthy);
+  font-size: 11px;
 }
 
 .settings-panel__save {
   align-self: flex-start;
   padding: 0.5rem 1rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: var(--accent-contrast);
+  color: var(--bg);
   font-weight: 600;
   cursor: pointer;
 }
@@ -280,7 +316,7 @@ code,
    editor fieldset's single-line rows. */
 .settings-panel__pr-bots {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 0;
   padding: 0.75rem 1rem;
   display: flex;
   flex-direction: column;
@@ -293,16 +329,17 @@ code,
 
 .settings-panel__pr-bots legend {
   padding: 0 0.25rem;
-  color: var(--text-muted);
-  font-size: 0.8rem;
+  color: var(--text-mute);
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
 .settings-panel__pr-bots-hint {
   margin: 0;
-  color: var(--text-muted);
-  font-size: 0.85rem;
+  color: var(--text-mute);
+  font-size: 10.5px;
+  line-height: 1.45;
 }
 
 .settings-panel__pr-bot {
@@ -330,10 +367,11 @@ code,
 
 .settings-panel__pr-bot-ingestion button {
   padding: 0.35rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -352,17 +390,23 @@ code,
    covers the plain, non-error status text's own size/color. */
 .settings-panel__pr-bot-ingestion-status {
   margin: 0;
-  font-size: 0.85rem;
-  color: var(--text-muted);
+  font-size: 11px;
+  color: var(--text-mute);
 }
 
+/* Generic "needs attention" notice, amber — used across Settings/App
+   chrome for moderate-severity states (a stale backend fetch, a disclosure
+   worth surfacing) that aren't one of the Code Map's own named risk-signal
+   or staleness families; those keep their own dedicated tokens
+   (`--stale-yellow`/`--risk-red`) elsewhere in this file. */
 .settings-panel .notice--warning button {
   margin-top: 0.5rem;
   padding: 0.3rem 0.75rem;
-  border-radius: 6px;
-  border: 1px solid var(--warning);
+  border-radius: 0;
+  border: 1px solid var(--risk-amber);
   background: transparent;
-  color: var(--warning);
+  color: var(--risk-amber);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -372,10 +416,11 @@ code,
 .settings-panel .notice--error button {
   margin-top: 0.5rem;
   padding: 0.3rem 0.75rem;
-  border-radius: 6px;
-  border: 1px solid var(--error);
+  border-radius: 0;
+  border: 1px solid var(--risk-red);
   background: transparent;
-  color: var(--error);
+  color: var(--risk-red);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -388,11 +433,11 @@ code,
 
 .open-folder__button {
   padding: 0.75rem 1.5rem;
-  font-size: 1rem;
-  border-radius: 8px;
+  font-size: 11px;
+  border-radius: 0;
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: var(--accent-contrast);
+  color: var(--bg);
   font-weight: 600;
   cursor: pointer;
 }
@@ -405,26 +450,27 @@ code,
 .notice {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border-radius: 6px;
-  font-size: 0.9rem;
+  border-radius: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
 }
 
 .notice--warning {
-  background: color-mix(in srgb, var(--warning) 15%, transparent);
-  color: var(--warning);
-  border: 1px solid var(--warning);
+  background: color-mix(in srgb, var(--risk-amber) 15%, transparent);
+  color: var(--risk-amber);
+  border: 1px solid var(--risk-amber);
 }
 
 .notice--error {
-  background: color-mix(in srgb, var(--error) 15%, transparent);
-  color: var(--error);
-  border: 1px solid var(--error);
+  background: color-mix(in srgb, var(--risk-red) 15%, transparent);
+  color: var(--risk-red);
+  border: 1px solid var(--risk-red);
 }
 
 .recent-projects__heading {
   margin: 0 0 0.75rem;
-  font-size: 1rem;
-  color: var(--text-muted);
+  font-size: 11px;
+  color: var(--text-mute);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -442,9 +488,9 @@ code,
   width: 100%;
   text-align: left;
   padding: 0.75rem 1rem;
-  border-radius: 8px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel);
   color: var(--text);
   cursor: pointer;
   display: flex;
@@ -458,11 +504,15 @@ code,
 
 .recent-projects__name {
   font-weight: 600;
+  font-size: 11px;
 }
 
+/* A filesystem path — DESIGN.md Colors: "text-dim for summaries and
+   module paths". */
 .recent-projects__path {
-  color: var(--text-muted);
-  font-size: 0.8rem;
+  color: var(--text-dim);
+  font-size: 9.5px;
+  font-weight: 700;
 }
 
 .graph-service-status {
@@ -472,50 +522,56 @@ code,
   gap: 0.75rem;
   padding-top: 1rem;
   border-top: 1px solid var(--border);
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 .badge {
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
   border: 1px solid var(--border);
+  font-size: 9.5px;
+  font-weight: 700;
 }
 
 .badge--pending {
-  color: var(--text-muted);
+  color: var(--text-mute);
 }
 
 .badge--ok {
-  color: var(--ok);
-  border-color: var(--ok);
+  color: var(--healthy);
+  border-color: var(--healthy);
 }
 
 .badge--muted {
-  color: var(--text-muted);
+  color: var(--text-mute);
 }
 
 /*
  * Partial-coverage indexed state (Phase 2, FR2/UX-DR11): visually distinct
  * from both the clean `badge--ok` indexed state and the `badge--error`
  * failure state — a coverage gap is neither success nor failure. Never
- * color-only: the badge text itself always names the gap counts.
+ * color-only: the badge text itself always names the gap counts. Amber
+ * (not the Code Map's own risk-red Coverage Gap Indicator token) — this is
+ * app-level index coverage, a different concept from a per-Node Coverage
+ * Gap signal.
  */
 .badge--warning {
-  color: var(--warning);
-  border-color: var(--warning);
+  color: var(--risk-amber);
+  border-color: var(--risk-amber);
 }
 
 .badge--error {
-  color: var(--error);
-  border-color: var(--error);
+  color: var(--risk-red);
+  border-color: var(--risk-red);
 }
 
 .graph-service-status__retry {
   padding: 0.25rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -532,15 +588,16 @@ code,
   align-items: center;
   gap: 0.75rem;
   padding-top: 0.5rem;
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 .model-status__retry {
   padding: 0.25rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -555,7 +612,7 @@ code,
   align-items: center;
   gap: 0.75rem;
   padding-top: 0.5rem;
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 /*
@@ -565,15 +622,18 @@ code,
  * wrap awkwardly inside a pill shape.
  */
 .mcp-server-status__message {
-  color: var(--error);
+  color: var(--risk-red);
+  font-size: 10.5px;
+  line-height: 1.45;
 }
 
 .mcp-server-status__retry {
   padding: 0.25rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -590,7 +650,7 @@ code,
   flex-direction: column;
   gap: 0.35rem;
   padding-top: 0.5rem;
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 /*
@@ -607,7 +667,9 @@ code,
 
 .hardware-advisory__notice {
   margin: 0;
-  color: var(--warning);
+  color: var(--risk-amber);
+  font-size: 10.5px;
+  line-height: 1.45;
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -627,7 +689,7 @@ code,
   flex-direction: column;
   gap: 0.35rem;
   padding-top: 0.5rem;
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 .app__pr-bot-tool-notice:empty {
@@ -637,7 +699,9 @@ code,
 
 .app__pr-bot-tool-notice-item {
   margin: 0;
-  color: var(--error);
+  color: var(--risk-red);
+  font-size: 10.5px;
+  line-height: 1.45;
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -661,7 +725,7 @@ code,
 }
 
 .app--map .app__title {
-  font-size: 1rem;
+  font-size: 11px;
 }
 
 .app--map .graph-service-status {
@@ -704,6 +768,26 @@ code,
   inset: 0;
 }
 
+/* DESIGN.md `canvas`: background `{colors.bg}`, a `{colors.border}` dot
+   grid at the `{spacing.canvas-grid}` (40px) cell size. `@xyflow/react`'s
+   own base stylesheet (`CodeMap.tsx`'s `import '@xyflow/react/dist/
+   style.css'`) ships its own dark-mode canvas background (`colorMode=
+   "dark"` resolves to its `--xy-background-color-default: #141414`) and a
+   3px node-wrapper radius — both would otherwise survive this restyle as
+   a mismatched, off-palette layer underneath our own sharp/`--bg` styling,
+   so both are overridden here rather than by touching the vendored
+   stylesheet itself (Never: no new UI/CSS dependency, and this file stays
+   the only one this app owns). The dot-grid gap/color themselves are set
+   as `<Background>` props in CodeMap.tsx, not here — `@xyflow/react` has
+   no CSS hook for them. */
+.code-map .react-flow {
+  background-color: var(--bg);
+}
+
+.code-map .react-flow__node {
+  border-radius: 0;
+}
+
 .code-map__notice {
   position: absolute;
   inset: 0;
@@ -714,33 +798,40 @@ code,
   gap: 0.75rem;
   padding: 2rem;
   text-align: center;
-  color: var(--text-muted);
+  color: var(--text-mute);
+  font-size: 10.5px;
+  line-height: 1.45;
 }
 
 .code-map__notice--error {
-  color: var(--error);
+  color: var(--risk-red);
 }
 
 .code-map__notice button {
   padding: 0.4rem 1rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
+  font-size: 11px;
   cursor: pointer;
 }
 
 /* Every Node shows only its identifier, verbatim and monospace — no
    summary/signal-strip content yet (Always: this phase's Node is
-   intentionally minimal). */
+   intentionally minimal). DESIGN.md `node-card`: `{colors.panel}`
+   background, sharp corners, a `{colors.border-strong}` edge — the one
+   place in this file `--border-strong` (not the plain `--border` every
+   other hairline divider uses) applies, since this is explicitly a Node's
+   "own edge," DESIGN.md's own distinguishing use for that token. */
 .code-map__node {
   display: flex;
   flex-direction: column;
   gap: 0.15rem;
-  padding: 0.5rem 0.75rem;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--surface);
+  padding: 10px 11px 9px;
+  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  background: var(--panel);
   min-width: 160px;
   cursor: pointer;
 }
@@ -767,24 +858,40 @@ code,
    selector on the shared `border` property — CSS specificity, not source
    order, decides, and the two-class rule wins regardless of which comes
    first. The explicit `.code-map__path-highlight .code-map__node--changed`
-   rule below resolves that intersection deliberately. */
+   rule below resolves that intersection deliberately.
+
+   DESIGN.md `node-card-changed`: `border: 1px solid {colors.accent}` plus
+   `ring: 0 0 0 1px {colors.accent}` — `--accent` (bright terminal green),
+   not `--risk-amber`: the old placeholder palette had no dedicated
+   "changed" hue and reused `--warning` amber for it; DESIGN.md's own
+   Colors section is explicit that accent means "changed" (and, additively,
+   keyboard focus) and nothing else, so this call site's `--warning` was a
+   placeholder-era borrow, not this system's real assignment. The `ring` is
+   a second, zero-blur `box-shadow` outline (not a soft glow — Elevation &
+   Depth forbids those), giving the doubled-line weight DESIGN.md's own
+   token literally specifies. */
 .code-map__node--changed {
-  border: 2px solid var(--warning);
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 
 /* The "Changed" label itself — same always-visible-text convention as
    `.code-map__node-staleness`/the Coverage Gap indicator (never color-only,
    Accessibility Floor), styled as a small pill so it reads as a distinct
-   marker rather than another line of prose. */
+   marker rather than another line of prose. The one deliberate rounded-
+   corner exception (Shapes: "badges only") — kept at `999px` per the
+   spec's own "identify via existing 999px usage" rule, sized/weighted via
+   `{typography.meta}` (badge label text) and colored `--accent` to match
+   the border/ring above (DESIGN.md: "prefix in {colors.accent}"). */
 .code-map__node-changed-badge {
   align-self: flex-start;
   margin: 0.1rem 0 0;
-  padding: 0.05rem 0.4rem;
+  padding: 3px 8px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--warning) 25%, transparent);
-  color: var(--warning);
-  font-size: 0.65rem;
-  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  color: var(--accent);
+  font-size: 9.5px;
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
@@ -794,7 +901,10 @@ code,
    at all (review finding) — the accessibility floor requires a keyboard
    path, and a keyboard path with no visible focus indicator isn't usable.
    `:focus-visible` (not plain `:focus`) so this only shows for keyboard
-   navigation, not every mouse click. */
+   navigation, not every mouse click. DESIGN.md `focus-ring`: `2px solid
+   {colors.accent}` — the pre-existing `--accent`-keyed convention at every
+   `:focus-visible` site in this file; no separate edit needed beyond the
+   `:root` value swap above (Boundaries & Constraints). */
 .code-map__node:focus-visible,
 .code-map__cluster:focus-visible {
   outline: 2px solid var(--accent);
@@ -802,14 +912,18 @@ code,
 }
 
 .code-map__node-kind {
-  font-size: 0.7rem;
+  font-size: 9.5px;
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--text-muted);
+  color: var(--text-mute);
 }
 
+/* A Node's own identifier — DESIGN.md `{typography.code}` (13px, 600
+   weight), the one role reserved for verbatim source-derived text. */
 .code-map__node-id {
-  font-size: 0.85rem;
+  font-size: 13px;
+  font-weight: 600;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
@@ -817,41 +931,58 @@ code,
 }
 
 /* Story 1.5 (Phase 2): one-line summary / pending / coverage-gap. Plain
-   prose (not monospace) — distinguishes generated/derived text from the
-   verbatim-from-source identifier above it. Clamped to two lines so a long
-   summary doesn't blow out the card's compact layout at a glance. */
+   prose (not monospace in the old placeholder system — DESIGN.md keeps
+   every piece of text, including this one, in the same monospace stack,
+   distinguished from the identifier above only by the `{typography.body}`
+   role's smaller size/weight, not by a different family). Clamped to two
+   lines so a long summary doesn't blow out the card's compact layout at a
+   glance. DESIGN.md Colors: "text-dim for summaries" — this is the real
+   generated-summary text; the pending/coverage-gap/notice variants below
+   each override this base color for their own distinct meaning (a
+   placeholder, or a signal with its own dedicated hue). */
 .code-map__node-summary {
   margin: 0.15rem 0 0;
-  font-size: 0.75rem;
-  line-height: 1.3;
-  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
+/* "Summary pending…" is a placeholder, not real summary content — DESIGN.md
+   Colors: "text-mute for placeholders, hints" — distinct from the real
+   generated-summary text's own `--text-dim` above. */
 .code-map__node-summary--pending {
+  color: var(--text-mute);
   font-style: italic;
 }
 
 /* Never color-only (Accessibility Floor): the "⚠" glyph and "Coverage gap"
-   text carry the signal on their own — the warning color is reinforcement,
-   not the only cue. Distinct from `.code-map__node-summary--pending`'s
-   plain muted italic so a coverage gap never reads as "just not generated
-   yet". */
+   text carry the signal on their own — the color is reinforcement, not the
+   only cue. Distinct from `.code-map__node-summary--pending`'s plain muted
+   italic so a coverage gap never reads as "just not generated yet".
+   DESIGN.md `coverage-gap-indicator.color`: `{colors.risk-red}` — the old
+   placeholder system used the same amber `--warning` here as it did for
+   every other "needs attention" state; DESIGN.md gives Coverage Gap its
+   own explicit, more severe red, distinct from Staleness's amber-family
+   `--stale-yellow` below (its own component's own "note" field is explicit
+   that the two must never share a treatment). */
 .code-map__node-summary--coverage-gap {
-  color: var(--warning);
+  color: var(--risk-red);
   font-style: normal;
 }
 
 /* Story 1.6 (Phase 2): the "no summary backend available"/"cloud selected,
    no key" Actionable Notices, rendered per-Node in place of the ordinary
-   pending state (CodeMap.tsx). Same "never color-only" treatment as
-   `--coverage-gap` above — the ☁/⚠ glyph and message text carry the signal
-   on their own. */
+   pending state (CodeMap.tsx). A generic backend/setup notice — amber, the
+   same "moderate concern" hue this file's other non-signal-family warnings
+   use (`.notice--warning`), not Coverage Gap's dedicated red or
+   Staleness's dedicated yellow, since this isn't either of those two named
+   signal families. */
 .code-map__node-summary--notice {
-  color: var(--warning);
+  color: var(--risk-amber);
   font-style: normal;
 }
 
@@ -864,17 +995,29 @@ code,
    coverage-gap/notice variants above do. Same "never color-only" treatment
    as `--coverage-gap`/`--notice`: the "⏳" glyph (distinct from Coverage
    Gap's/the Actionable Notices' "⚠") and the exact copy carry the signal on
-   their own — color is reinforcement, not the only cue. */
+   their own — color is reinforcement, not the only cue.
+   DESIGN.md `staleness-indicator.color`: `{colors.stale-yellow}` —
+   Staleness's own dedicated hue, exclusively (DESIGN.md: "the Staleness
+   Indicator exclusively"), not the generic amber other warnings share. */
 .code-map__node-staleness {
   margin: 0.15rem 0 0;
-  font-size: 0.75rem;
-  line-height: 1.3;
-  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--stale-yellow);
   font-style: normal;
 }
 
+/* DESIGN.md `canvas-edge`: `{colors.border-strong}` stroke, 1.5px width,
+   cubic-bezier path. `@xyflow/react` v12's default edge type (no `type` set
+   on the edge object, confirmed in `toFlowEdges`/`CodeMap.tsx`) is already
+   `BezierEdge` — curved paths need no CodeMap.tsx change, only this
+   restyle's own stroke/width. `code-map__edge--<kind>` (per-`CodeMapEdgeKind`
+   classes from `toFlowEdges`) intentionally has no per-kind color rule of
+   its own here — DESIGN.md draws no distinction between edge kinds, only
+   between plain/path-highlighted/changed-source, all below. */
 .code-map__edge {
-  stroke: var(--text-muted);
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
   cursor: pointer;
 }
 
@@ -891,12 +1034,13 @@ code,
 }
 
 .code-map__node-affordance {
-  padding: 0.1rem 0.4rem;
-  font-size: 0.65rem;
+  padding: 3px 8px;
+  font-size: 9.5px;
+  font-weight: 700;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-mute);
   cursor: pointer;
   line-height: 1.4;
   white-space: nowrap;
@@ -926,19 +1070,28 @@ code,
   flex-wrap: wrap;
 }
 
-/* Same compact-pill padding/border/font-size convention as
-   `.code-map__node-affordance` above — a chip, not a button, so no
-   hover/focus-visible states of its own. */
+/* DESIGN.md `badge` shared shell + `badge-risk-deterministic`: solid
+   `{colors.risk-amber}` fill, the AA-verified dark-ink `#241a04` (never
+   re-derived — Boundaries & Constraints), pill radius, `{typography.meta}`
+   size/weight. This is the one existing element that's a genuine, shipped
+   instance of one of DESIGN.md's five named badge families — the LLM-
+   judgment callout and ingested-findings list below it are deliberately
+   NOT restyled into this same solid-pill shape (see their own comments):
+   both are full-sentence/multi-row content that a compact badge pill can't
+   hold, a distinction this codebase's own prior review rounds already
+   established and this pass doesn't reverse (Never: no IA/behavior
+   changes). */
 .code-map__signal-chip {
   display: inline-flex;
   align-items: center;
   gap: 0.2rem;
-  padding: 0.1rem 0.4rem;
-  font-size: 0.65rem;
+  padding: 3px 8px;
+  font-size: 9.5px;
+  font-weight: 700;
   border-radius: 999px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-muted);
+  border: none;
+  background: var(--risk-amber);
+  color: #241a04;
   line-height: 1.4;
   white-space: nowrap;
 }
@@ -951,18 +1104,27 @@ code,
    icon + bare number) — per this story's own Boundaries & Constraints: "no
    shared visual language between the two families" (FR8/UX-DR7). Prose,
    not a short numeric value, so it wraps as a full-width block rather than
-   sitting inline in a chip row. */
+   sitting inline in a chip row.
+   DESIGN.md `badge-llm-judgment` specifies `{colors.llm-violet}` +
+   `fontStyle: italic` for this signal family — carried over onto this
+   callout's own dashed-block shape (border/text color + italic) rather
+   than forcing it into the compact solid-pill badge shell, for the same
+   "full sentence doesn't fit a pill" reasoning above; DESIGN.md's own
+   `badge` shell is one of several places a family's fill/ink/glyph can
+   land, not a mandate that every risk-signal element become a literal
+   pill. */
 .code-map__llm-judgment {
   display: flex;
   align-items: flex-start;
   gap: 0.3rem;
   margin: 0.15rem 0 0;
   padding: 0.25rem 0.45rem;
-  font-size: 0.7rem;
-  line-height: 1.35;
-  color: var(--text-muted);
-  border: 1px dashed var(--border);
-  border-radius: 6px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  font-style: italic;
+  color: var(--llm-violet);
+  border: 1px dashed var(--llm-violet);
+  border-radius: 0;
   background: transparent;
   /* Review round (patch): purely protective, no truncation/height policy —
      an unbroken long token in the model's response (e.g. a leaked
@@ -977,7 +1139,11 @@ code,
    dashed-single-sentence rules — a solid-border list block, one row per
    finding, per this story's own Boundaries & Constraints ("own visual
    treatment, never .code-map__signal-chip's classes, never llm-judgment's
-   callout classes"). */
+   callout classes"). DESIGN.md `badge-ingested-finding` shares
+   `badge-risk-deterministic`'s amber/dark-ink pair — carried onto this
+   list block's own border/accent color rather than the pill shell, same
+   "full multi-row content, not a chip" reasoning as the llm-judgment
+   callout above. */
 .code-map__ingested-findings {
   list-style: none;
   margin: 0.15rem 0 0;
@@ -985,8 +1151,8 @@ code,
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  border: 1px solid var(--risk-amber);
+  border-radius: 0;
   background: transparent;
 }
 
@@ -994,9 +1160,9 @@ code,
   display: flex;
   align-items: baseline;
   gap: 0.3rem;
-  font-size: 0.7rem;
-  line-height: 1.35;
-  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-mute);
   /* Same protective wrap `.code-map__llm-judgment` already applies to a
      model/tool-supplied sentence of unbounded length. */
   overflow-wrap: break-word;
@@ -1005,31 +1171,38 @@ code,
 /* Severity is real visible text, not color/icon alone (Accessibility
    Floor) — this uppercase/letter-spacing/bold treatment is a purely
    cosmetic emphasis on top of that text, never the sole carrier of the
-   distinction. */
+   distinction. `{typography.meta}` role — short label text, same as a
+   badge's own label. */
 .code-map__ingested-finding-severity {
   flex-shrink: 0;
   text-transform: uppercase;
-  font-weight: 600;
-  font-size: 0.6rem;
+  font-weight: 700;
+  font-size: 9.5px;
   letter-spacing: 0.03em;
   color: var(--text);
 }
 
 .code-map__ingested-finding-tool {
   flex-shrink: 0;
-  font-weight: 600;
+  font-weight: 700;
+  font-size: 9.5px;
   color: var(--text);
 }
 
 .code-map__ingested-findings-more {
-  font-size: 0.65rem;
-  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-mute);
 }
 
 /* Back/Forward traversal history toolbar (Story 1.4): lightweight chrome
    floated over the map, matching the source panel's close button and the
    Retry button's plain bordered style rather than introducing a new visual
-   language. */
+   language. DESIGN.md's `{colors.panel-alt}` (chrome: titlebar/tab-bar/
+   status-line/search-row) is this floated-toolbar family's own background
+   throughout this file, not `{colors.panel}` (Node cards/frames/tables) —
+   `.code-map__node`/the side-panel "frame" surfaces use `panel` instead,
+   see their own rules. */
 .code-map__history-toolbar {
   position: absolute;
   top: 0.75rem;
@@ -1041,12 +1214,12 @@ code,
 
 .code-map__history-toolbar button {
   padding: 0.4rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
-  font-size: 0.8rem;
+  font-size: 11px;
 }
 
 .code-map__history-toolbar button:hover:not(:disabled) {
@@ -1079,9 +1252,9 @@ code,
      distinct rows, not a single run-on control. */
   flex-direction: column;
   gap: 0.3rem;
-  background: var(--surface);
+  background: var(--panel-alt);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 0;
   padding: 0.4rem 0.6rem;
 }
 
@@ -1089,7 +1262,7 @@ code,
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: 0.8rem;
+  font-size: 11px;
   color: var(--text);
   cursor: pointer;
 }
@@ -1101,7 +1274,14 @@ code,
 
 /* LOD cluster card (Story 1.3 Phase 2, AD-2): a lightweight aggregate
    representation, deliberately less detailed than `.code-map__node` — it
-   stands in for real Nodes, not for a Node of its own. */
+   stands in for real Nodes, not for a Node of its own. Kept at its
+   existing `999px` pill radius (the spec's own "keep existing 999px usage"
+   rule) even though DESIGN.md has no distinct LOD-cluster component of its
+   own — `{colors.panel}` background (it's the closest thing to a "Node
+   card" this element has, standing in for a group of them), plain
+   `{colors.border}` (not `--border-strong` — that token is reserved for a
+   real Node's own edge per DESIGN.md's `node-card` component, and a
+   cluster explicitly isn't one). */
 .code-map__cluster {
   display: flex;
   flex-direction: column;
@@ -1111,10 +1291,10 @@ code,
   padding: 0.5rem 0.9rem;
   border-radius: 999px;
   border: 1px dashed var(--border);
-  background: var(--surface);
+  background: var(--panel);
   min-width: 72px;
   cursor: pointer;
-  color: var(--text-muted);
+  color: var(--text-mute);
 }
 
 .code-map__cluster:hover {
@@ -1123,13 +1303,14 @@ code,
 }
 
 .code-map__cluster-count {
-  font-size: 1rem;
+  font-size: 11px;
   font-weight: 600;
   color: var(--text);
 }
 
 .code-map__cluster-label {
-  font-size: 0.65rem;
+  font-size: 9.5px;
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -1149,28 +1330,32 @@ code,
 /* Story 4.1: Health Audit Mode's bucketed heatmap tint on collapsed LOD
    clusters (Design Notes: "a simple signal-count bucket ... via color-mix,
    reuses the existing --warning token, no new one" — same formula
-   `.notice--warning`/`.code-map__blast-radius-highlight` already use
-   elsewhere in this file). Never color-only (Accessibility Floor): the
-   count itself is also stated in words in the cluster's own `aria-label`
-   (see `CodeMapClusterCard`) — this tint is reinforcement only. Increasing
-   opacity per bucket (`1-2` low, `3-5` medium, `6+` high) keeps the
-   strongest concentrations visually distinguishable at a glance without a
-   new severity-weighting scheme.
+   `.notice--warning`/`.code-map__blast-radius-highlight` already used
+   elsewhere in this file, now `--risk-amber`, the generic-warning hue's own
+   new name; this shipped cluster tint is a different, already-live feature
+   from DESIGN.md's own new, still-deferred Health Audit cluster-card grid
+   layout — Never: "build the Health Audit cluster-card layout" is about
+   that new grid, not this existing collapsed-cluster tint). Never
+   color-only (Accessibility Floor): the count itself is also stated in
+   words in the cluster's own `aria-label` (see `CodeMapClusterCard`) — this
+   tint is reinforcement only. Increasing opacity per bucket (`1-2` low,
+   `3-5` medium, `6+` high) keeps the strongest concentrations visually
+   distinguishable at a glance without a new severity-weighting scheme.
    Review finding (Medium): `.notice--warning` — this codebase's only other
    precedent for a tint sitting behind readable text — caps at 15% opacity.
    Kept all three buckets within that established readability precedent
    (10%/20%/32%) rather than escalating past it, so the cluster's own
    count/label text stays legible even at the "high" bucket. */
 .code-map__cluster--risk-low {
-  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  background: color-mix(in srgb, var(--risk-amber) 10%, transparent);
 }
 
 .code-map__cluster--risk-medium {
-  background: color-mix(in srgb, var(--warning) 20%, transparent);
+  background: color-mix(in srgb, var(--risk-amber) 20%, transparent);
 }
 
 .code-map__cluster--risk-high {
-  background: color-mix(in srgb, var(--warning) 32%, transparent);
+  background: color-mix(in srgb, var(--risk-amber) 32%, transparent);
 }
 
 /* Story 1.9 (Phase 2): the Path Trace search toolbar + notice + step list —
@@ -1196,15 +1381,20 @@ code,
   gap: 0.5rem;
 }
 
+/* DESIGN.md `path-trace-search`: the "trace>" prompt is `{colors.accent}`
+   (JSX/placeholder copy, not this rule); `input-color` is
+   `{colors.text-mute}`. The input's own background follows this file's
+   "floated toolbar chrome = panel-alt" convention (see
+   `.code-map__history-toolbar` above). */
 .code-map__path-trace-input {
   flex: 1;
   min-width: 0;
   padding: 0.4rem 0.6rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 0.85rem;
+  background: var(--panel-alt);
+  color: var(--text-mute);
+  font-size: 11px;
 }
 
 .code-map__path-trace-input:focus-visible {
@@ -1219,12 +1409,12 @@ code,
 .code-map__path-trace-toolbar button {
   flex-shrink: 0;
   padding: 0.4rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
-  font-size: 0.8rem;
+  font-size: 11px;
 }
 
 .code-map__path-trace-toolbar button:hover:not(:disabled) {
@@ -1242,14 +1432,17 @@ code,
 }
 
 /* The step-list panel: same floated-chrome surface as the search toolbar
-   above (`var(--surface)`/`var(--border)`), capped in height with its own
-   scroll so a long path never grows past the visible map. */
+   above, but a result "frame" rather than a toolbar row — `{colors.panel}`,
+   matching DESIGN.md's `path-trace-stack-row.background` token directly
+   (the stack rows below are rendered inside this very panel), capped in
+   height with its own scroll so a long path never grows past the visible
+   map. */
 .code-map__path-trace-steps-panel {
   max-height: min(360px, calc(100vh - 8rem));
   overflow-y: auto;
-  border-radius: 8px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel);
   padding: 0.35rem;
 }
 
@@ -1262,19 +1455,24 @@ code,
   gap: 0.15rem;
 }
 
+/* Base row/button shape shared by the disambiguation candidate list below
+   (`.code-map__path-trace-candidate`) and the dismiss affordance's own
+   layout — the resolved `found`-path step list itself no longer uses this
+   class; see `.code-map__path-trace-stack-row` further below for its own
+   dense-profiler-sourced treatment (DESIGN.md `path-trace-stack-row`). */
 .code-map__path-trace-step {
   width: 100%;
   display: flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.35rem 0.5rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: none;
   background: transparent;
   color: var(--text);
   cursor: pointer;
   text-align: left;
-  font-size: 0.8rem;
+  font-size: 11px;
 }
 
 .code-map__path-trace-step:hover {
@@ -1292,7 +1490,52 @@ code,
   white-space: nowrap;
 }
 
-.code-map__path-trace-step-index {
+/* Story 1.9 (Phase 2, restyled this pass): DESIGN.md `path-trace-stack-row`
+   — dense-profiler's own indented call-stack visual (hop circle,
+   tree-indent glyph, identifier, module), restyled into this system's own
+   tokens, deliberately dropping dense-profiler's duration column (driller
+   never executes code — a duration figure here would be fabricated data,
+   per DESIGN.md's own note on this exact token and this app's Do's/Don'ts).
+   One row per traced hop, rendered as a real `<button>` (still
+   `navigateToNode`-wired, same as the old single-row treatment it
+   replaces) so keyboard/AT users get the same activation path as before —
+   only the visual composition inside it changed. `border-bottom` (not the
+   steps-panel's own already-bordered wrapper) is this row's own divider
+   between consecutive hops, per DESIGN.md's own field. */
+.code-map__path-trace-stack-row {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font-size: 11px;
+}
+
+.code-map__path-trace-steps li:last-child .code-map__path-trace-stack-row {
+  border-bottom: none;
+}
+
+.code-map__path-trace-stack-row:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.code-map__path-trace-stack-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* The hop circle — DESIGN.md `hop-circle-background`/`hop-circle-color`:
+   `{colors.trace-cyan}` fill, the AA-verified dark-ink pairing Path Trace's
+   own route/stack-row tokens share (`#04211f`), matching
+   `{components.path-trace-route}`'s own hop-pill pair exactly. */
+.code-map__path-trace-hop-circle {
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
@@ -1300,10 +1543,53 @@ code,
   width: 1.25rem;
   height: 1.25rem;
   border-radius: 999px;
-  background: var(--accent);
-  color: var(--accent-contrast);
-  font-size: 0.65rem;
+  background: var(--trace-cyan);
+  color: #04211f;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+/* The tree-indent glyph — DESIGN.md `indent-glyph`: "└─, {colors.text-mute}".
+   One glyph per row after the first hop (the entry point has nothing to
+   descend from); each subsequent row's own `margin-left` grows by one
+   `{spacing.2}` (8px) step so the list reads as a descending call stack,
+   not a flat run of identical connectors — dense-profiler's own resolved
+   visual (Design Notes), expressed here via the row's index rather than a
+   new persisted field. */
+.code-map__path-trace-indent {
+  flex-shrink: 0;
+  color: var(--text-mute);
+}
+
+.code-map__path-trace-stack-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  min-width: 0;
+}
+
+/* The traced identifier — DESIGN.md `name-color`: `{colors.text}`, in
+   `{typography.code}` (13px/600) since this is, same as every other Node
+   identifier in this app, "a Node's own identifier". */
+.code-map__path-trace-stack-row-name {
+  font-size: 13px;
   font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The module/file path — DESIGN.md `module-color`: `{colors.text-mute}`,
+   `{typography.meta}` (9.5px/700) — "module path lines" is that role's own
+   named use case. */
+.code-map__path-trace-stack-row-module {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Story 1.9 (Phase 3) — review fix: every candidate in one `ambiguous`
@@ -1318,24 +1604,31 @@ code,
   gap: 0.1rem;
 }
 
+/* A candidate's distinguishing file/location text — DESIGN.md Colors:
+   "text-dim for summaries and module paths" (no more specific override
+   exists for this element, unlike `path-trace-stack-row-module` below,
+   which DESIGN.md's own component field pins to `text-mute` instead). */
 .code-map__path-trace-candidate-location {
   width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.7rem;
-  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-dim);
 }
 
 /* Review fix: the render-layer cap on how many `ambiguous` candidates get
-   rendered (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`, CodeMap.tsx) — shown only
-   when the full candidate list is longer than what's rendered, so
-   truncation is explicit rather than silently dropping matches from view. */
+   rendered (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`, see its own doc comment
+   above) — shown only when the full candidate list is longer than what's
+   rendered, so truncation is explicit rather than silently dropping
+   matches from view. */
 .code-map__path-trace-candidates-truncated {
   margin: 0.35rem 0 0;
   padding: 0 0.15rem;
-  font-size: 0.7rem;
-  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-mute);
 }
 
 /* Story 1.9 (Phase 4): "Dismiss" — shown on `found`/`no-path-found`/
@@ -1354,12 +1647,12 @@ code,
 .code-map__path-trace-dismiss {
   align-self: flex-start;
   padding: 0.3rem 0.6rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text-muted);
+  background: var(--panel-alt);
+  color: var(--text-mute);
   cursor: pointer;
-  font-size: 0.75rem;
+  font-size: 11px;
 }
 
 /* Spacing for the two step-list-panel contexts (`ambiguous`/`found`), where
@@ -1414,11 +1707,11 @@ code,
   flex: 1;
   min-width: 0;
   padding: 0.4rem 0.6rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel-alt);
   color: var(--text);
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 .code-map__pr-review-input:focus-visible {
@@ -1433,12 +1726,12 @@ code,
 .code-map__pr-review-toolbar button {
   flex-shrink: 0;
   padding: 0.4rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
-  font-size: 0.8rem;
+  font-size: 11px;
 }
 
 .code-map__pr-review-toolbar button:hover:not(:disabled) {
@@ -1459,17 +1752,21 @@ code,
    loading status lines reusing this same class) — a compact status line,
    same muted-chrome-surface treatment as the toolbar itself rather than
    the full `.code-map__notice` (this is a success confirmation, not a
-   "needs attention" state). `overflow-wrap` (review finding, Blind
-   Hunter): a long resolved ref name (e.g. a long remote-tracking branch)
-   had no defined wrapping behavior inside this fixed-width container. */
+   "needs attention" state). DESIGN.md `sync-status`: footer/status-line
+   text, `{colors.text-mute}`, `{typography.ui}` — the closest named token
+   to this element's own role even though it isn't literally the footer
+   "Last synced" line DESIGN.md coins that component for. `overflow-wrap`
+   (review finding, Blind Hunter): a long resolved ref name (e.g. a long
+   remote-tracking branch) had no defined wrapping behavior inside this
+   fixed-width container. */
 .code-map__pr-review-resolved {
   margin: 0;
   padding: 0.3rem 0.6rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text-muted);
-  font-size: 0.75rem;
+  background: var(--panel-alt);
+  color: var(--text-mute);
+  font-size: 11px;
   text-align: center;
   overflow-wrap: break-word;
 }
@@ -1495,12 +1792,12 @@ code,
 
 .code-map__blast-radius-stepper-controls button {
   padding: 0.3rem 0.7rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
-  font-size: 0.85rem;
+  font-size: 11px;
   line-height: 1;
 }
 
@@ -1521,8 +1818,8 @@ code,
 .code-map__blast-radius-stepper-depth {
   min-width: 3.5rem;
   text-align: center;
-  color: var(--text-muted);
-  font-size: 0.75rem;
+  color: var(--text-mute);
+  font-size: 11px;
 }
 
 /* Story 3.2 (Phase 2): PR Review Mode's combined blast-radius highlight —
@@ -1531,44 +1828,47 @@ code,
    descendant-selector-over-the-existing-card pattern
    `.code-map__path-highlight .code-map__node` below already established.
    Never color-only (Accessibility Floor): a distinct border STYLE (dashed),
-   not a color swap alone. Deliberately reuses the existing `--accent` token
-   dimmed via `color-mix` rather than a new token (Design Notes: a full
-   visual-token overhaul targeting the terminal-native UX direction is
-   planned separately and will likely replace this whole palette — this
-   phase's styling budget is deliberately minimal). Set via non-shorthand
-   `border-style`/`border-width`/`border-color` properties, not the `border`
-   shorthand `.code-map__path-highlight .code-map__node` below uses (Design
-   Notes) — declared BEFORE that rule specifically so equal-specificity
-   source order lets path-highlight's later shorthand win the intersection
-   by default (see that rule's own comment for why), which is exactly the
-   "would otherwise reset it back to solid" the combined selector further
-   below exists to undo. */
+   not a color swap alone.
+   DESIGN.md `node-card-affected`: `border: 1px dashed {colors.accent-dim}`
+   — this pass gives it the real, dedicated token DESIGN.md defines
+   specifically for "affected" (the old placeholder system had no such hue
+   and dimmed `--accent` itself via `color-mix` instead, a stand-in this
+   same rule's own prior comment already flagged as provisional pending
+   "a full visual-token overhaul ... planned separately," i.e. this pass).
+   No glow/box-shadow (Elevation & Depth: "no soft shadow, no glow" — the
+   old ring here is dropped, not carried over, since DESIGN.md's own
+   `node-card-affected` field list has no `ring` entry the way
+   `node-card-changed` does). */
 .code-map__blast-radius-highlight .code-map__node {
   border-style: dashed;
-  border-width: 2px;
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  border-width: 1px;
+  border-color: var(--accent-dim);
 }
 
 /* A `found` path's own Node/edge highlight (Code Map: "no existing highlight
    mechanism to extend, this is new"). Never color-only (Accessibility
-   Floor): a thicker solid border + glow ring is a shape/weight cue on its
-   own, not just a color swap, and every highlighted Node also carries its
-   step number via the step list above. Applied as a `className` directly on
-   the `@xyflow/react` node wrapper (`renderedNodes`'s own `withHighlight`
-   helper, Story 3.2 Phase 2: renamed from `withPathHighlight` when it was
-   extended to also thread the blast-radius highlight above), which wraps
-   this file's own `.code-map__node` card — styled here as a descendant so
-   the existing card markup/component needs no change. Declared AFTER
+   Floor): a distinct border color from every other state, and every
+   highlighted Node also carries its step number via the step list above.
+   Applied as a `className` directly on the `@xyflow/react` node wrapper
+   (`renderedNodes`'s own `withHighlight` helper, Story 3.2 Phase 2: renamed
+   from `withPathHighlight` when it was extended to also thread the
+   blast-radius highlight above), which wraps this file's own
+   `.code-map__node` card — styled here as a descendant so the existing
+   card markup/component needs no change. Declared AFTER
    `.code-map__blast-radius-highlight .code-map__node` above (same
    specificity, 0,2,0, two classes each) so this rule's `border` shorthand
    wins the intersection by source order for a Node carrying both classes —
    `.code-map__path-highlight.code-map__blast-radius-highlight
    .code-map__node` further below re-asserts just `border-style` on top of
-   that outcome. */
+   that outcome.
+   DESIGN.md: `--accent` means "changed" and nothing else (Do's/Don'ts) —
+   "on a traced path" has no such reservation, so this border is
+   `--trace-cyan` (Path Trace's own dedicated hue, used "exclusively" for
+   its route/stack-row highlights per DESIGN.md's Colors section) instead
+   of the old placeholder system's accent reuse. No glow/box-shadow
+   (Elevation & Depth), same reasoning as the affected-ring rule above. */
 .code-map__path-highlight .code-map__node {
-  border: 2px solid var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+  border: 2px solid var(--trace-cyan);
 }
 
 /* Review finding (Blind Hunter): a Node that is both changed AND on a
@@ -1579,16 +1879,18 @@ code,
    of source order) — contradicting that rule's own comment claiming "both
    apply without conflict". This explicit combined-state selector
    (specificity 0,3,0, strictly higher than either rule alone) resolves the
-   intersection deliberately: the changed (warning) border wins, since "this
+   intersection deliberately: the changed (accent) border wins, since "this
    Node changed" is PR Review Mode's organizing fact (FR11) — the
-   path-highlight's own `box-shadow` above is a different property and is
-   untouched here, so a traced, changed Node still visibly carries both
-   signals. (A changed Node is never also blast-radius-highlighted — Story
-   3.2's own Boundaries & Constraints: seed Nodes are excluded from the
-   blast-radius set by construction — so no three-way changed/path/
-   blast-radius intersection can arise here.) */
+   path-highlight's own trace-cyan border above is superseded here, so a
+   traced, changed Node reads unambiguously as "changed" first (its step
+   number in the list above still marks it as on the route). (A changed
+   Node is never also blast-radius-highlighted — Story 3.2's own Boundaries
+   & Constraints: seed Nodes are excluded from the blast-radius set by
+   construction — so no three-way changed/path/blast-radius intersection
+   can arise here.) */
 .code-map__path-highlight .code-map__node--changed {
-  border: 2px solid var(--warning);
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 
 /* A Node that is both path-highlighted AND blast-radius-highlighted at once
@@ -1605,20 +1907,40 @@ code,
    would otherwise reset `border-style` back to `solid` for a doubly-
    highlighted Node. This one-line rule's higher specificity (0,3,0) re-
    asserts dashed on top regardless of order, leaving path-highlight's own
-   accent color/glow (a different property, `box-shadow`, plus its own
-   `border-color`) untouched — so a Node that is both traced and in the
-   blast radius still visibly carries both signals at once: path-highlight's
-   solid accent color/glow, with a dashed (not solid) outline. */
+   trace-cyan border-color untouched (a different, non-shorthand property
+   here) — so a Node that is both traced and in the blast radius still
+   visibly carries both signals at once: path-highlight's solid trace-cyan
+   color, with a dashed (not solid) outline. */
 .code-map__path-highlight.code-map__blast-radius-highlight .code-map__node {
   border-style: dashed;
 }
 
-/* The route's own consecutive-pair `CALLS` edges — thicker + solid accent
-   stroke, distinguishing a traced route from every other rendered edge (also
-   never color-only: the width change alone reads at a glance). */
+/* The route's own consecutive-pair `CALLS` edges. DESIGN.md
+   `path-trace-route`: `{colors.trace-cyan}` stroke, 2px width — Path
+   Trace's own dedicated hue (see the Node-highlight rule above), distinct
+   from `canvas-edge-highlighted`'s accent stroke below, which marks a
+   different thing (an edge leaving a changed Node, not a traced route —
+   DESIGN.md's own `canvas-edge-highlighted.note` is explicit the two never
+   share a treatment). Also never color-only: the width change alone reads
+   at a glance, and every highlighted Node also carries its step number. */
 .code-map__edge--path-highlight {
+  stroke: var(--trace-cyan);
+  stroke-width: 2;
+}
+
+/* DESIGN.md `canvas-edge-highlighted`: `{colors.accent}` stroke, 2px width
+   — "edges leading out of a changed Node in PR Review Mode." New this
+   pass: `renderedEdges`'s own edge-mapping memo (CodeMap.tsx) now threads
+   this class onto any edge whose `source` is in `changedNodeIds`, mirroring
+   how it already threads `--path-highlight` onto a traced route's own
+   edges just above. Mutually exclusive with `--path-highlight` in practice
+   (a `CALLS` edge on a traced route vs. any edge leaving a changed Node are
+   independent conditions checked in source order in that same memo — the
+   first match wins, since DESIGN.md's own two tokens are never meant to
+   layer on the same edge). */
+.code-map__edge--changed-source {
   stroke: var(--accent);
-  stroke-width: 3;
+  stroke-width: 2;
 }
 
 .code-map__cluster .react-flow__handle {
@@ -1647,7 +1969,7 @@ code,
 .code-map__source-panel {
   width: min(640px, 90vw);
   height: 100%;
-  background: var(--surface);
+  background: var(--panel);
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -1660,7 +1982,7 @@ code,
   justify-content: space-between;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
-  font-size: 0.85rem;
+  font-size: 11px;
 }
 
 /* Scoped to its own class (Story 1.10, Phase 2 fix) rather than a generic
@@ -1671,8 +1993,8 @@ code,
 .code-map__source-close {
   background: transparent;
   border: none;
-  color: var(--text-muted);
-  font-size: 1.25rem;
+  color: var(--text-mute);
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
 }
@@ -1690,14 +2012,14 @@ code,
 
 /* A labeled secondary action, distinct from the icon-only `×` close button
    immediately next to it (same header, same `button` selector above would
-   otherwise apply its icon-sized 1.25rem/transparent styling here too). */
+   otherwise apply its icon-sized styling here too). */
 .code-map__source-open-in-editor {
   padding: 0.35rem 0.75rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
-  font-size: 0.8rem;
+  font-size: 11px;
   line-height: 1.2;
   cursor: pointer;
 }
@@ -1714,39 +2036,42 @@ code,
 
 .code-map__source-error {
   padding: 1rem;
-  color: var(--error);
+  color: var(--risk-red);
+  font-size: 10.5px;
+  line-height: 1.45;
 }
 
 .code-map__source-content {
   margin: 0;
   padding: 1rem;
   overflow: auto;
-  font-size: 0.85rem;
+  font-size: 13px;
+  font-weight: 600;
   line-height: 1.5;
 }
 
 /* Story 1.8 (Phase 4): the "Details" affordance — same base look as the
    caller/callee affordances (`.code-map__node-affordance`), reinforced with
-   the staleness signal's own warning tint (never color-only on its own —
-   the "Details" text label carries the meaning; the tint is reinforcement),
-   matching `.code-map__node-staleness`'s color for the entry point into the
-   exact overlay that shows that same staleness note. */
+   the staleness signal's own `--stale-yellow` tint (never color-only on its
+   own — the "Details" text label carries the meaning; the tint is
+   reinforcement), matching `.code-map__node-staleness`'s color for the
+   entry point into the exact overlay that shows that same staleness note. */
 .code-map__node-affordance--details {
-  border-color: var(--warning);
-  color: var(--warning);
+  border-color: var(--stale-yellow);
+  color: var(--stale-yellow);
 }
 
 /* Review round 2 fix: the base rule above already sets border/color to
-   `--warning`, so a hover rule repeating those same two values gave no
-   visible feedback at all. A background fill on hover (same
-   `color-mix(in srgb, var(--warning) N%, transparent)` formula
-   `.notice--warning` already uses elsewhere in this file) keeps the
-   warning-tinted identity while still giving real, visible hover feedback,
-   distinct from every other affordance's own (accent-colored) hover. */
+   the staleness hue, so a hover rule repeating those same two values gave
+   no visible feedback at all. A background fill on hover (same
+   `color-mix(in srgb, <hue> N%, transparent)` formula `.notice--warning`
+   already uses elsewhere in this file) keeps the warning-tinted identity
+   while still giving real, visible hover feedback, distinct from every
+   other affordance's own (accent-colored) hover. */
 .code-map__node-affordance--details:hover {
-  border-color: var(--warning);
-  background: color-mix(in srgb, var(--warning) 18%, transparent);
-  color: var(--warning);
+  border-color: var(--stale-yellow);
+  background: color-mix(in srgb, var(--stale-yellow) 18%, transparent);
+  color: var(--stale-yellow);
 }
 
 /* The Node Detail panel (Story 1.8, Phase 4): a right-docked overlay
@@ -1766,7 +2091,7 @@ code,
 .code-map__node-detail-panel {
   width: min(420px, 90vw);
   height: 100%;
-  background: var(--surface);
+  background: var(--panel);
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -1780,10 +2105,12 @@ code,
   gap: 0.5rem;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
-  font-size: 0.9rem;
+  font-size: 11px;
 }
 
 .code-map__node-detail-header code {
+  font-size: 13px;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1792,8 +2119,8 @@ code,
 .code-map__node-detail-header button {
   background: transparent;
   border: none;
-  color: var(--text-muted);
-  font-size: 1.25rem;
+  color: var(--text-mute);
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
   flex-shrink: 0;
@@ -1807,17 +2134,27 @@ code,
   overflow-y: auto;
 }
 
+/* The file/line location — DESIGN.md's own "module path lines" use case
+   for `{typography.meta}` sizing, and Colors' "text-dim for ... module
+   paths" for color. */
 .code-map__node-detail-location {
   margin: 0;
-  font-size: 0.8rem;
-  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-dim);
 }
 
+/* DESIGN.md Colors: "text-dim for summaries" — this is the same real
+   generated-summary text `.code-map__node-summary` shows inline on the
+   card itself, just expanded here; both now share the one color DESIGN.md
+   assigns that content, in place of the old system's inconsistent
+   per-surface choice (inline card: muted gray; this detail panel: full
+   `--text`). */
 .code-map__node-detail-summary {
   margin: 0;
-  font-size: 0.9rem;
-  line-height: 1.4;
-  color: var(--text);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
 }
 
 /* Mirrors `.settings-panel__save`'s primary-action styling (Settings.tsx —
@@ -1826,11 +2163,12 @@ code,
 .code-map__node-detail-regenerate {
   align-self: flex-start;
   padding: 0.5rem 1rem;
-  border-radius: 6px;
+  border-radius: 0;
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: var(--accent-contrast);
+  color: var(--bg);
   font-weight: 600;
+  font-size: 11px;
   cursor: pointer;
 }
 
