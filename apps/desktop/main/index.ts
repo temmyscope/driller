@@ -50,6 +50,7 @@ import {
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type LlmJudgmentProgressMessage,
+  type McpServerStatusMessage,
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
@@ -368,6 +369,17 @@ function sendHardwareAdvisory(message: HardwareAdvisoryMessage): void {
 }
 
 /**
+ * Relays the MCP listener's own bind/error status (Story 5.2) to the
+ * renderer — same destroyed-webContents guard and "own channel" pattern as
+ * `sendModelStatus`/`sendHardwareAdvisory`.
+ */
+function sendMcpServerStatus(message: McpServerStatusMessage): void {
+  if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(IpcChannels.mcpServerStatus, message);
+  }
+}
+
+/**
  * True for a `graphService:codeMap`/`graphService:codeMapError` reply —
  * distinguished from a `GraphServiceStatusMessage` by `type` rather than
  * `state`, per `ipc-contracts`'s doc comment on `GraphServiceCodeMapMessage`.
@@ -492,6 +504,18 @@ function isHardwareAdvisoryMessage(message: unknown): message is HardwareAdvisor
     return false;
   }
   return (message as { type?: unknown }).type === 'graphService:hardwareAdvisory';
+}
+
+/**
+ * True for a `graphService:mcpServerStatus` post (Story 5.2) — distinguished
+ * from the other message shapes on this same `parentPort` channel by `type`,
+ * same convention as `isHardwareAdvisoryMessage`/`isModelStatusMessage`.
+ */
+function isMcpServerStatusMessage(message: unknown): message is McpServerStatusMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (message as { type?: unknown }).type === 'graphService:mcpServerStatus';
 }
 
 /**
@@ -748,7 +772,8 @@ function spawnGraphService(): void {
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
-        | HardwareAdvisoryMessage,
+        | HardwareAdvisoryMessage
+        | McpServerStatusMessage,
     ) => {
       if (isCodeMapMessage(message)) {
         settlePendingCodeMapRequest(
@@ -792,6 +817,10 @@ function spawnGraphService(): void {
       }
       if (isHardwareAdvisoryMessage(message)) {
         sendHardwareAdvisory(message);
+        return;
+      }
+      if (isMcpServerStatusMessage(message)) {
+        sendMcpServerStatus(message);
         return;
       }
       sendGraphServiceStatus(message);
@@ -1673,19 +1702,48 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(IpcChannels.projectListRecent, () => listRecentProjects());
 
-  ipcMain.handle(IpcChannels.graphServiceRestart, () => {
-    spawnGraphService();
-    // spawnGraphService's fork() + catch above run synchronously, so
-    // `graphService` already reflects whether the spawn actually succeeded.
-    if (graphService && currentProjectPath) {
-      // Covers both a fresh respawn (the subprocess itself died) and a
-      // still-alive subprocess whose indexing MCP call errored (spawn's own
-      // guard no-ops in that case) — either way, Retry re-attempts indexing
-      // rather than leaving the project un-indexed with no further signal.
-      sendIndexRequest(currentProjectPath);
-    }
-    return { ok: graphService !== null };
-  });
+  ipcMain.handle(
+    IpcChannels.graphServiceRestart,
+    (_event, forceRespawn: unknown): Promise<{ ok: boolean }> => {
+      const respawnAndReindex = (): { ok: boolean } => {
+        spawnGraphService();
+        // spawnGraphService's fork() + catch above run synchronously, so
+        // `graphService` already reflects whether the spawn actually succeeded.
+        if (graphService && currentProjectPath) {
+          // Covers both a fresh respawn (the subprocess itself died) and a
+          // still-alive subprocess whose indexing MCP call errored (spawn's
+          // own guard no-ops in that case) — either way, Retry re-attempts
+          // indexing rather than leaving the project un-indexed with no
+          // further signal.
+          sendIndexRequest(currentProjectPath);
+        }
+        return { ok: graphService !== null };
+      };
+
+      if (forceRespawn === true) {
+        // Story 5.2 (review finding, Critical): `spawnGraphService`'s own
+        // `if (graphService) return;` guard means the default behavior above
+        // is a no-op whenever the subprocess is still alive — exactly the
+        // case for an `'unavailable'` McpServerStatusMessage, which is by
+        // construction posted FROM a subprocess that's still alive when it
+        // posts (the MCP listener is just a sub-component of an otherwise-
+        // healthy process). `forceRespawn: true` tears the current
+        // subprocess down first via `teardownGraphService`, whose callback
+        // only fires once the old subprocess has actually exited (or was
+        // never running) — awaited here, not raced against an immediate
+        // `spawnGraphService()` call, so the old process actually releases
+        // the MCP port before the new one tries to bind it (respawning
+        // first would just trade one `EADDRINUSE` for another).
+        return new Promise((resolve) => {
+          teardownGraphService(() => {
+            resolve(respawnAndReindex());
+          });
+        });
+      }
+
+      return Promise.resolve(respawnAndReindex());
+    },
+  );
 
   ipcMain.handle(IpcChannels.codeMapGet, (): Promise<CodeMapResult> => requestCodeMap());
 

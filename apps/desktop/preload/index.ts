@@ -21,6 +21,7 @@ import {
   type GraphServiceStatusMessage,
   type HardwareAdvisoryMessage,
   type LlmJudgmentProgressMessage,
+  type McpServerStatusMessage,
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
@@ -45,8 +46,8 @@ const drillerApi: DrillerApi = {
   listRecentProjects: (): Promise<RecentProject[]> =>
     ipcRenderer.invoke(IpcChannels.projectListRecent),
 
-  restartGraphService: (): Promise<{ ok: boolean }> =>
-    ipcRenderer.invoke(IpcChannels.graphServiceRestart),
+  restartGraphService: (forceRespawn?: boolean): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke(IpcChannels.graphServiceRestart, forceRespawn),
 
   onGraphServiceStatus: (callback: (status: GraphServiceStatusMessage) => void) => {
     const listener = (_event: IpcRendererEvent, status: GraphServiceStatusMessage) =>
@@ -89,6 +90,14 @@ const drillerApi: DrillerApi = {
     ipcRenderer.on(IpcChannels.hardwareAdvisory, listener);
     return () => {
       ipcRenderer.removeListener(IpcChannels.hardwareAdvisory, listener);
+    };
+  },
+
+  onMcpServerStatus: (callback: (message: McpServerStatusMessage) => void) => {
+    const listener = (_event: IpcRendererEvent, message: McpServerStatusMessage) => callback(message);
+    ipcRenderer.on(IpcChannels.mcpServerStatus, listener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.mcpServerStatus, listener);
     };
   },
 

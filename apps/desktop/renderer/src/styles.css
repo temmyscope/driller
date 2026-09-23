@@ -545,6 +545,39 @@ code,
 }
 
 /*
+ * Story 5.2: the MCP listener's own degraded-state notice — mirrors
+ * `.model-status`'s layout (its own separate footer row, not sharing the
+ * class), rendered only for the `'unavailable'` case (App.tsx's own doc
+ * comment on this element explains why there's no happy-path counterpart).
+ */
+.mcp-server-status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+/*
+ * Review finding (Low): deliberately plain text, not `.badge` — `.badge` is
+ * a pill (`border-radius: 999px`) sized for a short single-line label like
+ * "Graph Service running," not a variable-length full sentence, which would
+ * wrap awkwardly inside a pill shape.
+ */
+.mcp-server-status__message {
+  color: var(--error);
+}
+
+.mcp-server-status__retry {
+  padding: 0.25rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+/*
  * Story 1.5 (Phase 3): the hardware-adequacy advisory — a real
  * Actionable-Notice-shaped element (icon+text, never color-only), near the
  * model-status indicator above. Deliberately its own footer row, same
@@ -637,6 +670,10 @@ code,
 }
 
 .app--map .model-status {
+  padding: 0 1.5rem 0.5rem;
+}
+
+.app--map .mcp-server-status {
   padding: 0 1.5rem 0.5rem;
 }
 

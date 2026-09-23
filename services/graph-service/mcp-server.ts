@@ -61,7 +61,7 @@ import {
   WebStandardStreamableHTTPServerTransport,
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import type { CodeMapNode } from '@driller/ipc-contracts';
+import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts';
 import {
   computeBlastRadiusExpansionResult,
   computeDiffScopeResult,
@@ -225,12 +225,30 @@ function jsonToolResult(result: unknown): { content: [{ type: 'text'; text: stri
  * where the HTTP listener could accept a connection before the transport
  * was actually attached.
  *
+ * `postMcpServerStatus` (Story 5.2) is called exactly once from the listener's
+ * own bind/error paths: `{state: 'listening', port}` from `httpServer.listen`'s
+ * successful-bind callback, `{state: 'unavailable', message}` from
+ * `httpServer.on('error', ...)`. This is the one gap Story 5.1 left: the
+ * Graph Service subprocess itself can stay `'alive'`/`'indexed'` while this
+ * listener silently fails to bind or crashes — before this, nothing told main
+ * or the renderer. Deliberately not posted from `server.connect(transport)`'s
+ * own `.catch()` above (Boundaries & Constraints, spec-5-2's Code Map): that
+ * failure already logs to console and leaves the listener never started,
+ * which the absence of any `'listening'` post already makes silently
+ * incomplete rather than falsely healthy — but it's a distinct, rarer failure
+ * mode (SDK/transport construction, not a bind/error the socket itself
+ * reports) that the spec scopes this new signal to the listener's own two
+ * existing event paths, not a third call site.
+ *
  * Returns a close function (review round 1, Medium) — `index.ts`'s
  * `finishShutdown` calls it so this listener is released on a clean
  * subprocess shutdown, the same resource-release discipline
  * `disposeModelContext` already established for this file.
  */
-export function startMcpServer(getActiveCodeMapNodes: () => CodeMapNode[] | undefined): () => Promise<void> {
+export function startMcpServer(
+  getActiveCodeMapNodes: () => CodeMapNode[] | undefined,
+  postMcpServerStatus: (message: McpServerStatusMessage) => void,
+): () => Promise<void> {
   // Phase 1 shipped '1.0.0' as the documented v1 contract covering
   // `lookup_node` alone. Phase 2 bumps the MINOR version (semver:
   // backward-compatible addition, no existing tool's shape changed) to
@@ -383,13 +401,33 @@ export function startMcpServer(getActiveCodeMapNodes: () => CodeMapNode[] | unde
   httpServer.timeout = SOCKET_IDLE_TIMEOUT_MS;
 
   httpServer.on('error', (error: NodeJS.ErrnoException) => {
+    // Console logging stays separate from the posted UI message (review
+    // finding, Low): a developer reading this log wants the full technical
+    // detail (and, for the generic branch, the original `Error` object with
+    // its stack trace) — the UI message is deliberately shorter, clean,
+    // non-redundant copy (review finding, Low: the earlier version restated
+    // "unavailable" inside a message already shown after an "unavailable:"
+    // prefix, and referenced "this instance," which doesn't read as
+    // end-user copy).
     if (error.code === 'EADDRINUSE') {
       console.error(
         `[mcp-server] port ${MCP_SERVER_PORT} is already in use — likely a second driller instance already running. The Agent-Facing Query Surface will not be available in this instance.`,
       );
+      postMcpServerStatus({
+        type: 'graphService:mcpServerStatus',
+        state: 'unavailable',
+        message: `Port ${MCP_SERVER_PORT} may already be in use by another driller window. Retry will restart driller's background service.`,
+        at: new Date().toISOString(),
+      });
       return;
     }
     console.error('[mcp-server] failed to start the Agent-Facing Query Surface:', error);
+    postMcpServerStatus({
+      type: 'graphService:mcpServerStatus',
+      state: 'unavailable',
+      message: `driller's background service failed to start this surface: ${error.message}. Retry will restart it.`,
+      at: new Date().toISOString(),
+    });
   });
 
   server
@@ -401,6 +439,12 @@ export function startMcpServer(getActiveCodeMapNodes: () => CodeMapNode[] | unde
       // default without it varies by platform and can bind all interfaces.
       httpServer.listen(MCP_SERVER_PORT, '127.0.0.1', () => {
         console.log(`[mcp-server] Agent-Facing Query Surface listening on 127.0.0.1:${MCP_SERVER_PORT}`);
+        postMcpServerStatus({
+          type: 'graphService:mcpServerStatus',
+          state: 'listening',
+          port: MCP_SERVER_PORT,
+          at: new Date().toISOString(),
+        });
       });
     })
     .catch((error: unknown) => {

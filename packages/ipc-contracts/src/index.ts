@@ -744,6 +744,38 @@ export interface HardwareAdvisoryMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Story 5.2: MCP listener bind/error status (epic-5-context.md; spec-5-2).
+//
+// A message stream distinct from `GraphServiceStatusMessage` even though the
+// subprocess it's posted from is the same one — own `type`, same
+// disambiguation convention `HardwareAdvisoryMessage`/`ModelStatusMessage`
+// already established. Never folded into `GraphServiceStatusMessage`'s own
+// union: the Graph Service subprocess can be genuinely `'alive'`/`'indexed'`
+// while only its MCP sub-component (services/graph-service/mcp-server.ts's
+// own HTTP listener) has failed to bind or errored — conflating the two
+// would misrepresent overall subprocess health.
+//
+// Explicit and enumerated (AD-13's broader pattern): never
+// null/undefined standing in for "no signal yet." `'listening'` is posted
+// once, from the listener's own successful-bind path, so there's a positive
+// confirmation the whole mechanism is actually wired up — not just an
+// absence of an `'unavailable'` post, which could equally mean "never
+// checked." `'unavailable'` is posted from the listener's own `error` event
+// (e.g. `EADDRINUSE`), independent of the Graph Service subprocess's own
+// lifecycle staying healthy.
+//
+// `at: string` on every variant (review finding, Medium) — the two sibling
+// status streams this one is closest to in shape, `GraphServiceStatusMessage`
+// and `ModelStatusMessage`, both carry a timestamp on every variant so
+// main/the renderer can tell how stale a currently-held status is; this one
+// shouldn't be the exception.
+// ---------------------------------------------------------------------------
+
+export type McpServerStatusMessage =
+  | { type: 'graphService:mcpServerStatus'; state: 'listening'; port: number; at: string }
+  | { type: 'graphService:mcpServerStatus'; state: 'unavailable'; message: string; at: string };
+
+// ---------------------------------------------------------------------------
 // Story 1.6 (Phase 1): cloud API key storage (FR6, AD-4).
 //
 // driller's first Settings UI surface and its first `safeStorage`
@@ -1250,6 +1282,7 @@ export const IpcChannels = {
   summaryProgress: 'summary:progress',
   llmJudgmentProgress: 'llmJudgment:progress',
   hardwareAdvisory: 'hardware:advisory',
+  mcpServerStatus: 'mcp:status',
   settingsGetBackendConfig: 'settings:getBackendConfig',
   settingsSetActiveBackend: 'settings:setActiveBackend',
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
@@ -1279,8 +1312,24 @@ export interface DrillerApi {
   openRecentProject: (path: string) => Promise<ProjectOpenResult>;
   /** Lists persisted recent projects, most-recently-opened first. */
   listRecentProjects: () => Promise<RecentProject[]>;
-  /** Manually retries spawning the Graph Service after it failed to start. */
-  restartGraphService: () => Promise<{ ok: boolean }>;
+  /**
+   * Manually retries spawning the Graph Service after it failed to start.
+   * With `forceRespawn` omitted/falsy, the existing behavior is unchanged:
+   * a no-op respawn (just a fresh index request) if the subprocess is
+   * already alive, since the two existing Retry buttons
+   * (`graphServiceStatus`'s own error state, `modelStatus`'s error state)
+   * both rely on that semantics for their own failure modes, which never
+   * require killing a still-alive subprocess.
+   *
+   * `forceRespawn: true` (Story 5.2, review finding, Critical) tears the
+   * current subprocess down and spawns a fresh one even if it's alive —
+   * needed specifically for the MCP listener's own Retry: an `'unavailable'`
+   * `McpServerStatusMessage` is, by construction, posted FROM a subprocess
+   * that is still alive when it posts (the listener is a sub-component of an
+   * otherwise-healthy process), so the no-op-if-alive default would silently
+   * do nothing for exactly the case this Retry button exists for.
+   */
+  restartGraphService: (forceRespawn?: boolean) => Promise<{ ok: boolean }>;
   /** Subscribes to Graph Service status changes; returns an unsubscribe function. */
   onGraphServiceStatus: (
     callback: (status: GraphServiceStatusMessage) => void,
@@ -1313,6 +1362,16 @@ export interface DrillerApi {
    * `onSummaryProgress`. Returns an unsubscribe function.
    */
   onHardwareAdvisory: (callback: (message: HardwareAdvisoryMessage) => void) => () => void;
+  /**
+   * Subscribes to the MCP listener's own bind/error status stream (Story
+   * 5.2) — a signal distinct from `onGraphServiceStatus`, since the Graph
+   * Service subprocess can be genuinely `'alive'`/`'indexed'` while only its
+   * MCP sub-component has failed to bind. Not project-scoped (mirrors
+   * `onModelStatus`, not `onGraphServiceStatus`): the listener is bound once
+   * per subprocess lifetime, independent of which project is open. Returns
+   * an unsubscribe function.
+   */
+  onMcpServerStatus: (callback: (message: McpServerStatusMessage) => void) => () => void;
   /**
    * Fetches the Code Map (Nodes + call/dependency edges) for the most
    * recently `indexed` project. Called once per successful `indexed` state

@@ -4,6 +4,7 @@ import type {
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   IndexCoverageSummary,
+  McpServerStatusMessage,
   ModelStatusMessage,
   PrBotId,
   PrBotIngestionResult,
@@ -56,6 +57,13 @@ export function App() {
   // way graphServiceStatus is: there's exactly one local model per
   // installation, not one per project.
   const [modelStatus, setModelStatus] = useState<ModelStatusMessage | null>(null);
+  // The MCP listener's own bind/error status (Story 5.2) — like modelStatus,
+  // not project-scoped: the listener binds once per subprocess lifetime,
+  // independent of which project is open, so this isn't reset on project
+  // open the way `hardwareAdvisories` is. `null` until the first post
+  // arrives (no footer renders until then; see the render below, which only
+  // ever shows a notice for the degraded `'unavailable'` case).
+  const [mcpServerStatus, setMcpServerStatus] = useState<McpServerStatusMessage | null>(null);
   // Story 1.6 (Phase 2): the backend config (already used by Settings) —
   // fetched once here too so App.tsx can derive the two new Actionable
   // Notice conditions (`noSummaryBackendAvailable`/`cloudSelectedNoKey`,
@@ -171,6 +179,13 @@ export function App() {
   useEffect(() => {
     const unsubscribe = window.driller.onModelStatus((status) => {
       setModelStatus(status);
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = window.driller.onMcpServerStatus((message) => {
+      setMcpServerStatus(message);
     });
     return unsubscribe;
   }, []);
@@ -353,6 +368,27 @@ export function App() {
     // the current project, if/when the condition is still actually true.
     setHardwareAdvisories(new Set());
     window.driller.restartGraphService().catch(reportUnexpectedError);
+  }, [reportUnexpectedError]);
+
+  /**
+   * The MCP-status footer's own Retry handler (Story 5.2, review finding,
+   * Critical) — deliberately NOT `handleRetryGraphService` above. That
+   * handler's default `restartGraphService()` call no-ops whenever the
+   * subprocess is still alive (`spawnGraphService`'s own guard), which it
+   * always is at the moment an `'unavailable'` McpServerStatusMessage is
+   * shown: the MCP listener is just a sub-component of an otherwise-healthy
+   * subprocess, so that status is, by construction, posted from a subprocess
+   * that hasn't died. `restartGraphService(true)` forces an actual respawn
+   * instead. Clears `mcpServerStatus` immediately (mirrors
+   * `handleRetryGraphService`'s own `setHardwareAdvisories(new Set())`
+   * clear-before-retry, for the identical reason: a stale banner from the
+   * pre-restart subprocess must not linger on screen through it) — the fresh
+   * subprocess posts its own status once its own listener bind/error path
+   * runs again.
+   */
+  const handleRetryMcpServer = useCallback(() => {
+    setMcpServerStatus(null);
+    window.driller.restartGraphService(true).catch(reportUnexpectedError);
   }, [reportUnexpectedError]);
 
   // Review finding (Edge Case Hunter, major): Settings' own request-id-ref
@@ -599,6 +635,28 @@ export function App() {
               Retry
             </button>
           )}
+        </footer>
+      )}
+
+      {/* Story 5.2: the MCP listener's own bind/error notice — minimal and
+          rendered ONLY in the degraded `'unavailable'` case (Boundaries &
+          Constraints: no happy-path "Agent surface OK" badge; the human
+          doesn't need a permanent indicator for a healthy background
+          surface). Its own `handleRetryMcpServer` (review finding, Critical
+          — NOT `handleRetryGraphService`, whose default no-op-if-alive
+          behavior would do nothing here) forces an actual subprocess
+          respawn via `restartGraphService(true)`. A plain-text message, not
+          `.badge` (review finding, Low): that class is a pill sized for
+          short single-line labels, and this notice's message is a
+          variable-length sentence that would wrap awkwardly inside one. */}
+      {mcpServerStatus && mcpServerStatus.state === 'unavailable' && (
+        <footer className="mcp-server-status" role="status">
+          <span className="mcp-server-status__message">
+            Agent-Facing Query Surface unavailable: {mcpServerStatus.message}
+          </span>
+          <button type="button" className="mcp-server-status__retry" onClick={handleRetryMcpServer}>
+            Retry
+          </button>
         </footer>
       )}
 

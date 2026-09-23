@@ -154,6 +154,7 @@ import type {
   HardwareAdvisoryReason,
   IndexCoverageSummary,
   LlmJudgmentProgressMessage,
+  McpServerStatusMessage,
   ModelStatusMessage,
   PrBotId,
   PrBotIngestionResult,
@@ -450,9 +451,25 @@ initNodeRecordStore(userDataPath);
 // shutdown (review round 1, Medium).
 let closeMcpServer: (() => Promise<void>) | undefined;
 try {
-  closeMcpServer = startMcpServer(() => activeCodeMapNodes);
+  closeMcpServer = startMcpServer(() => activeCodeMapNodes, postMcpServerStatus);
 } catch (error) {
   console.error('[graph-service] failed to start the Agent-Facing Query Surface (mcp-server.ts):', error);
+  // Review finding (Medium): a synchronous construction-time throw (a
+  // malformed tool registration, transport construction failure) is itself
+  // exactly the kind of "listener never came up" failure Story 5.2 exists to
+  // make visible — logging alone here would leave it invisible to main/the
+  // renderer, defeating the story's own purpose. `mcp-server.ts`'s own
+  // `httpServer.on('error', ...)`/`listen(...)` callback posts never run in
+  // this case (construction failed before either was reached), so this is
+  // the only point that can post an explicit status for it.
+  postMcpServerStatus({
+    type: 'graphService:mcpServerStatus',
+    state: 'unavailable',
+    message: `driller's background service failed to start the Agent-Facing Query Surface: ${
+      error instanceof Error ? error.message : String(error)
+    }. Retry will restart it.`,
+    at: new Date().toISOString(),
+  });
 }
 
 // Memoizes the local-model download/verify attempt for this subprocess's
@@ -571,6 +588,19 @@ function postHardwareAdvisory(reason: HardwareAdvisoryReason): void {
     type: 'graphService:hardwareAdvisory',
     reason,
   } satisfies HardwareAdvisoryMessage);
+}
+
+/**
+ * Posts a `graphService:mcpServerStatus` message (Story 5.2) — own
+ * `type`/channel, same disambiguation convention as `postHardwareAdvisory`/
+ * `postModelStatus`. Passed into `startMcpServer` below as a callback (rather
+ * than that module posting over `parentPort` directly) so `mcp-server.ts`
+ * stays free of any direct `process.parentPort` dependency of its own, the
+ * same separation `startMcpServer`'s `getActiveCodeMapNodes` getter parameter
+ * already establishes for reading this module's state.
+ */
+function postMcpServerStatus(message: McpServerStatusMessage): void {
+  process.parentPort?.postMessage(message);
 }
 
 /**
