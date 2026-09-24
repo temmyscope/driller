@@ -121,8 +121,18 @@ export type NodeLookupResult =
  * Mirrors `computeBlastRadiusExpansionResult`'s established guard verbatim
  * (same message) rather than inventing a new phrasing for the same
  * "no project has finished indexing yet" condition (I/O & Edge-Case Matrix).
+ *
+ * P0-4: `deriveLive` is applied to the found Node only — `index.ts` injects
+ * `live-node.ts`'s `deriveLiveNode`, so the cached fetch-time snapshot's
+ * summary/staleness and record-backed signals are re-derived from the live
+ * record store at query time. The not-found/error paths are unchanged; a
+ * throw from `deriveLive` becomes an explicit `{status: 'error'}`.
  */
-export function lookupNode(nodeId: string, nodes: CodeMapNode[] | undefined): NodeLookupResult {
+export function lookupNode(
+  nodeId: string,
+  nodes: CodeMapNode[] | undefined,
+  deriveLive: (cached: CodeMapNode) => CodeMapNode,
+): NodeLookupResult {
   if (!nodes) {
     return { status: 'error', message: 'No project has finished indexing yet.' };
   }
@@ -130,7 +140,17 @@ export function lookupNode(nodeId: string, nodes: CodeMapNode[] | undefined): No
   if (!node) {
     return { status: 'not-found' };
   }
-  return { status: 'ok', node };
+  // A throw while re-deriving (e.g. a record-store read failing) must still
+  // come back as this tool's own explicit error state, never a rejected
+  // tool call (AD-13).
+  try {
+    return { status: 'ok', node: deriveLive(node) };
+  } catch (error) {
+    return {
+      status: 'error',
+      message: `Failed to read this Node's current state: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 /**
@@ -248,6 +268,7 @@ function jsonToolResult(result: unknown): { content: [{ type: 'text'; text: stri
 export function startMcpServer(
   getActiveCodeMapNodes: () => CodeMapNode[] | undefined,
   postMcpServerStatus: (message: McpServerStatusMessage) => void,
+  deriveLiveNode: (cached: CodeMapNode) => CodeMapNode,
 ): () => Promise<void> {
   // Phase 1 shipped '1.0.0' as the documented v1 contract covering
   // `lookup_node` alone. Phase 2 bumps the MINOR version (semver:
@@ -266,7 +287,7 @@ export function startMcpServer(
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),
     },
-    async ({ nodeId }) => jsonToolResult(lookupNode(nodeId, getActiveCodeMapNodes())),
+    async ({ nodeId }) => jsonToolResult(lookupNode(nodeId, getActiveCodeMapNodes(), deriveLiveNode)),
   );
 
   // Story 5.1 (Phase 2): the remaining four operations. Each handler calls

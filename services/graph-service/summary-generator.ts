@@ -92,7 +92,7 @@ import type { LocalModelReady } from './model-manager';
 // that could hit the same `ERR_REQUIRE_ASYNC_MODULE` node-llama-cpp's own
 // dynamic-import workaround exists for (see model-manager.ts's doc comment).
 import PQueue from 'p-queue';
-import { getNodeRecord, mergeNodeRecord } from './node-record-store';
+import { getNodeRecord, mergeNodeRecord, type NodeRecord } from './node-record-store';
 
 // See model-manager.ts's doc comment for why node-llama-cpp (ESM-only, top-
 // level await in its dependency graph) must be lazily `import()`-ed rather
@@ -312,15 +312,20 @@ export async function disposeModelContext(): Promise<void> {
  * `coverageGapFiles.has(node.file)` inline) guarantees it can never silently
  * drift out of sync with what this file's other two callers already agree
  * on.
+ *
+ * P0-4: `getRecord` defaults to the live `getNodeRecord` and is injectable so
+ * `live-node.ts`'s `deriveLiveNode` (the `lookup_node` live derivation) can
+ * reuse this exact classification as a pure function under test.
  */
 export function classifyNode(
   node: CodeMapNode,
   coverageGapFiles: ReadonlySet<string>,
+  getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
 ): { summaryStatus: SummaryStatus; summary?: string; stale?: boolean } {
   if (coverageGapFiles.has(node.file)) {
     return { summaryStatus: 'coverage-gap' };
   }
-  const record = getNodeRecord(node.id);
+  const record = getRecord(node.id);
   if (record?.summary) {
     // Story 1.8 Phase 3: thread the record's `stale` flag through the same
     // classification step that already threads `summary` — `record.stale`

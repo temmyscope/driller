@@ -148,6 +148,20 @@ export function applyProjectClosedToSessionMap(state: SessionMapState): SessionM
   return { ...state, loadedProjectPath: null, lastIndexedKey: null };
 }
 
+/**
+ * P0-4: main relayed a summary-backend switch, so the Graph Service cleared
+ * every summary and a loaded map is showing text the record store no longer
+ * has — refetch it through the one refresh path (`dataVersion`). One bump per
+ * reported switch. A no-op (same object) when no map is loaded: the next
+ * load reads the cleared state anyway.
+ */
+export function applyBackendSwitchedToSessionMap(state: SessionMapState): SessionMapState {
+  if (state.loadedProjectPath === null) {
+    return state;
+  }
+  return { ...state, dataVersion: state.dataVersion + 1 };
+}
+
 // ---------------------------------------------------------------------------
 // Map refresh outcome (CodeMap.tsx)
 // ---------------------------------------------------------------------------

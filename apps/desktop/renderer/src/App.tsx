@@ -15,6 +15,7 @@ import { CodeMap, type CodeMapMode } from './CodeMap';
 import { Settings } from './Settings';
 import {
   INITIAL_SESSION_MAP_STATE,
+  applyBackendSwitchedToSessionMap,
   applyProjectClosedToSessionMap,
   applyProjectOpenedToSessionMap,
   applyStatusToSessionMap,
@@ -194,10 +195,20 @@ export function App() {
   // `backendConfig` at `null` rather than throwing; the derived booleans
   // below already treat `null` as "nothing to warn about yet" (same
   // conservative default a not-yet-loaded `modelStatus` gets).
+  //
+  // P0-4: `backendConfigRequestRef` sequences overlapping fetches (the one on
+  // mount and the one on Settings close can resolve out of order) so only
+  // the latest request's reply is applied.
+  const backendConfigRequestRef = useRef(0);
   const refetchBackendConfig = useCallback(() => {
+    backendConfigRequestRef.current += 1;
+    const request = backendConfigRequestRef.current;
     window.driller
       .getBackendConfig()
       .then((config) => {
+        if (request !== backendConfigRequestRef.current) {
+          return;
+        }
         setBackendConfig(config);
       })
       .catch(() => {
@@ -206,6 +217,15 @@ export function App() {
         // their derivation below) rather than showing a wrong/stale notice.
       });
   }, []);
+
+  // P0-4: Settings reports each backend switch main actually relayed (never a
+  // net before/after diff, which a local→cloud→local round trip nets to
+  // "unchanged" although the Graph Service cleared summaries twice). A
+  // loaded map is refetched through P0-3's `dataVersion` path so the human
+  // sees the cleared (`pending`) state, same as `lookup_node`.
+  const handleBackendSwitched = useCallback(() => {
+    commitSessionMap(applyBackendSwitchedToSessionMap(sessionMapRef.current));
+  }, [commitSessionMap]);
 
   useEffect(() => {
     refetchBackendConfig();
@@ -893,6 +913,7 @@ export function App() {
         <Settings
           projectPath={currentProjectPath}
           onIngestionResult={handleIngestionResult}
+          onBackendSwitched={handleBackendSwitched}
           onClose={() => {
             setIsSettingsOpen(false);
             // Story 1.6 (Phase 2): the backend choice/key may have just

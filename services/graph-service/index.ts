@@ -121,11 +121,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildBidirectionalAdjacency,
-  computeBlastRadiusFromAdjacency,
   computeBlastRadiusHopDistances,
   findChangedNodeIds,
   traceCallPath,
-  type BidirectionalAdjacency,
   type PathTraceResult,
 } from '@driller/graph-contracts';
 import type {
@@ -159,7 +157,6 @@ import type {
   PrBotId,
   PrBotIngestionResult,
   RegenerateNodeResult,
-  RiskSignal,
   SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 // Type-only import: pulls in Electron's ambient `process.parentPort`
@@ -171,8 +168,10 @@ import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-ada
 import { computeDiffScope } from './git-diff-scope';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
-import { hasCoverageGap, loadLcovCoverage, type LcovCoverage } from './lcov';
+import { loadLcovCoverage } from './lcov';
 import { fetchCodeMap, indexRepository, stopCbmDaemon, type CodeMapNodeWithSignalSources } from './mcp-client';
+import { deriveLiveNode } from './live-node';
+import { buildRiskSignals } from './risk-signals';
 import { startMcpServer } from './mcp-server';
 import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
 import {
@@ -480,7 +479,15 @@ initNodeRecordStore(userDataPath);
 // shutdown (review round 1, Medium).
 let closeMcpServer: (() => Promise<void>) | undefined;
 try {
-  closeMcpServer = startMcpServer(() => activeCodeMapNodes, postMcpServerStatus);
+  // P0-4: the found Node is live-derived at query time — summary/staleness
+  // and record-backed signals re-read from the Node record store through the
+  // same code the fetch path uses — so `lookup_node` never serves the
+  // fetch-time snapshot `activeCodeMapNodes` holds (FR15 parity).
+  closeMcpServer = startMcpServer(
+    () => activeCodeMapNodes,
+    postMcpServerStatus,
+    (node) => deriveLiveNode(node, { getRecord: getNodeRecord, coverageGapFiles: coverageGapFileSet }),
+  );
 } catch (error) {
   console.error('[graph-service] failed to start the Agent-Facing Query Surface (mcp-server.ts):', error);
   // Review finding (Medium): a synchronous construction-time throw (a
@@ -1331,110 +1338,6 @@ async function handleGetCodeMapRequest(): Promise<void> {
       message: error instanceof Error ? error.message : String(error),
     });
   }
-}
-
-/**
- * Story 2.1 (Phase 1): builds one Node's `riskSignals` array (FR7, AD-9
- * corrected). `complexity`/`cognitive-complexity`/`hotspot` are surfaced only
- * when the backend actually reported a value for this Node/File (Boundaries
- * & Constraints — "no complexity data for a Node... not an error", I/O
- * matrix) — each is simply omitted from the array rather than included with
- * a placeholder value. `blast-radius` is the one signal always present, even
- * at value `0` for an isolated Node with no edges at all (I/O matrix),
- * computed via `@driller/graph-contracts`'s cycle-safe
- * `computeBlastRadiusFromAdjacency` against a pre-built `adjacency` — the
- * Code Map's already-fetched edges, never a second graph fetch.
- *
- * `location` duplicates `node`'s own `{file, startLine, endLine}` on every
- * signal (Design Notes) — degenerate here, but required by the Consistency
- * Conventions table since later signal families may report a narrower
- * location than their owning Node's full range.
- *
- * Pushed in a fixed field order (complexity, cognitive-complexity, hotspot,
- * blast-radius) so `riskSignals` is byte-identical across repeated fetches
- * of unchanged repo state (FR7 reproducibility) — no wall-clock, random, or
- * non-deterministic ordering input anywhere in this function. (Live-verified
- * this review round: `query_graph`'s row order is stable across repeated
- * identical calls against an unchanged index, so this ordering claim holds
- * in practice, not just by construction.)
- *
- * `adjacency` is built once per `getCodeMap` fetch by the caller (review
- * round, patch — see `handleGetCodeMapRequest`) and passed in rather than
- * rebuilt per Node.
- *
- * Story 2.1 (Phase 2): `coverage` is likewise loaded once per fetch by the
- * caller and passed in rather than re-read per Node. A `'test-coverage-gap'`
- * signal (distinct from `SummaryStatus`'s unrelated `'coverage-gap'`) is
- * pushed only when `coverage !== undefined` (the LCOV file existed and
- * parsed) `&&` `hasCoverageGap` finds zero covered lines in this Node's
- * range — omitted entirely otherwise, same omission-means-absent convention
- * as the other optional signals above, never a placeholder/zero entry.
- *
- * Story 2.2 (Phase 2): reads `getNodeRecord(node.id)?.llmJudgment` — the
- * Node record store's persisted state, not anything recomputed live — and
- * pushes one `LlmJudgmentRiskSignal` when present (FR8). Unlike the four
- * deterministic signals above, this one is NOT recomputed/reproducible by
- * construction (Epic 2 Context: reproducibility is a deterministic-signal
- * requirement only) — it reflects whatever `generateJudgments` has
- * persisted so far, which can differ fetch-to-fetch while generation is
- * still catching up on a large project. Return type widens from
- * `DeterministicRiskSignal[]` to the full `RiskSignal[]` union to
- * accommodate it.
- */
-function buildRiskSignals(
-  node: CodeMapNodeWithSignalSources,
-  adjacency: BidirectionalAdjacency,
-  coverage: LcovCoverage | undefined,
-): RiskSignal[] {
-  const location = { file: node.file, startLine: node.startLine, endLine: node.endLine };
-  const signals: RiskSignal[] = [];
-
-  if (node.complexity !== undefined) {
-    signals.push({ family: 'deterministic', type: 'complexity', value: node.complexity, location });
-  }
-  if (node.cognitiveComplexity !== undefined) {
-    signals.push({
-      family: 'deterministic',
-      type: 'cognitive-complexity',
-      value: node.cognitiveComplexity,
-      location,
-    });
-  }
-  if (node.hotspotChangeCount !== undefined) {
-    signals.push({ family: 'deterministic', type: 'hotspot', value: node.hotspotChangeCount, location });
-  }
-  signals.push({
-    family: 'deterministic',
-    type: 'blast-radius',
-    value: computeBlastRadiusFromAdjacency(adjacency, node.id),
-    location,
-  });
-  if (coverage !== undefined && hasCoverageGap(coverage, node.file, node.startLine, node.endLine)) {
-    signals.push({ family: 'deterministic', type: 'test-coverage-gap', value: 1, location });
-  }
-
-  const judgment = getNodeRecord(node.id)?.llmJudgment;
-  if (judgment !== undefined) {
-    signals.push({ family: 'llm-judgment', judgment: judgment.text, location });
-  }
-
-  // Story 2.3 (Phase 4): reads `getNodeRecord(node.id)?.ingestedFindings` —
-  // Phase 2/3's persisted PR-bot findings, unchanged field-for-field — and
-  // pushes each straight into the `'ingested'` family. This is the only
-  // change to this function this phase makes (Boundaries & Constraints):
-  // no re-normalization, re-sorting, or capping here — the severity-sort
-  // and 3-finding cap are this phase's render-layer concern
-  // (CodeMap.tsx's `CodeMapNodeCard`), not this data-assembly step. A Node
-  // with no ingested findings (no bot has run, or this Node had none) gets
-  // no entries here at all — `ingestedFindings` stays `undefined` and
-  // nothing is pushed, so the family is absent entirely rather than an
-  // empty placeholder (Boundaries & Constraints, FR9/UX-DR7).
-  const ingested = getNodeRecord(node.id)?.ingestedFindings;
-  if (ingested) {
-    signals.push(...ingested);
-  }
-
-  return signals;
 }
 
 /**

@@ -10,6 +10,7 @@ import type { CodeMapNode, GraphServiceStatusMessage } from '@driller/ipc-contra
 
 import {
   INITIAL_SESSION_MAP_STATE,
+  applyBackendSwitchedToSessionMap,
   applyProjectClosedToSessionMap,
   applyProjectOpenedToSessionMap,
   applyStatusToSessionMap,
@@ -203,6 +204,21 @@ describe('session map transitions', () => {
     const reloaded = applyStatusToSessionMap(closed, indexed(PROJECT, LATER));
     assert.equal(reloaded.loadedProjectPath, PROJECT);
     assert.equal(reloaded.dataVersion, a.dataVersion + 1);
+  });
+
+  it('each reported backend switch with a map loaded bumps dataVersion once', () => {
+    const a = applyStatusToSessionMap(INITIAL_SESSION_MAP_STATE, indexed(PROJECT, AT));
+    const once = applyBackendSwitchedToSessionMap(a);
+    assert.equal(once.dataVersion, a.dataVersion + 1);
+    assert.equal(once.loadedProjectPath, PROJECT);
+    assert.equal(once.lastIndexedKey, a.lastIndexedKey);
+    // A local→cloud→local round trip is two reported switches, two bumps —
+    // never netted to "unchanged".
+    assert.equal(applyBackendSwitchedToSessionMap(once).dataVersion, a.dataVersion + 2);
+  });
+
+  it('a backend switch with no map loaded is a no-op', () => {
+    assert.equal(applyBackendSwitchedToSessionMap(INITIAL_SESSION_MAP_STATE), INITIAL_SESSION_MAP_STATE);
   });
 });
 

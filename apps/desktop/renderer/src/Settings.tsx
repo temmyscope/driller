@@ -52,6 +52,18 @@ import type {
 interface SettingsProps {
   onClose: () => void;
   /**
+   * P0-4: called once per successful `setActiveBackend` that changed the
+   * backend from the value this panel last held — i.e. each time main
+   * actually relays a switch that makes the Graph Service clear summaries.
+   * Reported per switch (not as a net before/after diff at close) so a
+   * local→cloud→local round trip inside one Settings session still counts:
+   * the Graph Service cleared summaries twice even though the net value is
+   * unchanged. Fired after the IPC reply, which main sends only after
+   * posting `backendSwitched`, so a map refetch triggered from here is
+   * ordered after the clear.
+   */
+  onBackendSwitched: () => void;
+  /**
    * Absolute, OS-native path of the currently open project, or `null` when
    * none is open (Story 2.3, Phase 1) — PR-bot opt-in is per-project, so
    * this is the one piece of state this component needs from its caller
@@ -202,7 +214,7 @@ function prBotDisclosureText(bot: PrBotId): string {
   return `${toolName}'s local CLI mode sends this project's diff/code content to ${toolName}'s own cloud service to generate findings. That transfer is outside driller's control and is not covered by driller's own no-server privacy guarantee.`;
 }
 
-export function Settings({ onClose, projectPath, onIngestionResult }: SettingsProps) {
+export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionResult }: SettingsProps) {
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
@@ -566,7 +578,14 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
       setConfig((current) => (current ? { ...current, activeBackend: backend } : current));
       window.driller
         .setActiveBackend(backend)
-        .then(refetchConfig)
+        .then(() => {
+          // P0-4: a genuine change (or an unknown previous value — an extra
+          // map refetch is harmless, a missed one is a parity break).
+          if (previousConfig?.activeBackend !== backend) {
+            onBackendSwitched();
+          }
+          return refetchConfig();
+        })
         .catch((error) => {
           setLoadError(error instanceof Error ? error.message : String(error));
           // Roll back the optimistic update on failure (review finding,
@@ -575,7 +594,7 @@ export function Settings({ onClose, projectPath, onIngestionResult }: SettingsPr
           setConfig(previousConfig);
         });
     },
-    [refetchConfig],
+    [refetchConfig, onBackendSwitched],
   );
 
   // Story 1.10 (Phase 1): mirrors `handleBackendChange`'s exact

@@ -52,6 +52,13 @@ export function resolve(specifier, context, nextResolve) {
     for (const suffix of ['', '.ts', '.tsx', '/index.ts', '/index.tsx']) {
       const candidate = new URL(base.href + suffix);
       if (isFile(candidate)) {
+        // Only claim TypeScript sources. A relative specifier that already
+        // names a real non-TS file (e.g. `eventemitter3/index.mjs` importing
+        // its CommonJS `./index.js`, reached via `p-queue`) must keep Node's
+        // own format detection — forcing `'module'` on it breaks CJS interop.
+        if (!TYPESCRIPT_FILE.test(candidate.pathname)) {
+          break;
+        }
         return { url: candidate.href, format: 'module', shortCircuit: true };
       }
     }
