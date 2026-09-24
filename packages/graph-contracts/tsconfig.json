@@ -5,5 +5,9 @@
     "types": [],
     "noEmit": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  // Unit tests run under `node --test` and need Node's types, which this
+  // pure package deliberately withholds from its shipped source. They are
+  // typechecked by `tsconfig.test.json` instead (same split as the renderer).
+  "exclude": ["node_modules", "src/**/*.test.ts"]
 }

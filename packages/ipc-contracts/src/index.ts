@@ -24,6 +24,14 @@ import type { PathTraceResult } from '@driller/graph-contracts';
 
 export type { PathTraceResult } from '@driller/graph-contracts';
 
+/**
+ * P0-5: re-exported so the renderer (whose only contracts dependency is this
+ * package) reads the same hop bound the Graph Service's Blast Radius badge
+ * uses — for PR Review's initial stepper depth and the Blast Radius chip's
+ * tooltip/accessible name ("within N hops"), never a second literal.
+ */
+export { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/graph-contracts';
+
 // ---------------------------------------------------------------------------
 // Recent Projects (AD-5: persisted via electron-store under userData)
 // ---------------------------------------------------------------------------

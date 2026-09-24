@@ -231,92 +231,182 @@ function resolveEntryNode(nodes: PathTraceNode[], query: string): EntryResolutio
 // `computeBlastRadius` mirrors `traceCallPath`'s BFS shape (same `visited`
 // Set keyed by Node id, same dangling-edge exclusion via a `validNodeIds`
 // check) but differs in exactly the ways the PRD's "reachable from, or
-// dependent on" framing requires: both edge directions are unioned (never
-// outgoing-only), every edge kind counts (never filtered to `CALLS` only),
-// and the result is a plain reachable-Node count rather than an ordered id
-// path — Phase 3's UI only needs a magnitude, never the route.
+// dependent on" framing requires: it searches both edge directions, every
+// edge kind counts (never filtered to `CALLS` only), and the result is a
+// plain Node count rather than an ordered id path — the UI only needs a
+// magnitude, never the route.
+//
+// P0-5 (founder decisions, 2026-09-25): the search is bounded at
+// `BLAST_RADIUS_DEFAULT_HOPS`, and each direction is searched SEPARATELY —
+// a forward search (source -> target: what this Node reaches) and a backward
+// search (target -> source: what depends on it), unioned. A path never mixes
+// directions, so two "siblings" that merely share a caller or a callee
+// (H -> S1, H -> S3) never count each other: a change to S1 cannot affect
+// S3. The previous unbounded, direction-mixing BFS returned the whole
+// connected component — the same number for every Node.
 // ---------------------------------------------------------------------------
 
-/** Reusable adjacency built once by `buildBidirectionalAdjacency`, consumed by `computeBlastRadiusFromAdjacency`. */
+/**
+ * P0-5: the one hop bound shared by the Blast Radius badge
+ * (`computeBlastRadiusFromAdjacency`'s default `maxHops`) and PR Review
+ * Mode's initial highlight depth, so the badge and FR-12's default highlight
+ * always cover the same Node set for a one-Node diff.
+ */
+export const BLAST_RADIUS_DEFAULT_HOPS = 2;
+
+/**
+ * Reusable adjacency built once by `buildBidirectionalAdjacency`, consumed by
+ * `blastRadiusNodeIds`/`computeBlastRadiusFromAdjacency` and
+ * `computeBlastRadiusHopDistances`. Both directions are kept as separate maps
+ * (never unioned) so each search follows exactly one direction.
+ */
 export interface BidirectionalAdjacency {
   validNodeIds: Set<string>;
-  neighborsById: Map<string, string[]>;
+  /** source -> targets: the Nodes each Node reaches in one hop. */
+  forward: Map<string, string[]>;
+  /** target -> sources: the Nodes that depend on each Node in one hop. */
+  backward: Map<string, string[]>;
 }
 
 /**
- * Builds the bidirectional adjacency `computeBlastRadiusFromAdjacency` walks
- * — both edge directions unioned (PRD: "reachable from, or dependent on"),
+ * Builds the directional adjacency the blast-radius searches walk — one
+ * forward and one backward neighbour map from a single pass over `edges`,
  * unlike `traceCallPath`'s single-direction outgoing-`CALLS`-only walk.
  * Dangling-edge-safe: an edge endpoint with no corresponding entry in
- * `nodes` is never added.
+ * `nodes` is never added. Parallel edges (same pair, different kinds) and
+ * self-loops are kept as-is; the searches' `visited` dedup makes both
+ * harmless.
  *
  * Review round (patch): extracted out of what was `computeBlastRadius` so a
- * caller computing blast radius for every Node in a Code Map (its only
- * caller today, `graph-service/index.ts`) builds this once — O(V+E) — and
- * reuses it across all N `computeBlastRadiusFromAdjacency` calls, instead of
- * the O(N·(V+E)) that rebuilding it inside a per-Node call produced.
+ * caller computing blast radius for every Node in a Code Map builds this
+ * once — O(V+E) — and reuses it across every per-Node call, instead of the
+ * O(N·(V+E)) that rebuilding it inside a per-Node call produced.
  */
 export function buildBidirectionalAdjacency(nodes: PathTraceNode[], edges: PathTraceEdge[]): BidirectionalAdjacency {
   const validNodeIds = new Set(nodes.map((node) => node.id));
-  const neighborsById = new Map<string, string[]>();
-  const addDirectedNeighbor = (from: string, to: string): void => {
-    if (!validNodeIds.has(from) || !validNodeIds.has(to)) {
-      return;
-    }
-    const existing = neighborsById.get(from);
+  const forward = new Map<string, string[]>();
+  const backward = new Map<string, string[]>();
+  const addNeighbor = (map: Map<string, string[]>, from: string, to: string): void => {
+    const existing = map.get(from);
     if (existing) {
       existing.push(to);
     } else {
-      neighborsById.set(from, [to]);
+      map.set(from, [to]);
     }
   };
   for (const edge of edges) {
-    addDirectedNeighbor(edge.source, edge.target);
-    addDirectedNeighbor(edge.target, edge.source);
+    if (!validNodeIds.has(edge.source) || !validNodeIds.has(edge.target)) {
+      continue;
+    }
+    addNeighbor(forward, edge.source, edge.target);
+    addNeighbor(backward, edge.target, edge.source);
   }
-  return { validNodeIds, neighborsById };
+  return { validNodeIds, forward, backward };
 }
 
 /**
- * Computes `nodeId`'s blast radius against a pre-built `adjacency`: the
- * count of other Nodes reachable from it, or that depend on it.
+ * `true` only for a usable hop bound: a finite integer >= 1. `NaN`,
+ * `Infinity`, fractions, zero and negatives are all rejected, and every
+ * bounded operation below treats a rejected bound as "count nothing".
+ */
+function isValidMaxHops(maxHops: number): boolean {
+  return Number.isInteger(maxHops) && maxHops >= 1;
+}
+
+/**
+ * Multi-source single-direction BFS over `neighbors` (one of the adjacency's
+ * `forward`/`backward` maps). Returns each reached Node's minimum hop count
+ * from the nearest seed; seeds themselves get no entry. `maxHops`, when
+ * given, stops expansion at that depth: a Node exactly at the bound is
+ * recorded but its own neighbours are never enqueued.
  *
- * Cycle-safe (Always): a `visited` Set-keyed-by-id dedup, mirroring
- * `traceCallPath`'s own, so a circular edge (A -> B -> A) terminates instead
- * of looping, and every Node is counted at most once. The origin `nodeId`
- * itself is excluded from its own count (Always) — an isolated Node with no
- * edges at all, or a `nodeId` not present in `adjacency.validNodeIds`, both
- * correctly return `0`.
+ * Cycle-safe: a `visited` Set (seeded with every seed) means each Node is
+ * enqueued at most once, so a cycle or self-loop terminates. Because BFS
+ * processes Nodes in non-decreasing distance order (all seeds at 0, FIFO
+ * queue), the first distance a Node is reached at is its minimum.
+ *
+ * O(V+E): dequeues through an incrementing `head` cursor, never
+ * `Array.prototype.shift()` (itself O(n), which would make the walk O(n²)).
+ */
+function directionalHopDistances(
+  neighbors: Map<string, string[]>,
+  seedIds: readonly string[],
+  maxHops?: number,
+): Map<string, number> {
+  const visited = new Set<string>(seedIds);
+  const hopDistances = new Map<string, number>();
+  const queue: Array<{ id: string; distance: number }> = seedIds.map((id) => ({ id, distance: 0 }));
+  let head = 0;
+  while (head < queue.length) {
+    // Non-null: `head < queue.length` just guarded this index.
+    const { id: current, distance } = queue[head]!;
+    head += 1;
+    if (maxHops !== undefined && distance >= maxHops) {
+      // At the bound: already recorded, never expanded further.
+      continue;
+    }
+    const next = neighbors.get(current);
+    if (!next) {
+      continue;
+    }
+    for (const neighbor of next) {
+      if (visited.has(neighbor)) {
+        continue;
+      }
+      visited.add(neighbor);
+      hopDistances.set(neighbor, distance + 1);
+      queue.push({ id: neighbor, distance: distance + 1 });
+    }
+  }
+  return hopDistances;
+}
+
+/**
+ * The bounded Blast Radius Node set for `nodeId`: the union of Nodes it
+ * reaches following edges forward within `maxHops` hops and Nodes that reach
+ * it (following edges backward) within `maxHops` hops — never a path that
+ * mixes directions. Origin excluded; distinct. Empty for an isolated Node, a
+ * `nodeId` not in `adjacency.validNodeIds`, or an invalid `maxHops` (see
+ * `isValidMaxHops`).
  *
  * Pure (Always, mirrors `traceCallPath`): no I/O, no dependency on
  * `@driller/ipc-contracts` or any other package.
  */
-export function computeBlastRadiusFromAdjacency(adjacency: BidirectionalAdjacency, nodeId: string): number {
-  if (!adjacency.validNodeIds.has(nodeId)) {
-    return 0;
+export function blastRadiusNodeIds(
+  adjacency: BidirectionalAdjacency,
+  nodeId: string,
+  maxHops: number = BLAST_RADIUS_DEFAULT_HOPS,
+): Set<string> {
+  if (!adjacency.validNodeIds.has(nodeId) || !isValidMaxHops(maxHops)) {
+    return new Set();
   }
-
-  const visited = new Set<string>([nodeId]);
-  const queue: string[] = [nodeId];
-  while (queue.length > 0) {
-    // Non-null: `queue.length > 0` just guarded this shift.
-    const current = queue.shift()!;
-    const neighbors = adjacency.neighborsById.get(current);
-    if (!neighbors) {
-      continue;
-    }
-    for (const neighbor of neighbors) {
-      if (visited.has(neighbor)) {
-        // Dedup — cycle safety, mirrors `traceCallPath`'s own dedup.
-        continue;
-      }
-      visited.add(neighbor);
-      queue.push(neighbor);
-    }
+  const reached = new Set<string>(directionalHopDistances(adjacency.forward, [nodeId], maxHops).keys());
+  for (const id of directionalHopDistances(adjacency.backward, [nodeId], maxHops).keys()) {
+    reached.add(id);
   }
+  // A cycle can lead either search back to the origin only through
+  // `visited`, which is seeded with it — so it is never in either map; this
+  // delete just states the Always explicitly.
+  reached.delete(nodeId);
+  return reached;
+}
 
-  // Origin excluded from its own count (Always).
-  return visited.size - 1;
+/**
+ * The Blast Radius badge value: the size of `blastRadiusNodeIds` — Nodes
+ * reachable from, or dependent on, `nodeId` within `maxHops` hops (default
+ * `BLAST_RADIUS_DEFAULT_HOPS`), each direction searched separately. `0` for
+ * an isolated or unknown Node and for an invalid `maxHops` (anything but a
+ * finite integer >= 1).
+ *
+ * Pure (Always, mirrors `traceCallPath`): no I/O, no dependency on
+ * `@driller/ipc-contracts` or any other package.
+ */
+export function computeBlastRadiusFromAdjacency(
+  adjacency: BidirectionalAdjacency,
+  nodeId: string,
+  maxHops: number = BLAST_RADIUS_DEFAULT_HOPS,
+): number {
+  return blastRadiusNodeIds(adjacency, nodeId, maxHops).size;
 }
 
 /**
@@ -327,90 +417,62 @@ export function computeBlastRadiusFromAdjacency(adjacency: BidirectionalAdjacenc
  * call the two underlying functions directly and reuse one adjacency build,
  * not call this once per Node.
  */
-export function computeBlastRadius(nodes: PathTraceNode[], edges: PathTraceEdge[], nodeId: string): number {
-  return computeBlastRadiusFromAdjacency(buildBidirectionalAdjacency(nodes, edges), nodeId);
+export function computeBlastRadius(
+  nodes: PathTraceNode[],
+  edges: PathTraceEdge[],
+  nodeId: string,
+  maxHops: number = BLAST_RADIUS_DEFAULT_HOPS,
+): number {
+  return computeBlastRadiusFromAdjacency(buildBidirectionalAdjacency(nodes, edges), nodeId, maxHops);
 }
 
 /**
- * Story 3.2 (Phase 1): multi-source, hop-distance-tracking BFS sibling to
- * `computeBlastRadiusFromAdjacency` (FR12, AD-13) — instead of a single
- * reachable-count, computes every reachable Node's minimum hop distance from
- * the nearest of `nodeIds`. PR Review Mode needs this to render a combined
- * Blast Radius highlight across every changed Node in a diff, with an
- * interactive 1-hop/2-hop/further stepper (Phase 2).
+ * Story 3.2 (Phase 1): multi-source, hop-distance-tracking sibling to
+ * `blastRadiusNodeIds` (FR12, AD-13) — instead of a bounded set, computes
+ * every reachable Node's minimum hop distance from the nearest of `nodeIds`.
+ * PR Review Mode renders a combined Blast Radius highlight across every
+ * changed Node in a diff, with an interactive 1-hop/2-hop/further stepper.
  *
- * Multi-source (Always): a reachable Node's distance is the minimum hop
- * count from *any* seed in `nodeIds`, never summed or averaged — this is a
- * standard multi-source BFS, all seeds enqueued at distance 0 together, so
- * the first (and therefore minimum) distance a Node is discovered at is its
- * final one.
+ * Directional (P0-5): runs one multi-source forward BFS and one multi-source
+ * backward BFS, and keeps each Node's SMALLER of the two distances — the same
+ * per-direction rule as the badge, so for a one-Node diff the Nodes at
+ * distance 1..d are exactly `blastRadiusNodeIds(adjacency, nodeId, d)`.
  *
- * Unbounded (Always: no `maxHops` parameter) — returns hop distances for the
- * entire reachable set in one call; Phase 2 slices this locally per stepper
- * click rather than re-requesting per hop depth (Design Notes).
+ * Multi-source (Always): all seeds start at distance 0 together, so a Node's
+ * distance in each direction is its minimum from any seed, never summed or
+ * averaged.
  *
- * Cycle-safe (Always), mirrors `computeBlastRadiusFromAdjacency`'s own
- * `visited` Set dedup: a Node already visited (whether a seed or already
- * discovered at a smaller-or-equal distance) is never re-visited or
- * re-enqueued, so a circular edge terminates instead of looping.
+ * Unbounded (Always: no `maxHops` parameter) — returns distances for the
+ * entire reachable set in one call; the stepper slices this locally per
+ * click rather than re-requesting per hop depth.
  *
- * Seed Nodes are excluded from the returned map (Always), mirroring
- * `computeBlastRadiusFromAdjacency`'s own origin-exclusion — they're seeded
- * into `visited` up front but never given a map entry. A seed `nodeId`
- * absent from `adjacency.validNodeIds` is skipped, never an error (Always);
- * an empty or entirely-stale `nodeIds` simply produces an empty map.
- * Duplicate ids in `nodeIds` are deduplicated via `Set` before seeding — the
- * `visited` check alone would have made a duplicate harmless anyway, but
- * de-duping up front skips the wasted duplicate distance-0 queue entries.
+ * Cycle-safe (Always): each direction's `visited` Set dedup means a circular
+ * edge terminates instead of looping.
  *
- * O(V+E) (review finding, Medium): the queue is dequeued via an incrementing
- * `head` index, never `Array.prototype.shift()` (which is itself O(n),
- * making a naive shift-based BFS O(n²) overall) — the array is only ever
- * appended to, never spliced. This is what `BLAST_RADIUS_REQUEST_TIMEOUT_MS`
- * (`apps/desktop/main/index.ts`) assumes when it sizes its timeout for "a
- * very large graph."
+ * Seed Nodes are excluded from the returned map (Always). A seed absent from
+ * `adjacency.validNodeIds` is skipped, never an error; an empty or
+ * entirely-stale `nodeIds` produces an empty map. Duplicate ids are
+ * deduplicated before seeding.
  *
- * Pure (Always, mirrors `computeBlastRadiusFromAdjacency`): no I/O, no
- * dependency on `@driller/ipc-contracts` or any other package.
+ * O(V+E): two `head`-cursor BFS passes (see `directionalHopDistances`), which
+ * is what `BLAST_RADIUS_REQUEST_TIMEOUT_MS` in the desktop main process
+ * assumes when it sizes its timeout for "a very large graph."
+ *
+ * Pure (Always): no I/O, no dependency on `@driller/ipc-contracts` or any
+ * other package.
  */
 export function computeBlastRadiusHopDistances(
   adjacency: BidirectionalAdjacency,
   nodeIds: string[],
 ): Map<string, number> {
   const seedIds = [...new Set(nodeIds)].filter((nodeId) => adjacency.validNodeIds.has(nodeId));
-
-  const visited = new Set<string>(seedIds);
-  const hopDistances = new Map<string, number>();
-  const queue: Array<{ id: string; distance: number }> = seedIds.map((id) => ({ id, distance: 0 }));
-
-  // `head` is an index cursor into `queue`, never spliced/shifted — O(1) per
-  // dequeue, keeping the whole traversal O(V+E) instead of the O(n²) a
-  // `queue.shift()`-based loop would produce (see this function's own doc
-  // comment).
-  let head = 0;
-  while (head < queue.length) {
-    // Non-null: `head < queue.length` just guarded this index.
-    const { id: current, distance } = queue[head]!;
-    head += 1;
-    const neighbors = adjacency.neighborsById.get(current);
-    if (!neighbors) {
-      continue;
-    }
-    for (const neighbor of neighbors) {
-      if (visited.has(neighbor)) {
-        // Dedup — cycle safety, mirrors `computeBlastRadiusFromAdjacency`'s
-        // own dedup. Also what makes this a correct minimum: BFS processes
-        // Nodes in non-decreasing distance order (all seeds start at 0, and
-        // this queue is FIFO), so the first time a Node is reached is
-        // necessarily its shortest path from any seed.
-        continue;
-      }
-      visited.add(neighbor);
-      hopDistances.set(neighbor, distance + 1);
-      queue.push({ id: neighbor, distance: distance + 1 });
+  const hopDistances = directionalHopDistances(adjacency.forward, seedIds);
+  for (const [id, distance] of directionalHopDistances(adjacency.backward, seedIds)) {
+    const existing = hopDistances.get(id);
+    if (existing === undefined || distance < existing) {
+      hopDistances.set(id, distance);
     }
   }
-
   return hopDistances;
 }
 

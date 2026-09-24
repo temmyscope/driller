@@ -1,0 +1,12 @@
+{
+  // This package's unit tests (run by `node --test`, see
+  // `scripts/find-tests.mjs`). Identical to `tsconfig.json` except that
+  // Node's types are available; `tsconfig.json` still checks the shipped
+  // source without them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src/**/*.test.ts"],
+  "exclude": ["node_modules"]
+}

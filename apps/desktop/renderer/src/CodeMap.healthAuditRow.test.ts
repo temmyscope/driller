@@ -50,6 +50,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { CodeMapNode, DeterministicRiskSignalType, RiskSignal } from '@driller/ipc-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 
 import {
   HEALTH_CLUSTER_LIMIT,
@@ -57,6 +58,7 @@ import {
   HealthAuditClusterGrid,
   HealthAuditClusterRow,
   type HealthClusterNode,
+  formatDeterministicSignalLabel,
   groupNodesIntoHealthClusters,
   heatForRiskCount,
   riskCountForNode,
@@ -716,3 +718,33 @@ describe('Health Audit grid keyboard reach', () => {
     assert.equal(new Set(keys).size, keys.length);
   });
 });
+
+// P0-5: the Blast Radius chip must say its count is bounded, at the place it
+// actually renders. Reverting this row's call site to a bare "label: value"
+// fails here, not only in the helper's own unit test.
+describe('Health Audit row Blast Radius chip', () => {
+  it('labels the chip with the bounded count, and the row name carries it', () => {
+    const only = node({
+      id: 'api/svc.ts.charge',
+      name: 'charge',
+      file: 'api/svc.ts',
+      riskSignals: [deterministic('blast-radius', 4)],
+    });
+    const { tree, button } = renderRow(only);
+    const expected = formatDeterministicSignalLabel({ type: 'blast-radius', value: 4 });
+    const chip = tree.find(
+      (element) =>
+        element.props.role === 'img' &&
+        typeof element.props['aria-label'] === 'string' &&
+        element.props['aria-label'].startsWith('Blast radius'),
+    );
+    assert.ok(chip !== undefined, 'the row renders a Blast Radius chip');
+    assert.equal(chip.props['aria-label'], expected);
+    assert.equal(chip.props.title, expected);
+    assert.ok(expected.includes('within'));
+    assert.ok(expected.includes(String(BLAST_RADIUS_DEFAULT_HOPS)));
+    assert.notEqual(expected, 'Blast radius: 4');
+    assert.ok(accessibleNameOf(button).includes(expected), 'the row button name includes the chip label');
+  });
+});
+

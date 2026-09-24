@@ -92,6 +92,7 @@ import type {
   LlmJudgmentRiskSignal,
   RiskSignal,
 } from '@driller/ipc-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
 
@@ -705,6 +706,25 @@ const DETERMINISTIC_SIGNAL_LABELS: Record<DeterministicRiskSignalType, string> =
 };
 
 /**
+ * P0-5: the full accessible name / tooltip for one deterministic chip —
+ * `"Complexity: 4"` for most signals. Blast Radius spells out its bound and
+ * what it counts (`"Blast radius: 4 Nodes within 2 hops (callers and
+ * callees)"`, built from `BLAST_RADIUS_DEFAULT_HOPS`) so the number never
+ * reads as total impact. An unknown `type` (a future backend's value this
+ * renderer's union doesn't know) falls back to the raw type string.
+ * Every chip surface (canvas card, Health Audit row) goes through this, so
+ * the wording can't fork.
+ */
+export function formatDeterministicSignalLabel(signal: Pick<DeterministicRiskSignal, 'type' | 'value'>): string {
+  const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+  if (signal.type === 'blast-radius') {
+    const hops: number = BLAST_RADIUS_DEFAULT_HOPS;
+    return `${label}: ${signal.value} Node${signal.value === 1 ? '' : 's'} within ${hops} hop${hops === 1 ? '' : 's'} (callers and callees)`;
+  }
+  return `${label}: ${signal.value}`;
+}
+
+/**
  * Story 2.3 (Phase 4): severity ordering for the ingested-findings callout
  * — `blocker` > `major` > `minor` > `info` (Boundaries & Constraints,
  * lower rank number sorts first). `Array.prototype.sort` is stable per spec
@@ -828,8 +848,12 @@ function hasVisibleRiskSignals(signals: RiskSignal[], toggles: RiskSignalFamilyT
  *
  * Renders `null` when nothing is visible, so neither surface ever produces
  * an empty row/container.
+ *
+ * Exported only so `CodeMap.blastRadius.test.ts` can render the canvas chip
+ * strip directly (P0-5). That test calls this as a plain function, so it must
+ * stay HOOKLESS — same pact as `HealthAuditClusterRow`.
  */
-function NodeRiskSignalSections({
+export function NodeRiskSignalSections({
   signals,
   toggles,
 }: {
@@ -865,15 +889,15 @@ function NodeRiskSignalSections({
       {toggles.showDeterministicSignals && deterministicSignals.length > 0 && (
         <div className="code-map__node-signal-strip">
           {deterministicSignals.map((signal) => {
-            const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+            const label = formatDeterministicSignalLabel(signal);
             const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
             return (
               <span
                 key={signal.type}
                 className="code-map__signal-chip"
                 role="img"
-                aria-label={`${label}: ${signal.value}`}
-                title={`${label}: ${signal.value}`}
+                aria-label={label}
+                title={label}
               >
                 <span aria-hidden="true">{icon}</span>
                 {signal.value}
@@ -1514,6 +1538,22 @@ export function resolveCodeMapSurfaces(mode: CodeMapMode, mapIsRenderable: boole
 }
 
 /**
+ * P0-5: PR Review's initial Blast Radius stepper depth for a resolved result
+ * whose farthest Node is `maxDepth` hops away — `BLAST_RADIUS_DEFAULT_HOPS`
+ * (the badge's own bound), clamped into the stepper's range `[1, maxDepth]`
+ * so a scope whose farthest Node is 1 hop away shows "1-hop", never a depth
+ * that doesn't exist. A `maxDepth` of 0 (nothing reachable; the stepper is
+ * not rendered) still yields 1, the stepper's floor; so does a non-finite
+ * `maxDepth` (`NaN`/`Infinity`), and a fractional one is floored first.
+ */
+export function initialBlastRadiusDepth(maxDepth: number): number {
+  if (!Number.isFinite(maxDepth)) {
+    return 1;
+  }
+  return Math.max(1, Math.min(BLAST_RADIUS_DEFAULT_HOPS, Math.floor(maxDepth)));
+}
+
+/**
  * P0-2b: what a Path Trace submit does, in order. An ordered effect list
  * rather than a `{query, switchMode}` record, because the ORDER is the part
  * that matters and the part a test must be able to fail: the mode switch has
@@ -1682,15 +1722,15 @@ export function HealthAuditClusterRow({
         <span className={`code-map__health-row-values code-map__health-row-values--${heat}`}>
           <span className="code-map__health-row-band">{heat}</span>
           {member.deterministicSignals.map((signal) => {
-            const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+            const label = formatDeterministicSignalLabel(signal);
             const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
             return (
               <span
                 key={signal.type}
                 className="code-map__health-row-signal"
                 role="img"
-                aria-label={`${label}: ${signal.value}`}
-                title={`${label}: ${signal.value}`}
+                aria-label={label}
+                title={label}
               >
                 <span aria-hidden="true">{icon}</span>
                 {signal.value}
@@ -2099,11 +2139,14 @@ export function CodeMap({
   // Story 3.2 (Phase 2): the combined blast-radius expansion's own result
   // state and the stepper's current depth — CodeMap-owned, same division-of-
   // responsibility reasoning as `baseRefInput`/`diffScopeState` just above.
-  // `blastRadiusDepth` defaults to 1 (Design Notes: "Default depth = 1-hop"),
-  // reset to 1 alongside `blastRadiusState` at each of its own three reset
-  // points (never left stale at a deeper depth from a previous diff scope).
+  // P0-5: `blastRadiusDepth` defaults to `BLAST_RADIUS_DEFAULT_HOPS` — the
+  // same bound the Blast Radius badge counts, so a one-Node diff's default
+  // highlight is exactly that Node's badge set — and is reset to it alongside
+  // `blastRadiusState` at each of its own reset points (never left stale at
+  // a deeper depth from a previous diff scope). Once a result resolves, it is
+  // clamped to that result's own max depth via `initialBlastRadiusDepth`.
   const [blastRadiusState, setBlastRadiusState] = useState<BlastRadiusState>({ status: 'idle' });
-  const [blastRadiusDepth, setBlastRadiusDepth] = useState(1);
+  const [blastRadiusDepth, setBlastRadiusDepth] = useState(BLAST_RADIUS_DEFAULT_HOPS);
   // Correlates an `expandBlastRadius` response back to the auto-trigger (or
   // reset) that started/invalidated it — same stale-response guard shape as
   // `diffScopeRequestIdRef` just above: bumped on every reset point (project
@@ -2296,7 +2339,7 @@ export function CodeMap({
     // invalidates any still-in-flight `expandBlastRadius` call from before
     // this reload the same way `diffScopeRequestIdRef` just above does.
     setBlastRadiusState({ status: 'idle' });
-    setBlastRadiusDepth(1);
+    setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     blastRadiusRequestIdRef.current += 1;
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
@@ -2378,7 +2421,7 @@ export function CodeMap({
     setDiffScopeState({ status: 'idle' });
     diffScopeRequestIdRef.current += 1;
     setBlastRadiusState({ status: 'idle' });
-    setBlastRadiusDepth(1);
+    setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     blastRadiusRequestIdRef.current += 1;
     // The decision lives in `resolveRefreshOutcome` (sessionView.ts, unit
     // tested); this only carries it out.
@@ -2527,7 +2570,7 @@ export function CodeMap({
     // into the new one. Also deliberately does NOT depend on `mode`, same
     // reasoning as the reset above.
     setBlastRadiusState({ status: 'idle' });
-    setBlastRadiusDepth(1);
+    setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     blastRadiusRequestIdRef.current += 1;
   }, [projectPath]);
 
@@ -2578,7 +2621,7 @@ export function CodeMap({
     // non-empty `nodeIds` set — no separate reset is needed in `.then`/
     // `.catch` below anymore, since this one already covers both outcomes.
     setBlastRadiusState({ status: 'idle' });
-    setBlastRadiusDepth(1);
+    setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     blastRadiusRequestIdRef.current += 1;
     window.driller
       .computeDiffScope(projectPath, trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined)
@@ -2707,7 +2750,7 @@ export function CodeMap({
             }
           }
           setBlastRadiusState({ status: 'resolved', hopDistances, maxDepth });
-          setBlastRadiusDepth(1);
+          setBlastRadiusDepth(initialBlastRadiusDepth(maxDepth));
         } else {
           setBlastRadiusState({ status: 'error', message: result.message });
         }

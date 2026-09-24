@@ -62,6 +62,7 @@ import {
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/graph-contracts';
 import {
   computeBlastRadiusExpansionResult,
   computeDiffScopeResult,
@@ -282,7 +283,8 @@ export function startMcpServer(
     {
       title: 'Look up a Code Map Node',
       description:
-        "Look up a single Node from driller's Code Map by its stable id (qualified name). Returns the exact same shape the human-facing UI shows for that Node, including its full Risk Overlay signals and summary staleness (summaryStatus) — nothing is computed differently for this surface than for the renderer.",
+        "Look up a single Node from driller's Code Map by its stable id (qualified name). Returns the exact same shape the human-facing UI shows for that Node, including its full Risk Overlay signals and summary staleness (summaryStatus) — nothing is computed differently for this surface than for the renderer. " +
+        `The 'blast-radius' signal's value is a bounded count, not total impact: the distinct Nodes within ${BLAST_RADIUS_DEFAULT_HOPS} hops that this Node reaches (following edges forward) or that reach it (following edges backward), each direction searched separately — Nodes that merely share a caller or callee with it are not counted.`,
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),
@@ -321,7 +323,9 @@ export function startMcpServer(
     {
       title: 'Expand blast radius from a Node set',
       description:
-        "Compute hop-distance blast radius expansion from a seed set of Node ids through driller's Code Map. Returns the exact same BlastRadiusExpansionResult the human-facing UI would get for the identical seed set — an explicit result state (resolved/error), never collapsed into a generic success/failure.",
+        "Compute hop-distance blast radius expansion from a seed set of Node ids through driller's Code Map. Returns the exact same BlastRadiusExpansionResult the human-facing UI would get for the identical seed set — an explicit result state (resolved/error), never collapsed into a generic success/failure. " +
+        "Hop distances are per direction and unbounded: each Node's distance is the smaller of its forward (seed reaches it) and backward (it reaches a seed) distance from the nearest seed, never a path that mixes directions, so Nodes that only share a caller or callee with a seed are not returned. Seeds are excluded. " +
+        `Filtering to distances 1..${BLAST_RADIUS_DEFAULT_HOPS} for a single seed gives exactly the Node set that seed's 'blast-radius' signal counts.`,
       inputSchema: z.object({
         projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
         nodeIds: z
