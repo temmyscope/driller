@@ -456,6 +456,27 @@ export function App() {
   }, [reportUnexpectedError]);
 
   /**
+   * P1-3: the model-status footer's Retry — retries only the local-model
+   * download/verify in the running Graph Service. Deliberately NOT
+   * `handleRetryGraphService`: that restarts the subprocess and re-indexes
+   * the whole repository, a multi-minute cost a model retry must never pay.
+   * Progress arrives via the existing `onModelStatus` stream; an `ok: false`
+   * (e.g. "Graph Service is not running.") or a rejection surfaces through
+   * the same error notice every other failed IPC call uses.
+   */
+  const handleRetryLocalModel = useCallback(() => {
+    setNotice((current) => (current?.kind === 'error' ? null : current));
+    window.driller
+      .retryLocalModel()
+      .then((result) => {
+        if (!result.ok) {
+          reportUnexpectedError(new Error(result.message ?? 'The model retry could not be started.'));
+        }
+      })
+      .catch(reportUnexpectedError);
+  }, [reportUnexpectedError]);
+
+  /**
    * P0-3: Close project — the route back to Recent Projects now that the map
    * no longer unmounts on its own. Clearing the ref synchronously is what
    * makes any later status for the closed project inert: the correlation
@@ -823,14 +844,9 @@ export function App() {
         <footer className="model-status" role="status">
           <ModelStatusBadge status={modelStatus} />
           {modelStatus.state === 'error' && (
-            // Reuses the Graph Service's own restart flow rather than a
-            // bespoke retry channel (Code Map — this story adds no new IPC
-            // request beyond onModelStatus): restarting respawns the Graph
-            // Service subprocess and re-sends graphService:index for the
-            // current project, which re-triggers ensureLocalModel() in the
-            // fresh process (a failed attempt is never silently
-            // auto-retried within the same process — see model-manager.ts).
-            <button type="button" className="model-status__retry" onClick={handleRetryGraphService}>
+            // P1-3: its own model-only retry path — no restart, no
+            // re-index, map untouched (see `handleRetryLocalModel`).
+            <button type="button" className="model-status__retry" onClick={handleRetryLocalModel}>
               Retry
             </button>
           )}

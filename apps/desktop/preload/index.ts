@@ -22,6 +22,7 @@ import {
   type HardwareAdvisoryMessage,
   type LlmJudgmentProgressMessage,
   type McpServerStatusMessage,
+  type ModelRetryResult,
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
@@ -49,6 +50,9 @@ const drillerApi: DrillerApi = {
 
   restartGraphService: (forceRespawn?: boolean): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke(IpcChannels.graphServiceRestart, forceRespawn),
+
+  retryLocalModel: (): Promise<ModelRetryResult> =>
+    ipcRenderer.invoke(IpcChannels.modelRetry),
 
   onGraphServiceStatus: (callback: (status: GraphServiceStatusMessage) => void) => {
     const listener = (_event: IpcRendererEvent, status: GraphServiceStatusMessage) =>

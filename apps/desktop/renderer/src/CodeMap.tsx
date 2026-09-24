@@ -91,6 +91,7 @@ import type {
   IngestedRiskSignal,
   LlmJudgmentRiskSignal,
   RiskSignal,
+  SummaryStatus,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
@@ -1635,6 +1636,34 @@ export function formatHealthClusterHeat(
  */
 export function formatRemainingNodes(remainingNodeCount: number): string {
   return `+${remainingNodeCount} more Node${remainingNodeCount === 1 ? '' : 's'}`;
+}
+
+/**
+ * P1-2: the Node Detail panel's per-Node summary action, worded for the
+ * Node's state — "Regenerate" for a `'ready'` Node, "Generate summary" for a
+ * `'pending'` one (a Node whose generation failed stays `'pending'` all
+ * session, so this is its only retry), and `null` for `'coverage-gap'`,
+ * which the service rejects outright. Both labels run through the same
+ * `regenerateNode` IPC. `busyLabel` is the in-flight button text.
+ */
+export function nodeDetailSummaryAction(
+  summaryStatus: SummaryStatus,
+): { label: string; busyLabel: string } | null {
+  switch (summaryStatus) {
+    case 'ready':
+      return { label: 'Regenerate', busyLabel: 'Regenerating…' };
+    case 'pending':
+      return { label: 'Generate summary', busyLabel: 'Generating…' };
+    case 'coverage-gap':
+      return null;
+    default: {
+      // Exhaustive: a new `SummaryStatus` member fails to compile here. At
+      // runtime an unknown value arriving over IPC offers no action.
+      const unknownStatus: never = summaryStatus;
+      void unknownStatus;
+      return null;
+    }
+  }
 }
 
 /** P0-2b: the cluster-list cap's own remainder. See `formatRemainingNodes`. */
@@ -3938,6 +3967,12 @@ export function CodeMap({
   // without re-narrowing `blastRadiusState.status` inside a nested callback.
   const blastRadiusMaxDepth = blastRadiusState.status === 'resolved' ? blastRadiusState.maxDepth : 0;
 
+  // P1-2: the Node Detail panel's summary action (Regenerate / Generate
+  // summary / none) — hoisted here, like `blastRadiusMaxDepth`, rather than
+  // computed in an IIFE inside the JSX below.
+  const nodeDetailAction =
+    nodeDetail.status === 'open' ? nodeDetailSummaryAction(nodeDetail.node.summaryStatus) : null;
+
   return (
     <div className="code-map" ref={containerRef}>
       {/* Story 3.1 (Phase 2): the base-ref input + trigger — rendered
@@ -4760,15 +4795,14 @@ export function CodeMap({
               >
                 View source
               </button>
-              {/* P0-1 (2026-09-24): Regenerate is offered only where it can
-                  succeed. Story 1.8 could leave it unconditional because the
-                  panel was reachable only from a `'ready' && stale` Node;
-                  activation opens it for any Node now, and the service
-                  rejects a `'coverage-gap'` Node outright, so an
-                  unconditional button would be guaranteed to error there.
-                  A `'pending'` Node is already mid-generation, so a manual
-                  regenerate is equally meaningless. */}
-              {nodeDetail.node.summaryStatus === 'ready' && (
+              {/* P0-1 (2026-09-24): the summary action is offered only where
+                  it can succeed — the service rejects a `'coverage-gap'`
+                  Node outright. P1-2: a `'pending'` Node gets it too, worded
+                  "Generate summary" — a Node whose generation failed stays
+                  `'pending'` for the whole session, so this is its only way
+                  to retry (e.g. after adding a cloud key). Same
+                  `regenerateNode` IPC either way. */}
+              {nodeDetailAction && (
                 <button
                   type="button"
                   className={`code-map__node-detail-regenerate${graphServiceAvailable ? '' : ` ${SERVICE_UNAVAILABLE_CLASS}`}`}
@@ -4776,7 +4810,7 @@ export function CodeMap({
                   disabled={regenerateState.kind === 'regenerating' || !graphServiceAvailable}
                   title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
                 >
-                  {regenerateState.kind === 'regenerating' ? 'Regenerating…' : 'Regenerate'}
+                  {regenerateState.kind === 'regenerating' ? nodeDetailAction.busyLabel : nodeDetailAction.label}
                 </button>
               )}
               {regenerateState.kind === 'error' && (

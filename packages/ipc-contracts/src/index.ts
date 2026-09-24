@@ -886,6 +886,30 @@ export interface SetCloudApiKeyResult {
 // untouched and `message` carries safe, user-facing text.
 // ---------------------------------------------------------------------------
 
+/**
+ * P1-3: message main posts to a running Graph Service subprocess to retry
+ * ONLY the local-model download + checksum verification after a
+ * `graphService:modelStatus` 'error' — never a restart, re-index, or
+ * summary wipe. The service ignores it if the model is already ready or an
+ * attempt is in flight; on success it resumes generation for the cached
+ * Code Map's still-pending Nodes. Fire-and-forget: progress is reported
+ * through the existing `graphService:modelStatus` stream.
+ */
+export interface GraphServiceRetryModelRequest {
+  type: 'graphService:retryModel';
+}
+
+/**
+ * P1-3: the reply to `DrillerApi.retryLocalModel` — whether main could hand
+ * the retry to a running Graph Service. `ok: false` carries a user-facing
+ * `message` (e.g. the Graph Service isn't running); the download's own
+ * progress/outcome arrives separately via `onModelStatus`.
+ */
+export interface ModelRetryResult {
+  ok: boolean;
+  message?: string;
+}
+
 export type RegenerateNodeResult =
   | { status: 'ok'; node: CodeMapNode }
   | { status: 'error'; message: string };
@@ -1354,6 +1378,7 @@ export const IpcChannels = {
   projectListRecent: 'project:listRecent',
   graphServiceStatus: 'graphService:status',
   graphServiceRestart: 'graphService:restart',
+  modelRetry: 'model:retry',
   codeMapGet: 'codeMap:get',
   sourceReadRange: 'source:readRange',
   shellOpenInEditor: 'shell:openInEditor',
@@ -1397,10 +1422,11 @@ export interface DrillerApi {
    * Manually retries spawning the Graph Service after it failed to start.
    * With `forceRespawn` omitted/falsy, the existing behavior is unchanged:
    * a no-op respawn (just a fresh index request) if the subprocess is
-   * already alive, since the two existing Retry buttons
-   * (`graphServiceStatus`'s own error state, `modelStatus`'s error state)
-   * both rely on that semantics for their own failure modes, which never
-   * require killing a still-alive subprocess.
+   * already alive, since the Graph Service's own Retry buttons (its
+   * `graphServiceStatus` error state and the session notice) rely on that
+   * semantics for their own failure modes, which never require killing a
+   * still-alive subprocess. (The model-status footer's Retry no longer uses
+   * this — P1-3 gave it `retryLocalModel`, which never re-indexes.)
    *
    * `forceRespawn: true` (Story 5.2, review finding, Critical) tears the
    * current subprocess down and spawns a fresh one even if it's alive —
@@ -1411,6 +1437,13 @@ export interface DrillerApi {
    * do nothing for exactly the case this Retry button exists for.
    */
   restartGraphService: (forceRespawn?: boolean) => Promise<{ ok: boolean }>;
+  /**
+   * P1-3: the model-status footer's Retry — retries only the local-model
+   * download/verify in the running Graph Service (no restart, no re-index).
+   * `ok: false` with a `message` when the Graph Service isn't running or the
+   * request couldn't be sent; progress arrives via `onModelStatus`.
+   */
+  retryLocalModel: () => Promise<ModelRetryResult>;
   /** Subscribes to Graph Service status changes; returns an unsubscribe function. */
   onGraphServiceStatus: (
     callback: (status: GraphServiceStatusMessage) => void,

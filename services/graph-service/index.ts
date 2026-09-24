@@ -144,6 +144,7 @@ import type {
   GraphServicePathTraceResultMessage,
   GraphServiceRegenerateNodeRequest,
   GraphServiceRegenerateNodeResultMessage,
+  GraphServiceRetryModelRequest,
   GraphServiceRunIngestionRequest,
   GraphServiceRunIngestionResultMessage,
   GraphServiceShutdownRequest,
@@ -657,13 +658,13 @@ function postMcpServerStatus(message: McpServerStatusMessage): void {
  * second project, or a future explicit retry affordance) can simply
  * re-invoke this function and get a clean new attempt.
  */
-function kickOffModelDownload(): void {
+function kickOffModelDownload(): Promise<void> {
   if (modelAttempt) {
     // Already attempted (in flight, or already succeeded) this process
     // lifetime.
-    return;
+    return modelAttempt;
   }
-  modelAttempt = ensureLocalModel({
+  const attempt = ensureLocalModel({
     userDataPath,
     onProgress: (progress) => {
       postModelStatus({
@@ -701,6 +702,11 @@ function kickOffModelDownload(): void {
       // failed attempt.
       modelAttempt = null;
     });
+  modelAttempt = attempt;
+  // P1-3: returned so `handleRetryModelRequest` can chain on exactly this
+  // attempt. Always resolves (the `.catch` above swallows the failure after
+  // posting it) — callers check `localModelReady` to tell ready from error.
+  return attempt;
 }
 
 /**
@@ -810,6 +816,86 @@ function isRegenerateNodeRequest(data: unknown): data is GraphServiceRegenerateN
   }
   const { type, nodeId } = data as { type?: unknown; nodeId?: unknown };
   return type === 'graphService:regenerateNode' && typeof nodeId === 'string' && nodeId.length > 0;
+}
+
+/**
+ * True for a `graphService:retryModel` request (P1-3) — a payload-free
+ * message, so only `type` is checked, same untrusted-shape treatment as
+ * every other guard here.
+ */
+function isRetryModelRequest(data: unknown): data is GraphServiceRetryModelRequest {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (data as { type?: unknown }).type === 'graphService:retryModel'
+  );
+}
+
+/**
+ * Handles a `graphService:retryModel` request (P1-3) — the model-status
+ * Retry. Retries ONLY the local-model download + verification: never a
+ * re-index, subprocess restart, or summary wipe. A failed attempt already
+ * resets `modelAttempt` to `null` (see `kickOffModelDownload`), so this
+ * needs no new state — just a trigger:
+ *  - model already ready → nothing to retry; re-post `ready`;
+ *  - an attempt in flight (e.g. a double click) → no second download;
+ *  - otherwise → a fresh `kickOffModelDownload()`, whose own posts drive
+ *    the `downloading → verifying → ready|error` status stream.
+ * On success, summary and LLM-judgment generation resume for the cached
+ * Code Map's Nodes through the existing guarded
+ * `startSummaryGenerationForProject`/`startJudgmentGenerationForProject`
+ * (whose run guards stop a duplicate run). If the model is already ready,
+ * the current `ready` status is re-posted instead. Only on the local
+ * backend: a cloud backend never waited on this model, and its own
+ * generation is driven by the backend-switch path.
+ */
+function handleRetryModelRequest(): void {
+  if (localModelReady) {
+    // Nothing to retry — but re-post the current `ready` status so a footer
+    // still showing a stale `error` catches up rather than the Retry
+    // looking like it silently did nothing (review round 1).
+    postModelStatus({
+      type: 'graphService:modelStatus',
+      state: 'ready',
+      at: now(),
+      model: localModelReady.model,
+    });
+    return;
+  }
+  if (modelAttempt) {
+    // In flight (e.g. a double click) — its own progress posts already
+    // update the footer; never start a second download.
+    return;
+  }
+  // The generation this retry belongs to — a project switch/re-index while
+  // the download runs starts its own generation, which awaits the (same,
+  // memoized) attempt itself; this retry must not also kick the old one.
+  const generationId = activeSummaryGenerationId;
+  const logFailure = (label: string) => (error: unknown) => {
+    console.error(
+      `[graph-service] ${label} after model retry failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  };
+  void kickOffModelDownload()
+    .then(() => {
+      if (!localModelReady || generationId !== activeSummaryGenerationId) {
+        return;
+      }
+      if (activeIndexPath) {
+        checkConstrainedTierAdvisory(activeIndexPath).catch(logFailure('hardware advisory check'));
+      }
+      const nodes = activeCodeMapNodes;
+      const edges = activeCodeMapEdges;
+      if (nodes && edges && activeBackendConfig.activeBackend === 'local') {
+        // Both runs exited early on the model failure, and each run guard
+        // (`activeGenerationRunId`/`activeJudgmentGenerationRunId`) clears
+        // itself in its `finally`, so neither blocks this restart — while
+        // still stopping a duplicate if one is somehow already running.
+        startSummaryGenerationForProject(nodes, edges).catch(logFailure('summary generation'));
+        startJudgmentGenerationForProject(nodes).catch(logFailure('judgment generation'));
+      }
+    })
+    .catch(logFailure('model retry follow-up'));
 }
 
 /**
@@ -1044,7 +1130,7 @@ async function handleIndexRequest(
   // other. Memoized (see `kickOffModelDownload`'s doc comment), so this is
   // a no-op after the first `graphService:index` request in this process's
   // lifetime.
-  kickOffModelDownload();
+  void kickOffModelDownload();
   // Story 1.5 Phase 3 (review finding, High): re-checked per project, not
   // just inside `kickOffModelDownload`'s own one-shot `.then()` — see
   // `checkConstrainedTierAdvisory`'s own doc comment for why. Fire-and-
@@ -2485,6 +2571,10 @@ process.parentPort?.on('message', (event) => {
     // other branch here — `handlePathTraceRequest` posts its own
     // `graphService:pathTraceResult` reply asynchronously and never throws.
     void handlePathTraceRequest(event.data.query, event.data.requestId);
+    return;
+  }
+  if (!isShuttingDown && isRetryModelRequest(event.data)) {
+    handleRetryModelRequest();
     return;
   }
   if (!isShuttingDown && isRegenerateNodeRequest(event.data)) {

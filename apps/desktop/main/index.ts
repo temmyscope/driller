@@ -44,6 +44,7 @@ import {
   type GraphServicePathTraceRequest,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
+  type GraphServiceRetryModelRequest,
   type GraphServiceRegenerateNodeResultMessage,
   type GraphServiceRunIngestionRequest,
   type GraphServiceRunIngestionResultMessage,
@@ -51,6 +52,7 @@ import {
   type HardwareAdvisoryMessage,
   type LlmJudgmentProgressMessage,
   type McpServerStatusMessage,
+  type ModelRetryResult,
   type ModelStatusMessage,
   type OpenInEditorResult,
   type PathTraceResult,
@@ -1759,6 +1761,26 @@ function registerIpcHandlers(): void {
       return Promise.resolve(respawnAndReindex());
     },
   );
+
+  // P1-3: the model-status Retry — relays a model-only retry to the running
+  // subprocess. Deliberately never spawns, tears down, or re-indexes (unlike
+  // `graphServiceRestart` above): a model retry must not cost a full index.
+  ipcMain.handle(IpcChannels.modelRetry, (): ModelRetryResult => {
+    if (!graphService) {
+      return { ok: false, message: "The Graph Service isn't running — use its Retry to restart it first." };
+    }
+    try {
+      graphService.postMessage({ type: 'graphService:retryModel' } satisfies GraphServiceRetryModelRequest);
+    } catch (error) {
+      return {
+        ok: false,
+        message: `Failed to send the model retry request to the Graph Service: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
+    return { ok: true };
+  });
 
   ipcMain.handle(IpcChannels.codeMapGet, (): Promise<CodeMapResult> => requestCodeMap());
 
