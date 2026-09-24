@@ -1586,6 +1586,22 @@ export function formatRemainingClusters(remainingClusterCount: number): string {
 }
 
 /**
+ * P0-2c: the row control's affordance text — the "and activating it opens
+ * Node detail" half of the Node card's own `aria-label` convention, carried as
+ * real (visually hidden) CONTENT rather than as an `aria-label`.
+ *
+ * The distinction is the whole point. An `aria-label` REPLACES an element's
+ * text as its accessible name, so labelling the row button would silently
+ * delete every chip's own `aria-label` from what a screen reader announces:
+ * "Complexity: 21", "Blast radius: 14" and the entire AI-judgment sentence are
+ * rendered for sighted users and announced nowhere. Composing the name from
+ * content keeps all of it, and cannot drift from what is displayed the way a
+ * hand-built label can — the row's name is, by construction, exactly what the
+ * row shows plus this one phrase.
+ */
+const HEALTH_ROW_AFFORDANCE = 'open Node detail';
+
+/**
  * P0-2b: one Node's row inside a cluster card. Values are the Node's real
  * `DeterministicRiskSignal.value`s, rendered through the same
  * `DETERMINISTIC_SIGNAL_ICONS`/`DETERMINISTIC_SIGNAL_LABELS` +
@@ -1608,49 +1624,99 @@ export function formatRemainingClusters(remainingClusterCount: number): string {
  * a `handle` and would otherwise render as two identical rows. That helper
  * already exists in this file for exactly this problem in the Path Trace
  * candidate list.
+ *
+ * P0-2c: the row is now a real control — a native `<button>` filling the
+ * `<li>`, calling `onActivate` with ITS OWN `member.node` (the object, never a
+ * name/id the callee would have to resolve, which is what makes two
+ * same-named rows in one cluster open their own Nodes rather than the first
+ * match). A native button rather than the canvas card's
+ * `tabIndex`/`role="button"`/`onKeyDown` trio: that pattern exists on the card
+ * because React Flow owns the card's mouse handling, which is not a constraint
+ * here — and a real button gets Enter, Space, the focus stop and the AT role
+ * from the platform instead of from three hand-written handlers.
+ *
+ * Exactly ONE control per row (Never: "no second click target per row"), so
+ * unlike the Node card there is no nested pill and therefore no
+ * `stopPropagation` handling to match: the signal chips stay `role="img"`
+ * spans, and — because the button carries NO `aria-label` — each chip's own
+ * label still reaches the accessible name (`HEALTH_ROW_AFFORDANCE`).
+ *
+ * The `title` is the mouse's recovery path for the two lines that ellipsise
+ * (`.code-map__health-row-name` and `-location`): a long identifier under a
+ * deep qualified path is otherwise unreadable at this card width with no way
+ * to get it back. Same role the Node card's `title` and the cluster heading's
+ * `title={cluster.directory}` already play; it sits on the button because the
+ * button is what the pointer is actually over.
+ *
+ * MUST STAY HOOKLESS. This component and `HealthAuditClusterGrid` are invoked
+ * as plain functions by `CodeMap.healthAuditRow.test.ts`, which is how the
+ * handlers are reachable at all without a DOM (this repo's runner has none —
+ * `docs/agent.md`). A `useMemo`/`useId` here, or a `memo()` wrapper around
+ * either component, makes every one of those tests fail as a React dispatcher
+ * error rather than as an assertion. Neither component needs one: both are
+ * pure renderings of already-computed props.
  */
-function HealthAuditClusterRow({ member }: { member: HealthClusterNode }) {
+export function HealthAuditClusterRow({
+  member,
+  onActivate,
+}: {
+  member: HealthClusterNode;
+  onActivate: (node: CodeMapNode) => void;
+}) {
   const heat = heatForRiskCount(member.riskCount);
   const judgment = member.llmJudgment;
+  const location = formatCandidateLocation(member.node);
   return (
     <li className="code-map__health-row">
-      <span className="code-map__health-row-identity">
-        <span className="code-map__health-row-name">{member.node.name}</span>
-        <span className="code-map__health-row-location">{formatCandidateLocation(member.node)}</span>
-      </span>
-      <span className={`code-map__health-row-values code-map__health-row-values--${heat}`}>
-        <span className="code-map__health-row-band">{heat}</span>
-        {member.deterministicSignals.map((signal) => {
-          const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
-          const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
-          return (
+      <button
+        type="button"
+        className="code-map__health-row-button"
+        title={`${member.node.name} · ${location}`}
+        onClick={() => onActivate(member.node)}
+      >
+        <span className="code-map__health-row-identity">
+          <span className="code-map__health-row-name">{member.node.name}</span>
+          <span className="code-map__health-row-location">{location}</span>
+        </span>
+        <span className={`code-map__health-row-values code-map__health-row-values--${heat}`}>
+          <span className="code-map__health-row-band">{heat}</span>
+          {member.deterministicSignals.map((signal) => {
+            const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+            const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
+            return (
+              <span
+                key={signal.type}
+                className="code-map__health-row-signal"
+                role="img"
+                aria-label={`${label}: ${signal.value}`}
+                title={`${label}: ${signal.value}`}
+              >
+                <span aria-hidden="true">{icon}</span>
+                {signal.value}
+              </span>
+            );
+          })}
+          {/* The judgment is a sentence, not a measurement — its glyph and
+              accessible name follow `.code-map__llm-judgment`'s own "AI
+              judgment:" lead-in so it never reads with a deterministic
+              signal's unqualified-measurement confidence. */}
+          {judgment !== undefined && (
             <span
-              key={signal.type}
               className="code-map__health-row-signal"
               role="img"
-              aria-label={`${label}: ${signal.value}`}
-              title={`${label}: ${signal.value}`}
+              aria-label={`AI judgment: ${judgment.judgment}`}
+              title={`AI judgment: ${judgment.judgment}`}
             >
-              <span aria-hidden="true">{icon}</span>
-              {signal.value}
+              <span aria-hidden="true">✦</span>
             </span>
-          );
-        })}
-        {/* The judgment is a sentence, not a measurement — its glyph and
-            accessible name follow `.code-map__llm-judgment`'s own "AI
-            judgment:" lead-in so it never reads with a deterministic
-            signal's unqualified-measurement confidence. */}
-        {judgment !== undefined && (
-          <span
-            className="code-map__health-row-signal"
-            role="img"
-            aria-label={`AI judgment: ${judgment.judgment}`}
-            title={`AI judgment: ${judgment.judgment}`}
-          >
-            <span aria-hidden="true">✦</span>
-          </span>
-        )}
-      </span>
+          )}
+        </span>
+        {/* Last, so the name reads "<identifier> <location> <band> <signals…>
+            open Node detail" — what the row is, then what activating it does.
+            Visually hidden rather than `aria-label`d: see
+            `HEALTH_ROW_AFFORDANCE`. */}
+        <span className="visually-hidden">{HEALTH_ROW_AFFORDANCE}</span>
+      </button>
     </li>
   );
 }
@@ -1665,9 +1731,19 @@ const HEALTH_GRID_HEADING_ID = 'code-map-health-grid-heading';
  *
  * Every number here comes from P0-2a's `groupNodesIntoHealthClusters`: the
  * grouping, the ordering, the caps, the remainders and the heat banding. This
- * component decides nothing about risk — it is the rendering half only. Rows
- * are deliberately inert in this spec; row interaction (click to open Node
- * Detail) is sibling spec P0-2c's, not something to bolt on here.
+ * component decides nothing about risk — it is the rendering half only.
+ *
+ * P0-2c: rows are no longer inert. `onActivateNode` is threaded to every
+ * `HealthAuditClusterRow` and is the component's ONLY behavioral prop —
+ * `openNodeDetail`, the same one-click open path the Code Map's Node cards
+ * take, so Health Audit gains a caller of Node detail rather than a second
+ * detail surface. Nothing else about the card changed: the heat, the chips and
+ * the remainder lines are P0-2b's, unaltered.
+ *
+ * The remainder lines ("+N more Nodes"/"+N more modules") stay plain `<p>`s
+ * deliberately (I/O Matrix): they are COUNTS of Nodes the caps dropped, not
+ * Nodes, so there is nothing for them to open and they must not look or behave
+ * as if there were.
  *
  * Deliberately NOT rendered when there is nothing ready to group: the loading,
  * fetch-error, empty-map and PR-Review notices keep the surface entirely to
@@ -1675,13 +1751,28 @@ const HEALTH_GRID_HEADING_ID = 'code-map-health-grid-heading';
  * There is also no "Last full scan N ago" footer, unlike the mockup's: driller
  * has no scan-timestamp source, and the figure will not be faked.
  *
- * `tabIndex={0}` on the scroll container is load-bearing, not decoration: this
- * is a scrollable region whose only descendants are static text, so without it
- * a keyboard-only user has nothing to focus and cannot scroll it at all. The
- * `<h2>` gives the cards' `<h3>`s a parent in the heading outline instead of
- * starting it at level 3, and names the region.
+ * `tabIndex={0}` on the scroll container survives P0-2c and is still
+ * load-bearing, for a narrower reason than the one that put it here. Row
+ * buttons now give the region focusable descendants, and moving focus between
+ * them scrolls the region on its own — but the remainder lines and the
+ * heading are NOT focusable, so a card list whose last content below the fold
+ * is "+2 more modules" would have nothing to tab to in order to bring it into
+ * view. The container's own focus stop is what keeps the whole region
+ * scrollable, not just the parts that happen to be controls.
+ *
+ * The `<h2>` gives the cards' `<h3>`s a parent in the heading outline instead
+ * of starting it at level 3, and names the region. Its id is a module-scope
+ * constant rather than a `useId`, which is also what keeps this component
+ * hookless — see `HealthAuditClusterRow`'s own MUST STAY HOOKLESS note, which
+ * applies to this component identically.
  */
-function HealthAuditClusterGrid({ grouping }: { grouping: HealthClusterGrouping }) {
+export function HealthAuditClusterGrid({
+  grouping,
+  onActivateNode,
+}: {
+  grouping: HealthClusterGrouping;
+  onActivateNode: (node: CodeMapNode) => void;
+}) {
   return (
     <section
       className="code-map__health-grid"
@@ -1705,8 +1796,23 @@ function HealthAuditClusterGrid({ grouping }: { grouping: HealthClusterGrouping 
               {formatHealthClusterHeat(cluster.heat, cluster.heatCount, cluster.totalRiskCount)}
             </p>
             <ul className="code-map__health-rows">
-              {cluster.nodes.map((member) => (
-                <HealthAuditClusterRow key={member.node.id} member={member} />
+              {/* P0-2c: the key carries the member's POSITION as well as its
+                  Node id. A Node id is a fully-qualified name, which is
+                  unique in practice but is not guaranteed unique by anything
+                  in `graph-contracts` — and two Nodes sharing one inside a
+                  single cluster is exactly the "Duplicate names" case this
+                  surface already has to survive. Id alone would make that a
+                  duplicate React key: React would reuse one row element for
+                  both, so the second row could render the first row's Node
+                  and open it. The index is safe as a tiebreak here because
+                  the list is a total order `groupNodesIntoHealthClusters`
+                  already settled, not a user-reorderable one. */}
+              {cluster.nodes.map((member, index) => (
+                <HealthAuditClusterRow
+                  key={`${member.node.id}#${index}`}
+                  member={member}
+                  onActivate={onActivateNode}
+                />
               ))}
             </ul>
             {cluster.remainingNodeCount > 0 && (
@@ -1773,6 +1879,18 @@ const nodeTypes = { codeMapNode: CodeMapNodeCard, codeMapCluster: CodeMapCluster
  * a consumer reading this for aggregate stats (avg/percentile fps) can just
  * take `frameDeltas.slice(0, frameDeltaCount)` as an unordered sample set;
  * chronological order was never meaningful for that kind of aggregate.
+ *
+ * `selectionToDetailMs` (AD-14's click-to-UI-response latency) is written only
+ * from `activateNode` — i.e. only from a Node card ON THE CANVAS. P0-2c
+ * (2026-09-24) gave Health Audit Mode's cluster grid its own route into the
+ * same Node Detail panel via `openNodeDetail`, and that route deliberately
+ * starts no timer, so the app's FIRST-OPEN surface contributes no samples to
+ * this metric at all. Nothing is mis-measured — the recording effect
+ * early-returns while `selectionStartRef` is null, so a grid open cannot be
+ * attributed a stale start time — but a profiling run against this array is
+ * measuring the canvas only, and must not be read as covering Health Audit.
+ * Widening it means starting the clock in `openNodeDetail` itself (both
+ * callers) rather than adding a second timer here.
  */
 interface DrillerDevPerfWindow {
   __drillerPerf?: {
@@ -3812,8 +3930,26 @@ export function CodeMap({
           panning or zooming, rather than Story 4.1's cluster tint, which only
           ever appeared below `LOD_ZOOM_THRESHOLD` (0.2) and so was invisible
           at a real repo's `fitView`. */}
+      {/* P0-2c: `openNodeDetail`, not `activateNode`. Calling the open path
+          directly is what keeps the promise that a row activation is not a
+          mode switch, a canvas mount or a Path Trace side effect — but be
+          precise about what skipping `activateNode` costs, because neither of
+          its two side effects is scoped to the canvas:
+
+          - `focusedNodeIdRef` is component-wide and outlives a mode change.
+            A grid activation deliberately does not write it, so after opening
+            Nodes here and switching to Code Map Mode, `resolveEdgeClickTarget`
+            still resolves against whatever was last activated ON THE CANVAS
+            (or nothing). That is a degradation, not a defect: the resolver's
+            final branch returns `edge.target` whenever the focused id matches
+            neither endpoint, which is the same answer a fresh session gives.
+            Writing it from here would be the worse option — it would claim a
+            Node as the canvas's traversal origin without the user ever having
+            been on the canvas.
+          - The dev-fixture `selectionToDetailMs` timer is likewise skipped;
+            see `DrillerDevPerfWindow`'s note on what that excludes. */}
       {surfaces.healthAuditGrid && healthClusters !== null && (
-        <HealthAuditClusterGrid grouping={healthClusters} />
+        <HealthAuditClusterGrid grouping={healthClusters} onActivateNode={openNodeDetail} />
       )}
 
       {surfaces.canvas && (
@@ -4266,6 +4402,17 @@ export function CodeMap({
           now that it is what every card click lands on, a screen-reader user
           would otherwise be told only that *a* detail dialog opened, with
           nothing saying which Node they hit. */}
+      {/* P0-2c (2026-09-24): this gate reads `nodeDetail` and NOTHING else —
+          verified, not assumed, when Health Audit's grid became a second
+          caller. It is a sibling of the surface gates above, never nested
+          inside `surfaces.canvas`, so a row activated on the cluster grid
+          opens the panel over that grid exactly as a card click opens it over
+          the canvas. Do not fold it under a surface flag: the grid and the
+          canvas both open THIS panel, and gating it on either one silently
+          turns the other surface's rows into controls that open nothing.
+          Because it is a sibling rather than a replacement, the grid stays
+          mounted underneath while the panel is open and still holds its own
+          scroll offset when the panel closes. */}
       {nodeDetail.status === 'open' && (
         <div
           className="code-map__node-detail-overlay"

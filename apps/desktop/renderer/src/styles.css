@@ -69,6 +69,35 @@ code,
   font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
+/* P0-2c (2026-09-24): the one screen-reader-only utility, and the only rule in
+   this file that is not scoped to a single component — deliberately, because
+   its whole purpose is to be reusable.
+
+   It exists so a control can carry text that belongs in its ACCESSIBLE NAME
+   without an `aria-label`. That matters wherever a control's visible content
+   is already meaningful: `aria-label` replaces an element's text as its name,
+   so labelling such a control deletes its own children's labels from what a
+   screen reader announces (the exact trade `.code-map__health-row-button`
+   would otherwise make with its `role="img"` signal chips). Hidden text keeps
+   both.
+
+   The clip-rect idiom rather than `display: none`/`visibility: hidden`, which
+   remove the element from the accessibility tree entirely and would hide the
+   text from the very reader it is for. `white-space: nowrap` stops a
+   1px-wide box from wrapping its content into a tall column that can still
+   trigger layout/scroll. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .app {
   max-width: 720px;
   margin: 0 auto;
@@ -1350,10 +1379,13 @@ code,
    can ever occupy is kept free instead. `min(260px, 100%)` on the track keeps
    a narrow window from forcing horizontal scroll once that gutter is taken.
 
-   `:focus-visible` is load-bearing here, not decoration: this is a scroll
-   container with no focusable descendants, so it carries `tabIndex={0}` for
-   keyboard scrolling and therefore has to show focus like every other
-   keyboard-reachable element in this file. */
+   `:focus-visible` is load-bearing here, not decoration: this scroll container
+   carries `tabIndex={0}` for keyboard scrolling and therefore has to show
+   focus like every other keyboard-reachable element in this file. P0-2c added
+   focusable row buttons inside it, which narrows what the container's own
+   focus stop is for without removing the need for it — the heading and the
+   "+N more" remainder lines are not focusable, so row focus alone cannot
+   scroll them into view (see `HealthAuditClusterGrid`). */
 .code-map__health-grid {
   position: absolute;
   inset: 0;
@@ -1473,19 +1505,80 @@ code,
 }
 
 /* `row-border: 1px solid {colors.border}` — as a top border, dropped on the
-   first row so the card never opens with a rule directly under its heading. */
+   first row so the card never opens with a rule directly under its heading.
+
+   P0-2c: the `<li>` now carries only that divider. Every other property moved
+   down to `.code-map__health-row-button`, the real control that fills it —
+   layout has to live on the focusable element, or the focus ring would trace
+   the list item while the thing that is actually focused is something else
+   inside it. */
 .code-map__health-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 0.6rem;
-  padding: 0.35rem 0;
   border-top: 1px solid var(--border);
-  font-size: 10.5px;
 }
 
 .code-map__health-row:first-child {
   border-top: none;
+}
+
+/* P0-2c: the row AS A CONTROL — the same treatment
+   `.code-map__path-trace-stack-row` already established for "a real
+   `<button>` that has to look like a row, not like a button": reset the
+   platform chrome (`border`/`background`/`font`/`text-align`), keep the row's
+   own layout, add `cursor: pointer` and a hover state so a pointer user can
+   see it is activatable before clicking.
+
+   `font: inherit` before `font-size` on purpose — the shorthand resets the
+   whole font, including the size, so the row's own 10.5px has to be restated
+   after it rather than before.
+
+   The inline padding is the precedent's own `0.5rem`, pulled back out with a
+   matching negative margin (and a `width` that accounts for both) so the row
+   still LINES UP with the card's text while the button's own box reaches into
+   the card's gutter. Without that, the hover fill and the focus ring would
+   stop at the glyphs and leave a dead strip either side — a row that
+   highlights narrower than the row it is.
+
+   The heat colouring is NOT touched here: it lives on
+   `.code-map__health-row-values--{heat}` inside this button and keeps working
+   unchanged (Always: this adds an affordance, it does not restyle the card).
+   That is also why the focus ring is `outline`, drawn OVER the row rather
+   than composed into it — an inset `box-shadow` or a border would have to
+   share space with that colouring. `outline-offset: -2px` draws the ring
+   INSIDE the button's own box: rows are stacked flush, each separated only by
+   the `<li>`'s 1px top border, so a ring at offset 0 or greater would sit on
+   top of that divider and overlap the neighbouring rows, reading as if two
+   rows were focused. Nothing clips it — the card is not an overflow box — the
+   ring just has nowhere of its own to go. */
+.code-map__health-row-button {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6rem;
+  width: calc(100% + 1rem);
+  margin-inline: -0.5rem;
+  padding: 0.35rem 0.5rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 10.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.code-map__health-row-button:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+/* DESIGN.md `focus-ring`: `2px solid {colors.accent}` — the same
+   `:focus-visible` treatment every other keyboard-activatable element in this
+   file uses. Load-bearing, not decoration: the grid is this app's first-open
+   surface, and until P0-2c the only thing in it that could take focus was the
+   scroll container — there was no control to indicate. */
+.code-map__health-row-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 /* `row-label-color: {colors.text}`. The location line under it comes from
