@@ -20,7 +20,6 @@ import {
   HEALTH_CLUSTER_NODE_LIMIT,
   HEALTH_CLUSTER_ROOT_KEY,
   HEALTH_CLUSTER_ROOT_LABEL,
-  buildRiskCountByNodeId,
   groupNodesIntoHealthClusters,
   riskCountForNode,
 } from './CodeMap';
@@ -344,16 +343,21 @@ describe('groupNodesIntoHealthClusters', () => {
     );
   });
 
-  // Acceptance: parity with the Code Map cluster tint's per-Node count.
+  // P0-2a acceptance 3 was "every Node's count matches `riskCountByNodeId`",
+  // the Code Map cluster tint's own map. P0-2b deleted that tint (Health Audit
+  // Mode renders a card grid instead of a canvas, so a cluster and a health
+  // tint can no longer coexist) and `buildRiskCountByNodeId` with it, leaving
+  // nothing for the count to drift against and no second production map to
+  // compare to.
   //
-  // `buildRiskCountByNodeId` IS `riskCountByNodeId`'s body — the `useMemo`
-  // is now that call plus its mode/fetch-state gating — so this compares the
-  // helper against the real production map, not against a re-derivation of
-  // it. The fixture deliberately contains each case where a re-implemented
-  // counter would drift: an ingested signal (excluded), a repeated
-  // deterministic `type` (counted once) and a whitespace-only judgment (not
-  // counted).
-  it('reports per-Node counts identical to the Code Map cluster tint count', () => {
+  // What that acceptance was really protecting is kept here, pinned to
+  // LITERAL expected counts rather than to a deleted symbol or to
+  // `riskCountForNode` itself — the latter would make the assertion
+  // self-referential, the exact finding P0-2a's own review round had to fix.
+  // The fixture still carries each case a re-implemented counter would get
+  // wrong: an ingested signal (excluded), a repeated deterministic `type`
+  // (counted once) and a whitespace-only judgment (not counted).
+  it('counts each Node exactly once per de-duplicated signal, ingested excluded', () => {
     const repo = [
       node({ id: 'a', file: 'pkg/a.ts', riskSignals: [deterministic('hotspot'), judgment('x')] }),
       node({ id: 'b', file: 'pkg/b.ts', riskSignals: [judgment('\t ')] }),
@@ -366,18 +370,31 @@ describe('groupNodesIntoHealthClusters', () => {
       }),
     ];
 
-    const tintCounts = buildRiskCountByNodeId(repo);
+    const grouping = groupNodesIntoHealthClusters(repo);
 
-    assert.deepEqual(
-      [...tintCounts.entries()],
-      repo.map((member) => [member.id, riskCountForNode(member)]),
-    );
-    for (const cluster of groupNodesIntoHealthClusters(repo).clusters) {
+    // Cap-independence, asserted rather than assumed: `cluster.nodes` is
+    // already sliced to `HEALTH_CLUSTER_NODE_LIMIT`, so if this fixture ever
+    // grew past the cap the dropped Nodes would vanish from the comparison and
+    // it would quietly cover less than it claims to. Both remainders being `0`
+    // is what makes the map below the WHOLE fixture.
+    assert.equal(grouping.remainingClusterCount, 0, 'fixture must fit under the cluster cap');
+    for (const cluster of grouping.clusters) {
+      assert.equal(cluster.remainingNodeCount, 0, `cluster ${cluster.directory} must fit under the Node cap`);
+    }
+
+    const actualCounts: Record<string, number> = {};
+    for (const cluster of grouping.clusters) {
       for (const member of cluster.nodes) {
-        assert.equal(member.riskCount, tintCounts.get(member.node.id));
+        actualCounts[member.node.id] = member.riskCount;
       }
     }
-    assert.deepEqual([...tintCounts.values()], [2, 0, 0, 5, 1]);
+
+    // Compared as plain objects: `deepEqual` ignores key insertion order, so
+    // this is order-independent by construction rather than by a `.sort()`
+    // that would have been comparing `[string, number]` tuples through default
+    // string coercion.
+    assert.deepEqual(actualCounts, { a: 2, b: 0, c: 0, d: 5, e: 1 });
+    assert.equal(Object.keys(actualCounts).length, repo.length, 'every fixture Node must be present');
   });
 
   // The terminal tiebreak. Two Nodes sharing a cluster, a count AND a name,

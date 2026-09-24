@@ -92,7 +92,7 @@ import type {
   LlmJudgmentRiskSignal,
   RiskSignal,
 } from '@driller/ipc-contracts';
-import { computeLOD, type Cluster, type LODInputNode } from '../map/lod';
+import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 
 type FetchState =
   | { status: 'loading' }
@@ -614,9 +614,15 @@ function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
 // module scope instead.
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-// Story 4.1: same stable-empty-reference precedent as `EMPTY_ID_SET` just
-// above, for `clusterRiskCounts` outside `mode === 'healthAudit'`.
-const EMPTY_RISK_COUNT_MAP: ReadonlyMap<string, number> = new Map();
+/**
+ * P0-2b: what the LOD/render pipeline returns in a mode that mounts no canvas
+ * (Health Audit). Stable module-scope references, same precedent as
+ * `EMPTY_ID_SET` just above — a fresh literal per render would be referentially
+ * new every time and defeat the very memos these short-circuit.
+ */
+const EMPTY_LOD_RESULT: ComputeLODResult = { fullNodeIds: new Set(), clusters: [] };
+const EMPTY_FLOW_NODES: CodeMapAnyFlowNode[] = [];
+const EMPTY_FLOW_EDGES: FlowEdge[] = [];
 
 /** Consecutive-pair key for `pathHighlightEdgeKeys` (Story 1.9, Phase 2) — matches `toFlowEdges`'s own `id` separator. */
 function pathEdgeKey(source: string, target: string): string {
@@ -1167,14 +1173,14 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
  * camera with no explanation of why this one behaved differently from
  * every other cluster).
  *
- * Story 4.1: `riskCount` is Health Audit Mode's aggregated deterministic +
- * LLM-judgment risk-signal count across this cluster's member Nodes
- * (`clusterRiskCounts`, computed by the parent) — always `0` outside
- * `mode === 'healthAudit'`, so a plain Code Map cluster renders identically
- * to before this story.
+ * P0-2b: Story 4.1's `riskCount` tint prop is gone. It only ever had a
+ * non-zero value in Health Audit Mode, and that mode no longer renders a
+ * canvas — so a cluster and a health tint can never coexist again. The
+ * heat a user came for lives on the cluster-card grid instead
+ * (`HealthAuditClusterGrid`).
  */
 type CodeMapClusterFlowNode = FlowNode<
-  { cluster: Cluster; onExpand: (cluster: Cluster) => void; riskCount: number },
+  { cluster: Cluster; onExpand: (cluster: Cluster) => void },
   'codeMapCluster'
 >;
 
@@ -1222,33 +1228,16 @@ function selectCountedLlmJudgment(signals: RiskSignal[]): LlmJudgmentRiskSignal 
  * `selectCountedLlmJudgment`. `family: 'ingested'` is excluded: that is
  * Epic 3's PR-bot-findings concept, not part of Epic 2's Risk Overlay.
  *
- * Extracted from `buildRiskCountByNodeId`'s loop body, which now calls this,
- * so the two surfaces agree **per Node** by construction rather than by two
- * hand-maintained copies staying in step. That is the whole of the
- * guarantee: how each surface then AGGREGATES those per-Node counts differs
- * on purpose — see `clusterRiskCounts` and `HealthCluster.heatCount`.
+ * P0-2b: `groupNodesIntoHealthClusters` is now the only caller. The Code
+ * Map's LOD cluster tint used to be the second one, aggregating these same
+ * per-Node counts into `clusterRiskCounts`; that tint is gone (it could only
+ * ever appear below `LOD_ZOOM_THRESHOLD`, and Health Audit Mode no longer
+ * renders a canvas at all), so there is nothing left for this count to drift
+ * against.
  */
 export function riskCountForNode(node: CodeMapNode): number {
   const judgmentCount = selectCountedLlmJudgment(node.riskSignals) !== undefined ? 1 : 0;
   return selectDeterministicSignals(node.riskSignals).length + judgmentCount;
-}
-
-/**
- * P0-2a: the per-Node count map the Code Map's LOD cluster tint is built
- * from, lifted out of its `useMemo` so it is reachable without React.
- * `riskCountByNodeId` is now nothing but this function plus the memo's own
- * mode/fetch-state gating — which is what lets a test assert the spec's
- * third acceptance criterion against the real production map rather than
- * against a re-derivation of it.
- */
-export function buildRiskCountByNodeId(
-  nodes: readonly CodeMapNode[],
-): ReadonlyMap<string, number> {
-  const counts = new Map<string, number>();
-  for (const node of nodes) {
-    counts.set(node.id, riskCountForNode(node));
-  }
-  return counts;
 }
 
 /**
@@ -1273,6 +1262,20 @@ const HEAT_BY_BUCKET = {
 } as const satisfies Record<Exclude<ReturnType<typeof riskCountBucket>, null>, HealthClusterHeat>;
 
 /**
+ * P0-2a's banding, as a function. `groupNodesIntoHealthClusters` bands a
+ * cluster's `heatCount` through this, and P0-2b's grid bands each ROW's own
+ * `riskCount` through the same call — so the row's colour and the card's
+ * colour can never come from two separately-maintained thresholds (Always:
+ * "All grouping, ordering, capping, and heat banding come from 2a's helper —
+ * no second copy"). Extracted, not re-implemented: this is verbatim the
+ * expression the helper already inlined.
+ */
+export function heatForRiskCount(riskCount: number): HealthClusterHeat {
+  const bucket = riskCountBucket(riskCount);
+  return bucket === null ? 'healthy' : HEAT_BY_BUCKET[bucket];
+}
+
+/**
  * P0-2a: one Node inside a health cluster, carrying the count it was ranked
  * by and the signals behind that count — so a caller renders rows from real
  * signal values (`DETERMINISTIC_SIGNAL_LABELS`/`_ICONS` plus each signal's
@@ -1280,7 +1283,7 @@ const HEAT_BY_BUCKET = {
  */
 export interface HealthClusterNode {
   node: CodeMapNode;
-  /** `riskCountForNode(node)` — identical to this Node's `riskCountByNodeId` entry. */
+  /** `riskCountForNode(node)` — deterministic signals plus a non-blank judgment, never `ingested`. */
   riskCount: number;
   /** De-duplicated per `type`, then ordered by `type` ascending so the row order is total. */
   deterministicSignals: DeterministicRiskSignal[];
@@ -1307,10 +1310,10 @@ export interface HealthCluster {
    * volume. Carried so a caller can state the evidence next to the band
    * ("hot · 7 signals") instead of showing a bare adjective.
    *
-   * This is where this surface parts company with the Code Map's LOD cluster
-   * tint, which bands the SUM of its members instead — intentionally, since
-   * that cluster is a viewport artifact rather than a module. The two share
-   * `riskCountForNode` and therefore agree per Node, never per cluster.
+   * The MAX is what makes a health cluster a module being ranked against
+   * other modules rather than a bag whose score grows with its size. (Story
+   * 4.1's LOD cluster tint banded the SUM instead, correctly for a viewport
+   * artifact; P0-2b deleted it, so that divergence no longer exists.)
    */
   heatCount: number;
   /** Sum of every member Node's `riskCount`, including Nodes dropped by the cap. The secondary ordering key. */
@@ -1415,11 +1418,10 @@ export function groupNodesIntoHealthClusters(nodes: readonly CodeMapNode[]): Hea
         compareAscending(a.node.name, b.node.name) ||
         compareAscending(a.node.id, b.node.id),
     );
-    const bucket = riskCountBucket(heatCount);
     clusters.push({
       directory,
       label: directory === HEALTH_CLUSTER_ROOT_KEY ? HEALTH_CLUSTER_ROOT_LABEL : directory,
-      heat: bucket === null ? 'healthy' : HEAT_BY_BUCKET[bucket],
+      heat: heatForRiskCount(heatCount),
       heatCount,
       totalRiskCount,
       nodes: members.slice(0, HEALTH_CLUSTER_NODE_LIMIT),
@@ -1440,27 +1442,300 @@ export function groupNodesIntoHealthClusters(nodes: readonly CodeMapNode[]): Hea
   };
 }
 
+/** The three modes `App.tsx` switches between, as one name both this file's prop and its render gates use. */
+export type CodeMapMode = 'codeMap' | 'prReview' | 'healthAudit';
+
+/**
+ * P0-2b: which of this component's mutually-exclusive surfaces are on, for a
+ * given mode and a given "is there a real, showable map here" (`mapIsRenderable`).
+ *
+ * One record rather than three same-shaped predicates, because three
+ * `(CodeMapMode, boolean) => boolean` functions are interchangeable at a call
+ * site: the compiler cannot tell a canvas gate from a search gate, so swapping
+ * one for another in the JSX type-checks and renders two surfaces at once. A
+ * single mapping makes the WHOLE decision one value a test can pin
+ * exhaustively, and each JSX gate a named property read.
+ *
+ * (What a test still cannot reach: which property each JSX block actually
+ * reads. This repo's runner is `node --test` with no DOM — see `docs/agent.md`
+ * — so the wiring itself is covered by the spec's manual checks, not here.)
+ */
+export interface CodeMapSurfaces {
+  /** `<ReactFlow>` and the Back/Forward history toolbar that floats over it. */
+  canvas: boolean;
+  /** Health Audit Mode's cluster-card grid. Replaces the canvas; never renders beside one. */
+  healthAuditGrid: boolean;
+  /**
+   * The Path Trace query input. On in every mode: "search is always
+   * reachable, not mode-gated". Submitting from Health Audit Mode switches the
+   * app to Code Map Mode so the route lands on a canvas (FR-10) — see
+   * `resolvePathTraceSubmit`.
+   */
+  pathTraceInput: boolean;
+  /**
+   * The Path Trace RESULT surfaces — the found route's step list, the
+   * disambiguation candidate list, and the no-path/error notices.
+   *
+   * Tied to `canvas`, NOT to `pathTraceInput`, and that is deliberate: every
+   * one of them describes or acts on a route drawn across the canvas (a
+   * candidate click re-runs the trace and fits the viewport to it), so
+   * offering them with no canvas mounted is offering a control for something
+   * that is not there. Nothing resets `pathTrace` on a mode change, so a user
+   * who traces and then switches to Health Audit really would otherwise be
+   * left holding a live, clickable route list over a grid.
+   */
+  pathTraceResult: boolean;
+}
+
+/**
+ * P0-2b: the asymmetry at the heart of this spec, resolved in one place so it
+ * cannot be collapsed back by accident.
+ *
+ * `mapIsRenderable` is the single "there is a real, showable map here"
+ * derivation three JSX gates used to share verbatim. Health Audit Mode splits
+ * it, because it renders a DIFFERENT SURFACE rather than a variant of the
+ * canvas: the canvas and its history toolbar go, the cluster-card grid takes
+ * their place, and the Path Trace INPUT stays while its RESULT surfaces follow
+ * the canvas.
+ *
+ * Do not "simplify" this back into one flag: `canvas` and `healthAuditGrid`
+ * are opposites, `pathTraceInput` deliberately agrees with neither, and that
+ * disagreement is the whole decision this spec makes.
+ */
+export function resolveCodeMapSurfaces(mode: CodeMapMode, mapIsRenderable: boolean): CodeMapSurfaces {
+  const canvas = mapIsRenderable && mode !== 'healthAudit';
+  return {
+    canvas,
+    healthAuditGrid: mapIsRenderable && mode === 'healthAudit',
+    pathTraceInput: mapIsRenderable,
+    pathTraceResult: canvas,
+  };
+}
+
+/**
+ * P0-2b: what a Path Trace submit does, in order. An ordered effect list
+ * rather than a `{query, switchMode}` record, because the ORDER is the part
+ * that matters and the part a test must be able to fail: the mode switch has
+ * to be requested BEFORE the trace runs, so `setMode` is flushed and
+ * `<ReactFlow>` has mounted and called `onInit` by the time the `tracePath`
+ * IPC round trip resolves and `fitViewToPath` reaches for its instance.
+ *
+ * `handlePathTraceSubmit` is a dumb interpreter of this list — it decides
+ * nothing itself. That is the point: the previous version of this logic lived
+ * entirely inside the handler, so its test could only re-transcribe it and
+ * assert the transcription (the self-referential-assertion failure mode P0-2a's
+ * review round 1 had to fix once already).
+ *
+ * The trimmed-empty rejection lives here too, and returns NO effects at all:
+ * `traceCallPath`'s substring tier (`name.includes('')`) is vacuously true, so
+ * an empty query would match every Node — and an empty submit must not move
+ * the user off the surface they are reading either.
+ */
+export type PathTraceSubmitEffect =
+  | { readonly kind: 'requestCodeMapMode' }
+  | { readonly kind: 'runPathTrace'; readonly query: string };
+
+export function resolvePathTraceSubmit(
+  mode: CodeMapMode,
+  rawQuery: string,
+): PathTraceSubmitEffect[] {
+  const query = rawQuery.trim();
+  if (query.length === 0) {
+    return [];
+  }
+  return mode === 'healthAudit'
+    ? [{ kind: 'requestCodeMapMode' }, { kind: 'runPathTrace', query }]
+    : [{ kind: 'runPathTrace', query }];
+}
+
+/**
+ * P0-2b: a cluster's heat label. Always the band AND the count it came from
+ * (Always: never a bare adjective), never colour alone — this text sits beside
+ * the dot and is what a screen reader reads.
+ *
+ * It also says WHAT the number is. `heatCount` is the highest count on any
+ * SINGLE Node in the cluster, never the sum, so a bare "hot · 7 signals" on a
+ * card listing eight Nodes reads as a module total it is not. When the module
+ * carries more than its worst Node does, `totalRiskCount` is stated alongside
+ * it; when the two are equal there is nothing to disambiguate and the clause
+ * is dropped, which is also what a clean repo's "healthy · 0 signals on its
+ * worst Node" reads as — ordinary output stating an explicit zero (P3-9).
+ */
+export function formatHealthClusterHeat(
+  heat: HealthClusterHeat,
+  heatCount: number,
+  totalRiskCount: number,
+): string {
+  const worst = `${heat} · ${heatCount} signal${heatCount === 1 ? '' : 's'} on its worst Node`;
+  return totalRiskCount === heatCount ? worst : `${worst}, ${totalRiskCount} in the module`;
+}
+
+/**
+ * P0-2b: the per-cluster cap's explicit remainder (AD-13's
+ * explicit-result-state pattern applied to truncation) — never silent
+ * truncation. Pure and exported so the pluralization is pinned by a test
+ * rather than by reading the JSX.
+ */
+export function formatRemainingNodes(remainingNodeCount: number): string {
+  return `+${remainingNodeCount} more Node${remainingNodeCount === 1 ? '' : 's'}`;
+}
+
+/** P0-2b: the cluster-list cap's own remainder. See `formatRemainingNodes`. */
+export function formatRemainingClusters(remainingClusterCount: number): string {
+  return `+${remainingClusterCount} more module${remainingClusterCount === 1 ? '' : 's'}`;
+}
+
+/**
+ * P0-2b: one Node's row inside a cluster card. Values are the Node's real
+ * `DeterministicRiskSignal.value`s, rendered through the same
+ * `DETERMINISTIC_SIGNAL_ICONS`/`DETERMINISTIC_SIGNAL_LABELS` +
+ * `role="img"`/`aria-label` chip convention `NodeRiskSignalSections` already
+ * uses on the canvas — glyph and number visible, full signal name in the
+ * accessible name. No percentages are derived: `test-coverage-gap` is a
+ * boolean flag carrying `value: 1`, and no signal has a severity, so the
+ * mockup's "61% gap"/"2 hotspots" figures depict data driller does not have.
+ *
+ * The row's own band is rendered as a WORD, not only as the value colour
+ * (Accessibility Floor: the `--{heat}` class is reinforcement only, and the
+ * signal chips' `aria-label`s carry name and value but never the band). It is
+ * banded from this Node's own `riskCount` through the same `heatForRiskCount`
+ * the card bands `heatCount` with, so a row and its card can never come from
+ * two sets of thresholds — and a Node carrying nothing reads "healthy", which
+ * is that same word, not a separate empty-state string.
+ *
+ * `formatCandidateLocation` supplies the row's second line: a directory
+ * cluster merges every file under it, so `a.ts` and `b.ts` can both contribute
+ * a `handle` and would otherwise render as two identical rows. That helper
+ * already exists in this file for exactly this problem in the Path Trace
+ * candidate list.
+ */
+function HealthAuditClusterRow({ member }: { member: HealthClusterNode }) {
+  const heat = heatForRiskCount(member.riskCount);
+  const judgment = member.llmJudgment;
+  return (
+    <li className="code-map__health-row">
+      <span className="code-map__health-row-identity">
+        <span className="code-map__health-row-name">{member.node.name}</span>
+        <span className="code-map__health-row-location">{formatCandidateLocation(member.node)}</span>
+      </span>
+      <span className={`code-map__health-row-values code-map__health-row-values--${heat}`}>
+        <span className="code-map__health-row-band">{heat}</span>
+        {member.deterministicSignals.map((signal) => {
+          const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+          const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
+          return (
+            <span
+              key={signal.type}
+              className="code-map__health-row-signal"
+              role="img"
+              aria-label={`${label}: ${signal.value}`}
+              title={`${label}: ${signal.value}`}
+            >
+              <span aria-hidden="true">{icon}</span>
+              {signal.value}
+            </span>
+          );
+        })}
+        {/* The judgment is a sentence, not a measurement — its glyph and
+            accessible name follow `.code-map__llm-judgment`'s own "AI
+            judgment:" lead-in so it never reads with a deterministic
+            signal's unqualified-measurement confidence. */}
+        {judgment !== undefined && (
+          <span
+            className="code-map__health-row-signal"
+            role="img"
+            aria-label={`AI judgment: ${judgment.judgment}`}
+            title={`AI judgment: ${judgment.judgment}`}
+          >
+            <span aria-hidden="true">✦</span>
+          </span>
+        )}
+      </span>
+    </li>
+  );
+}
+
+/** The grid's own heading, referenced by the scroll region's `aria-labelledby`. */
+const HEALTH_GRID_HEADING_ID = 'code-map-health-grid-heading';
+
+/**
+ * P0-2b: Health Audit Mode's own surface — the cluster-card grid that renders
+ * INSTEAD OF the canvas (DESIGN.md `components.health-cluster-card`,
+ * EXPERIENCE.md "Health Audit cluster card", `mockups/health-audit-mode.html`).
+ *
+ * Every number here comes from P0-2a's `groupNodesIntoHealthClusters`: the
+ * grouping, the ordering, the caps, the remainders and the heat banding. This
+ * component decides nothing about risk — it is the rendering half only. Rows
+ * are deliberately inert in this spec; row interaction (click to open Node
+ * Detail) is sibling spec P0-2c's, not something to bolt on here.
+ *
+ * Deliberately NOT rendered when there is nothing ready to group: the loading,
+ * fetch-error, empty-map and PR-Review notices keep the surface entirely to
+ * themselves (I/O Matrix), so a partial card frame never appears over one.
+ * There is also no "Last full scan N ago" footer, unlike the mockup's: driller
+ * has no scan-timestamp source, and the figure will not be faked.
+ *
+ * `tabIndex={0}` on the scroll container is load-bearing, not decoration: this
+ * is a scrollable region whose only descendants are static text, so without it
+ * a keyboard-only user has nothing to focus and cannot scroll it at all. The
+ * `<h2>` gives the cards' `<h3>`s a parent in the heading outline instead of
+ * starting it at level 3, and names the region.
+ */
+function HealthAuditClusterGrid({ grouping }: { grouping: HealthClusterGrouping }) {
+  return (
+    <section
+      className="code-map__health-grid"
+      aria-labelledby={HEALTH_GRID_HEADING_ID}
+      tabIndex={0}
+    >
+      <h2 className="code-map__health-heading" id={HEALTH_GRID_HEADING_ID}>
+        Risk signals clustered by module
+      </h2>
+      <ol className="code-map__health-cards">
+        {grouping.clusters.map((cluster) => (
+          <li key={cluster.directory} className="code-map__health-card">
+            <h3 className="code-map__health-card-heading" title={cluster.directory}>
+              <span
+                className={`code-map__health-dot code-map__health-dot--${cluster.heat}`}
+                aria-hidden="true"
+              />
+              <span className="code-map__health-card-label">{cluster.label}</span>
+            </h3>
+            <p className="code-map__health-card-heat">
+              {formatHealthClusterHeat(cluster.heat, cluster.heatCount, cluster.totalRiskCount)}
+            </p>
+            <ul className="code-map__health-rows">
+              {cluster.nodes.map((member) => (
+                <HealthAuditClusterRow key={member.node.id} member={member} />
+              ))}
+            </ul>
+            {cluster.remainingNodeCount > 0 && (
+              <p className="code-map__health-more">{formatRemainingNodes(cluster.remainingNodeCount)}</p>
+            )}
+          </li>
+        ))}
+      </ol>
+      {grouping.remainingClusterCount > 0 && (
+        <p className="code-map__health-more code-map__health-more--clusters">
+          {formatRemainingClusters(grouping.remainingClusterCount)}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
-  const { cluster, onExpand, riskCount } = data;
+  const { cluster, onExpand } = data;
   const willZoomInsteadOfExpand = cluster.nodeIds.length > CLUSTER_EXPAND_MAX;
-  // Story 4.1: the bucketed heatmap tint (Always: "never color-only" —
-  // `aria-label` below states the count in words; this class is
-  // reinforcement only). `null` (zero signals) adds no modifier class, so a
-  // plain Code Map cluster (`riskCount` always `0` there) is byte-identical
-  // to its pre-Story-4.1 className.
-  const riskBucket = riskCountBucket(riskCount);
   return (
     <div
-      className={`code-map__cluster${willZoomInsteadOfExpand ? ' code-map__cluster--zoom' : ''}${
-        riskBucket ? ` code-map__cluster--risk-${riskBucket}` : ''
-      }`}
+      className={`code-map__cluster${willZoomInsteadOfExpand ? ' code-map__cluster--zoom' : ''}`}
       tabIndex={0}
       role="button"
       aria-label={
-        (willZoomInsteadOfExpand
+        willZoomInsteadOfExpand
           ? `Cluster of ${cluster.nodeIds.length} nodes, too many to expand — zoom in`
-          : `Cluster of ${cluster.nodeIds.length} nodes, expand`) +
-        (riskBucket ? `, ${riskCount} risk signal${riskCount === 1 ? '' : 's'}` : '')
+          : `Cluster of ${cluster.nodeIds.length} nodes, expand`
       }
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
@@ -1568,13 +1843,33 @@ export interface CodeMapProps {
    *
    * Story 4.1: widened to include `'healthAudit'` — `App.tsx`'s own `Mode`
    * type widens together with this one (Always: "both must change
-   * together"). Health Audit Mode gates `clusterRiskCounts` below, the same
-   * way `'prReview'` gates `changedNodeIds`/`blastRadiusNodeIds`.
+   * together").
+   *
+   * P0-2b: `'healthAudit'` is now a different SURFACE, not a tint on the
+   * shared one — it renders `HealthAuditClusterGrid` and suppresses both the
+   * `<ReactFlow>` canvas and the history toolbar. The Path Trace toolbar is
+   * deliberately NOT suppressed with them; see `healthAuditGridIsRenderable`.
    */
-  mode: 'codeMap' | 'prReview' | 'healthAudit';
+  mode: CodeMapMode;
+  /**
+   * P0-2b: asks `App.tsx` — which owns `mode` as shell state — to switch to
+   * Code Map Mode. Called on a Path Trace submit from Health Audit Mode and
+   * nowhere else: search stays reachable in every mode ("search is always
+   * reachable, not mode-gated"), but a traced route must render on a canvas
+   * (FR-10), and Health Audit Mode has none. A callback rather than local
+   * state because `mode` is `App.tsx`'s to own — the mode switcher's own
+   * radio has to reflect the change too.
+   */
+  onRequestCodeMapMode: () => void;
 }
 
-export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedNoKey, mode }: CodeMapProps) {
+export function CodeMap({
+  projectPath,
+  noSummaryBackendAvailable,
+  cloudSelectedNoKey,
+  mode,
+  onRequestCodeMapMode,
+}: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
   // Story 1.10 (Phase 2): the source overlay's "Open in external editor"
@@ -2578,18 +2873,32 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // at/above `threshold` (or a lone Node in its cell) AND within
   // `viewportBounds` (review finding — see `map/lod/index.ts`'s doc
   // comment for why the viewport gate is load-bearing, not decorative).
+  //
+  // P0-2b: short-circuited entirely in Health Audit Mode, which mounts no
+  // `<ReactFlow>` — this is an O(Nodes) pass, on the app's first-open landing
+  // surface, for a canvas that never appears (AD-15's budgets). arc42 §8 now
+  // says this mode does not consume the LOD module; this is what makes that
+  // true. `computeLOD` and `Cluster` themselves are untouched (the spec's Ask
+  // First) — only whether this caller calls them.
+  //
+  // `lodInputNodes` above is deliberately NOT gated with it: `centerOnNode`
+  // reads the same list to resolve a reveal-zoom, and handing that an empty
+  // list would be a silent wrong answer rather than a skipped one. It is a
+  // projection of an array `flowNodes` already built, not a second traversal.
   const lodResult = useMemo(
     () =>
-      computeLOD({
-        nodes: lodInputNodes,
-        zoom: zoomBand,
-        threshold: LOD_ZOOM_THRESHOLD,
-        viewportBounds: { x: boundsX, y: boundsY, width: worldWidth, height: worldHeight },
-      }),
+      mode === 'healthAudit'
+        ? EMPTY_LOD_RESULT
+        : computeLOD({
+            nodes: lodInputNodes,
+            zoom: zoomBand,
+            threshold: LOD_ZOOM_THRESHOLD,
+            viewportBounds: { x: boundsX, y: boundsY, width: worldWidth, height: worldHeight },
+          }),
     // Depends on the individual quantized numbers, not a `viewportBounds`
     // object literal — a fresh object every render would defeat memoization
     // even when its numeric contents are unchanged.
-    [lodInputNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
+    [mode, lodInputNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
   );
 
   // Story 1.9 (Phase 2): the `found` path's Node ids and its consecutive-pair
@@ -2636,95 +2945,40 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     return ids;
   }, [mode, blastRadiusState, blastRadiusDepth]);
 
-  // Story 4.1: Health Audit Mode's per-Node risk-signal count — split out
-  // from the per-cluster aggregation below (review finding, Medium,
-  // performance) so this O(total Nodes) scan is keyed only on
-  // `[mode, fetchState]`, not on `lodResult` too: `lodResult` recomputes on
-  // every pan/zoom that crosses a quantization boundary (see the `lodResult`
-  // memo above), and this scan's own inputs never change on that cadence.
-  // Counts only `family: 'deterministic'` and `family: 'llm-judgment'` risk
-  // signals (Always: "Epic 2's Risk Overlay applied" — never
-  // `family: 'ingested'`, which is Epic 3's own PR-bot-findings concept, not
-  // part of the Risk Overlay), gated on `mode === 'healthAudit'` only,
-  // mirroring how `changedNodeIds`/`blastRadiusNodeIds` are each gated to
-  // their own mode above.
-  //
-  // Review finding (Medium): this count must never exceed what a user would
-  // actually see by expanding into the cluster — otherwise a cluster's
-  // count/tint promises signals that aren't there.
-  //
-  // P0-1 (2026-09-24): that invariant is now structural rather than
-  // hand-maintained. This loop used to re-implement the per-`type`
-  // de-duplication itself, and justified doing so by citing
-  // `deterministicSignals` — a local inside `CodeMapNodeCard` that no longer
-  // exists, since the card's selection logic was extracted into the shared
-  // `selectDeterministicSignals`/`selectLlmJudgmentSignal` the renderer now
-  // uses. Two copies had already drifted: this loop counted EVERY
-  // `'llm-judgment'` signal while the renderer shows only the first, so a
-  // Node carrying two judgments tinted its cluster `2` and displayed `1`.
-  // Calling the same selectors the renderer calls makes that impossible by
-  // construction. The blank-judgment guard mirrors the renderer's own for
-  // the same reason — a whitespace-only judgment renders nothing, so
-  // counting it would reopen the identical gap.
-  //
-  // P0-2a (2026-09-24): the whole body now lives in
-  // `buildRiskCountByNodeId`, leaving this memo as nothing but the
-  // mode/fetch-state gating around it — so a test can assert the per-Node
-  // counts against the real production map instead of re-deriving one.
-  // `groupNodesIntoHealthClusters` calls the same `riskCountForNode`, so the
-  // two surfaces agree PER NODE by construction.
-  //
-  // That guarantee stops at the Node, and deliberately so: `clusterRiskCounts`
-  // below SUMS its members' counts, while `HealthCluster.heatCount` takes the
-  // MAX of them, so the same group of Nodes can legitimately band differently
-  // on the two surfaces. The sum is right here — a spatial LOD cluster is an
-  // arbitrary viewport-derived bag of Nodes whose tint should reflect how much
-  // is in it. The max is right there — a health cluster is a real module being
-  // ranked against other modules, where one bad Node must make it hot rather
-  // than a large directory doing so by volume. Do not "fix" the difference by
-  // making one call the other.
-  //
-  // Deliberately NOT gated on the three family toggles: those are Code Map
-  // rendering preferences, while this is Health Audit Mode's own Risk
-  // Overlay reading of what a Node carries (Always: "Epic 2's Risk Overlay
-  // applied"). `family: 'ingested'` stays excluded for the same reason — it
-  // is Epic 3's PR-bot-findings concept, not part of the Risk Overlay.
-  const riskCountByNodeId = useMemo<ReadonlyMap<string, number>>(() => {
+  /**
+   * P0-2b: Health Audit Mode's cluster-card grid, grouped by P0-2a's pure
+   * helper. Keyed only on `[mode, fetchState]` — never on `lodResult` — for
+   * the same reason Story 4.1's deleted per-Node count scan was: `lodResult`
+   * recomputes on every pan/zoom that crosses a quantization boundary, and
+   * this O(total Nodes) grouping's own inputs never change on that cadence.
+   * In this mode there is no canvas to pan at all, but the memo must still
+   * not re-run for the other two modes' viewport traffic.
+   *
+   * `null` outside Health Audit Mode, or before the fetch is `ready`, so the
+   * JSX gate below is a plain null check and the existing loading/empty/
+   * degraded notices keep the surface to themselves (I/O Matrix: "Existing
+   * notice only; no grid, no empty card frame").
+   *
+   * Deliberately NOT gated on the three signal-family toggles — those are
+   * Code Map canvas rendering preferences, and this is Health Audit Mode's
+   * own Risk Overlay reading of what a Node carries. `family: 'ingested'` is
+   * excluded by `riskCountForNode` for the same reason: Epic 3's PR-bot
+   * findings are not part of Epic 2's Risk Overlay.
+   */
+  const healthClusters = useMemo<HealthClusterGrouping | null>(() => {
     if (mode !== 'healthAudit' || fetchState.status !== 'ready') {
-      return EMPTY_RISK_COUNT_MAP;
+      return null;
     }
-    return buildRiskCountByNodeId(fetchState.nodes);
+    return groupNodesIntoHealthClusters(fetchState.nodes);
   }, [mode, fetchState]);
 
-  // Story 4.1: the per-cluster aggregation itself — a `useMemo` derived
-  // value keyed off `riskCountByNodeId`/`lodResult.clusters` (Always:
-  // "`computeLOD`/`Cluster` gain zero new fields", AD-2: never a second
-  // parallel LOD implementation). Kept as its own memo (see
-  // `riskCountByNodeId`'s own comment) so a `lodResult` recompute only ever
-  // re-sums already-counted per-Node values, never re-scans every Node's
-  // `riskSignals` from scratch.
-  //
-  // P0-2a (2026-09-24): this SUM is not the same aggregation as
-  // `HealthCluster.heatCount`'s MAX, and the divergence is intended — see
-  // `riskCountByNodeId`'s comment above for which is right where. The shared
-  // `riskCountForNode` guarantees the two agree on each Node's own count and
-  // nothing beyond that.
-  const clusterRiskCounts = useMemo<ReadonlyMap<string, number>>(() => {
-    if (riskCountByNodeId === EMPTY_RISK_COUNT_MAP) {
-      return EMPTY_RISK_COUNT_MAP;
-    }
-    const counts = new Map<string, number>();
-    for (const cluster of lodResult.clusters) {
-      let total = 0;
-      for (const nodeId of cluster.nodeIds) {
-        total += riskCountByNodeId.get(nodeId) ?? 0;
-      }
-      counts.set(cluster.id, total);
-    }
-    return counts;
-  }, [riskCountByNodeId, lodResult]);
-
+  // P0-2b: likewise skipped in Health Audit Mode — see `lodResult` above.
+  // Without this, every flow node and the whole `flowEdges` filter/map pass
+  // would still be built for a canvas that never mounts.
   const { renderedNodes, renderedEdges } = useMemo(() => {
+    if (mode === 'healthAudit') {
+      return { renderedNodes: EMPTY_FLOW_NODES, renderedEdges: EMPTY_FLOW_EDGES };
+    }
     const visibleNodeIds = new Set(lodResult.fullNodeIds);
     const nodes: CodeMapAnyFlowNode[] = [];
 
@@ -2789,10 +3043,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         id: cluster.id,
         type: 'codeMapCluster',
         position: cluster.position,
-        // Story 4.1: `riskCount` defaults to `0` outside Health Audit Mode
-        // (`clusterRiskCounts` returns `EMPTY_RISK_COUNT_MAP` there) — a
-        // plain Code Map cluster always renders with no heatmap tint.
-        data: { cluster, onExpand: expandCluster, riskCount: clusterRiskCounts.get(cluster.id) ?? 0 },
+        data: { cluster, onExpand: expandCluster },
       };
       nodes.push(clusterNode);
     }
@@ -2831,6 +3082,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
 
     return { renderedNodes: nodes, renderedEdges: edges };
   }, [
+    mode,
     lodResult,
     flowNodesById,
     expandedClusterIds,
@@ -2839,7 +3091,6 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     pathHighlightNodeIds,
     pathHighlightEdgeKeys,
     blastRadiusNodeIds,
-    clusterRiskCounts,
     changedNodeIds,
   ]);
 
@@ -3124,17 +3375,30 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
    * exact reason. A disambiguation candidate's `id` (`runPathTrace`'s other
    * call site, in the JSX below) needs no such guard — it's always a real,
    * non-empty Node id, never user-typed free text.
+   *
+   * P0-2b: what to do — including whether to leave Health Audit Mode first,
+   * and in which order — is `resolvePathTraceSubmit`'s, not this handler's.
+   * This is only the interpreter that performs the effects it returns, so the
+   * decision is pure, exported and directly testable rather than something a
+   * test can only re-transcribe. Both the trimmed-empty rejection and the
+   * "switch before you trace" ordering live there; see its doc comment.
+   *
+   * Only the submit path resolves effects, never `runPathTrace` itself: its
+   * other caller is a disambiguation-candidate click, which now renders only
+   * while the canvas does (`CodeMapSurfaces.pathTraceResult`).
    */
   const handlePathTraceSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
-      const trimmedQuery = pathQuery.trim();
-      if (trimmedQuery.length === 0) {
-        return;
+      for (const effect of resolvePathTraceSubmit(mode, pathQuery)) {
+        if (effect.kind === 'requestCodeMapMode') {
+          onRequestCodeMapMode();
+        } else {
+          runPathTrace(effect.query);
+        }
       }
-      runPathTrace(trimmedQuery);
     },
-    [pathQuery, runPathTrace],
+    [pathQuery, runPathTrace, mode, onRequestCodeMapMode],
   );
 
   /**
@@ -3303,8 +3567,27 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // one copy could silently drift from the other two. Named once here,
   // mirroring `pathTraceIsSearching`/`prReviewNoticeStatus`'s own
   // hoist-before-return convention just above.
+  //
+  // P0-2b: still one derivation, but no longer one gate. Health Audit Mode
+  // swaps the canvas for its own surface while keeping search, so every gate
+  // below reads a named property of `resolveCodeMapSurfaces`' one record —
+  // which is where that asymmetry is stated, and what a test pins.
   const mapIsRenderable =
     fetchState.status === 'ready' && fetchState.nodes.length > 0 && prReviewNoticeStatus === null;
+  const surfaces = resolveCodeMapSurfaces(mode, mapIsRenderable);
+
+  // P0-2b: `reactFlowInstanceRef` is written once, in `handleInit`, and was
+  // never cleared because before this spec the canvas only ever unmounted with
+  // the whole component. It now unmounts on every switch into Health Audit
+  // Mode, so without this the ref would keep a dead instance and the
+  // `if (!instance)` guards in `fitViewToPath`/`centerOnNode` could never fire
+  // again — they would call `fitBounds`/`setCenter` on an unmounted instance,
+  // silently, with not even the warning those guards exist to print.
+  useEffect(() => {
+    if (!surfaces.canvas) {
+      reactFlowInstanceRef.current = null;
+    }
+  }, [surfaces.canvas]);
 
   // Story 3.2 (Phase 2): the stepper's own upper bound — "its own 'further'"
   // (Always: "the stepper's upper bound is the maximum hop distance actually
@@ -3523,7 +3806,17 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         </div>
       )}
 
-      {mapIsRenderable && (
+      {/* P0-2b: Health Audit Mode's own surface, rendered in place of the
+          `<ReactFlow>` canvas below (and of the history toolbar further down)
+          — a genuinely different surface, visible at the default zoom with no
+          panning or zooming, rather than Story 4.1's cluster tint, which only
+          ever appeared below `LOD_ZOOM_THRESHOLD` (0.2) and so was invisible
+          at a real repo's `fitView`. */}
+      {surfaces.healthAuditGrid && healthClusters !== null && (
+        <HealthAuditClusterGrid grouping={healthClusters} />
+      )}
+
+      {surfaces.canvas && (
         // React Flow does not size itself from CSS alone — the parent
         // `.code-map` div is sized via `position: absolute; inset: 0`
         // (styles.css), but `<ReactFlow>`'s own root element still needs an
@@ -3647,7 +3940,9 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         </ReactFlow>
       )}
 
-      {mapIsRenderable && (
+      {/* P0-2b: also gated off Health Audit Mode — this floats over the
+          canvas, and there is no canvas there to traverse. */}
+      {surfaces.canvas && (
         // Story 1.4 Code Map: "New lightweight Back/Forward toolbar ...
         // disabled at either end of history" — renderer-local chrome over
         // the ephemeral `history` state, never persisted/IPC'd (AD-2
@@ -3671,7 +3966,12 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
         </div>
       )}
 
-      {mapIsRenderable && (
+      {/* P0-2b: `pathTraceInput`, NOT `canvas` — search stays reachable in
+          Health Audit Mode too; submitting there switches to Code Map Mode so
+          the route lands on a canvas (`resolvePathTraceSubmit`). The RESULT
+          surfaces inside this wrapper follow `pathTraceResult` instead, which
+          does track the canvas — see `CodeMapSurfaces`. */}
+      {surfaces.pathTraceInput && (
         // Story 1.9 (Phase 2): the always-reachable Path Trace search
         // affordance — persistent/non-modal, mirroring the history
         // toolbar's own `role="toolbar"`/absolute-over-canvas pattern just
@@ -3706,183 +4006,196 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
             </button>
           </form>
 
-          {/* `no-path-found`/`error` reuse this file's existing ad hoc
-              notice convention (Design Notes) — the same compact
-              `notice`/`notice--*` treatment the Node Detail panel's own
-              Regenerate error already uses, rather than the full-canvas
-              `.code-map__notice` reserved above for a whole-map-replacing
-              state (loading/fetch-error/empty-map): this notice sits
-              alongside a still-interactive map, never over it. */}
-          {pathTrace.status === 'no-path-found' && (
-            <div className="code-map__path-trace-dismissable-notice">
-              <p className="notice notice--warning" role="status">
-                No path found for that query.
-              </p>
-              {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
-                  the panel to `idle` — also driller's first clear-search
-                  affordance, resolving Phase 2's deferred gap. */}
-              <button
-                type="button"
-                className="code-map__path-trace-dismiss"
-                onClick={() => handleDismissPathTrace('no-path-found')}
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-          {pathTrace.status === 'error' && (
-            <p className="notice notice--error" role="alert">
-              {pathTrace.message}
-            </p>
-          )}
-
-          {pathTrace.status === 'ambiguous' && (
-            // Story 1.9 (Phase 3): the disambiguation Actionable Notice —
-            // one sentence plus one next action (pick a candidate), same
-            // Actionable Notice shape every other "needs attention" state
-            // in the app already uses (Epic 1 context, UX & Interaction
-            // Patterns). Reuses the `code-map__path-trace-steps` list class
-            // (the `<ol>` wrapper) from the `found` step list just below —
-            // the row button itself no longer shares a class with that
-            // list's own row (renamed to `code-map__path-trace-stack-row`,
-            // this pass's DESIGN.md restyle) since candidates and traced
-            // hops now have genuinely different visual shapes, not because
-            // this list stopped reusing shared structure (Boundaries &
-            // Constraints) — a clickable named list is still the same shape
-            // either way, it's just candidates instead of path steps. Each
-            // candidate's click
-            // re-runs the trace pinned to that exact `id` via the shared
-            // `runPathTrace` (resolves deterministically through the
-            // untouched exact-id tier) — never a new "resume" IPC
-            // parameter (Never).
-            <div className="code-map__path-trace-steps-panel" role="region" aria-label="Multiple matches — pick one">
-              <p className="notice notice--warning" role="status">
-                Multiple matches found — pick one to trace:
-              </p>
-              <ol className="code-map__path-trace-steps">
-                {/* Review fix: render-layer cap (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`,
-                    see its own doc comment above) — `pathTrace.candidates`
-                    itself is never truncated (the engine's own `ambiguous`
-                    contract stays the full, honest match list), only what
-                    gets rendered into this small fixed-width panel is. */}
-                {pathTrace.candidates.slice(0, MAX_RENDERED_AMBIGUOUS_CANDIDATES).map((candidate) => (
-                  <li key={candidate.id}>
-                    <button
-                      type="button"
-                      className="code-map__path-trace-step code-map__path-trace-candidate"
-                      disabled={pathTraceIsSearching}
-                      onClick={() => runPathTrace(candidate.id)}
-                    >
-                      {/* Review fix: every candidate in one `ambiguous`
-                          result shares the same `name` by construction —
-                          `formatCandidateLocation` surfaces the
-                          distinguishing file/location part of `candidate.id`
-                          so two same-named candidates never render as
-                          identical, unlabeled buttons. */}
-                      <code>{candidate.name}</code>
-                      <span className="code-map__path-trace-candidate-location">
-                        {formatCandidateLocation(candidate)}
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ol>
-              {pathTrace.candidates.length > MAX_RENDERED_AMBIGUOUS_CANDIDATES && (
-                <p className="code-map__path-trace-candidates-truncated">
-                  Showing the first {MAX_RENDERED_AMBIGUOUS_CANDIDATES} of {pathTrace.candidates.length} matches —
-                  refine your query for a shorter list.
+          {/* P0-2b: the RESULT surfaces, gated on `pathTraceResult` — which
+              tracks the canvas, not the input above. Every one of them
+              describes or acts on a route drawn across that canvas (a step row
+              re-centers it, a candidate row re-runs the trace and fits the
+              viewport to it), so with no canvas mounted they would be controls
+              for something that is not there. Nothing resets `pathTrace` on a
+              mode change, so a user who traces and then switches to Health
+              Audit Mode really would otherwise be left holding a live,
+              clickable route list over the cluster grid. See `CodeMapSurfaces`. */}
+          {surfaces.pathTraceResult && (
+            <>
+            {/* `no-path-found`/`error` reuse this file's existing ad hoc
+                notice convention (Design Notes) — the same compact
+                `notice`/`notice--*` treatment the Node Detail panel's own
+                Regenerate error already uses, rather than the full-canvas
+                `.code-map__notice` reserved above for a whole-map-replacing
+                state (loading/fetch-error/empty-map): this notice sits
+                alongside a still-interactive map, never over it. */}
+            {pathTrace.status === 'no-path-found' && (
+              <div className="code-map__path-trace-dismissable-notice">
+                <p className="notice notice--warning" role="status">
+                  No path found for that query.
                 </p>
-              )}
-              {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
-                  the panel to `idle` — also driller's first clear-search
-                  affordance, resolving Phase 2's deferred gap. */}
-              <button
-                type="button"
-                className="code-map__path-trace-dismiss"
-                onClick={() => handleDismissPathTrace('ambiguous')}
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
+                {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+                    the panel to `idle` — also driller's first clear-search
+                    affordance, resolving Phase 2's deferred gap. */}
+                <button
+                  type="button"
+                  className="code-map__path-trace-dismiss"
+                  onClick={() => handleDismissPathTrace('no-path-found')}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+            {pathTrace.status === 'error' && (
+              <p className="notice notice--error" role="alert">
+                {pathTrace.message}
+              </p>
+            )}
 
-          {pathTrace.status === 'found' && (
-            // Boundaries & Constraints (UX-DR10): "leaves the
-            // highlight/step list visible for further stepping" — clicking
-            // an entry only re-centers the map via `navigateToNode`, it
-            // never closes/collapses this panel.
-            //
-            // DESIGN.md `path-trace-stack-row` (this pass): dense-profiler's
-            // own indented call-stack visual — hop circle, tree-indent
-            // glyph, identifier, module — replacing the old flat numbered-
-            // pill/name row. Deliberately no duration/timing field (Never:
-            // driller resolves paths statically and never executes code;
-            // dense-profiler's own per-hop duration would be fabricated
-            // data here — see that token's own DESIGN.md comment).
-            <div className="code-map__path-trace-steps-panel" role="region" aria-label="Traced path steps">
-              <ol className="code-map__path-trace-steps">
-                {pathTrace.path.map((id, index) => {
-                  const node = flowNodesById.get(id)?.data.node;
-                  return (
-                    // Review fix: `id` alone isn't guaranteed unique — nothing
-                    // rules out a real graph shape producing a path that
-                    // revisits the same Node id twice — so the index is
-                    // folded into the key too.
-                    <li key={`${id}-${index}`}>
+            {pathTrace.status === 'ambiguous' && (
+              // Story 1.9 (Phase 3): the disambiguation Actionable Notice —
+              // one sentence plus one next action (pick a candidate), same
+              // Actionable Notice shape every other "needs attention" state
+              // in the app already uses (Epic 1 context, UX & Interaction
+              // Patterns). Reuses the `code-map__path-trace-steps` list class
+              // (the `<ol>` wrapper) from the `found` step list just below —
+              // the row button itself no longer shares a class with that
+              // list's own row (renamed to `code-map__path-trace-stack-row`,
+              // this pass's DESIGN.md restyle) since candidates and traced
+              // hops now have genuinely different visual shapes, not because
+              // this list stopped reusing shared structure (Boundaries &
+              // Constraints) — a clickable named list is still the same shape
+              // either way, it's just candidates instead of path steps. Each
+              // candidate's click
+              // re-runs the trace pinned to that exact `id` via the shared
+              // `runPathTrace` (resolves deterministically through the
+              // untouched exact-id tier) — never a new "resume" IPC
+              // parameter (Never).
+              <div className="code-map__path-trace-steps-panel" role="region" aria-label="Multiple matches — pick one">
+                <p className="notice notice--warning" role="status">
+                  Multiple matches found — pick one to trace:
+                </p>
+                <ol className="code-map__path-trace-steps">
+                  {/* Review fix: render-layer cap (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`,
+                      see its own doc comment above) — `pathTrace.candidates`
+                      itself is never truncated (the engine's own `ambiguous`
+                      contract stays the full, honest match list), only what
+                      gets rendered into this small fixed-width panel is. */}
+                  {pathTrace.candidates.slice(0, MAX_RENDERED_AMBIGUOUS_CANDIDATES).map((candidate) => (
+                    <li key={candidate.id}>
                       <button
                         type="button"
-                        className="code-map__path-trace-stack-row"
-                        onClick={() => navigateToNode(id)}
+                        className="code-map__path-trace-step code-map__path-trace-candidate"
+                        disabled={pathTraceIsSearching}
+                        onClick={() => runPathTrace(candidate.id)}
                       >
-                        <span className="code-map__path-trace-hop-circle" aria-hidden="true">
-                          {index + 1}
-                        </span>
-                        {/* The entry point (index 0) has nothing to descend
-                            from, so it carries no indent connector — every
-                            hop after it does, indented one further step
-                            than the last (dense-profiler's own "indented
-                            call-stack" visual, Design Notes).
-                            Review fix (Blind Hunter + Edge Case Hunter,
-                            independently): `(index - 1) * 8` put hop 1 (the
-                            first indented row) at 0px, visually flush with
-                            the unindented entry point — off by one. `index *
-                            8` fixes that (hop 1 → 8px, hop 2 → 16px, ...).
-                            Capped at 8 levels (64px) so a very long traced
-                            path can't push the row's text out of this fixed-
-                            width panel — depth beyond that stops being
-                            legible anyway, so no further indent is lost
-                            information, just a plateau. */}
-                        {index > 0 && (
-                          <span
-                            className="code-map__path-trace-indent"
-                            aria-hidden="true"
-                            style={{ marginLeft: `${Math.min(index * 8, 64)}px` }}
-                          >
-                            └─
-                          </span>
-                        )}
-                        <span className="code-map__path-trace-stack-row-text">
-                          <code className="code-map__path-trace-stack-row-name">{node?.name ?? id}</code>
-                          {node?.file && (
-                            <span className="code-map__path-trace-stack-row-module">{node.file}</span>
-                          )}
+                        {/* Review fix: every candidate in one `ambiguous`
+                            result shares the same `name` by construction —
+                            `formatCandidateLocation` surfaces the
+                            distinguishing file/location part of `candidate.id`
+                            so two same-named candidates never render as
+                            identical, unlabeled buttons. */}
+                        <code>{candidate.name}</code>
+                        <span className="code-map__path-trace-candidate-location">
+                          {formatCandidateLocation(candidate)}
                         </span>
                       </button>
                     </li>
-                  );
-                })}
-              </ol>
-              {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
-                  the panel to `idle` — also driller's first clear-search
-                  affordance, resolving Phase 2's deferred gap. */}
-              <button
-                type="button"
-                className="code-map__path-trace-dismiss"
-                onClick={() => handleDismissPathTrace('found')}
-              >
-                Dismiss
-              </button>
-            </div>
+                  ))}
+                </ol>
+                {pathTrace.candidates.length > MAX_RENDERED_AMBIGUOUS_CANDIDATES && (
+                  <p className="code-map__path-trace-candidates-truncated">
+                    Showing the first {MAX_RENDERED_AMBIGUOUS_CANDIDATES} of {pathTrace.candidates.length} matches —
+                    refine your query for a shorter list.
+                  </p>
+                )}
+                {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+                    the panel to `idle` — also driller's first clear-search
+                    affordance, resolving Phase 2's deferred gap. */}
+                <button
+                  type="button"
+                  className="code-map__path-trace-dismiss"
+                  onClick={() => handleDismissPathTrace('ambiguous')}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            {pathTrace.status === 'found' && (
+              // Boundaries & Constraints (UX-DR10): "leaves the
+              // highlight/step list visible for further stepping" — clicking
+              // an entry only re-centers the map via `navigateToNode`, it
+              // never closes/collapses this panel.
+              //
+              // DESIGN.md `path-trace-stack-row` (this pass): dense-profiler's
+              // own indented call-stack visual — hop circle, tree-indent
+              // glyph, identifier, module — replacing the old flat numbered-
+              // pill/name row. Deliberately no duration/timing field (Never:
+              // driller resolves paths statically and never executes code;
+              // dense-profiler's own per-hop duration would be fabricated
+              // data here — see that token's own DESIGN.md comment).
+              <div className="code-map__path-trace-steps-panel" role="region" aria-label="Traced path steps">
+                <ol className="code-map__path-trace-steps">
+                  {pathTrace.path.map((id, index) => {
+                    const node = flowNodesById.get(id)?.data.node;
+                    return (
+                      // Review fix: `id` alone isn't guaranteed unique — nothing
+                      // rules out a real graph shape producing a path that
+                      // revisits the same Node id twice — so the index is
+                      // folded into the key too.
+                      <li key={`${id}-${index}`}>
+                        <button
+                          type="button"
+                          className="code-map__path-trace-stack-row"
+                          onClick={() => navigateToNode(id)}
+                        >
+                          <span className="code-map__path-trace-hop-circle" aria-hidden="true">
+                            {index + 1}
+                          </span>
+                          {/* The entry point (index 0) has nothing to descend
+                              from, so it carries no indent connector — every
+                              hop after it does, indented one further step
+                              than the last (dense-profiler's own "indented
+                              call-stack" visual, Design Notes).
+                              Review fix (Blind Hunter + Edge Case Hunter,
+                              independently): `(index - 1) * 8` put hop 1 (the
+                              first indented row) at 0px, visually flush with
+                              the unindented entry point — off by one. `index *
+                              8` fixes that (hop 1 → 8px, hop 2 → 16px, ...).
+                              Capped at 8 levels (64px) so a very long traced
+                              path can't push the row's text out of this fixed-
+                              width panel — depth beyond that stops being
+                              legible anyway, so no further indent is lost
+                              information, just a plateau. */}
+                          {index > 0 && (
+                            <span
+                              className="code-map__path-trace-indent"
+                              aria-hidden="true"
+                              style={{ marginLeft: `${Math.min(index * 8, 64)}px` }}
+                            >
+                              └─
+                            </span>
+                          )}
+                          <span className="code-map__path-trace-stack-row-text">
+                            <code className="code-map__path-trace-stack-row-name">{node?.name ?? id}</code>
+                            {node?.file && (
+                              <span className="code-map__path-trace-stack-row-module">{node.file}</span>
+                            )}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+                {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+                    the panel to `idle` — also driller's first clear-search
+                    affordance, resolving Phase 2's deferred gap. */}
+                <button
+                  type="button"
+                  className="code-map__path-trace-dismiss"
+                  onClick={() => handleDismissPathTrace('found')}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+            </>
           )}
         </div>
       )}

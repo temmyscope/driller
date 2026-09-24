@@ -51,7 +51,7 @@ v1 ships as a single Electron desktop application, open-source, built to be used
 | **Coverage Gap** | A flag shown on a Node instead of a confident-looking summary, when the underlying Graph Service index has incomplete structural coverage for that Node's file. Distinct failure mode from the Staleness Indicator: missing data, not outdated data. |
 | **Graph Service** | driller's internal adapter between its own UI/query logic and the underlying MCP-based code-graph backend — the seam that keeps the backend swappable. See [arc42.md §3, §5](arc42.md). |
 | **PR Review Mode** | Mode scoped to a single local git change (diff against a selected branch or commit). |
-| **Health Audit Mode** | Mode presenting the whole-repo Code Map and Risk Overlay, independent of any single change. |
+| **Health Audit Mode** | Mode presenting the whole-repo Risk Overlay as directory-grouped, risk-ranked module cluster cards, independent of any single change. *[Corrected 2026-09-24, P0-2b: it renders its own cluster-card surface, not the Code Map canvas — see FR13.]* |
 | **Agent-Facing Query Surface** | The MCP server / API through which other agents and tools query the Code Map, summaries, and Risk Overlay. |
 | **Supervising Engineer** | The primary persona (see §2). |
 
@@ -84,7 +84,7 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 - **FR12 — Blast Radius on Change.** Highlights the computed Blast Radius (FR7) of changed Nodes; interactively expandable by hop depth (1-hop, 2-hop, ...).
 
 ### 4.7 Health Audit Mode
-- **FR13 — Whole-Repo Audit View.** Full-repo Code Map with the Risk Overlay applied, independent of any single change, reachable without selecting a git ref. Overlay signals aggregate visually (heatmap-style).
+- **FR13 — Whole-Repo Audit View.** Whole-repo view of the Risk Overlay, independent of any single change, reachable without selecting a git ref. Signals aggregate visually, ranked by module. *[Corrected 2026-09-24, P0-2b]:* this is no longer "the Code Map with the Risk Overlay applied". Health Audit Mode renders its own surface — Nodes grouped into cards by containing directory, each card heat-banded by the highest signal count on any single Node it holds and listing those Nodes with their real signal values — and renders no canvas at all. The earlier phrasing described the mode as a tint over the shared Code Map canvas, which is what shipped in Story 4.1 and what P0-2b replaced: that tint only appeared on LOD clusters, which only form past a zoom threshold a real repo's default view does not reach, so the mode had no visible output of its own. See [arc42.md §8](arc42.md#8-crosscutting-concepts) (AD-2).
 
 ### 4.8 Agent-facing query surface
 - **FR14 — MCP/API Graph Query.** Other agents and tools query driller's Code Map — structure, summaries, Risk Overlay — via an MCP server or API. *[Corrected 2026-09-23, analyst-verified against what actually shipped]:* the v1 surface is five distinct operations — Node lookup, Path Trace, Blast Radius expansion, diff-scoped Node-set computation, and coverage-check retrieval — not "Risk Overlay signal retrieval" as its own operation (an earlier planning-draft phrasing that doesn't correspond to anything actually built). Risk Overlay signals travel as fields on a Node-lookup response, per FR15's parity requirement, rather than as a separate query. No data leaves the local machine beyond what the querying agent's own runtime already has. Documented contract ships with v1.

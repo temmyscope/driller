@@ -1329,35 +1329,251 @@ code,
   color: var(--accent);
 }
 
-/* Story 4.1: Health Audit Mode's bucketed heatmap tint on collapsed LOD
-   clusters (Design Notes: "a simple signal-count bucket ... via color-mix,
-   reuses the existing --warning token, no new one" — same formula
-   `.notice--warning`/`.code-map__blast-radius-highlight` already used
-   elsewhere in this file, now `--risk-amber`, the generic-warning hue's own
-   new name; this shipped cluster tint is a different, already-live feature
-   from DESIGN.md's own new, still-deferred Health Audit cluster-card grid
-   layout — Never: "build the Health Audit cluster-card layout" is about
-   that new grid, not this existing collapsed-cluster tint). Never
-   color-only (Accessibility Floor): the count itself is also stated in
-   words in the cluster's own `aria-label` (see `CodeMapClusterCard`) — this
-   tint is reinforcement only. Increasing opacity per bucket (`1-2` low,
-   `3-5` medium, `6+` high) keeps the strongest concentrations visually
-   distinguishable at a glance without a new severity-weighting scheme.
-   Review finding (Medium): `.notice--warning` — this codebase's only other
-   precedent for a tint sitting behind readable text — caps at 15% opacity.
-   Kept all three buckets within that established readability precedent
-   (10%/20%/32%) rather than escalating past it, so the cluster's own
-   count/label text stays legible even at the "high" bucket. */
-.code-map__cluster--risk-low {
-  background: color-mix(in srgb, var(--risk-amber) 10%, transparent);
+/* P0-2b: Health Audit Mode's own surface — the cluster-card grid that
+   replaces the canvas in this mode (`HealthAuditClusterGrid`). It supersedes
+   Story 4.1's collapsed-LOD-cluster heatmap tint, deleted here: that tint
+   could only appear once clusters formed (below `LOD_ZOOM_THRESHOLD`, 0.2),
+   and a real repo's `fitView` lands near 0.29, so the mode's only visible
+   output was usually invisible. There is no canvas in this mode now, so no
+   cluster to tint.
+
+   Positioned like `.code-map__notice` (absolute, `inset: 0`) because it
+   likewise REPLACES the map rather than floating over it — but scrollable,
+   since the card list is as long as the repo is wide.
+
+   The left padding is a reserved GUTTER, not cosmetic spacing:
+   `.code-map__path-trace` stays floated over this surface (search is reachable
+   here too — `CodeMapSurfaces.pathTraceInput`), it is `position: absolute` at
+   `left: 0.75rem` with `width: min(320px, …)`, and it GROWS DOWNWARD as its
+   notice and panels appear. Clearing it vertically alone would still leave
+   cards underneath it the moment it got taller, so the whole left column it
+   can ever occupy is kept free instead. `min(260px, 100%)` on the track keeps
+   a narrow window from forcing horizontal scroll once that gutter is taken.
+
+   `:focus-visible` is load-bearing here, not decoration: this is a scroll
+   container with no focusable descendants, so it carries `tabIndex={0}` for
+   keyboard scrolling and therefore has to show focus like every other
+   keyboard-reachable element in this file. */
+.code-map__health-grid {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 0.75rem 0.75rem 1rem calc(320px + 1.5rem);
 }
 
-.code-map__cluster--risk-medium {
-  background: color-mix(in srgb, var(--risk-amber) 20%, transparent);
+.code-map__health-grid:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
-.code-map__cluster--risk-high {
-  background: color-mix(in srgb, var(--risk-amber) 32%, transparent);
+/* The region's own heading — also what gives the cards' `<h3>`s a level-2
+   parent instead of starting the outline at 3. Styled as this system's quiet
+   section label (the mockup's own `.section-label`), not as a page title. */
+.code-map__health-heading {
+  margin: 0 0 0.75rem;
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-mute);
+}
+
+/* DESIGN.md `components.health-cluster-card` renders as a plain responsive
+   grid — the mockup's fixed `flex: 1` row only holds for its own three cards.
+   `auto-fill` keeps a one- or two-card repo from stretching a card across the
+   whole window. */
+.code-map__health-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* `background: {colors.panel}`, `border: 1px solid {colors.border-strong}`,
+   `radius: {rounded.DEFAULT}` — which is this system's sharp `0`
+   (Shapes: rounded corners are badges only). */
+.code-map__health-card {
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 0;
+  padding: 0.6rem 0.75rem 0.4rem;
+}
+
+.code-map__health-card-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0 0 0.45rem;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text);
+}
+
+/* The directory can be long (`api/internal/service/...`); it ellipsises
+   rather than wrapping the heat label onto a second line, with the full path
+   in the heading's own `title` (see `HealthAuditClusterGrid`) so nothing is
+   lost. Deliberately a plain LTR ellipsis: the `direction: rtl` trick that
+   would keep the leaf visible instead resolves unpredictably under
+   `unicode-bidi`, and an unpredictable truncation is worse than a boring
+   one. */
+.code-map__health-card-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The band, the count it came from, and what that count MEANS ("on its worst
+   Node", plus the module total when the two differ) — always all of it
+   (Accessibility Floor: the dot in the heading above is reinforcement only,
+   never the sole carrier).
+
+   On its own line under the heading rather than inline right of it, as the
+   mockup has it: the mockup's inline label is the single word "hot", and a
+   sentence that has to distinguish a per-Node maximum from a module total does
+   not fit beside a directory path at this card width. */
+.code-map__health-card-heat {
+  margin: -0.25rem 0 0.55rem;
+  color: var(--text-mute);
+  font-size: 10px;
+}
+
+/* `heat-dot-hot`/`-warm`/`-cool`. `cool` and `healthy` share
+   `{colors.healthy}` by design (DESIGN.md `heat-band-to-dot`) — the two are
+   told apart by the count stated in the label beside them, never by colour,
+   which is exactly why sharing one token loses nothing. First call site for
+   `--healthy` outside the Node-card staleness/coverage text. */
+.code-map__health-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+}
+
+.code-map__health-dot--hot {
+  background: var(--risk-red);
+}
+
+.code-map__health-dot--warm {
+  background: var(--risk-amber);
+}
+
+.code-map__health-dot--cool,
+.code-map__health-dot--healthy {
+  background: var(--healthy);
+}
+
+.code-map__health-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* `row-border: 1px solid {colors.border}` — as a top border, dropped on the
+   first row so the card never opens with a rule directly under its heading. */
+.code-map__health-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.35rem 0;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+}
+
+.code-map__health-row:first-child {
+  border-top: none;
+}
+
+/* `row-label-color: {colors.text}`. The location line under it comes from
+   `formatCandidateLocation`: a directory cluster merges every file under it,
+   so two files can each contribute a `handle` and the names alone would render
+   as two identical rows. */
+.code-map__health-row-identity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.code-map__health-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.code-map__health-row-location {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-mute);
+  font-size: 9.5px;
+  font-weight: 400;
+}
+
+/* `row-value-color: matches its own heat-dot color` — banded from the ROW's
+   own `riskCount` through the same `heatForRiskCount` the card uses, so a card
+   and its rows can never disagree.
+
+   Colour is reinforcement ONLY, and that needs `.code-map__health-row-band`
+   below to be true: the signal chips' `aria-label`s carry each signal's name
+   and value but never the band, so without the band rendered as a word this
+   would be the one place in this surface where information lives in hue alone
+   (Accessibility Floor). */
+.code-map__health-row-values {
+  display: flex;
+  align-items: baseline;
+  flex-shrink: 0;
+  gap: 0.4rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* The band as a word — "hot"/"warm"/"cool"/"healthy". Lighter than the values
+   beside it because it restates what they already show; it is there so the
+   band is never carried by colour alone, not to compete with the numbers. */
+.code-map__health-row-band {
+  font-weight: 400;
+  text-transform: uppercase;
+  font-size: 9.5px;
+  letter-spacing: 0.03em;
+  opacity: 0.85;
+}
+
+.code-map__health-row-values--hot {
+  color: var(--risk-red);
+}
+
+.code-map__health-row-values--warm {
+  color: var(--risk-amber);
+}
+
+.code-map__health-row-values--cool,
+.code-map__health-row-values--healthy {
+  color: var(--healthy);
+}
+
+.code-map__health-row-signal {
+  display: inline-flex;
+  gap: 0.2rem;
+  align-items: baseline;
+}
+
+/* The caps' explicit remainders ("+3 more Nodes" / "+2 more modules") — plain
+   muted text, never an Actionable Notice: nothing is wrong, the list is just
+   bounded. */
+.code-map__health-more {
+  margin: 0.4rem 0 0;
+  color: var(--text-mute);
+  font-size: 10px;
+}
+
+.code-map__health-more--clusters {
+  margin-top: 0.75rem;
 }
 
 /* Story 1.9 (Phase 2): the Path Trace search toolbar + notice + step list —

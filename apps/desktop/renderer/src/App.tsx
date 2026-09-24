@@ -11,7 +11,7 @@ import type {
   ProjectOpenResult,
   RecentProject,
 } from '@driller/ipc-contracts';
-import { CodeMap } from './CodeMap';
+import { CodeMap, type CodeMapMode } from './CodeMap';
 import { Settings } from './Settings';
 
 type Notice =
@@ -23,11 +23,16 @@ type Notice =
  * switcher (Code Map / PR Review Mode / Health Audit Mode).
  *
  * Story 4.1: `'healthAudit'` is now a real, reachable third value — Health
- * Audit Mode's radio is no longer disabled (Epic 4 exists). `CodeMap.tsx`'s
- * own independently-declared `mode` prop type widens together with this one
- * (Always: "both must change together").
+ * Audit Mode's radio is no longer disabled (Epic 4 exists).
+ *
+ * P0-2b: this used to be an independent copy of `CodeMap.tsx`'s own prop
+ * union, kept in step by a comment saying the two "must change together". It
+ * is now an alias of that type, so they change together structurally: adding a
+ * fourth mode here without teaching `CodeMap` about it is a compile error, not
+ * a review catch. The local name stays because this shell reads better talking
+ * about `Mode`.
  */
-type Mode = 'codeMap' | 'prReview' | 'healthAudit';
+type Mode = CodeMapMode;
 
 /**
  * Story 4.1 (review finding, Medium): mirrors `apps/desktop/main/settings.ts`'s
@@ -115,6 +120,18 @@ export function App() {
   // fixed `'codeMap'` — see `applyOpenResult`'s own comment for the two
   // outcomes.
   const [mode, setMode] = useState<Mode>('codeMap');
+
+  /**
+   * P0-2b: Health Audit Mode renders a cluster-card grid instead of the
+   * canvas, so a Path Trace submitted there has nowhere to draw its route
+   * (FR-10). `CodeMap` calls this on submit; search itself stays reachable in
+   * every mode, only the surface the result lands on moves. Nothing else may
+   * call it — this is not a general "set the mode" escape hatch for the child,
+   * which would put shell state back in two owners.
+   */
+  const handleRequestCodeMapMode = useCallback(() => {
+    setMode('codeMap');
+  }, []);
   useEffect(() => {
     currentProjectPathRef.current = currentProjectPath;
   }, [currentProjectPath]);
@@ -618,6 +635,7 @@ export function App() {
             noSummaryBackendAvailable={noSummaryBackendAvailable}
             cloudSelectedNoKey={cloudSelectedNoKey}
             mode={mode}
+            onRequestCodeMapMode={handleRequestCodeMapMode}
           />
         </section>
       )}
