@@ -93,6 +93,7 @@ import type {
   RiskSignal,
 } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
+import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
 
 type FetchState =
   | { status: 'loading' }
@@ -1979,7 +1980,35 @@ export interface CodeMapProps {
    * radio has to reflect the change too.
    */
   onRequestCodeMapMode: () => void;
+  /**
+   * P0-3: false while the Graph Service isn't live (re-indexing, exited or
+   * errored) — the map stays mounted showing the last completed index, but
+   * the actions that need the Graph Service (diff-scope submit, Path Trace
+   * submit, Regenerate) are disabled with an explanatory `title`. Source view
+   * and Open in editor stay enabled: both are served by main alone.
+   */
+  graphServiceAvailable: boolean;
+  /**
+   * P0-3: `App.tsx` bumps this once per new `indexed` status for this
+   * project. The value present at mount is the initial load (never a second
+   * one); every later change triggers exactly one refetch that keeps the
+   * canvas mounted, so viewport and Back/Forward history survive it. This is
+   * the one refresh path — the map is no longer unmounted/remounted to
+   * refresh.
+   */
+  dataVersion: number;
 }
+
+/** P0-3: the `title` every Graph-Service-backed action carries while it's disabled for not being live. */
+const GRAPH_SERVICE_UNAVAILABLE_TITLE =
+  'Unavailable while the Graph Service is not live — the map shows the last completed index.';
+
+/**
+ * P0-3: marks a button disabled because the Graph Service is down, not merely
+ * busy ("Computing…"/"Searching…"/"Regenerating…") — styles.css gives only
+ * these `cursor: not-allowed`.
+ */
+const SERVICE_UNAVAILABLE_CLASS = 'code-map__action--service-unavailable';
 
 export function CodeMap({
   projectPath,
@@ -1987,8 +2016,19 @@ export function CodeMap({
   cloudSelectedNoKey,
   mode,
   onRequestCodeMapMode,
+  graphServiceAvailable,
+  dataVersion,
 }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
+  // P0-3: read by `refreshCodeMap`'s async settle to tell whether a completed
+  // map is on screen to fall back to.
+  const fetchStateRef = useRef<FetchState>(fetchState);
+  useEffect(() => {
+    fetchStateRef.current = fetchState;
+  }, [fetchState]);
+  // P0-3: a failed `refreshCodeMap` — shown as a map-level notice over the
+  // still-mounted last completed map, never by replacing it.
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
   // Story 1.10 (Phase 2): the source overlay's "Open in external editor"
   // button state — kept separate from `sourceView` itself (the overlay's
@@ -2083,6 +2123,10 @@ export function CodeMap({
   // at call time) and `loadCodeMap`'s reset; a response is only applied if
   // it's still the latest.
   const pathTraceRequestIdRef = useRef(0);
+  // P0-3: correlates a `refreshCodeMap` reply (see below) with the latest
+  // refresh — and is bumped by `loadCodeMap` too, so a full reload started
+  // after a refresh can never be overwritten by that refresh's late reply.
+  const refreshRequestIdRef = useRef(0);
   // Review fix (Phase 4): the query text that actually produced the
   // *currently-displayed* `pathTrace` result — set alongside
   // `pathTraceRequestIdRef` at the top of `runPathTrace`, so it always holds
@@ -2197,6 +2241,12 @@ export function CodeMap({
   }, []);
 
   const loadCodeMap = useCallback(() => {
+    // P0-3: this full load shares `refreshRequestIdRef` with
+    // `refreshCodeMap`, so whichever started last wins — a slow initial reply
+    // can never overwrite a map refreshed after a newer `indexed`, and a
+    // refresh started before this reload can never land after it.
+    const requestId = ++refreshRequestIdRef.current;
+    setRefreshError(null);
     setFetchState({ status: 'loading' });
     // Review fix: `history` and `focusedNodeIdRef` are scoped to one
     // fetched map — a Retry (this function is the Retry button's own
@@ -2275,6 +2325,9 @@ export function CodeMap({
     window.driller
       .getCodeMap()
       .then((result) => {
+        if (requestId !== refreshRequestIdRef.current) {
+          return;
+        }
         if (result.status === 'ok') {
           setFetchState({ status: 'ready', nodes: result.nodes, edges: result.edges });
         } else {
@@ -2282,6 +2335,9 @@ export function CodeMap({
         }
       })
       .catch((error: unknown) => {
+        if (requestId !== refreshRequestIdRef.current) {
+          return;
+        }
         // NFR4: no silent failure — a rejected IPC call surfaces the same
         // explicit error/retry state as a reported `{status: 'error'}`.
         setFetchState({
@@ -2294,6 +2350,93 @@ export function CodeMap({
   useEffect(() => {
     loadCodeMap();
   }, [loadCodeMap]);
+
+  /**
+   * P0-3: refetch the map after a new `indexed` for the same project
+   * (`dataVersion` bump) WITHOUT `loadCodeMap`'s full reset — the canvas
+   * stays mounted on the previous data while the fetch is in flight, so the
+   * viewport, Back/Forward history and focused Node all survive (Node ids are
+   * content-stable across re-index, so history entries keep resolving).
+   *
+   * What does reset is every query result computed against the previous
+   * index — a Path Trace route, a diff scope and its blast radius — since
+   * showing those against the refreshed map would be serving stale
+   * structural data as current (EXPERIENCE.md). Their request ids are bumped
+   * too, so an in-flight reply from before the refresh can't land after it.
+   * An open Node Detail panel is re-pointed at the refreshed copy of its
+   * Node, or closed if that Node is gone.
+   */
+  const refreshCodeMap = useCallback(() => {
+    if (isDevFixtureMode) {
+      // A synthetic fixture has no index behind it to refresh from.
+      return;
+    }
+    const requestId = ++refreshRequestIdRef.current;
+    setRefreshError(null);
+    setPathTrace({ status: 'idle' });
+    pathTraceRequestIdRef.current += 1;
+    setDiffScopeState({ status: 'idle' });
+    diffScopeRequestIdRef.current += 1;
+    setBlastRadiusState({ status: 'idle' });
+    setBlastRadiusDepth(1);
+    blastRadiusRequestIdRef.current += 1;
+    // The decision lives in `resolveRefreshOutcome` (sessionView.ts, unit
+    // tested); this only carries it out.
+    const settle = (reply: CodeMapFetchReply) => {
+      const openDetail = nodeDetailRef.current;
+      const outcome = resolveRefreshOutcome({
+        requestId,
+        latestRequestId: refreshRequestIdRef.current,
+        reply,
+        hasReadyData: fetchStateRef.current.status === 'ready',
+        openDetailNodeId: openDetail.status === 'open' ? openDetail.node.id : null,
+      });
+      switch (outcome.kind) {
+        case 'ignore':
+          return;
+        case 'keep-with-error':
+          // The last completed map stays on screen (P0-3 Always: the map
+          // stays mounted) — only a map-level notice says the refresh failed.
+          setRefreshError(outcome.message);
+          return;
+        case 'replace-with-error':
+          setFetchState({ status: 'error', message: outcome.message });
+          return;
+        case 'apply':
+          setFetchState({ status: 'ready', nodes: outcome.nodes, edges: outcome.edges });
+          if (outcome.nodeDetail.kind === 'close') {
+            updateNodeDetail({ status: 'closed' });
+            setRegenerateState({ kind: 'idle' });
+          } else if (outcome.nodeDetail.kind === 'repoint') {
+            updateNodeDetail({ status: 'open', node: outcome.nodeDetail.node });
+          }
+          return;
+      }
+    };
+    window.driller
+      .getCodeMap()
+      .then((result) => {
+        settle(
+          result.status === 'ok'
+            ? { kind: 'ok', nodes: result.nodes, edges: result.edges }
+            : { kind: 'failed', message: result.message },
+        );
+      })
+      .catch((error: unknown) => {
+        settle({ kind: 'failed', message: error instanceof Error ? error.message : String(error) });
+      });
+  }, [isDevFixtureMode, updateNodeDetail]);
+
+  // The version present at mount was already covered by `loadCodeMap` just
+  // above — only a later change is a refresh.
+  const loadedDataVersionRef = useRef(dataVersion);
+  useEffect(() => {
+    if (dataVersion === loadedDataVersionRef.current) {
+      return;
+    }
+    loadedDataVersionRef.current = dataVersion;
+    refreshCodeMap();
+  }, [dataVersion, refreshCodeMap]);
 
   // Story 1.5 Phase 2: incoming batched summary-generation progress patches
   // the already-rendered node set in place — never a full remap/refetch
@@ -2482,9 +2625,13 @@ export function CodeMap({
   const handleDiffScopeSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
+      // P0-3: belt-and-suspenders on top of the disabled submit button.
+      if (!graphServiceAvailable) {
+        return;
+      }
       handleComputeDiffScope();
     },
-    [handleComputeDiffScope],
+    [handleComputeDiffScope, graphServiceAvailable],
   );
 
   /**
@@ -2526,6 +2673,9 @@ export function CodeMap({
     if (
       mode !== 'prReview' ||
       projectPath === null ||
+      // P0-3: `expandBlastRadius` needs the Graph Service. Left `'idle'`, so
+      // it fires once the service is live again.
+      !graphServiceAvailable ||
       diffScopeState.status !== 'resolved' ||
       diffScopeState.nodeIds.size === 0 ||
       blastRadiusState.status !== 'idle'
@@ -2571,7 +2721,7 @@ export function CodeMap({
           message: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [mode, projectPath, diffScopeState, blastRadiusState.status]);
+  }, [mode, projectPath, diffScopeState, blastRadiusState.status, graphServiceAvailable]);
 
   const openSourceForNode = useCallback((node: CodeMapNode) => {
     const requestId = ++sourceRequestIdRef.current;
@@ -2671,7 +2821,9 @@ export function CodeMap({
    * displayed panel/button state.
    */
   const handleRegenerate = useCallback(() => {
-    if (nodeDetail.status !== 'open') {
+    // P0-3: `!graphServiceAvailable` is belt-and-suspenders on top of the
+    // disabled button.
+    if (nodeDetail.status !== 'open' || !graphServiceAvailable) {
       return;
     }
     const targetNode = nodeDetail.node;
@@ -2719,7 +2871,7 @@ export function CodeMap({
           message: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [nodeDetail]);
+  }, [nodeDetail, graphServiceAvailable]);
 
   const expandCluster = useCallback((cluster: Cluster) => {
     if (cluster.nodeIds.length > CLUSTER_EXPAND_MAX) {
@@ -3508,6 +3660,10 @@ export function CodeMap({
   const handlePathTraceSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
+      // P0-3: belt-and-suspenders on top of the disabled submit button.
+      if (!graphServiceAvailable) {
+        return;
+      }
       for (const effect of resolvePathTraceSubmit(mode, pathQuery)) {
         if (effect.kind === 'requestCodeMapMode') {
           onRequestCodeMapMode();
@@ -3516,7 +3672,7 @@ export function CodeMap({
         }
       }
     },
-    [pathQuery, runPathTrace, mode, onRequestCodeMapMode],
+    [pathQuery, runPathTrace, mode, onRequestCodeMapMode, graphServiceAvailable],
   );
 
   /**
@@ -3751,7 +3907,12 @@ export function CodeMap({
               onChange={(event) => setBaseRefInput(event.target.value)}
               disabled={projectPath === null || diffScopeState.status === 'loading'}
             />
-            <button type="submit" disabled={projectPath === null || diffScopeState.status === 'loading'}>
+            <button
+              type="submit"
+              disabled={projectPath === null || diffScopeState.status === 'loading' || !graphServiceAvailable}
+              title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
+              className={graphServiceAvailable ? undefined : SERVICE_UNAVAILABLE_CLASS}
+            >
               {diffScopeState.status === 'loading' ? 'Computing…' : 'Compute diff scope'}
             </button>
           </form>
@@ -3885,6 +4046,26 @@ export function CodeMap({
               {diffScopeState.message}
             </p>
           )}
+        </div>
+      )}
+
+      {/* P0-3: a failed refresh keeps the last completed map (above) and
+          says so here, with a Retry that re-runs only the refresh — never
+          `loadCodeMap`'s full reset of viewport and history. */}
+      {refreshError !== null && fetchState.status === 'ready' && (
+        <div className="code-map__refresh-error" role="status">
+          <p className="notice notice--warning">
+            <span aria-hidden="true">⚠</span> Couldn&rsquo;t refresh the map — showing the last completed index ({refreshError}).{' '}
+            <button
+              type="button"
+              className={`code-map__refresh-retry${graphServiceAvailable ? '' : ` ${SERVICE_UNAVAILABLE_CLASS}`}`}
+              onClick={refreshCodeMap}
+              disabled={!graphServiceAvailable}
+              title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
+            >
+              Retry
+            </button>
+          </p>
         </div>
       )}
 
@@ -4137,7 +4318,12 @@ export function CodeMap({
                 No-op — input/button disabled until the first resolves" —
                 the `disabled` attributes here are belt-and-suspenders on
                 top of `handlePathTraceSubmit`'s own no-op guard. */}
-            <button type="submit" disabled={pathTrace.status === 'searching'}>
+            <button
+              type="submit"
+              disabled={pathTrace.status === 'searching' || !graphServiceAvailable}
+              title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
+              className={graphServiceAvailable ? undefined : SERVICE_UNAVAILABLE_CLASS}
+            >
               {pathTrace.status === 'searching' ? 'Searching…' : 'Trace'}
             </button>
           </form>
@@ -4519,9 +4705,10 @@ export function CodeMap({
               {nodeDetail.node.summaryStatus === 'ready' && (
                 <button
                   type="button"
-                  className="code-map__node-detail-regenerate"
+                  className={`code-map__node-detail-regenerate${graphServiceAvailable ? '' : ` ${SERVICE_UNAVAILABLE_CLASS}`}`}
                   onClick={handleRegenerate}
-                  disabled={regenerateState.kind === 'regenerating'}
+                  disabled={regenerateState.kind === 'regenerating' || !graphServiceAvailable}
+                  title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
                 >
                   {regenerateState.kind === 'regenerating' ? 'Regenerating…' : 'Regenerate'}
                 </button>

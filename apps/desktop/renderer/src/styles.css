@@ -2536,3 +2536,94 @@ code,
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
+
+/*
+ * P0-3: the map-level Actionable Notice shown above the Code Map whenever the
+ * Graph Service isn't live (App.tsx `session-notice`). Reuses the shared
+ * `.notice` tokens; `:empty` collapses it to zero height while live, but
+ * never `display: none` — that would drop the always-mounted `role="status"`
+ * region from the accessibility tree and risk its first message going
+ * unannounced.
+ */
+.session-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-notice:empty {
+  padding: 0;
+  border-bottom: 0;
+}
+
+.notice--info {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.session-notice__retry {
+  margin-left: 0.25rem;
+  padding: 0.15rem 0.6rem;
+  border-radius: 0;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.app__close-project-button {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 0.4rem 0.6rem;
+  border-radius: 0;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.app__close-project-button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.app__close-project-button:focus-visible,
+.session-notice__retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* P0-3: a Graph-Service-backed action disabled because the service is down —
+   not one that is merely busy ("Computing…", "Searching…", "Regenerating…"). */
+.code-map__action--service-unavailable:disabled {
+  cursor: not-allowed;
+}
+
+/* P0-3: a failed map refresh — the last completed map stays mounted beneath
+   this notice (CodeMap.tsx `refreshError`). Bottom-centred so it clears both
+   the top-left Path Trace and top-right history toolbars. */
+.code-map__refresh-error {
+  position: absolute;
+  bottom: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  max-width: min(40rem, calc(100% - 2rem));
+}
+
+.code-map__refresh-retry {
+  margin-left: 0.25rem;
+  padding: 0.15rem 0.6rem;
+  border-radius: 0;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}

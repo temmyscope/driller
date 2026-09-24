@@ -13,6 +13,15 @@ import type {
 } from '@driller/ipc-contracts';
 import { CodeMap, type CodeMapMode } from './CodeMap';
 import { Settings } from './Settings';
+import {
+  INITIAL_SESSION_MAP_STATE,
+  applyProjectClosedToSessionMap,
+  applyProjectOpenedToSessionMap,
+  applyStatusToSessionMap,
+  deriveSessionView,
+  isStatusForCurrentProject,
+  type SessionMapState,
+} from './sessionView';
 
 type Notice =
   | { kind: 'not-a-git-repo'; path: string }
@@ -110,7 +119,7 @@ export function App() {
   const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
   const currentProjectPathRef = useRef<string | null>(null);
   // Story 3.1 (Phase 2): the active mode — first-class shell state (UX-DR9:
-  // "never a settings toggle"), independent of `isIndexed`, so the switcher
+  // "never a settings toggle"), independent of `showMap`, so the switcher
   // itself always renders regardless of whether a project is even open yet.
   // Reset on every fresh 'opened' project result (see `applyOpenResult`
   // below) — a newly-opened project must never silently land in a stale PR
@@ -120,6 +129,30 @@ export function App() {
   // fixed `'codeMap'` — see `applyOpenResult`'s own comment for the two
   // outcomes.
   const [mode, setMode] = useState<Mode>('codeMap');
+  // P0-3: the map's lifetime — `loadedProjectPath` (set when an `indexed`
+  // for the current project passes the correlation filter below, cleared only
+  // on Close or a project switch) and `dataVersion` (bumped once per NEW
+  // `indexed`, the one refresh path into `CodeMap`). This, not the live
+  // status, keeps the Code Map mounted: a crash or re-index relabels the map
+  // as the last completed index instead of stranding the session on the
+  // pre-load screen. Every transition is a pure function in sessionView.ts;
+  // the ref is the synchronous source of truth for the once-registered
+  // status subscription (same shape as `currentProjectPathRef`), the state
+  // drives rendering.
+  const sessionMapRef = useRef<SessionMapState>(INITIAL_SESSION_MAP_STATE);
+  const [sessionMap, setSessionMap] = useState<SessionMapState>(INITIAL_SESSION_MAP_STATE);
+  const commitSessionMap = useCallback((next: SessionMapState) => {
+    if (next === sessionMapRef.current) {
+      return;
+    }
+    sessionMapRef.current = next;
+    setSessionMap(next);
+  }, []);
+  // P0-3: set by Close project so focus lands on "Open a folder" once
+  // the pre-load screen has rendered, rather than falling to <body> when the
+  // Close button unmounts.
+  const focusOpenFolderAfterCloseRef = useRef(false);
+  const openFolderButtonRef = useRef<HTMLButtonElement | null>(null);
 
   /**
    * P0-2b: Health Audit Mode renders a cluster-card grid instead of the
@@ -185,13 +218,20 @@ export function App() {
       // project's attempt resolving after the user has already moved on to
       // another one. Discard it rather than showing project B's screen
       // with project A's counts or error (review round 1's concurrency bug).
-      if ('path' in status && status.path !== currentProjectPathRef.current) {
+      if (!isStatusForCurrentProject(status, currentProjectPathRef.current)) {
         return;
       }
       setGraphServiceStatus(status);
+      const next = applyStatusToSessionMap(sessionMapRef.current, status);
+      if (next !== sessionMapRef.current) {
+        commitSessionMap(next);
+        // A fresh index means any earlier Retry failure is resolved — don't
+        // leave its error on the now-live map.
+        setNotice((current) => (current?.kind === 'error' ? null : current));
+      }
     });
     return unsubscribe;
-  }, []);
+  }, [commitSessionMap]);
 
   useEffect(() => {
     const unsubscribe = window.driller.onModelStatus((status) => {
@@ -305,6 +345,11 @@ export function App() {
         // this window before React has re-rendered and run that effect.
         currentProjectPathRef.current = result.project.path;
         setCurrentProjectPath(result.project.path);
+        // P0-3: a map loaded for a different project never survives a switch
+        // — but an `indexed` for the NEW project that landed before this
+        // result (`handleOpenRecent` sets the ref optimistically) does. See
+        // `applyProjectOpenedToSessionMap`.
+        commitSessionMap(applyProjectOpenedToSessionMap(sessionMapRef.current, result.project.path));
         setRecentProjects((current) => {
           const withoutDuplicate = (current ?? []).filter(
             (p) => p.path !== result.project.path,
@@ -329,7 +374,7 @@ export function App() {
     // closure was created in — not a stale one frozen at mount, which would
     // permanently read as "always empty" and misclassify every open after
     // the first as a first-ever open.
-  }, [recentProjects]);
+  }, [recentProjects, commitSessionMap]);
 
   const reportUnexpectedError = useCallback((error: unknown) => {
     setNotice({
@@ -384,8 +429,41 @@ export function App() {
     // clearing. The fresh subprocess re-posts an advisory of its own, for
     // the current project, if/when the condition is still actually true.
     setHardwareAdvisories(new Set());
+    // P0-3: a previous Retry's failure is superseded by this attempt. Only an
+    // `error` notice — e.g. a `not-a-git-repo` one is unrelated and stays.
+    setNotice((current) => (current?.kind === 'error' ? null : current));
     window.driller.restartGraphService().catch(reportUnexpectedError);
   }, [reportUnexpectedError]);
+
+  /**
+   * P0-3: Close project — the route back to Recent Projects now that the map
+   * no longer unmounts on its own. Clearing the ref synchronously is what
+   * makes any later status for the closed project inert: the correlation
+   * filter in the status subscription drops every path-correlated status
+   * that doesn't match the (now `null`) current project. Path-less
+   * (subprocess-level) statuses still arrive, but their footer only renders
+   * while a project is current or opening. See
+   * `applyProjectClosedToSessionMap` for why reopening waits for a fresh
+   * `indexed`.
+   */
+  const handleCloseProject = useCallback(() => {
+    currentProjectPathRef.current = null;
+    setCurrentProjectPath(null);
+    commitSessionMap(applyProjectClosedToSessionMap(sessionMapRef.current));
+    setGraphServiceStatus(null);
+    setNotice(null);
+    setHardwareAdvisories(new Set());
+    focusOpenFolderAfterCloseRef.current = true;
+  }, [commitSessionMap]);
+
+  // P0-3: after Close, the button that had focus is gone — hand focus to
+  // "Open a folder", the first control of the Recent Projects screen.
+  useEffect(() => {
+    if (currentProjectPath === null && focusOpenFolderAfterCloseRef.current) {
+      focusOpenFolderAfterCloseRef.current = false;
+      openFolderButtonRef.current?.focus();
+    }
+  }, [currentProjectPath]);
 
   /**
    * The MCP-status footer's own Retry handler (Story 5.2, review finding,
@@ -478,7 +556,23 @@ export function App() {
   // screen as the only landing view (FR3) — never a file-tree/editor-first
   // view. The status badge stays visible, just demoted to a small
   // persistent footer rather than the main content (Code Map task list).
-  const isIndexed = graphServiceStatus?.state === 'indexed';
+  //
+  // P0-3: that switch is now keyed on the map having loaded for the current
+  // project (`loadedProjectPath`), not on the live status — see
+  // `deriveSessionView`.
+  const sessionView = deriveSessionView({
+    currentProjectPath,
+    loadedProjectPath: sessionMap.loadedProjectPath,
+    status: graphServiceStatus,
+  });
+  // P0-3: the Graph Service / model footers belong to a project session. With
+  // none current and none opening (e.g. just after Close), a path-less
+  // `exited`/`error` would otherwise bring back a footer Retry that restarts
+  // the backend for the project the user just closed. `isOpening` keeps a
+  // spawn error during an open visible.
+  const showServiceFooters = currentProjectPath !== null || isOpening;
+  const showMap = sessionView.showMap;
+  const graphServiceLive = sessionView.availability === 'live';
 
   // Story 1.6 (Phase 2): the two new Actionable Notice conditions (Boundaries
   // & Constraints), derived entirely from already-fetched/subscribed state —
@@ -506,16 +600,16 @@ export function App() {
   const noSummaryBackendAvailable = !cloudSelectedNoKey && localUnusable && !hasCloudKey;
 
   return (
-    <main className={`app${isIndexed ? ' app--map' : ''}`}>
+    <main className={`app${showMap ? ' app--map' : ''}`}>
       <header className="app__header">
         <div className="app__header-text">
           <h1 className="app__title">driller</h1>
-          {!isIndexed && (
+          {!showMap && (
             <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
           )}
         </div>
         {/* Story 3.1 (Phase 2): the mode switcher — always visible in the
-            header regardless of `isIndexed` (Always: "mode is first-class
+            header regardless of `showMap` (Always: "mode is first-class
             state, never a settings toggle", UX-DR9), mirroring
             `.settings-panel__radio`'s existing radio-group precedent (a
             native `<input type="radio">` group, not a custom control) but
@@ -563,6 +657,19 @@ export function App() {
             Health Audit Mode
           </label>
         </div>
+        {/* P0-3: reachable whenever a project is open — including while it
+            is still indexing on the pre-load screen — and the only route back
+            to Recent Projects once its map has loaded. */}
+        {currentProjectPath !== null && (
+          <button
+            type="button"
+            className="app__close-project-button"
+            onClick={handleCloseProject}
+            title="Close this project and return to Recent Projects"
+          >
+            Close project
+          </button>
+        )}
         <button
           type="button"
           className="app__settings-button"
@@ -574,10 +681,11 @@ export function App() {
         </button>
       </header>
 
-      {!isIndexed && (
+      {!showMap && (
         <>
           <section className="open-folder" aria-label="Open a project folder">
             <button
+              ref={openFolderButtonRef}
               type="button"
               className="open-folder__button"
               onClick={handleOpenFolder}
@@ -621,29 +729,69 @@ export function App() {
         </>
       )}
 
-      {isIndexed && (
+      {showMap && (
+        // P0-3: the map-level Actionable Notice (icon + one sentence + at most
+        // one action) whenever the map isn't live — always mounted with the
+        // map (a live region only reliably announces a change it already
+        // existed for), empty and collapsed while live. "Refreshing" and
+        // "degraded" are deliberately different states: a normal re-index
+        // must not read as a failure. A rejected Retry shows here too, since
+        // the pre-load screen that used to host it isn't on screen.
+        <div className="session-notice" role="status">
+          {sessionView.availability === 'refreshing' && (
+            <p className="notice notice--info">
+              <span aria-hidden="true">↻</span> Re-indexing — the map shows the last completed index until it finishes.
+            </p>
+          )}
+          {sessionView.availability === 'degraded' && (
+            <p className="notice notice--warning">
+              <span aria-hidden="true">⚠</span> The Graph Service is unavailable — the map shows the last completed
+              index, and Path Trace, diff scope and Regenerate are unavailable until it recovers.
+              {sessionView.showRetry && (
+                <>
+                  {' '}
+                  <button type="button" className="session-notice__retry" onClick={handleRetryGraphService}>
+                    Retry
+                  </button>
+                </>
+              )}
+            </p>
+          )}
+          {/* No nested `role="alert"` — the enclosing `role="status"` region
+              announces it. */}
+          {notice?.kind === 'error' && (
+            <p className="notice notice--error">
+              <span aria-hidden="true">✕</span> {notice.message}
+            </p>
+          )}
+        </div>
+      )}
+
+      {showMap && (
         <section className="app__map" aria-label="Code Map">
           {/* `projectPath` (review finding, Medium) lets CodeMap reject a
               stale `graphService:summaryProgress` message for a project the
               user has since navigated away from — reliably non-null here:
-              `isIndexed` only becomes true once an `indexed` status has
-              already passed this component's own `currentProjectPathRef`
-              correlation filter above, by which point `currentProjectPath`
-              already reflects that same project. */}
+              `showMap` requires `currentProjectPath` to equal the
+              non-null `loadedProjectPath` (P0-3). */}
           <CodeMap
             projectPath={currentProjectPath}
             noSummaryBackendAvailable={noSummaryBackendAvailable}
             cloudSelectedNoKey={cloudSelectedNoKey}
             mode={mode}
             onRequestCodeMapMode={handleRequestCodeMapMode}
+            graphServiceAvailable={graphServiceLive}
+            dataVersion={sessionMap.dataVersion}
           />
         </section>
       )}
 
-      {graphServiceStatus && (
+      {showServiceFooters && graphServiceStatus && (
         <footer className="graph-service-status" role="status">
           <GraphServiceStatusBadge status={graphServiceStatus} />
-          {graphServiceStatus.state === 'error' && (
+          {/* P0-3: `exited` gets Retry too — it was the one terminal state
+              that used to leave the session with no way back. */}
+          {sessionView.showRetry && (
             <button type="button" className="graph-service-status__retry" onClick={handleRetryGraphService}>
               Retry
             </button>
@@ -651,7 +799,7 @@ export function App() {
         </footer>
       )}
 
-      {modelStatus && (
+      {showServiceFooters && modelStatus && (
         <footer className="model-status" role="status">
           <ModelStatusBadge status={modelStatus} />
           {modelStatus.state === 'error' && (
