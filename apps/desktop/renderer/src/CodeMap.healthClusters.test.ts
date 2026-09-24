@@ -27,7 +27,7 @@ import {
 const LOCATION = { file: 'unused.ts', startLine: 1, endLine: 2 };
 
 function deterministic(type: DeterministicRiskSignalType, value = 1): RiskSignal {
-  return { family: 'deterministic', type, value, location: LOCATION };
+  return { family: 'deterministic', type, value, location: LOCATION, severity: 'moderate' };
 }
 
 function judgment(text: string): RiskSignal {

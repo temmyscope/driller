@@ -284,7 +284,8 @@ export function startMcpServer(
       title: 'Look up a Code Map Node',
       description:
         "Look up a single Node from driller's Code Map by its stable id (qualified name). Returns the exact same shape the human-facing UI shows for that Node, including its full Risk Overlay signals and summary staleness (summaryStatus) — nothing is computed differently for this surface than for the renderer. " +
-        `The 'blast-radius' signal's value is a bounded count, not total impact: the distinct Nodes within ${BLAST_RADIUS_DEFAULT_HOPS} hops that this Node reaches (following edges forward) or that reach it (following edges backward), each direction searched separately — Nodes that merely share a caller or callee with it are not counted.`,
+        `The 'blast-radius' signal's value is a bounded count, not total impact: the distinct Nodes within ${BLAST_RADIUS_DEFAULT_HOPS} hops that this Node reaches (following edges forward) or that reach it (following edges backward), each direction searched separately — Nodes that merely share a caller or callee with it are not counted. ` +
+        "Every deterministic signal carries a 'severity': 'severe' means the value crossed driller's severe threshold; 'moderate' means only \"not severe\" — it covers every value below that threshold, including trivial ones, and is not a claim that the value is risky.",
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),

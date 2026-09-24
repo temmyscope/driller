@@ -252,7 +252,7 @@ function activate(button: RenderedElement): void {
 const LOCATION = { file: 'unused.ts', startLine: 1, endLine: 2 };
 
 function deterministic(type: DeterministicRiskSignalType, value = 1): RiskSignal {
-  return { family: 'deterministic', type, value, location: LOCATION };
+  return { family: 'deterministic', type, value, location: LOCATION, severity: 'moderate' };
 }
 
 function judgment(text: string): RiskSignal {
@@ -731,7 +731,7 @@ describe('Health Audit row Blast Radius chip', () => {
       riskSignals: [deterministic('blast-radius', 4)],
     });
     const { tree, button } = renderRow(only);
-    const expected = formatDeterministicSignalLabel({ type: 'blast-radius', value: 4 });
+    const expected = formatDeterministicSignalLabel({ type: 'blast-radius', value: 4, severity: 'moderate' });
     const chip = tree.find(
       (element) =>
         element.props.role === 'img' &&

@@ -450,7 +450,23 @@ export interface DeterministicRiskSignal {
   type: DeterministicRiskSignalType;
   value: number;
   location: RiskSignalLocation;
+  /**
+   * P1-1: the triage band for `value` — `'severe'` renders red with a `!`
+   * glyph and "(severe)" in its label, `'moderate'` renders amber (DESIGN.md:
+   * "amber for moderate, red for severe"). `'moderate'` means only "not
+   * severe": it is every value below the severe threshold, down to trivial
+   * ones, and makes no claim that the value is risky (there is no neutral
+   * third tier). Assigned once, in the Graph
+   * Service (`risk-signals.ts`'s `assignDeterministicSeverities`), from
+   * named default thresholds, so the renderer and `lookup_node` always carry
+   * the same judgement (FR15). Deterministic like `value` (FR-7). Unrelated
+   * to `IngestedRiskSignal.severity`, which keeps its own mapping.
+   */
+  severity: DeterministicRiskSeverity;
 }
+
+/** P1-1: see `DeterministicRiskSignal.severity`. No neutral third tier. */
+export type DeterministicRiskSeverity = 'moderate' | 'severe';
 
 /**
  * Story 2.2 (Phase 1): the qualitative LLM-judgment risk signal (FR8) — a

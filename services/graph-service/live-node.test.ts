@@ -20,14 +20,14 @@ import { deriveLiveNode } from './live-node';
 import type { LcovCoverage } from './lcov';
 import type { CodeMapNodeWithSignalSources } from './mcp-client';
 import { getNodeRecord, mergeNodeRecord, type NodeRecord } from './node-record-store';
-import { buildRiskSignals } from './risk-signals';
+import { attachProjectRiskSignals } from './risk-signals';
 import { annotateNodesWithSummaryState } from './summary-generator';
 
 const location = { file: 'src/a.ts', startLine: 1, endLine: 10 };
 
 const deterministic: RiskSignal[] = [
-  { family: 'deterministic', type: 'complexity', value: 7, location },
-  { family: 'deterministic', type: 'blast-radius', value: 3, location },
+  { family: 'deterministic', type: 'complexity', value: 7, location, severity: 'moderate' },
+  { family: 'deterministic', type: 'blast-radius', value: 3, location, severity: 'severe' },
 ];
 
 const finding: IngestedRiskSignal = {
@@ -134,22 +134,33 @@ describe('deriveLiveNode', () => {
 
 describe('parity with the Code Map fetch path', () => {
   /**
-   * The fetch path's per-Node assembly, in `handleGetCodeMapRequest`'s own
-   * order: `annotateNodesWithSummaryState`, strip the raw FR7 fields, attach
-   * the real `buildRiskSignals`. Both read the real record store through
-   * their default `getNodeRecord`, exactly as `getCodeMap` does.
+   * The fetch path's assembly, in `handleGetCodeMapRequest`'s own order:
+   * `annotateNodesWithSummaryState`, then the real `attachProjectRiskSignals`
+   * (build, rate across the whole population, strip the raw FR7 fields).
+   * Both read the real record store through their default `getNodeRecord`,
+   * exactly as `getCodeMap` does. P1-1: run over a MULTI-Node population —
+   * severity is project-relative, so a one-Node population would not match
+   * production. Returns the Node under test.
    */
   function fetchPath(raw: CodeMapNodeWithSignalSources, gaps: ReadonlySet<string>, coverage?: LcovCoverage) {
-    const adjacency = buildBidirectionalAdjacency([raw], []);
-    const [annotated] = annotateNodesWithSummaryState([raw], gaps);
-    const {
-      complexity: _c,
-      cognitiveComplexity: _cc,
-      hotspotChangeCount: _h,
-      ...clean
-    } = annotated as CodeMapNodeWithSignalSources;
-    return { ...clean, riskSignals: buildRiskSignals(raw, adjacency, coverage) } satisfies CodeMapNode;
+    const population = [raw, ...PEERS];
+    const adjacency = buildBidirectionalAdjacency(population, []);
+    const annotated = annotateNodesWithSummaryState(population, gaps);
+    const node = attachProjectRiskSignals(annotated, population, adjacency, coverage).find((n) => n.id === raw.id);
+    assert.ok(node !== undefined);
+    return node;
   }
+
+  /**
+   * 20 peers, each alone in its own file, with hotspot 13..32. The per-file
+   * hotspot population is then 21 files, whose top 10% (3 files) cuts at 30
+   * — so the Node under test (hotspot 12, ≥ the floor) is `moderate` here,
+   * but would be `severe` rated alone.
+   */
+  const PEERS: CodeMapNodeWithSignalSources[] = Array.from({ length: 20 }, (_, i) => ({
+    ...cachedNode({ id: `parity-peer-${i}`, file: `src/peer-${i}.ts`, summaryStatus: 'pending', riskSignals: [] }),
+    hotspotChangeCount: 13 + i,
+  }));
 
   const EMPTY: NodeRecord = { summary: undefined, stale: undefined, llmJudgment: undefined, ingestedFindings: undefined };
 
@@ -182,7 +193,7 @@ describe('parity with the Code Map fetch path', () => {
         ...cachedNode({ id, summaryStatus: 'pending', riskSignals: [] }),
         complexity: 4,
         cognitiveComplexity: 2,
-        hotspotChangeCount: 5,
+        hotspotChangeCount: 12,
       };
 
       mergeNodeRecord(id, { ...EMPTY, ...before });
@@ -192,6 +203,10 @@ describe('parity with the Code Map fetch path', () => {
 
       const live = deriveLiveNode(cached, { getRecord: getNodeRecord, coverageGapFiles: gapSet });
       assert.deepStrictEqual(live, fresh);
+      // Rated against the whole population, not alone (see PEERS).
+      const hotspot = live.riskSignals.find((s) => s.family === 'deterministic' && s.type === 'hotspot');
+      assert.ok(hotspot?.family === 'deterministic');
+      assert.equal(hotspot.severity, 'moderate');
     });
   }
 });

@@ -78,30 +78,30 @@ describe('formatDeterministicSignalLabel', () => {
 
   it('says the Blast Radius count is within the shared hop bound', () => {
     assert.equal(
-      formatDeterministicSignalLabel({ type: 'blast-radius', value: 4 }),
+      formatDeterministicSignalLabel({ type: 'blast-radius', value: 4, severity: 'moderate' }),
       `Blast radius: 4 Nodes within ${hops} (callers and callees)`,
     );
     assert.equal(
-      formatDeterministicSignalLabel({ type: 'blast-radius', value: 1 }),
+      formatDeterministicSignalLabel({ type: 'blast-radius', value: 1, severity: 'moderate' }),
       `Blast radius: 1 Node within ${hops} (callers and callees)`,
     );
   });
 
   it('pluralises zero', () => {
     assert.equal(
-      formatDeterministicSignalLabel({ type: 'blast-radius', value: 0 }),
+      formatDeterministicSignalLabel({ type: 'blast-radius', value: 0, severity: 'moderate' }),
       `Blast radius: 0 Nodes within ${hops} (callers and callees)`,
     );
   });
 
   it('falls back to the raw type string for an unknown signal type', () => {
     const unknownType = 'future-signal' as DeterministicRiskSignalType;
-    assert.equal(formatDeterministicSignalLabel({ type: unknownType, value: 3 }), 'future-signal: 3');
+    assert.equal(formatDeterministicSignalLabel({ type: unknownType, value: 3, severity: 'moderate' }), 'future-signal: 3');
   });
 
   it('keeps "Label: value" for every other deterministic signal', () => {
-    assert.equal(formatDeterministicSignalLabel({ type: 'complexity', value: 21 }), 'Complexity: 21');
-    assert.equal(formatDeterministicSignalLabel({ type: 'hotspot', value: 3 }), 'Hotspot: 3');
+    assert.equal(formatDeterministicSignalLabel({ type: 'complexity', value: 21, severity: 'moderate' }), 'Complexity: 21');
+    assert.equal(formatDeterministicSignalLabel({ type: 'hotspot', value: 3, severity: 'moderate' }), 'Hotspot: 3');
   });
 });
 
@@ -112,11 +112,11 @@ describe('canvas Blast Radius chip', () => {
     const location = { file: 'a.ts', startLine: 1, endLine: 2 };
     const tree = elementsOf(
       NodeRiskSignalSections({
-        signals: [{ family: 'deterministic', type: 'blast-radius', value: 4, location }],
+        signals: [{ family: 'deterministic', type: 'blast-radius', value: 4, location, severity: 'moderate' }],
         toggles: { showDeterministicSignals: true, showLlmJudgment: true, showIngestedFindings: true },
       }),
     );
-    const expected = formatDeterministicSignalLabel({ type: 'blast-radius', value: 4 });
+    const expected = formatDeterministicSignalLabel({ type: 'blast-radius', value: 4, severity: 'moderate' });
     const chip = tree.find((element) => element.props.className === 'code-map__signal-chip');
     assert.ok(chip !== undefined, 'the strip renders a chip');
     assert.equal(chip.props['aria-label'], expected);

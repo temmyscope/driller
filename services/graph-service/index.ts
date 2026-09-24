@@ -169,9 +169,9 @@ import { computeDiffScope } from './git-diff-scope';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { loadLcovCoverage } from './lcov';
-import { fetchCodeMap, indexRepository, stopCbmDaemon, type CodeMapNodeWithSignalSources } from './mcp-client';
+import { fetchCodeMap, indexRepository, stopCbmDaemon } from './mcp-client';
 import { deriveLiveNode } from './live-node';
-import { buildRiskSignals } from './risk-signals';
+import { attachProjectRiskSignals } from './risk-signals';
 import { startMcpServer } from './mcp-server';
 import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
 import {
@@ -1267,32 +1267,20 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // `coverage/lcov.info` doesn't exist or doesn't parse — never thrown,
     // so it can never fail this fetch (Boundaries & Constraints).
     const coverage = await loadLcovCoverage(projectRoot);
-    // Built off `normalizedNodes` (not `annotatedNodes`, whose declared
-    // return type is plain `CodeMapNode[]` and has therefore lost the raw
-    // complexity/cognitive/hotspot fields `annotateNodesWithSummaryState`'s
-    // `{...node, ...}` spread carries through at runtime but not in its
-    // static type) — both `.map()` calls preserve order/length 1:1 off the
-    // same `nodes`, so a parallel index lookup here is safe and avoids
-    // building an id-keyed Map for no reason.
-    const nodesWithRiskSignals: CodeMapNode[] = annotatedNodes.map((node, i) => {
-      // Review round (patch): `node` is runtime-shaped
-      // `CodeMapNodeWithSignalSources` (the spread above preserves the raw
-      // complexity/cognitiveComplexity/hotspotChangeCount fields even though
-      // `annotateNodesWithSummaryState`'s declared return type doesn't carry
-      // them) — destructured out explicitly so they never leak onto the wire
-      // `CodeMapNode` alongside the `riskSignals` array that now represents
-      // them properly.
-      const {
-        complexity: _complexity,
-        cognitiveComplexity: _cognitiveComplexity,
-        hotspotChangeCount: _hotspotChangeCount,
-        ...cleanNode
-      } = node as CodeMapNodeWithSignalSources;
-      return {
-        ...cleanNode,
-        riskSignals: buildRiskSignals(normalizedNodes[i]!, blastRadiusAdjacency, coverage),
-      };
-    });
+    // P1-1: severity for `blast-radius`/`hotspot` is project-relative, so
+    // `attachProjectRiskSignals` builds every Node's signals, rates them in
+    // one whole-project pass, and zips them back onto `annotatedNodes` before
+    // anything is posted or cached — the renderer and `lookup_node` (which
+    // carries these cached deterministic signals unchanged) therefore read
+    // the same `severity`. Signals are built off `normalizedNodes` (not
+    // `annotatedNodes`, whose declared type has lost the raw complexity/
+    // cognitive/hotspot fields); both are 1:1 in order off the same nodes.
+    const nodesWithRiskSignals: CodeMapNode[] = attachProjectRiskSignals(
+      annotatedNodes,
+      normalizedNodes,
+      blastRadiusAdjacency,
+      coverage,
+    );
     postCodeMapMessage({ type: 'graphService:codeMap', nodes: nodesWithRiskSignals, edges });
     // Review round (patch): passes `nodesWithRiskSignals`, not
     // `normalizedNodes` — `startSummaryGenerationForProject` caches its

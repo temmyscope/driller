@@ -683,7 +683,7 @@ function formatCandidateLocation(candidate: { id: string; name: string }): strin
  * each chip — the chip's own `aria-label` carries the accessible name, not
  * this glyph.
  */
-const DETERMINISTIC_SIGNAL_ICONS: Record<DeterministicRiskSignalType, string> = {
+export const DETERMINISTIC_SIGNAL_ICONS: Record<DeterministicRiskSignalType, string> = {
   complexity: '●',
   'cognitive-complexity': '■',
   hotspot: '▲',
@@ -715,14 +715,26 @@ const DETERMINISTIC_SIGNAL_LABELS: Record<DeterministicRiskSignalType, string> =
  * Every chip surface (canvas card, Health Audit row) goes through this, so
  * the wording can't fork.
  */
-export function formatDeterministicSignalLabel(signal: Pick<DeterministicRiskSignal, 'type' | 'value'>): string {
+export function formatDeterministicSignalLabel(
+  signal: Pick<DeterministicRiskSignal, 'type' | 'value' | 'severity'>,
+): string {
   const label = DETERMINISTIC_SIGNAL_LABELS[signal.type] ?? signal.type;
+  const severe = signal.severity === 'severe' ? ' (severe)' : '';
   if (signal.type === 'blast-radius') {
     const hops: number = BLAST_RADIUS_DEFAULT_HOPS;
-    return `${label}: ${signal.value} Node${signal.value === 1 ? '' : 's'} within ${hops} hop${hops === 1 ? '' : 's'} (callers and callees)`;
+    return `${label}: ${signal.value} Node${signal.value === 1 ? '' : 's'} within ${hops} hop${hops === 1 ? '' : 's'} (callers and callees)${severe}`;
   }
-  return `${label}: ${signal.value}`;
+  return `${label}: ${signal.value}${severe}`;
 }
+
+/**
+ * P1-1: the glyph a severe deterministic chip adds before its type icon —
+ * red is never the only cue (Accessibility Floor), so a severe chip also
+ * carries this and "(severe)" in its label. Moderate chips get neither.
+ * Must differ from every `DETERMINISTIC_SIGNAL_ICONS` value (`▲` was
+ * rejected in review because it is hotspot's own icon); a test pins that.
+ */
+export const SEVERE_SIGNAL_GLYPH = '!';
 
 /**
  * Story 2.3 (Phase 4): severity ordering for the ingested-findings callout
@@ -894,11 +906,16 @@ export function NodeRiskSignalSections({
             return (
               <span
                 key={signal.type}
-                className="code-map__signal-chip"
+                className={
+                  signal.severity === 'severe'
+                    ? 'code-map__signal-chip code-map__signal-chip--severe'
+                    : 'code-map__signal-chip'
+                }
                 role="img"
                 aria-label={label}
                 title={label}
               >
+                {signal.severity === 'severe' && <span aria-hidden="true">{SEVERE_SIGNAL_GLYPH}</span>}
                 <span aria-hidden="true">{icon}</span>
                 {signal.value}
               </span>
@@ -1395,11 +1412,10 @@ function compareAscending(a: string, b: string): number {
  * (P0-2b) owns rendering only.
  *
  * Grouping is the containing directory and nothing else: no semantic, AI, or
- * heuristic module inference. Ranking is signal COUNT, not severity —
- * `DeterministicRiskSignal` carries no severity field and nothing in this
- * repo thresholds a raw `value` into a band, so a severity-derived heat
- * would mean inventing unvalidated per-type thresholds. P1-1 can upgrade
- * this once a real severity exists.
+ * heuristic module inference. Ranking is signal COUNT, not severity. P1-1
+ * added `DeterministicRiskSignal.severity`, but deliberately left this
+ * ranking and count unchanged (its Never list); severity shows only on the
+ * row's chips.
  *
  * Every comparison chain ends in a key that is unique at its level
  * (`directory` for clusters, `id` for Nodes), so ordering is total and no
@@ -1649,8 +1665,10 @@ const HEALTH_ROW_AFFORDANCE = 'open Node detail';
  * `role="img"`/`aria-label` chip convention `NodeRiskSignalSections` already
  * uses on the canvas — glyph and number visible, full signal name in the
  * accessible name. No percentages are derived: `test-coverage-gap` is a
- * boolean flag carrying `value: 1`, and no signal has a severity, so the
- * mockup's "61% gap"/"2 hotspots" figures depict data driller does not have.
+ * boolean flag carrying `value: 1`, so the mockup's "61% gap"/"2 hotspots"
+ * figures depict data driller does not have. P1-1: a severe signal's chip
+ * gets the same `!` glyph and "(severe)" label as the canvas chip, and its
+ * own `code-map__health-row-signal--severe` modifier.
  *
  * The row's own band is rendered as a WORD, not only as the value colour
  * (Accessibility Floor: the `--{heat}` class is reinforcement only, and the
@@ -1727,11 +1745,16 @@ export function HealthAuditClusterRow({
             return (
               <span
                 key={signal.type}
-                className="code-map__health-row-signal"
+                className={
+                  signal.severity === 'severe'
+                    ? 'code-map__health-row-signal code-map__health-row-signal--severe'
+                    : 'code-map__health-row-signal'
+                }
                 role="img"
                 aria-label={label}
                 title={label}
               >
+                {signal.severity === 'severe' && <span aria-hidden="true">{SEVERE_SIGNAL_GLYPH}</span>}
                 <span aria-hidden="true">{icon}</span>
                 {signal.value}
               </span>

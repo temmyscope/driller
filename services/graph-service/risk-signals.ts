@@ -11,10 +11,40 @@ import {
   computeBlastRadiusFromAdjacency,
   type BidirectionalAdjacency,
 } from '@driller/graph-contracts';
-import type { RiskSignal, RiskSignalLocation } from '@driller/ipc-contracts';
+import type {
+  CodeMapNode,
+  DeterministicRiskSeverity,
+  DeterministicRiskSignal,
+  RiskSignal,
+  RiskSignalLocation,
+} from '@driller/ipc-contracts';
 import { hasCoverageGap, type LcovCoverage } from './lcov';
 import type { CodeMapNodeWithSignalSources } from './mcp-client';
 import { getNodeRecord, type NodeRecord } from './node-record-store';
+
+/**
+ * P1-1: default severity thresholds — the one place they live. Defaults,
+ * meant to be retuned with dogfooding data.
+ */
+/** McCabe's "complex" band starts at 21. */
+export const SEVERE_COMPLEXITY_MIN = 21;
+/** SonarQube's default cognitive-complexity threshold per function. */
+export const SEVERE_COGNITIVE_COMPLEXITY_MIN = 15;
+/**
+ * `blast-radius` and `hotspot` are severe when in the project's top 10% of
+ * that signal's values (ties at the cut inclusive) AND at least their own
+ * floor — the floor keeps a tiny repo from going red on trivial values.
+ * The two floors share a value today (the spec's default) but are separate
+ * so each can be retuned on its own.
+ */
+export const SEVERE_PERCENTILE_TOP_FRACTION = 0.1;
+export const BLAST_RADIUS_SEVERE_FLOOR = 10;
+export const HOTSPOT_SEVERE_FLOOR = 10;
+
+/** A deterministic signal as `buildRiskSignals` builds it: not yet rated. */
+export type UnratedDeterministicRiskSignal = Omit<DeterministicRiskSignal, 'severity'>;
+/** `buildRiskSignals`' output: `RiskSignal` with deterministic entries still unrated. */
+export type UnratedRiskSignal = Exclude<RiskSignal, DeterministicRiskSignal> | UnratedDeterministicRiskSignal;
 
 /**
  * Story 2.1 (Phase 1): builds one Node's `riskSignals` array (FR7, AD-9
@@ -63,15 +93,19 @@ import { getNodeRecord, type NodeRecord } from './node-record-store';
  * still catching up on a large project. Return type widens from
  * `DeterministicRiskSignal[]` to the full `RiskSignal[]` union to
  * accommodate it.
+ *
+ * P1-1: deterministic entries come out unrated (no `severity`) — severity
+ * for `blast-radius`/`hotspot` depends on the whole project, so the caller
+ * runs `assignDeterministicSeverities` over every Node's output afterwards.
  */
 export function buildRiskSignals(
   node: CodeMapNodeWithSignalSources,
   adjacency: BidirectionalAdjacency,
   coverage: LcovCoverage | undefined,
   getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
-): RiskSignal[] {
+): UnratedRiskSignal[] {
   const location = { file: node.file, startLine: node.startLine, endLine: node.endLine };
-  const signals: RiskSignal[] = [];
+  const signals: UnratedRiskSignal[] = [];
 
   if (node.complexity !== undefined) {
     signals.push({ family: 'deterministic', type: 'complexity', value: node.complexity, location });
@@ -126,4 +160,155 @@ export function recordBackedSignals(record: NodeRecord | undefined, location: Ri
     signals.push(...ingested);
   }
   return signals;
+}
+
+/**
+ * P1-1: the smallest value in the top `SEVERE_PERCENTILE_TOP_FRACTION` of
+ * `values` (at least one entry is always in the top slice). Every value
+ * equal to the cut is in, so tied Nodes always share a severity; sorting
+ * numbers makes the result independent of input order (FR-7). Non-finite
+ * values (`NaN`, `±Infinity`) are ignored — `NaN` would make the sort
+ * order-dependent and an infinity would swallow the cut. `undefined` when
+ * no finite value remains.
+ */
+function percentileCut(values: readonly number[]): number | undefined {
+  const sorted = values.filter((value) => Number.isFinite(value)).sort((a, b) => b - a);
+  if (sorted.length === 0) {
+    return undefined;
+  }
+  const topCount = Math.max(1, Math.ceil(sorted.length * SEVERE_PERCENTILE_TOP_FRACTION));
+  return sorted[topCount - 1];
+}
+
+/** P1-1: the project-wide percentile cuts `classifyDeterministicSeverity` reads. */
+export interface PercentileCuts {
+  blastRadius: number | undefined;
+  hotspot: number | undefined;
+}
+
+function isSevereByPercentile(value: number, cut: number | undefined, floor: number): boolean {
+  return cut !== undefined && value >= cut && value >= floor;
+}
+
+/**
+ * P1-1: rates one deterministic signal. Exhaustive over
+ * `DeterministicRiskSignalType`: a new type fails typecheck here until
+ * someone decides its threshold, rather than silently rating moderate.
+ */
+export function classifyDeterministicSeverity(
+  signal: Pick<DeterministicRiskSignal, 'type' | 'value'>,
+  cuts: PercentileCuts,
+): DeterministicRiskSeverity {
+  const type = signal.type;
+  switch (type) {
+    case 'complexity':
+      return signal.value >= SEVERE_COMPLEXITY_MIN ? 'severe' : 'moderate';
+    case 'cognitive-complexity':
+      return signal.value >= SEVERE_COGNITIVE_COMPLEXITY_MIN ? 'severe' : 'moderate';
+    case 'blast-radius':
+      return isSevereByPercentile(signal.value, cuts.blastRadius, BLAST_RADIUS_SEVERE_FLOOR) ? 'severe' : 'moderate';
+    case 'hotspot':
+      return isSevereByPercentile(signal.value, cuts.hotspot, HOTSPOT_SEVERE_FLOOR) ? 'severe' : 'moderate';
+    case 'test-coverage-gap':
+      return 'moderate';
+    default: {
+      const unhandled: never = type;
+      throw new Error(`classifyDeterministicSeverity: unhandled deterministic signal type ${String(unhandled)}`);
+    }
+  }
+}
+
+/**
+ * P1-1: the project-wide cuts. Blast radius is per Node, so its population
+ * is one value per `blast-radius` signal. Hotspot is per FILE —
+ * `mcp-client.ts`'s `fetchCodeMap` joins `File.change_count` onto every Node
+ * by `node.file` — so its population is one value per distinct
+ * `location.file`; counting it per Node would let one heavily churned,
+ * many-Node file fill the whole top 10% by itself. Should a file ever carry
+ * two different finite values, the larger is taken (order-independent).
+ */
+function computePercentileCuts(nodesSignals: readonly (readonly UnratedRiskSignal[])[]): PercentileCuts {
+  const blastRadiusValues: number[] = [];
+  const hotspotByFile = new Map<string, number>();
+  for (const signals of nodesSignals) {
+    for (const signal of signals) {
+      if (signal.family !== 'deterministic') {
+        continue;
+      }
+      if (signal.type === 'blast-radius') {
+        blastRadiusValues.push(signal.value);
+      } else if (signal.type === 'hotspot' && Number.isFinite(signal.value)) {
+        // Non-finite values are skipped here (as `percentileCut` would) so
+        // `Math.max` can never see a `NaN` and make the per-file pick
+        // order-dependent.
+        const previous = hotspotByFile.get(signal.location.file);
+        hotspotByFile.set(signal.location.file, previous === undefined ? signal.value : Math.max(previous, signal.value));
+      }
+    }
+  }
+  return { blastRadius: percentileCut(blastRadiusValues), hotspot: percentileCut([...hotspotByFile.values()]) };
+}
+
+/**
+ * P1-1: the project pass. Takes every Node's `buildRiskSignals` output
+ * (outer array = Nodes, in any order) and returns the same shape, each
+ * deterministic signal stamped with its `severity`; every other signal is
+ * passed through as-is. Pure and deterministic: the percentile cuts come
+ * from sorted finite values, so reordering the Nodes (or their signals)
+ * never changes any signal's severity. The cut is computed per population
+ * (see `computePercentileCuts`) and then applied to every Node's own value,
+ * so every Node in a severe hotspot file is severe.
+ */
+export function assignDeterministicSeverities(nodesSignals: readonly (readonly UnratedRiskSignal[])[]): RiskSignal[][] {
+  const cuts = computePercentileCuts(nodesSignals);
+  return nodesSignals.map((signals) =>
+    signals.map((signal): RiskSignal =>
+      signal.family === 'deterministic' ? { ...signal, severity: classifyDeterministicSeverity(signal, cuts) } : signal,
+    ),
+  );
+}
+
+/**
+ * P1-1: the Code Map fetch path's whole risk-signal step, pure and
+ * importable so it can be tested: build every Node's signals from its raw
+ * `sources` entry, rate them across the WHOLE project in one pass, then zip
+ * them back onto `annotatedNodes` by index. `annotatedNodes` and `sources`
+ * are parallel (both `.map()`s off the same fetched Nodes, 1:1 in order);
+ * a length or id mismatch throws rather than attaching one Node's signals
+ * to another.
+ *
+ * `annotatedNodes` is runtime-shaped `CodeMapNodeWithSignalSources` (the
+ * annotation spread keeps the raw complexity/cognitiveComplexity/
+ * hotspotChangeCount fields even though its declared type drops them), so
+ * those are destructured out here and never leak onto the wire alongside
+ * the `riskSignals` that now represent them.
+ */
+export function attachProjectRiskSignals(
+  annotatedNodes: readonly CodeMapNode[],
+  sources: readonly CodeMapNodeWithSignalSources[],
+  adjacency: BidirectionalAdjacency,
+  coverage: LcovCoverage | undefined,
+  getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
+): CodeMapNode[] {
+  if (annotatedNodes.length !== sources.length) {
+    throw new Error(
+      `attachProjectRiskSignals: ${annotatedNodes.length} annotated Nodes but ${sources.length} signal sources`,
+    );
+  }
+  const rated = assignDeterministicSeverities(
+    sources.map((source) => buildRiskSignals(source, adjacency, coverage, getRecord)),
+  );
+  return annotatedNodes.map((node, i) => {
+    const source = sources[i]!;
+    if (source.id !== node.id) {
+      throw new Error(`attachProjectRiskSignals: Node ${i} is ${node.id} but its signal source is ${source.id}`);
+    }
+    const {
+      complexity: _complexity,
+      cognitiveComplexity: _cognitiveComplexity,
+      hotspotChangeCount: _hotspotChangeCount,
+      ...cleanNode
+    } = node as CodeMapNodeWithSignalSources;
+    return { ...cleanNode, riskSignals: rated[i]! };
+  });
 }

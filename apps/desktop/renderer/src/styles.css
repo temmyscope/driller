@@ -41,6 +41,9 @@
   --accent-dim: #1f6b45;
   --risk-amber: #e8a33d;
   --risk-red: #ef5350;
+  /* P1-1: dark ink paired with `--risk-red` fills (DESIGN.md
+     `badge-risk-severe`, 5.25:1 — AA). */
+  --risk-red-ink: #2a0a0a;
   --llm-violet: #b48ce0;
   --stale-yellow: #d9c65a;
   --trace-cyan: #4fd8e0;
@@ -1127,6 +1130,14 @@ code,
   white-space: nowrap;
 }
 
+/* P1-1: DESIGN.md `badge-risk-severe` — `{colors.risk-red}` fill, dark ink
+   `--risk-red-ink` (5.25:1, AA). Never colour alone: the chip also carries a
+   `!` glyph and "(severe)" in its `aria-label`/`title`. */
+.code-map__signal-chip--severe {
+  background: var(--risk-red);
+  color: var(--risk-red-ink);
+}
+
 /* LLM-judgment risk-signal callout (Story 2.2 Phase 3): the qualitative
    `family: 'llm-judgment'` signal's own distinct treatment, rendered after
    `.code-map__node-signal-strip` above. Deliberately never reuses
@@ -1654,6 +1665,17 @@ code,
   display: inline-flex;
   gap: 0.2rem;
   align-items: baseline;
+}
+
+/* P1-1: a severe value in a Health Audit row becomes a compact red pill
+   (`badge-risk-severe`'s fill/ink) so it stands out of the row's
+   heat-coloured text; the `!` glyph and "(severe)" label carry it without
+   colour. */
+.code-map__health-row-signal--severe {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--risk-red);
+  color: var(--risk-red-ink);
 }
 
 /* The caps' explicit remainders ("+3 more Nodes" / "+2 more modules") — plain
