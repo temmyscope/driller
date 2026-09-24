@@ -26,6 +26,9 @@ export default tseslint.config(
       'services/graph-service/**/*.ts',
       'services/graph-service/*.config.ts',
       'packages/*/src/**/*.ts',
+      // Repo tooling that Node itself runs (the `npm test` TypeScript
+      // loader), not app code — a Node context like the three above.
+      'scripts/**/*.mjs',
       '*.config.js',
       'eslint.config.js',
     ],

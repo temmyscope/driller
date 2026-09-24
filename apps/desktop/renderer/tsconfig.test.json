@@ -1,0 +1,20 @@
+{
+  // The renderer's unit tests. Identical to `tsconfig.json` except that
+  // Node's types are available: these files are executed by `node --test`
+  // (see `scripts/find-tests.mjs`), never shipped into a BrowserWindow.
+  //
+  // Be precise about what this does NOT guarantee: `types` applies to the
+  // whole program, so while this config is checking a test, the renderer
+  // modules it imports — `CodeMap.tsx` included — can see Node's globals
+  // too. AD-11's boundary holds because `tsconfig.json` independently
+  // typechecks those same files WITHOUT Node types, and both configs run in
+  // `npm run typecheck`. Removing either one removes the boundary.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "vite/client"]
+  },
+  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/types/**/*.d.ts"],
+  // Overrides the inherited `exclude` (which excludes tests, the opposite of
+  // what this config is for) while keeping TypeScript's implicit defaults.
+  "exclude": ["node_modules", "bower_components", "jspm_packages"]
+}

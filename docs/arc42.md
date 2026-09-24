@@ -85,6 +85,7 @@ Key strategic choices this drives:
 | Port/adapter | `services/graph-service/` | Owns the MCP client connection, indexing, summary generation, risk-signal computation, and the Agent-Facing Query Surface (MCP server) |
 | Shared contracts | `packages/graph-contracts/` | Transport-agnostic Graph Service operation contracts — shapes + result-state enums (AD-13, AD-19, AD-20) |
 | Shared contracts | `packages/ipc-contracts/` | IPC-shaped wrapper re-exporting `graph-contracts` for main↔renderer and main↔Graph Service messages |
+| Repo tooling (not shipped) | `scripts/` | Node-run tooling that is never packaged into the app: `npm test`'s preflight/runner and the esbuild TypeScript loader that lets `node --test` import `.ts`/`.tsx` sources |
 | External (not owned) | — (out-of-repo) | The MCP-based graph backend and its own on-disk cache |
 
 ```text
@@ -99,6 +100,7 @@ driller/
   packages/
     graph-contracts/         # Transport-agnostic Graph Service operation contracts: shapes + result-state enums (AD-13, AD-19, AD-20)
     ipc-contracts/          # IPC-shaped wrapper re-exporting graph-contracts for main<->renderer and main<->Graph Service messages (AD-1)
+  scripts/                 # Repo tooling Node itself runs, never shipped: the `npm test` preflight/runner and its TypeScript loader
 ```
 
 ### Capability to Architecture Map

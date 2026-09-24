@@ -9,5 +9,22 @@
       "@driller/ipc-contracts": ["../../../packages/ipc-contracts/src/index.ts"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx"]
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  // Unit tests run under `node --test`, not in the renderer, so they need
+  // Node's own types — which this project deliberately withholds from
+  // renderer code (AD-11). They are typechecked by `tsconfig.test.json`
+  // instead.
+  //
+  // THIS config is what actually enforces AD-11: it checks every shipped
+  // renderer file with no Node types present, so a `process`/`require`/
+  // `Buffer` reference in app code fails here regardless of what the test
+  // config allows. Listing an explicit `exclude` drops TypeScript's implicit
+  // default, so the defaults are restored by hand below.
+  "exclude": [
+    "node_modules",
+    "bower_components",
+    "jspm_packages",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx"
+  ]
 }

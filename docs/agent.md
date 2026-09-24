@@ -42,6 +42,10 @@ Full rationale for this layout: [arc42.md §5](arc42.md#5-building-block-view). 
 - This is an npm workspaces monorepo (`apps/*`, `services/*`, `packages/*`). Run commands from the repo root (`app/`).
 - `npm run typecheck` — typechecks every workspace that has a `typecheck` script.
 - `npm run lint` / `npm run lint:fix` — ESLint across the repo.
+- `npm test` — `node --test` over every `*.test.ts`/`*.test.tsx` under `apps/`, `packages/` and `services/`, no test framework. Requires Node 22+ (`engines`), not the 20 that only the app itself needs.
+  - `scripts/find-tests.mjs` owns the glob patterns and is the entry point. It fails loudly when they match nothing — `node --test` exits 0 on an empty glob, so without it a rename could drop the repo to zero tests with every command still green. If tests move, change the patterns there AND in both renderer tsconfigs.
+  - `scripts/ts-test-loader.mjs` transforms TypeScript/TSX via esbuild (transform only, never a bundle), which is what lets a test import a pure helper out of a `.tsx` module — so a helper can stay next to the logic it must agree with instead of being relocated to be testable.
+  - Renderer tests are typechecked by `renderer/tsconfig.test.json`, which grants Node types. AD-11 is enforced by `renderer/tsconfig.json`, which checks those same shipped files *without* Node types — both run in `npm run typecheck`, and dropping either one removes the boundary. Never add `"node"` to `renderer/tsconfig.json` instead.
 - `npm start` — runs the desktop app (`@driller/desktop` workspace) via Electron Forge.
 - New code that touches an IPC channel name should follow the existing `<domain>:<action>` convention (e.g. `graphService:index:progress`), not invent a new naming scheme.
 - Before designing a new Graph Service capability, check whether it fits an existing `graph-contracts` operation shape before adding a new one — the contract's whole point is one definition serving both the human UI and the agent surface.

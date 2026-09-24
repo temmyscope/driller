@@ -1198,6 +1198,248 @@ function riskCountBucket(riskCount: number): 'low' | 'medium' | 'high' | null {
   return 'high';
 }
 
+/**
+ * P0-2a: the Node's LLM judgment if — and only if — it is one that actually
+ * counts and renders. `selectLlmJudgmentSignal` finds the judgment;
+ * this adds the blank-text gate, because a whitespace-only judgment renders
+ * nothing and so must not be counted either (the gap Story 4.1's review
+ * round had to close once already).
+ *
+ * One definition, deliberately: `riskCountForNode` and
+ * `groupNodesIntoHealthClusters`' `llmJudgment` field both call it, so a
+ * Node can never be counted as carrying a judgment while the field that is
+ * supposed to show it is absent, or vice versa.
+ */
+function selectCountedLlmJudgment(signals: RiskSignal[]): LlmJudgmentRiskSignal | undefined {
+  const judgment = selectLlmJudgmentSignal(signals);
+  return judgment !== undefined && judgment.judgment.trim().length > 0 ? judgment : undefined;
+}
+
+/**
+ * P0-2a: the per-Node risk-signal count Health Audit Mode ranks by —
+ * deterministic signals (de-duplicated per `DeterministicRiskSignalType` by
+ * `selectDeterministicSignals`) plus one for a judgment that passes
+ * `selectCountedLlmJudgment`. `family: 'ingested'` is excluded: that is
+ * Epic 3's PR-bot-findings concept, not part of Epic 2's Risk Overlay.
+ *
+ * Extracted from `buildRiskCountByNodeId`'s loop body, which now calls this,
+ * so the two surfaces agree **per Node** by construction rather than by two
+ * hand-maintained copies staying in step. That is the whole of the
+ * guarantee: how each surface then AGGREGATES those per-Node counts differs
+ * on purpose — see `clusterRiskCounts` and `HealthCluster.heatCount`.
+ */
+export function riskCountForNode(node: CodeMapNode): number {
+  const judgmentCount = selectCountedLlmJudgment(node.riskSignals) !== undefined ? 1 : 0;
+  return selectDeterministicSignals(node.riskSignals).length + judgmentCount;
+}
+
+/**
+ * P0-2a: the per-Node count map the Code Map's LOD cluster tint is built
+ * from, lifted out of its `useMemo` so it is reachable without React.
+ * `riskCountByNodeId` is now nothing but this function plus the memo's own
+ * mode/fetch-state gating — which is what lets a test assert the spec's
+ * third acceptance criterion against the real production map rather than
+ * against a re-derivation of it.
+ */
+export function buildRiskCountByNodeId(
+  nodes: readonly CodeMapNode[],
+): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>();
+  for (const node of nodes) {
+    counts.set(node.id, riskCountForNode(node));
+  }
+  return counts;
+}
+
+/**
+ * P0-2a: a cluster's heat band. One-to-one with `riskCountBucket`'s own
+ * four outcomes — `null` → `'healthy'`, `'low'` → `'cool'`, `'medium'` →
+ * `'warm'`, `'high'` → `'hot'` — so the banding itself is reused verbatim
+ * and nothing new is thresholded. The rename is only so a caller never has
+ * to render `null` as a band: a clean repo's cluster is ordinary output
+ * carrying `'healthy'`, never an absent heat.
+ *
+ * DESIGN.md's `components.health-cluster-card` defines three heat-dot
+ * colors, with `heat-dot-cool` already being `{colors.healthy}` — so
+ * `'cool'` and `'healthy'` share a color there while staying distinct here,
+ * and no information is lost in either direction.
+ */
+export type HealthClusterHeat = 'hot' | 'warm' | 'cool' | 'healthy';
+
+const HEAT_BY_BUCKET = {
+  high: 'hot',
+  medium: 'warm',
+  low: 'cool',
+} as const satisfies Record<Exclude<ReturnType<typeof riskCountBucket>, null>, HealthClusterHeat>;
+
+/**
+ * P0-2a: one Node inside a health cluster, carrying the count it was ranked
+ * by and the signals behind that count — so a caller renders rows from real
+ * signal values (`DETERMINISTIC_SIGNAL_LABELS`/`_ICONS` plus each signal's
+ * own `value`) and never has to re-derive, or invent, a metric.
+ */
+export interface HealthClusterNode {
+  node: CodeMapNode;
+  /** `riskCountForNode(node)` — identical to this Node's `riskCountByNodeId` entry. */
+  riskCount: number;
+  /** De-duplicated per `type`, then ordered by `type` ascending so the row order is total. */
+  deterministicSignals: DeterministicRiskSignal[];
+  /** Present only when the Node carries a judgment with non-whitespace text — the same gate `riskCountForNode` counts by. */
+  llmJudgment?: LlmJudgmentRiskSignal;
+}
+
+/** P0-2a: one module cluster — the Nodes under a single containing directory. */
+export interface HealthCluster {
+  /**
+   * The full containing directory, POSIX-relative (`api/internal/service`),
+   * or `HEALTH_CLUSTER_ROOT_KEY` for a file that sits at the repo root.
+   * Unique across the returned list, which is what makes the cluster
+   * ordering below total.
+   */
+  directory: string;
+  /** What to display. Never the bare `'.'` sentinel — see `HEALTH_CLUSTER_ROOT_LABEL`. */
+  label: string;
+  /** Banded from `heatCount` via `riskCountBucket`. */
+  heat: HealthClusterHeat;
+  /**
+   * The highest per-Node `riskCount` in the cluster — never the sum, so one
+   * bad Node makes a cluster hot rather than a large directory doing so by
+   * volume. Carried so a caller can state the evidence next to the band
+   * ("hot · 7 signals") instead of showing a bare adjective.
+   *
+   * This is where this surface parts company with the Code Map's LOD cluster
+   * tint, which bands the SUM of its members instead — intentionally, since
+   * that cluster is a viewport artifact rather than a module. The two share
+   * `riskCountForNode` and therefore agree per Node, never per cluster.
+   */
+  heatCount: number;
+  /** Sum of every member Node's `riskCount`, including Nodes dropped by the cap. The secondary ordering key. */
+  totalRiskCount: number;
+  /** Capped at `HEALTH_CLUSTER_NODE_LIMIT`, ordered by `riskCount` desc, then `name` asc, then `id` asc. */
+  nodes: HealthClusterNode[];
+  /** How many member Nodes the cap left out. `0` when all of them fit. */
+  remainingNodeCount: number;
+}
+
+/** P0-2a: the helper's whole return shape — a settled contract with `spec-p0-2b-health-audit-surface.md`. */
+export interface HealthClusterGrouping {
+  clusters: HealthCluster[];
+  /** How many clusters `HEALTH_CLUSTER_LIMIT` left out. `0` when all of them fit. */
+  remainingClusterCount: number;
+}
+
+/**
+ * The directory key for a Node whose `file` has no `/` at all (`main.ts`).
+ * A stable sentinel rather than `''`, so the root cluster can never collide
+ * with, or be mistaken for, a missing key.
+ */
+export const HEALTH_CLUSTER_ROOT_KEY = '.';
+
+/** What to show for `HEALTH_CLUSTER_ROOT_KEY` — the sentinel is never rendered raw. */
+export const HEALTH_CLUSTER_ROOT_LABEL = '(repo root)';
+
+/**
+ * Display caps. Renderer-local presentation limits, never a Graph Service
+ * concern: the full Node set is still grouped and counted, and whatever the
+ * caps drop is reported as an explicit remainder rather than silently
+ * vanishing (AD-13's explicit-result-state pattern applied to truncation).
+ */
+export const HEALTH_CLUSTER_LIMIT = 12;
+export const HEALTH_CLUSTER_NODE_LIMIT = 8;
+
+/**
+ * Plain code-unit ordering, deliberately NOT `localeCompare`: that consults
+ * the runtime's ICU data, so the same input could order differently on two
+ * machines. Every tiebreak below has to be reproducible, not merely stable
+ * within one process.
+ */
+function compareAscending(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+  return a > b ? 1 : 0;
+}
+
+/**
+ * P0-2a: group `CodeMapNode[]` into Health Audit Mode's ranked module
+ * clusters (UJ-2 step 3). Pure — no React, DOM, clock, or IPC — so the
+ * whole thing is unit-testable and the surface spec that consumes it
+ * (P0-2b) owns rendering only.
+ *
+ * Grouping is the containing directory and nothing else: no semantic, AI, or
+ * heuristic module inference. Ranking is signal COUNT, not severity —
+ * `DeterministicRiskSignal` carries no severity field and nothing in this
+ * repo thresholds a raw `value` into a band, so a severity-derived heat
+ * would mean inventing unvalidated per-type thresholds. P1-1 can upgrade
+ * this once a real severity exists.
+ *
+ * Every comparison chain ends in a key that is unique at its level
+ * (`directory` for clusters, `id` for Nodes), so ordering is total and no
+ * tie ever falls through to input order — running this twice over the same
+ * input yields deeply equal results, array order included.
+ */
+export function groupNodesIntoHealthClusters(nodes: readonly CodeMapNode[]): HealthClusterGrouping {
+  const byDirectory = new Map<string, HealthClusterNode[]>();
+
+  for (const node of nodes) {
+    const separator = node.file.lastIndexOf('/');
+    const directory = separator > 0 ? node.file.slice(0, separator) : HEALTH_CLUSTER_ROOT_KEY;
+    const judgment = selectCountedLlmJudgment(node.riskSignals);
+    const members = byDirectory.get(directory);
+    const member: HealthClusterNode = {
+      node,
+      riskCount: riskCountForNode(node),
+      deterministicSignals: selectDeterministicSignals(node.riskSignals).sort((a, b) =>
+        compareAscending(a.type, b.type),
+      ),
+      ...(judgment !== undefined ? { llmJudgment: judgment } : {}),
+    };
+    if (members === undefined) {
+      byDirectory.set(directory, [member]);
+    } else {
+      members.push(member);
+    }
+  }
+
+  const clusters: HealthCluster[] = [];
+  for (const [directory, members] of byDirectory) {
+    let heatCount = 0;
+    let totalRiskCount = 0;
+    for (const member of members) {
+      heatCount = Math.max(heatCount, member.riskCount);
+      totalRiskCount += member.riskCount;
+    }
+    members.sort(
+      (a, b) =>
+        b.riskCount - a.riskCount ||
+        compareAscending(a.node.name, b.node.name) ||
+        compareAscending(a.node.id, b.node.id),
+    );
+    const bucket = riskCountBucket(heatCount);
+    clusters.push({
+      directory,
+      label: directory === HEALTH_CLUSTER_ROOT_KEY ? HEALTH_CLUSTER_ROOT_LABEL : directory,
+      heat: bucket === null ? 'healthy' : HEAT_BY_BUCKET[bucket],
+      heatCount,
+      totalRiskCount,
+      nodes: members.slice(0, HEALTH_CLUSTER_NODE_LIMIT),
+      remainingNodeCount: Math.max(0, members.length - HEALTH_CLUSTER_NODE_LIMIT),
+    });
+  }
+
+  clusters.sort(
+    (a, b) =>
+      b.heatCount - a.heatCount ||
+      b.totalRiskCount - a.totalRiskCount ||
+      compareAscending(a.directory, b.directory),
+  );
+
+  return {
+    clusters: clusters.slice(0, HEALTH_CLUSTER_LIMIT),
+    remainingClusterCount: Math.max(0, clusters.length - HEALTH_CLUSTER_LIMIT),
+  };
+}
+
 function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
   const { cluster, onExpand, riskCount } = data;
   const willZoomInsteadOfExpand = cluster.nodeIds.length > CLUSTER_EXPAND_MAX;
@@ -2425,6 +2667,23 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // the same reason — a whitespace-only judgment renders nothing, so
   // counting it would reopen the identical gap.
   //
+  // P0-2a (2026-09-24): the whole body now lives in
+  // `buildRiskCountByNodeId`, leaving this memo as nothing but the
+  // mode/fetch-state gating around it — so a test can assert the per-Node
+  // counts against the real production map instead of re-deriving one.
+  // `groupNodesIntoHealthClusters` calls the same `riskCountForNode`, so the
+  // two surfaces agree PER NODE by construction.
+  //
+  // That guarantee stops at the Node, and deliberately so: `clusterRiskCounts`
+  // below SUMS its members' counts, while `HealthCluster.heatCount` takes the
+  // MAX of them, so the same group of Nodes can legitimately band differently
+  // on the two surfaces. The sum is right here — a spatial LOD cluster is an
+  // arbitrary viewport-derived bag of Nodes whose tint should reflect how much
+  // is in it. The max is right there — a health cluster is a real module being
+  // ranked against other modules, where one bad Node must make it hot rather
+  // than a large directory doing so by volume. Do not "fix" the difference by
+  // making one call the other.
+  //
   // Deliberately NOT gated on the three family toggles: those are Code Map
   // rendering preferences, while this is Health Audit Mode's own Risk
   // Overlay reading of what a Node carries (Always: "Epic 2's Risk Overlay
@@ -2434,13 +2693,7 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
     if (mode !== 'healthAudit' || fetchState.status !== 'ready') {
       return EMPTY_RISK_COUNT_MAP;
     }
-    const counts = new Map<string, number>();
-    for (const node of fetchState.nodes) {
-      const judgment = selectLlmJudgmentSignal(node.riskSignals);
-      const judgmentCount = judgment !== undefined && judgment.judgment.trim().length > 0 ? 1 : 0;
-      counts.set(node.id, selectDeterministicSignals(node.riskSignals).length + judgmentCount);
-    }
-    return counts;
+    return buildRiskCountByNodeId(fetchState.nodes);
   }, [mode, fetchState]);
 
   // Story 4.1: the per-cluster aggregation itself — a `useMemo` derived
@@ -2450,6 +2703,12 @@ export function CodeMap({ projectPath, noSummaryBackendAvailable, cloudSelectedN
   // `riskCountByNodeId`'s own comment) so a `lodResult` recompute only ever
   // re-sums already-counted per-Node values, never re-scans every Node's
   // `riskSignals` from scratch.
+  //
+  // P0-2a (2026-09-24): this SUM is not the same aggregation as
+  // `HealthCluster.heatCount`'s MAX, and the divergence is intended — see
+  // `riskCountByNodeId`'s comment above for which is right where. The shared
+  // `riskCountForNode` guarantees the two agree on each Node's own count and
+  // nothing beyond that.
   const clusterRiskCounts = useMemo<ReadonlyMap<string, number>>(() => {
     if (riskCountByNodeId === EMPTY_RISK_COUNT_MAP) {
       return EMPTY_RISK_COUNT_MAP;
