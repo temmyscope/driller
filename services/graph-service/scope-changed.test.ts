@@ -1,0 +1,174 @@
+/**
+ * P2-1: `graphService:scopeChanged` end to end through the real `index.ts`
+ * message handler — a `getCodeMap` posted right after it is filtered with the
+ * new scope, no status is posted (no re-index), and an index in flight when
+ * the scope is saved finishes with the saved scope.
+ *
+ * `index.ts` has load-time side effects, so this file loads it once, after:
+ *  - a stub `process.parentPort` (an EventEmitter recording `postMessage`) —
+ *    the Electron `utilityProcess` channel it listens and posts on;
+ *  - a temp userData dir as `process.argv[2]`, for the Node record store;
+ *  - module hooks, registered at runtime with `module.register` (no
+ *    experimental mocking flag), that swap `index.ts`'s imports of
+ *    `./mcp-client` (CBM), `./model-manager` (the GGUF download) and
+ *    `./mcp-server` (the port bind) for in-memory stubs. Nothing else is
+ *    stubbed: the filter, the handlers and the state are the real ones.
+ */
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { mkdtempSync } from 'node:fs';
+import { register } from 'node:module';
+import os from 'node:os';
+import path from 'node:path';
+import { before, describe, it } from 'node:test';
+
+const toDataUrl = (source: string): string => `data:text/javascript,${encodeURIComponent(source)}`;
+
+const MCP_CLIENT_STUB = toDataUrl(`
+export function stopCbmDaemon() {}
+export async function indexRepository() {
+  const gate = globalThis.__scopeTestIndexGate;
+  if (gate) await gate;
+  return { nodes: 4, edges: 2, project: 'stub-project' };
+}
+const node = (id, file) => ({ id, name: id, file, startLine: 1, endLine: 2, kind: 'Function', summaryStatus: 'pending', riskSignals: [] });
+export async function fetchCodeMap() {
+  return {
+    nodes: [node('w', 'web/a.ts'), node('a', 'app/b.ts'), node('d', 'docs/c.ts'), node('x', 'webapp/d.ts')],
+    edges: [{ source: 'w', target: 'a', kind: 'CALLS' }, { source: 'a', target: 'd', kind: 'CALLS' }],
+  };
+}
+`);
+const MODEL_MANAGER_STUB = toDataUrl('export function ensureLocalModel() { return new Promise(() => {}); }');
+const MCP_SERVER_STUB = toDataUrl('export function startMcpServer() { return async () => {}; }');
+
+const HOOKS = toDataUrl(`
+const STUBS = ${JSON.stringify({
+  './mcp-client': MCP_CLIENT_STUB,
+  './model-manager': MODEL_MANAGER_STUB,
+  './mcp-server': MCP_SERVER_STUB,
+})};
+export function resolve(specifier, context, nextResolve) {
+  if (context.parentURL && context.parentURL.endsWith('/services/graph-service/index.ts') && STUBS[specifier]) {
+    return { url: STUBS[specifier], format: 'module', shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+`);
+
+interface Posted {
+  type?: string;
+  state?: string;
+  nodes?: { file: string }[];
+  message?: string;
+}
+
+const port = new EventEmitter() as EventEmitter & { postMessage: (message: Posted) => void };
+const posted: Posted[] = [];
+port.postMessage = (message) => {
+  posted.push(message);
+};
+
+const PROJECT = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-project-'));
+const OTHER_PROJECT = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-other-'));
+
+const send = (data: unknown): void => {
+  port.emit('message', { data });
+};
+
+async function waitFor<T>(find: () => T | undefined, what: string): Promise<T> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const found = find();
+    if (found !== undefined) {
+      return found;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/** Every Graph Service status posted since `from` (status messages carry `state` and no `type`). */
+const statusesSince = (from: number): string[] =>
+  posted.slice(from).flatMap((message) => (message.type === undefined && message.state ? [message.state] : []));
+
+/** Posts `getCodeMap` and resolves with the reply's Node files. */
+async function fetchMapFiles(): Promise<string[]> {
+  const from = posted.length;
+  send({ type: 'graphService:getCodeMap' });
+  const reply = await waitFor(
+    () =>
+      posted
+        .slice(from)
+        .find((message) => message.type === 'graphService:codeMap' || message.type === 'graphService:codeMapError'),
+    'a Code Map reply',
+  );
+  assert.equal(reply.type, 'graphService:codeMap', reply.message);
+  return (reply.nodes ?? []).map((node) => node.file);
+}
+
+/** Posts an index request and resolves once its `indexed` (or `error`) status lands. */
+async function index(projectPath: string, includedPaths?: string[]): Promise<void> {
+  const from = posted.length;
+  send({ type: 'graphService:index', path: projectPath, activeBackend: 'local', ...(includedPaths ? { includedPaths } : {}) });
+  await waitFor(() => statusesSince(from).find((state) => state === 'indexed' || state === 'error'), 'an index to finish');
+}
+
+const ALL = ['web/a.ts', 'app/b.ts', 'docs/c.ts', 'webapp/d.ts'];
+
+describe('graphService:scopeChanged through index.ts', () => {
+  before(async () => {
+    register(HOOKS, import.meta.url);
+    (process as unknown as { parentPort: typeof port }).parentPort = port;
+    process.argv[2] = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-userdata-'));
+    await import('./index');
+    await index(PROJECT);
+  });
+
+  it('filters the next Code Map fetch with the saved scope, posting no status', async () => {
+    const from = posted.length;
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web'] });
+    assert.deepEqual(await fetchMapFiles(), ['web/a.ts']);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web', 'app'] });
+    assert.deepEqual(await fetchMapFiles(), ['web/a.ts', 'app/b.ts']);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    assert.deepEqual(await fetchMapFiles(), ALL);
+    assert.deepEqual(statusesSince(from), []);
+  });
+
+  it('ignores a malformed scopeChanged', async () => {
+    send({ type: 'graphService:scopeChanged', path: 'relative/path', includedPaths: ['web'] });
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [1] });
+    assert.deepEqual(await fetchMapFiles(), ALL);
+  });
+
+  it("a scope for a project that isn't active or indexing leaves the map alone", async () => {
+    send({ type: 'graphService:scopeChanged', path: OTHER_PROJECT, includedPaths: ['web'] });
+    assert.deepEqual(await fetchMapFiles(), ALL);
+  });
+
+  it('an index in flight finishes with a scope saved mid-index, not the one it started with', async () => {
+    let release!: () => void;
+    (globalThis as { __scopeTestIndexGate?: Promise<void> }).__scopeTestIndexGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const from = posted.length;
+    send({ type: 'graphService:index', path: PROJECT, activeBackend: 'local', includedPaths: ['docs'] });
+    await waitFor(() => statusesSince(from).find((state) => state === 'indexing'), 'indexing');
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['app'] });
+    release();
+    await waitFor(() => statusesSince(from).find((state) => state === 'indexed'), 'indexed');
+    delete (globalThis as { __scopeTestIndexGate?: Promise<void> }).__scopeTestIndexGate;
+    assert.deepEqual(await fetchMapFiles(), ['app/b.ts']);
+  });
+
+  it('a stale override is dropped when a new index starts', async () => {
+    // Saved while no index runs: adopted now, and also recorded as the
+    // override for the last-requested project.
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web'] });
+    assert.deepEqual(await fetchMapFiles(), ['web/a.ts']);
+    // The next index carries what main persisted since; the earlier override
+    // must not win over it.
+    await index(PROJECT, ['docs']);
+    assert.deepEqual(await fetchMapFiles(), ['docs/c.ts']);
+  });
+});

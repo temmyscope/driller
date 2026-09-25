@@ -61,6 +61,7 @@ import {
   type PrBotIngestionResult,
   type ProjectOpenResult,
   type ProjectScopeConfig,
+  type ProjectScopeSaveResult,
   type ReadSourceRangeResult,
   type RegenerateNodeResult,
   type SetCloudApiKeyResult,
@@ -76,6 +77,7 @@ import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
+import { resolveProjectScopeSave } from './project-scope-save';
 import { getProjectScope, setProjectScope } from './project-scope-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
 
@@ -1949,17 +1951,22 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     IpcChannels.settingsSetProjectScope,
-    (_event, projectPath: unknown, includedPaths: unknown): ProjectScopeConfig => {
-      if (typeof projectPath !== 'string' || projectPath.length === 0) {
-        return { includedPaths: [] };
+    (_event, projectPath: unknown, includedPaths: unknown): ProjectScopeSaveResult => {
+      // P2-1: validation (a malformed call throws, so the renderer's
+      // save-error notice shows it), persistence and the apply decision all
+      // live in project-scope-save.ts. The scope is a query-time filter in
+      // the Graph Service, so the open project's running service adopts it
+      // right away — no re-index. Posted before this reply, so the renderer's
+      // map refetch is ordered after it on the same channel.
+      const { post, result } = resolveProjectScopeSave(projectPath, includedPaths, {
+        persist: setProjectScope,
+        serviceRunning: graphService !== null,
+        currentProjectPath,
+      });
+      if (post) {
+        graphService?.postMessage(post);
       }
-      if (!Array.isArray(includedPaths) || !includedPaths.every((entry) => typeof entry === 'string')) {
-        // Malformed value: no-op, same defensive-backstop precedent as
-        // settingsSetPrBotEnabled's own guard, returning the project's
-        // current, unchanged config rather than a stale default.
-        return getProjectScope(projectPath);
-      }
-      return setProjectScope(projectPath, includedPaths);
+      return result;
     },
   );
 

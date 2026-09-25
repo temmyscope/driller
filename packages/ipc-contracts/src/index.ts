@@ -1125,6 +1125,37 @@ export interface ProjectScopeConfig {
   includedPaths: string[];
 }
 
+/**
+ * `setProjectScope`'s reply (P2-1). `config` is the persisted, normalized
+ * scope. `applied` is true when main also handed it to the running Graph
+ * Service for the open project (`graphService:scopeChanged`), so the map
+ * reflects it on its next fetch. False when it was only persisted — no Graph
+ * Service running (or a project other than the open one): it applies when
+ * the Graph Service is running again, since its next index of the project
+ * reads the persisted scope. A malformed call persists nothing and rejects
+ * instead of replying.
+ */
+export interface ProjectScopeSaveResult {
+  config: ProjectScopeConfig;
+  applied: boolean;
+}
+
+/**
+ * Message main sends when the open project's indexing scope is saved (P2-1).
+ * The scope is a query-time filter (`filterCodeMapToScope`), so this is a
+ * state hand-off, never a re-index: the Graph Service adopts `includedPaths`
+ * for `path` if it's the active project, and, if an index for `path` is in
+ * flight, makes that index finish with this scope instead of the one its
+ * request carried. Posts no status and no reply.
+ */
+export interface GraphServiceScopeChangedRequest {
+  type: 'graphService:scopeChanged';
+  /** Absolute, OS-native project root the scope belongs to. */
+  path: string;
+  /** The persisted `ProjectScopeConfig.includedPaths`; empty means no restriction. */
+  includedPaths: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Story 2.3 (Phase 2): ingest CodeRabbit findings via the CodeRabbit CLI.
 //
@@ -1574,12 +1605,16 @@ export interface DrillerApi {
   getProjectScope: (projectPath: string) => Promise<ProjectScopeConfig>;
   /**
    * Sets one project's indexing-scope allowlist (Bug fix, 2026-09-23).
-   * Takes effect on the next index (a fresh folder open, or a manual
-   * Graph Service restart) — this call itself doesn't trigger a re-index.
-   * Returns the project's updated `ProjectScopeConfig` so the renderer can
-   * update its state without a separate refetch.
+   * Never triggers a re-index. P2-1: when `projectPath` is the open project
+   * and the Graph Service is running, main also hands the scope to it
+   * (`graphService:scopeChanged`) and replies `applied: true` — the renderer
+   * then refetches the map to show it. Otherwise `applied: false`: saved, and
+   * applies when the Graph Service is running again (see
+   * `ProjectScopeSaveResult`). Rejects, persisting nothing, on a malformed
+   * call. `config` is the persisted value, so the renderer can update its
+   * state without a separate refetch.
    */
-  setProjectScope: (projectPath: string, includedPaths: string[]) => Promise<ProjectScopeConfig>;
+  setProjectScope: (projectPath: string, includedPaths: string[]) => Promise<ProjectScopeSaveResult>;
   /**
    * Runs one PR-bot's ingestion pass against `projectPath` (Story 2.3, Phase
    * 2) — this phase's only entry point (Never: "Any UI trigger, entry

@@ -156,6 +156,22 @@ export function applyProjectClosedToSessionMap(state: SessionMapState): SessionM
  * load reads the cleared state anyway.
  */
 export function applyBackendSwitchedToSessionMap(state: SessionMapState): SessionMapState {
+  return refetchLoadedMap(state);
+}
+
+/**
+ * P2-1: main handed a newly saved indexing scope to the running Graph
+ * Service, whose next Code Map fetch is filtered by it — refetch a loaded map
+ * through the same `dataVersion` path as a backend switch (map stays mounted,
+ * viewport untouched, Node Detail closes if its Node fell out of scope). A
+ * no-op (same object) when no map is loaded: the next load is already scoped.
+ */
+export function applyProjectScopeAppliedToSessionMap(state: SessionMapState): SessionMapState {
+  return refetchLoadedMap(state);
+}
+
+/** One `dataVersion` bump for a loaded map; the same object when none is loaded. */
+function refetchLoadedMap(state: SessionMapState): SessionMapState {
   if (state.loadedProjectPath === null) {
     return state;
   }

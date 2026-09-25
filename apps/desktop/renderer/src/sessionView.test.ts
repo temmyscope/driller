@@ -11,6 +11,7 @@ import type { CodeMapNode, GraphServiceStatusMessage } from '@driller/ipc-contra
 import {
   INITIAL_SESSION_MAP_STATE,
   applyBackendSwitchedToSessionMap,
+  applyProjectScopeAppliedToSessionMap,
   applyProjectClosedToSessionMap,
   applyProjectOpenedToSessionMap,
   applyStatusToSessionMap,
@@ -219,6 +220,18 @@ describe('session map transitions', () => {
 
   it('a backend switch with no map loaded is a no-op', () => {
     assert.equal(applyBackendSwitchedToSessionMap(INITIAL_SESSION_MAP_STATE), INITIAL_SESSION_MAP_STATE);
+  });
+
+  it('an applied scope save with a map loaded bumps dataVersion once, map kept', () => {
+    const a = applyStatusToSessionMap(INITIAL_SESSION_MAP_STATE, indexed(PROJECT, AT));
+    const next = applyProjectScopeAppliedToSessionMap(a);
+    assert.equal(next.dataVersion, a.dataVersion + 1);
+    assert.equal(next.loadedProjectPath, PROJECT);
+    assert.equal(next.lastIndexedKey, a.lastIndexedKey);
+  });
+
+  it('an applied scope save with no map loaded is a no-op', () => {
+    assert.equal(applyProjectScopeAppliedToSessionMap(INITIAL_SESSION_MAP_STATE), INITIAL_SESSION_MAP_STATE);
   });
 });
 

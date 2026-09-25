@@ -17,6 +17,7 @@ import { Settings } from './Settings';
 import {
   INITIAL_SESSION_MAP_STATE,
   applyBackendSwitchedToSessionMap,
+  applyProjectScopeAppliedToSessionMap,
   applyProjectClosedToSessionMap,
   applyProjectOpenedToSessionMap,
   applyStatusToSessionMap,
@@ -250,6 +251,13 @@ export function App() {
   // sees the cleared (`pending`) state, same as `lookup_node`.
   const handleBackendSwitched = useCallback(() => {
     commitSessionMap(applyBackendSwitchedToSessionMap(sessionMapRef.current));
+  }, [commitSessionMap]);
+
+  // P2-1: Settings reports each scope save main handed to the running Graph
+  // Service. The scope is a query-time filter, so the loaded map is refetched
+  // through the same `dataVersion` path — no re-index, no `indexing` status.
+  const handleProjectScopeApplied = useCallback(() => {
+    commitSessionMap(applyProjectScopeAppliedToSessionMap(sessionMapRef.current));
   }, [commitSessionMap]);
 
   useEffect(() => {
@@ -947,6 +955,7 @@ export function App() {
           projectPath={currentProjectPath}
           onIngestionResult={handleIngestionResult}
           onBackendSwitched={handleBackendSwitched}
+          onProjectScopeApplied={handleProjectScopeApplied}
           onClose={() => {
             setIsSettingsOpen(false);
             // Story 1.6 (Phase 2): the backend choice/key may have just

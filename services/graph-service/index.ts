@@ -172,6 +172,12 @@ import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { loadLcovCoverage } from './lcov';
 import { fetchCodeMap, indexRepository, stopCbmDaemon } from './mcp-client';
 import { deriveLiveNode } from './live-node';
+import {
+  applyScopeChanged,
+  isScopeChangedRequest,
+  resolveIncludedPathsOnIndexSuccess,
+  type PendingScopeOverride,
+} from './project-scope';
 import { attachProjectRiskSignals } from './risk-signals';
 import { startMcpServer } from './mcp-server';
 import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
@@ -262,6 +268,13 @@ let activeProjectPath: string | undefined;
 // so this is a query-time filter over the already-fetched, already-full
 // Node/edge set.
 let activeIncludedPaths: readonly string[] = [];
+
+// P2-1: a scope saved (`graphService:scopeChanged`) for the most recently
+// requested index's project. `handleIndexRequest`'s success branch adopts it
+// instead of the scope its own request carried, so a save made mid-index
+// isn't overwritten when that index finishes. Cleared when a new index
+// starts, on success once adopted, and on failure. See project-scope.ts.
+let pendingScopeOverride: PendingScopeOverride | undefined;
 
 // The current index's coverage-gap files (FR5), as POSIX-relative paths
 // matching `CodeMapNode.file`'s own format — the backend's `index_status`
@@ -1012,6 +1025,19 @@ function isIndexRequest(data: unknown): data is GraphServiceIndexRequest {
   );
 }
 
+/**
+ * Handles a `graphService:scopeChanged` (P2-1). Synchronous on receipt, so a
+ * `graphService:getCodeMap` main posts after it (the renderer's refetch) is
+ * filtered with the new scope. Posts nothing: no status, no reply, no index.
+ */
+function handleScopeChangedRequest(projectPath: string, includedPaths: readonly string[]): void {
+  ({ activeIncludedPaths, pendingScopeOverride } = applyScopeChanged(
+    { activeProjectPath, activeIncludedPaths, activeIndexPath, pendingScopeOverride },
+    projectPath,
+    includedPaths,
+  ));
+}
+
 function isBackendSwitchedRequest(data: unknown): data is GraphServiceBackendSwitchedRequest {
   if (typeof data !== 'object' || data === null) {
     return false;
@@ -1086,6 +1112,9 @@ async function handleIndexRequest(
   includedPaths: readonly string[],
 ): Promise<void> {
   activeIndexPath = projectPath;
+  // P2-1: this request carries the scope main read just now, so any override
+  // saved during an earlier attempt is already reflected in it.
+  pendingScopeOverride = undefined;
   // Bug fix (2026-09-23): see `activeIndexInFlight`'s own declaration
   // comment — this is the half of the re-entrancy guard that actually means
   // "still running," reset unconditionally in the `finally` below.
@@ -1166,7 +1195,10 @@ async function handleIndexRequest(
     // Bug fix (2026-09-23): captured alongside `activeProjectPath`, same
     // never-on-failure reasoning — see `activeIncludedPaths`'s own
     // declaration comment.
-    activeIncludedPaths = includedPaths;
+    // P2-1: unless a newer scope was saved while this index ran — see
+    // `pendingScopeOverride`.
+    activeIncludedPaths = resolveIncludedPathsOnIndexSuccess(projectPath, includedPaths, pendingScopeOverride);
+    pendingScopeOverride = undefined;
     coverageGapFileSet = new Set(
       (coverage?.gapPaths ?? []).map((gap) =>
         toProjectRelativePosixPath(projectPath, gap.path, 'coverage gap file'),
@@ -1195,6 +1227,9 @@ async function handleIndexRequest(
     if (activeIndexPath !== projectPath) {
       return;
     }
+    // P2-1: a scope saved while this failed index ran has nothing to apply
+    // to; main persisted it, and the next index request carries it.
+    pendingScopeOverride = undefined;
     // Backend-unavailable (spawn fails, or the MCP call errors/rejects/times
     // out) reuses Story 1.1's error status path — no separate failure UI.
     // This error came from an in-flight index attempt, so elapsedMs (like
@@ -2634,6 +2669,10 @@ process.parentPort?.on('message', (event) => {
       },
       event.data.includedPaths ?? [],
     );
+    return;
+  }
+  if (!isShuttingDown && isScopeChangedRequest(event.data)) {
+    handleScopeChangedRequest(event.data.path, [...event.data.includedPaths]);
     return;
   }
   if (!isShuttingDown && isBackendSwitchedRequest(event.data)) {

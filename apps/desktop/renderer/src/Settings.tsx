@@ -47,6 +47,7 @@ import type {
   PrBotId,
   PrBotIngestionResult,
   ProjectScopeConfig,
+  ProjectScopeSaveResult,
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
 
@@ -64,6 +65,14 @@ interface SettingsProps {
    * ordered after the clear.
    */
   onBackendSwitched: () => void;
+  /**
+   * P2-1: called once per successful `setProjectScope` that main reports as
+   * `applied` — handed to the running Graph Service for the open project, so
+   * App.tsx refetches the loaded map to show the new scope. Fired after the
+   * IPC reply, which main sends only after posting `scopeChanged`, so the
+   * refetch is ordered after the scope change.
+   */
+  onProjectScopeApplied: () => void;
   /**
    * Absolute, OS-native path of the currently open project, or `null` when
    * none is open (Story 2.3, Phase 1) — PR-bot opt-in is per-project, so
@@ -215,7 +224,38 @@ function prBotDisclosureText(bot: PrBotId): string {
   return `${toolName}'s local CLI mode sends this project's diff/code content to ${toolName}'s own cloud service to generate findings. That transfer is outside driller's control and is not covered by driller's own no-server privacy guarantee.`;
 }
 
-export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionResult }: SettingsProps) {
+/**
+ * P2-1: the one confirmation sentence the indexing-scope group shows after a
+ * successful save — what the map now shows when main applied it, or when it
+ * will apply when it couldn't (Graph Service not running).
+ */
+export function projectScopeSavedMessage(config: ProjectScopeConfig, applied: boolean): string {
+  if (!applied) {
+    return 'Saved — applies when the Graph Service is running again.';
+  }
+  if (config.includedPaths.length === 0) {
+    return 'Saved — the map shows the whole project.';
+  }
+  return `Saved — the map now shows only ${config.includedPaths.join(', ')}.`;
+}
+
+/**
+ * P2-1: what a successful save does in Settings — the confirmation to show,
+ * and whether to ask App.tsx to refetch the map (only when main applied the
+ * scope to the running Graph Service; an unapplied save has nothing new to
+ * fetch).
+ */
+export function projectScopeSaveOutcome(result: ProjectScopeSaveResult): { notice: string; refetch: boolean } {
+  return { notice: projectScopeSavedMessage(result.config, result.applied), refetch: result.applied };
+}
+
+export function Settings({
+  onClose,
+  onBackendSwitched,
+  onProjectScopeApplied,
+  projectPath,
+  onIngestionResult,
+}: SettingsProps) {
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
@@ -312,6 +352,9 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
   const [projectScopeInput, setProjectScopeInput] = useState('');
   const [projectScopeSaveError, setProjectScopeSaveError] = useState<string | null>(null);
   const [projectScopeSaving, setProjectScopeSaving] = useState(false);
+  // P2-1: the last successful save's confirmation (`projectScopeSavedMessage`);
+  // cleared on edit, on a new save, and on a project change.
+  const [projectScopeSavedNotice, setProjectScopeSavedNotice] = useState<string | null>(null);
 
   // Review finding (Edge Case Hunter): Settings stays mounted across a
   // project switch (App.tsx never unmounts it), so a fetch/save promise
@@ -390,6 +433,7 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
     // allowlist group.
     refetchProjectScope();
     setProjectScopeSaveError(null);
+    setProjectScopeSavedNotice(null);
     // Story 2.3 (Phase 4): same reasoning applied to the ingestion-run
     // display state — a "Running…"/result line left over from a previous
     // project must never linger and be mistaken for the newly-switched-to
@@ -646,14 +690,20 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
       .filter((entry) => entry.length > 0);
     setProjectScopeSaving(true);
     setProjectScopeSaveError(null);
+    setProjectScopeSavedNotice(null);
     window.driller
       .setProjectScope(projectPath, includedPaths)
-      .then((next) => {
+      .then((result) => {
         if (projectPathRef.current !== projectPath) {
           return;
         }
-        setProjectScope(next);
-        setProjectScopeInput(next.includedPaths.join(', '));
+        setProjectScope(result.config);
+        setProjectScopeInput(result.config.includedPaths.join(', '));
+        const { notice, refetch } = projectScopeSaveOutcome(result);
+        setProjectScopeSavedNotice(notice);
+        if (refetch) {
+          onProjectScopeApplied();
+        }
       })
       .catch((error) => {
         if (projectPathRef.current !== projectPath) {
@@ -666,7 +716,7 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
           setProjectScopeSaving(false);
         }
       });
-  }, [projectPath, projectScopeInput]);
+  }, [projectPath, projectScopeInput, onProjectScopeApplied]);
 
   const attemptSaveKey = useCallback(
     (key: string, acknowledgeInsecureStorage: boolean) => {
@@ -1068,9 +1118,9 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
           {projectPath !== null && projectScope && (
             <>
               <p className="settings-panel__project-scope-hint">
-                Comma-separated subfolders to index (e.g. <code>web, app, api</code>). Leave
-                empty to index the whole project — the default. Takes effect on the next index
-                (reopen the project, or restart the Graph Service).
+                Comma-separated subfolders the map shows (e.g. <code>web, app, api</code>). Leave
+                empty to show the whole project — the default. While the Graph Service is running,
+                saving updates the map right away, without re-indexing.
               </p>
               <label className="settings-panel__project-scope-label">
                 Included subfolders
@@ -1078,7 +1128,10 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
                   type="text"
                   value={projectScopeInput}
                   disabled={projectScopeSaving}
-                  onChange={(event) => setProjectScopeInput(event.target.value)}
+                  onChange={(event) => {
+                    setProjectScopeInput(event.target.value);
+                    setProjectScopeSavedNotice(null);
+                  }}
                   placeholder="web, app, api"
                 />
               </label>
@@ -1088,6 +1141,11 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
               {projectScopeSaveError && (
                 <ActionableNotice tone="error" role="alert">
                   {projectScopeSaveError}
+                </ActionableNotice>
+              )}
+              {projectScopeSavedNotice && (
+                <ActionableNotice tone="info" role="status">
+                  {projectScopeSavedNotice}
                 </ActionableNotice>
               )}
             </>

@@ -31,6 +31,7 @@ import {
   type PrBotIngestionResult,
   type ProjectOpenResult,
   type ProjectScopeConfig,
+  type ProjectScopeSaveResult,
   type ReadSourceRangeResult,
   type RecentProject,
   type RegenerateNodeResult,
@@ -141,7 +142,7 @@ const drillerApi: DrillerApi = {
   getProjectScope: (projectPath: string): Promise<ProjectScopeConfig> =>
     ipcRenderer.invoke(IpcChannels.settingsGetProjectScope, projectPath),
 
-  setProjectScope: (projectPath: string, includedPaths: string[]): Promise<ProjectScopeConfig> =>
+  setProjectScope: (projectPath: string, includedPaths: string[]): Promise<ProjectScopeSaveResult> =>
     ipcRenderer.invoke(IpcChannels.settingsSetProjectScope, projectPath, includedPaths),
 
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
