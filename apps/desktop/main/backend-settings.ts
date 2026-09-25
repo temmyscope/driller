@@ -28,6 +28,8 @@ import Store from 'electron-store';
 import { safeStorage } from 'electron';
 import type { BackendConfig, CloudBackend, SetCloudApiKeyResult } from '@driller/ipc-contracts';
 
+import { backendConfigFrom, removeCloudKey, type CloudKeyStore } from './cloud-key-store';
+
 interface BackendSettingsSchema {
   activeBackend: CloudBackend;
   cloudKeyCiphertextBase64?: string;
@@ -45,11 +47,12 @@ function coerceBackend(value: unknown): CloudBackend {
   return value === 'local' || value === 'cloud' ? value : 'local';
 }
 
-/** The subset of electron-store's API this module actually uses. */
-interface BackendSettingsStore {
-  getActiveBackend(): CloudBackend;
+/**
+ * The subset of electron-store's API this module actually uses. The key
+ * read/delete half is `CloudKeyStore` (cloud-key-store.ts, P2-6).
+ */
+interface BackendSettingsStore extends CloudKeyStore {
   setActiveBackendValue(value: CloudBackend): void;
-  getCloudKeyCiphertextBase64(): string | undefined;
   setCloudKeyCiphertextBase64(value: string): void;
 }
 
@@ -76,6 +79,7 @@ function createStore(): BackendSettingsStore {
       setActiveBackendValue: (value) => store.set('activeBackend', value),
       getCloudKeyCiphertextBase64: () => store.get('cloudKeyCiphertextBase64'),
       setCloudKeyCiphertextBase64: (value) => store.set('cloudKeyCiphertextBase64', value),
+      deleteCloudKeyCiphertextBase64: () => store.delete('cloudKeyCiphertextBase64'),
     };
   } catch (error) {
     console.error(
@@ -92,6 +96,9 @@ function createStore(): BackendSettingsStore {
       getCloudKeyCiphertextBase64: () => inMemoryCloudKeyCiphertextBase64,
       setCloudKeyCiphertextBase64: (value) => {
         inMemoryCloudKeyCiphertextBase64 = value;
+      },
+      deleteCloudKeyCiphertextBase64: () => {
+        inMemoryCloudKeyCiphertextBase64 = undefined;
       },
     };
   }
@@ -143,11 +150,11 @@ function isLinuxInsecureBackend(): boolean {
  * alternative would be routing every single cloud API call through main,
  * which fights AD-8's "generation lives in the Graph Service" boundary far
  * more than this one-time transient key handoff does. Called only at the
- * two points a generation run can actually start/restart
- * (`sendIndexRequest` and the `settingsSetActiveBackend` handler in
- * main/index.ts) — the decrypted key is never stored in a module-level
- * variable here, so nothing in this process retains it beyond the single
- * call that needed it.
+ * points a generation run can actually start/restart (`sendIndexRequest`,
+ * the `settingsSetActiveBackend` handler, and the P2-6 key-change relay
+ * after a key save/removal in main/index.ts) — the decrypted key is never
+ * stored in a module-level variable here, so nothing in this process
+ * retains it beyond the single call that needed it.
  *
  * Returns `undefined` when no key is stored, when `safeStorage` encryption
  * is unavailable, or when decryption itself fails (e.g. ciphertext written
@@ -178,11 +185,7 @@ export function getDecryptedCloudApiKey(): string | undefined {
 
 /** Returns the current backend config for the Settings panel. */
 export function getBackendConfig(): BackendConfig {
-  return {
-    activeBackend: store.getActiveBackend(),
-    hasCloudKey: Boolean(store.getCloudKeyCiphertextBase64()),
-    isLinuxInsecureBackend: isLinuxInsecureBackend(),
-  };
+  return backendConfigFrom(store, isLinuxInsecureBackend());
 }
 
 /** Sets the active summary backend (local/cloud) choice. */
@@ -243,4 +246,17 @@ export function setCloudApiKey(
     );
     return { status: 'error', message: 'Failed to store the API key securely.' };
   }
+}
+
+/**
+ * Removes the stored cloud API key (P2-6): deletes the ciphertext so
+ * `hasCloudKey` becomes false. Returns the updated config and whether a key
+ * was actually removed (`false` when none was stored — a no-op). Never
+ * touches the active backend or any generated summaries. A store write
+ * failure propagates, so the IPC reply rejects; no key material is in scope
+ * here to leak through the error.
+ */
+export function clearCloudApiKey(): { config: BackendConfig; removed: boolean } {
+  const removed = removeCloudKey(store);
+  return { config: getBackendConfig(), removed };
 }

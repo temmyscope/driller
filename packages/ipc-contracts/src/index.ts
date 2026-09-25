@@ -863,6 +863,23 @@ export interface BackendConfig {
 export interface SetCloudApiKeyResult {
   status: 'ok' | 'warning' | 'error';
   message?: string;
+  /**
+   * P2-6, `'ok'` only: whether main relayed the new key to a running Graph
+   * Service (Cloud active, service running, project open). The renderer
+   * re-kicks the map's pending Nodes only when this is true.
+   */
+  relayed?: boolean;
+}
+
+/**
+ * Result of a `clearCloudApiKey` call (P2-6): the updated config, and
+ * whether main relayed the key-less state to a running Graph Service
+ * (`false` when no key was stored, or Cloud isn't active with a service
+ * running and a project open).
+ */
+export interface ClearCloudApiKeyResult {
+  config: BackendConfig;
+  relayed: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,6 +1438,7 @@ export const IpcChannels = {
   settingsGetBackendConfig: 'settings:getBackendConfig',
   settingsSetActiveBackend: 'settings:setActiveBackend',
   settingsSetCloudApiKey: 'settings:setCloudApiKey',
+  settingsClearCloudApiKey: 'settings:clearCloudApiKey',
   settingsGetEditorPreference: 'settings:getEditorPreference',
   settingsSetEditorPreference: 'settings:setEditorPreference',
   settingsGetPrBotConfig: 'settings:getPrBotConfig',
@@ -1566,6 +1584,14 @@ export interface DrillerApi {
     key: string,
     acknowledgeInsecureStorage?: boolean,
   ) => Promise<SetCloudApiKeyResult>;
+  /**
+   * Removes the stored cloud API key (P2-6): deletes its ciphertext so
+   * `hasCloudKey` becomes false, and resolves to the updated config. A no-op
+   * when no key is stored. Rejects if the store write fails. Never changes
+   * the active backend or deletes generated summaries. `relayed` says
+   * whether the running Graph Service was told.
+   */
+  clearCloudApiKey: () => Promise<ClearCloudApiKeyResult>;
   /**
    * Fetches the current external editor preference (Story 1.10, Phase 1,
    * AD-23) — always resolves to one of the three known values, never

@@ -11,6 +11,7 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import {
   IpcChannels,
   type BackendConfig,
+  type ClearCloudApiKeyResult,
   type BlastRadiusExpansionResult,
   type CloudBackend,
   type CodeMapResult,
@@ -123,6 +124,8 @@ const drillerApi: DrillerApi = {
 
   setCloudApiKey: (key: string, acknowledgeInsecureStorage?: boolean): Promise<SetCloudApiKeyResult> =>
     ipcRenderer.invoke(IpcChannels.settingsSetCloudApiKey, key, acknowledgeInsecureStorage),
+
+  clearCloudApiKey: (): Promise<ClearCloudApiKeyResult> => ipcRenderer.invoke(IpcChannels.settingsClearCloudApiKey),
 
   getEditorPreference: (): Promise<EditorPreference> =>
     ipcRenderer.invoke(IpcChannels.settingsGetEditorPreference),

@@ -164,6 +164,7 @@ import type {
 // augmentation (real, present only when forked via `utilityProcess.fork`)
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
+import { backendSwitchKind } from './backend-switch';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
 import { computeDiffScope } from './git-diff-scope';
@@ -2446,14 +2447,13 @@ async function handleBackendSwitchedRequest(backendConfig: {
 }): Promise<void> {
   // Review finding, High: captured before `activeBackendConfig` is
   // overwritten below — this is what distinguishes a GENUINE backend switch
-  // (local<->cloud, or between local tiers) from a same-value
-  // re-affirmation. Settings.tsx's "resume blocked generation" nudge
-  // (`attemptSaveKey` re-invoking `setActiveBackend('cloud')` after a key
-  // save while cloud is already active) reuses this exact relay path with
-  // `activeBackend` unchanged — without this comparison, that resume nudge
-  // would silently wipe every already-successful summary just to retry the
-  // Nodes that were genuinely blocked, spending real Anthropic API calls
-  // regenerating summaries that already existed.
+  // (local<->cloud) from a same-value re-affirmation (`backendSwitchKind`,
+  // backend-switch.ts). main's P2-6 key-change relay (key-change-relay.ts,
+  // posted after a key save or removal while cloud is already active)
+  // reuses this exact relay path with `activeBackend` unchanged — without
+  // this comparison, that relay would silently wipe every already-successful
+  // summary just to retry the Nodes that were genuinely blocked, spending
+  // real Anthropic API calls regenerating summaries that already existed.
   const previousBackend = activeBackendConfig.activeBackend;
   activeBackendConfig = backendConfig;
   const nodes = activeCodeMapNodes;
@@ -2468,8 +2468,8 @@ async function handleBackendSwitchedRequest(backendConfig: {
     return;
   }
 
-  if (backendConfig.activeBackend === previousBackend) {
-    // Same backend re-affirmed (the key-save resume case, or any other
+  if (backendSwitchKind(previousBackend, backendConfig.activeBackend) === 'reaffirm') {
+    // Same backend re-affirmed (the key-change relay, or any other
     // same-value call) — never clears (Boundaries & Constraints: "A backend
     // switch ... clears the current project's persisted summaries" only
     // applies to an actual switch). Just re-kicks generation:

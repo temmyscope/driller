@@ -8,6 +8,10 @@
  *    this component's own transient `keyInput` (what the user just typed,
  *    never re-populated from a saved value) and a masked "Key saved" state
  *    once `config.hasCloudKey` is true.
+ *  - P2-6: "Remove saved key" beside that masked state deletes the stored
+ *    key in one click (no confirmation — re-entering the key undoes it).
+ *    While a removal is in flight, the key input, Save and "Store anyway"
+ *    are disabled so a save can't race it.
  *  - An empty/whitespace-only key is rejected here, client-side, before any
  *    IPC call is made (I/O & Edge-Case Matrix).
  *  - On Linux with no secure OS keystore, `setCloudApiKey` returns
@@ -41,6 +45,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
 import type {
   BackendConfig,
+  ClearCloudApiKeyResult,
   CloudBackend,
   EditorPreference,
   PrBotConfig,
@@ -249,6 +254,24 @@ export function projectScopeSaveOutcome(result: ProjectScopeSaveResult): { notic
   return { notice: projectScopeSavedMessage(result.config, result.applied), refetch: result.applied };
 }
 
+/** P2-6: the fixed sentence for a failed key removal; the detail goes to the console. */
+export const KEY_REMOVE_FAILED_MESSAGE = "Couldn't remove the saved key.";
+
+/**
+ * P2-6: what a successful key removal does in Settings — the notice to show,
+ * and whether to re-kick the map's pending Nodes (`onBackendSwitched`), which
+ * is only when main actually relayed the change to a running Graph Service.
+ */
+export function keyRemovedOutcome(result: ClearCloudApiKeyResult): { notice: string; notify: boolean } {
+  return {
+    notice:
+      result.config.activeBackend === 'cloud'
+        ? 'Key removed. Cloud summaries are paused until you add a key.'
+        : 'Key removed.',
+    notify: result.relayed,
+  };
+}
+
 export function Settings({
   onClose,
   onBackendSwitched,
@@ -260,6 +283,10 @@ export function Settings({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
   const [keyEntry, setKeyEntry] = useState<KeyEntryState>({ kind: 'idle' });
+  // P2-6: the "Key removed." info notice, and whether a removal is in flight.
+  const [keyRemovedNotice, setKeyRemovedNotice] = useState<string | null>(null);
+  const [removingKey, setRemovingKey] = useState(false);
+  const [keyRemoveError, setKeyRemoveError] = useState<string | null>(null);
   // Mirrors `config` so handleBackendChange's rollback (below) can read the
   // pre-optimistic-update value without depending on `config` itself and
   // recreating the callback (and re-subscribing the Escape-key listener)
@@ -620,6 +647,9 @@ export function Settings({
       // Optimistic, since this is a same-machine, near-instant local write;
       // refetchConfig below confirms/corrects it on success.
       const previousConfig = configRef.current;
+      // P2-6: a backend change makes the removal notice's wording stale.
+      setKeyRemovedNotice(null);
+      setKeyRemoveError(null);
       setConfig((current) => (current ? { ...current, activeBackend: backend } : current));
       window.driller
         .setActiveBackend(backend)
@@ -720,6 +750,10 @@ export function Settings({
 
   const attemptSaveKey = useCallback(
     (key: string, acknowledgeInsecureStorage: boolean) => {
+      // P2-6: a save supersedes any removal notice or removal error, and
+      // any warning/error it produces must not sit beside "Key removed."
+      setKeyRemovedNotice(null);
+      setKeyRemoveError(null);
       setKeyEntry({ kind: 'saving' });
       window.driller
         .setCloudApiKey(key, acknowledgeInsecureStorage)
@@ -731,24 +765,12 @@ export function Settings({
             setKeyInput('');
             setKeyEntry({ kind: 'idle' });
             refetchConfig();
-            // Story 1.6 (Phase 2): if cloud is already the active backend
-            // (the "cloud selected, no key" case this exact form exists
-            // for), generation has been sitting blocked with no key to use.
-            // Re-invoking `setActiveBackend` with the same already-active
-            // value is a no-op for the persisted choice itself, but main's
-            // handler unconditionally relays a fresh `graphService:
-            // backendSwitched` (with the key now decryptable) whenever it's
-            // called — the same mechanism a genuine local<->cloud switch
-            // uses — so this is what actually resumes generation now that a
-            // key exists, rather than leaving the user stuck until they
-            // flip the radio away and back.
-            if (configRef.current?.activeBackend === 'cloud') {
-              window.driller.setActiveBackend('cloud').catch(() => {
-                // Best-effort nudge — a failure here just means generation
-                // stays blocked until the next real backend switch; nothing
-                // about the key save itself (already confirmed above) is
-                // affected.
-              });
+            // P2-6: main itself relays the new key to a running Graph
+            // Service (key-change-relay.ts), which re-kicks pending Nodes
+            // without clearing summaries — when it did, the map just needs
+            // to refetch, as after a backend switch.
+            if (result.relayed === true) {
+              onBackendSwitched();
             }
             return;
           }
@@ -758,22 +780,9 @@ export function Settings({
               message: result.message ?? 'This machine has no secure keystore available.',
               pendingKey: key,
             });
-            // Review finding, Low: a key can reach real storage via this
-            // 'warning' branch too — the insecure-keystore warning still
-            // means the key ends up genuinely stored (either an already-
-            // stored key from an earlier save, or, once the user clicks
-            // "Store anyway" here, this same pending key on the resulting
-            // 'ok' call above) — so the same resume-generation nudge applies
-            // here, not just on a clean 'ok' result. Safe to fire
-            // unconditionally alongside the warning state: with the same-
-            // backend-value guard in services/graph-service/index.ts's
-            // `handleBackendSwitchedRequest`, this never wipes existing
-            // summaries — it only ever re-kicks still-pending Nodes.
-            if (configRef.current?.activeBackend === 'cloud') {
-              window.driller.setActiveBackend('cloud').catch(() => {
-                // Best-effort nudge, same reasoning as the 'ok' branch above.
-              });
-            }
+            // P2-6: nothing was stored, so nothing is relayed — main only
+            // relays after a successful save (the resubmitted "Store anyway"
+            // call lands in the 'ok' branch above).
             return;
           }
           setKeyEntry({ kind: 'error', message: result.message ?? 'Failed to save the API key.' });
@@ -785,14 +794,49 @@ export function Settings({
           });
         });
     },
-    [refetchConfig],
+    [refetchConfig, onBackendSwitched],
   );
+
+  /**
+   * P2-6: one click, no confirmation. main deletes the ciphertext, relays the
+   * key-less state to a running Graph Service when one is affected, and
+   * returns the updated config plus whether it relayed. On failure a fixed
+   * sentence shows in its own error notice (not the save slot, so it never
+   * reads as a failed save), the detail goes to the console, and "Key saved"
+   * stays (the config is left as it was).
+   */
+  const handleRemoveKey = useCallback(() => {
+    setRemovingKey(true);
+    setKeyRemovedNotice(null);
+    setKeyRemoveError(null);
+    window.driller
+      .clearCloudApiKey()
+      .then((result) => {
+        const { notice, notify } = keyRemovedOutcome(result);
+        setConfig(result.config);
+        setLoadError(null);
+        setKeyInput('');
+        setKeyEntry({ kind: 'idle' });
+        setKeyRemovedNotice(notice);
+        if (notify) {
+          onBackendSwitched();
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to remove the saved cloud API key.', error instanceof Error ? error.message : String(error));
+        setKeyRemoveError(KEY_REMOVE_FAILED_MESSAGE);
+      })
+      .finally(() => {
+        setRemovingKey(false);
+      });
+  }, [onBackendSwitched]);
 
   const handleSaveKey = useCallback(() => {
     const trimmed = keyInput.trim();
     // Empty/whitespace-only key: rejected client-side, no IPC call made
     // (I/O & Edge-Case Matrix).
     if (trimmed.length === 0) {
+      setKeyRemovedNotice(null);
       setKeyEntry({ kind: 'error', message: 'Enter an API key before saving.' });
       return;
     }
@@ -808,6 +852,8 @@ export function Settings({
 
   const handleKeyInputChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     setKeyInput(event.target.value);
+    setKeyRemovedNotice(null);
+    setKeyRemoveError(null);
     // A fresh edit invalidates any prior warning/error left over from the
     // last save attempt for the old key value.
     setKeyEntry((current) => (current.kind === 'saving' ? current : { kind: 'idle' }));
@@ -881,9 +927,33 @@ export function Settings({
                 {config.hasCloudKey && keyEntry.kind !== 'warning' && keyInput.length === 0 && (
                   // Masked "Key saved" state — never re-displays the key
                   // itself, only that one is stored.
-                  <p className="settings-panel__key-saved" role="status">
-                    Key saved (••••••••)
-                  </p>
+                  // P2-6: the Remove button sits beside the status text, not
+                  // inside the live region, so it isn't re-announced.
+                  <div className="settings-panel__key-saved-row">
+                    <p className="settings-panel__key-saved" role="status">
+                      Key saved (••••••••)
+                    </p>
+                    <button
+                      type="button"
+                      className="settings-panel__remove-key"
+                      onClick={handleRemoveKey}
+                      disabled={removingKey || keyEntry.kind === 'saving'}
+                    >
+                      {removingKey ? 'Removing…' : 'Remove saved key'}
+                    </button>
+                  </div>
+                )}
+
+                {keyRemovedNotice && (
+                  <ActionableNotice tone="info" role="status">
+                    {keyRemovedNotice}
+                  </ActionableNotice>
+                )}
+
+                {keyRemoveError && (
+                  <ActionableNotice tone="error" role="alert">
+                    {keyRemoveError}
+                  </ActionableNotice>
                 )}
 
                 <label className="settings-panel__key-label">
@@ -894,6 +964,7 @@ export function Settings({
                     onChange={handleKeyInputChange}
                     placeholder={config.hasCloudKey ? 'Enter a new key to replace the saved one' : 'sk-…'}
                     autoComplete="off"
+                    disabled={removingKey}
                   />
                 </label>
 
@@ -901,7 +972,7 @@ export function Settings({
                   type="button"
                   className="settings-panel__save"
                   onClick={handleSaveKey}
-                  disabled={keyEntry.kind === 'saving'}
+                  disabled={keyEntry.kind === 'saving' || removingKey}
                 >
                   {keyEntry.kind === 'saving' ? 'Saving…' : 'Save key'}
                 </button>
@@ -911,7 +982,7 @@ export function Settings({
                     tone="warning"
                     role="alert"
                     action={
-                      <button type="button" onClick={handleAcknowledgeInsecureStorage}>
+                      <button type="button" onClick={handleAcknowledgeInsecureStorage} disabled={removingKey}>
                         Store anyway
                       </button>
                     }

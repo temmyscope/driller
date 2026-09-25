@@ -27,6 +27,7 @@ import started from 'electron-squirrel-startup';
 import {
   IpcChannels,
   type BackendConfig,
+  type ClearCloudApiKeyResult,
   type BlastRadiusExpansionResult,
   type CodeMapResult,
   type DiagnosticLogEntry,
@@ -68,6 +69,7 @@ import {
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 import {
+  clearCloudApiKey,
   getBackendConfig,
   getDecryptedCloudApiKey,
   setActiveBackend,
@@ -76,6 +78,7 @@ import {
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
+import { relayKeyChange } from './key-change-relay';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
 import { getProjectScope, setProjectScope } from './project-scope-settings';
@@ -923,6 +926,22 @@ function sendIndexRequest(projectPath: string): void {
       : {}),
     ...(includedPaths.length > 0 ? { includedPaths } : {}),
   } satisfies GraphServiceIndexRequest);
+}
+
+/**
+ * P2-6: after a successful key save or removal, relays the current key state
+ * to a running Graph Service when Cloud is active and a project is open, so
+ * a replaced or removed key takes effect without a re-index. Best-effort —
+ * never throws, so the storage result always stands (key-change-relay.ts).
+ * Returns whether a message was posted.
+ */
+function relayKeyChangeToGraphService(): boolean {
+  return relayKeyChange({
+    getConfig: getBackendConfig,
+    decrypt: getDecryptedCloudApiKey,
+    service: graphService,
+    currentProjectPath,
+  });
 }
 
 /**
@@ -1864,9 +1883,21 @@ function registerIpcHandlers(): void {
       if (typeof key !== 'string') {
         return { status: 'error', message: 'Invalid API key.' };
       }
-      return setCloudApiKey(key, acknowledgeInsecureStorage === true);
+      const result = setCloudApiKey(key, acknowledgeInsecureStorage === true);
+      if (result.status === 'ok') {
+        return { ...result, relayed: relayKeyChangeToGraphService() };
+      }
+      return result;
     },
   );
+
+  // P2-6: removes the stored key. A store write failure throws, rejecting
+  // the renderer's invoke so Settings shows its removal error notice. Relays
+  // only when a key was actually removed.
+  ipcMain.handle(IpcChannels.settingsClearCloudApiKey, (): ClearCloudApiKeyResult => {
+    const { config, removed } = clearCloudApiKey();
+    return { config, relayed: removed ? relayKeyChangeToGraphService() : false };
+  });
 
   // -------------------------------------------------------------------------
   // Story 1.10 (Phase 1): external editor preference. Thin delegation to

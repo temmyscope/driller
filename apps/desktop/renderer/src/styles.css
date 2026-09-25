@@ -401,6 +401,29 @@ code,
   font-size: 11px;
 }
 
+/* P2-6: "Key saved" with its Remove button beside it (outside the status
+   live region). A quiet secondary action, not the primary Save styling. */
+.settings-panel__key-saved-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.settings-panel__remove-key {
+  padding: 0.2rem 0.6rem;
+  border-radius: 0;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.settings-panel__remove-key:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .settings-panel__save {
   align-self: flex-start;
   padding: 0.5rem 1rem;
