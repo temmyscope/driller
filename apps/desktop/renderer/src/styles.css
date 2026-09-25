@@ -1820,6 +1820,39 @@ code,
   padding: 0.35rem;
 }
 
+/* P2-4: the neighbour-trace panel's heading ("Callers of <name> (N)" /
+   "Callees of <name> (N)") — a quiet label above the same stack rows a traced
+   path uses, not a new visual language. */
+.code-map__path-trace-neighbors-heading {
+  margin: 0 0 0.25rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* The origin's name in that heading is a button back to the origin — reset
+   to read as inline text, with the accent on hover/focus like a stack row. */
+.code-map__path-trace-neighbors-origin {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 2px;
+}
+
+.code-map__path-trace-neighbors-origin:hover {
+  color: var(--accent);
+}
+
+.code-map__path-trace-neighbors-origin:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .code-map__path-trace-steps {
   margin: 0;
   padding: 0;

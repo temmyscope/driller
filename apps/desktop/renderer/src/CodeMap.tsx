@@ -158,10 +158,15 @@ type OpenInEditorState = { status: 'idle' } | { status: 'opening' } | { status: 
  * resolved value is set into this state as-is, only `'idle'`/`'searching'`
  * are local additions.
  */
-type PathTraceState =
+export type PathTraceState =
   | { status: 'idle' }
   | { status: 'searching' }
   | { status: 'found'; path: string[] }
+  // P2-4: a 1-hop trace drawn by a Node card's "called by"/"calls" pill —
+  // renderer-local (no IPC), highlighted/fitted like `'found'`. It stores
+  // `neighborTrace`'s whole snapshot, so the step panel and the highlight
+  // (`pathTraceHighlight`) always read the same data, never live adjacency.
+  | ({ status: 'neighbors'; originId: string; direction: NeighborDirection } & NeighborTrace)
   | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
   | { status: 'error'; message: string };
@@ -495,30 +500,30 @@ function readFixtureNodeCount(): number | undefined {
 // implementation instead of two. P0-1 (2026-09-24) retargeted what that
 // shared path *does* — it opens Node Detail now, not the source viewer —
 // without changing how it's threaded.
-// `onNavigate`/the adjacency-derived counts+first-ids are threaded through
-// node `data` the same way `onActivate` already is (Story 1.4 Code Map:
-// "reused by both edge-click resolution and the affordance's counts/
-// targets") — the custom Node card's caller/callee affordances call
-// `onNavigate` directly, sharing the exact same `navigateToNode` path an
-// edge click resolves to.
+// `onShowNeighbors`/the adjacency-derived counts are threaded through node
+// `data` the same way `onActivate` already is. P2-4 retargeted the caller/
+// callee affordances: they draw a 1-hop neighbour trace (Path Trace's
+// `'neighbors'` state) instead of calling `navigateToNode` on the first
+// neighbour; edge-click navigation is unchanged.
 type CodeMapFlowNode = FlowNode<
   {
     node: CodeMapNode;
     onActivate: (node: CodeMapNode) => void;
-    onNavigate: (id: string) => void;
-    // P0-1 (2026-09-24): threaded through the same way `onActivate`/
-    // `onNavigate` already are — the Source pill in the affordance row calls
+    // P2-4: the caller/callee pills draw a 1-hop neighbour trace (all
+    // neighbours in that direction, highlighted like a Path Trace) instead
+    // of jumping to the first neighbour via `navigateToNode`.
+    onShowNeighbors: (originId: string, direction: NeighborDirection) => void;
+    // P0-1 (2026-09-24): threaded through the same way `onActivate` already
+    // is — the Source pill in the affordance row calls
     // this to open the source viewer. (It replaces Story 1.8's
     // `onOpenDetail`, whose "Details" pill this change removed: card
     // activation itself opens Node Detail now, so a pill for it would be
     // redundant.)
     onOpenSource: (node: CodeMapNode) => void;
     callerCount: number;
-    firstCallerId: string | undefined;
     calleeCount: number;
-    firstCalleeId: string | undefined;
-    // Story 1.6 (Phase 2): threaded through the same way `onActivate`/
-    // `onNavigate` already are — a `'pending'` Node renders one of these two
+    // Story 1.6 (Phase 2): threaded through the same way `onActivate`
+    // already is — a `'pending'` Node renders one of these two
     // Actionable Notices instead of the ordinary "Summary pending…" text
     // when generation can't actually produce anything right now (Boundaries
     // & Constraints: never a silent empty summary).
@@ -558,12 +563,239 @@ type CodeMapFlowNode = FlowNode<
 >;
 
 /** Per-Node adjacency (Code Map: `Map<nodeId, {callers, callees}>`), built once from the fetched `CodeMapEdge[]`. */
-type NodeAdjacency = Map<string, { callers: string[]; callees: string[] }>;
+export type NodeAdjacency = Map<string, { callers: string[]; callees: string[] }>;
+
+/** P2-4: which side of a Node a 1-hop neighbour trace follows. */
+export type NeighborDirection = 'callers' | 'callees';
+
+/** P2-4: `neighborTrace`'s result — also the snapshot a `'neighbors'` Path Trace state stores. */
+export interface NeighborTrace {
+  nodeIds: string[];
+  edgeKeys: string[];
+  neighborIds: string[];
+}
+
+/**
+ * P2-4: the 1-hop neighbour trace a Node card's "called by"/"calls" pill
+ * draws. Pure, over the already-built `NodeAdjacency` (no IPC): the origin
+ * plus every neighbour in `direction`, in adjacency order, and the
+ * `pathEdgeKey`s of the edges between them in their true orientation —
+ * caller→origin for `'callers'`, origin→callee for `'callees'`. Self-loops and
+ * duplicate pairs are already excluded by the adjacency itself. An origin
+ * with no neighbours (or absent from the adjacency) yields just itself.
+ */
+export function neighborTrace(adjacency: NodeAdjacency, originId: string, direction: NeighborDirection): NeighborTrace {
+  const entry = adjacency.get(originId);
+  const neighborIds = entry ? [...(direction === 'callers' ? entry.callers : entry.callees)] : [];
+  const edgeKeys = neighborIds.map((id) =>
+    direction === 'callers' ? pathEdgeKey(id, originId) : pathEdgeKey(originId, id),
+  );
+  return { nodeIds: [originId, ...neighborIds], edgeKeys, neighborIds };
+}
+
+/**
+ * P2-4: what the map highlights for a Path Trace state — the Node ids, the
+ * `pathEdgeKey`s of the edges between them, and whether an edge of any kind
+ * counts (`callsOnly`). A `'found'` path is `traceCallPath`'s `CALLS`-only
+ * walk, so only a `CALLS` edge on a consecutive pair highlights (unchanged
+ * from Story 1.9). A `'neighbors'` trace reads its stored snapshot, and since
+ * the adjacency it came from counts every edge kind, its connecting edges
+ * highlight whatever their kind. Every other state highlights nothing (the
+ * shared `EMPTY_ID_SET`, so memoized consumers don't see a new Set).
+ */
+export interface PathHighlight {
+  nodeIds: ReadonlySet<string>;
+  edgeKeys: ReadonlySet<string>;
+  callsOnly: boolean;
+}
+
+export function pathTraceHighlight(pathTrace: PathTraceState): PathHighlight {
+  if (pathTrace.status === 'found') {
+    const edgeKeys = new Set<string>();
+    for (let i = 0; i < pathTrace.path.length - 1; i += 1) {
+      edgeKeys.add(pathEdgeKey(pathTrace.path[i]!, pathTrace.path[i + 1]!));
+    }
+    return { nodeIds: new Set(pathTrace.path), edgeKeys, callsOnly: true };
+  }
+  if (pathTrace.status === 'neighbors') {
+    return { nodeIds: new Set(pathTrace.nodeIds), edgeKeys: new Set(pathTrace.edgeKeys), callsOnly: false };
+  }
+  return { nodeIds: EMPTY_ID_SET, edgeKeys: EMPTY_ID_SET, callsOnly: true };
+}
+
+/** P2-4: whether one rendered edge gets the Path Trace highlight — see `pathTraceHighlight`. */
+export function isPathHighlightEdge(
+  highlight: PathHighlight,
+  edge: { source: string; target: string; label?: unknown },
+): boolean {
+  if (highlight.callsOnly && edge.label !== 'CALLS') {
+    return false;
+  }
+  return highlight.edgeKeys.has(pathEdgeKey(edge.source, edge.target));
+}
+
+/**
+ * P2-4: a caller/callee pill's visible text (minus its arrow glyph):
+ * "3 called by" (no plural form) / "1 call" / "2 calls".
+ */
+export function neighborPillText(direction: NeighborDirection, count: number): string {
+  return direction === 'callers' ? `${count} called by` : `${count} call${count === 1 ? '' : 's'}`;
+}
+
+/**
+ * P2-4: a caller/callee pill's `aria-label` — its visible text first, then
+ * what activating it does: "3 called by — show the callers of handle",
+ * "1 call — show the callee of handle".
+ */
+export function neighborPillLabel(direction: NeighborDirection, count: number, originName: string): string {
+  const noun = direction === 'callers' ? 'caller' : 'callee';
+  return `${neighborPillText(direction, count)} — show the ${noun}${count === 1 ? '' : 's'} of ${originName}`;
+}
+
+/** P2-4: the neighbour-trace step panel's heading text ("Callers of handle (3)"). */
+export function neighborTraceHeading(originName: string, direction: NeighborDirection, count: number): string {
+  return `${direction === 'callers' ? 'Callers' : 'Callees'} of ${originName} (${count})`;
+}
+
+/**
+ * P2-4: the Node card's caller/callee pills. Each draws a 1-hop neighbour
+ * trace via `onShowNeighbors` rather than jumping to one neighbour. A pill
+ * stays absent (not just hidden) when its count is 0. Hookless so a test
+ * can walk its element tree and fire each `onClick`.
+ *
+ * `stopPropagation` on mousedown, click, AND keydown keeps these nested
+ * controls from also being read as an interaction with the Node card itself
+ * (see `CodeMapNodeCard`'s affordance-row comment).
+ */
+export function NodeNeighborPills({
+  node,
+  callerCount,
+  calleeCount,
+  onShowNeighbors,
+}: {
+  node: { id: string; name: string };
+  callerCount: number;
+  calleeCount: number;
+  onShowNeighbors: (originId: string, direction: NeighborDirection) => void;
+}) {
+  return (
+    <>
+      {callerCount > 0 && (
+        <button
+          type="button"
+          className="code-map__node-affordance"
+          aria-label={neighborPillLabel('callers', callerCount, node.name)}
+          onMouseDown={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onShowNeighbors(node.id, 'callers');
+          }}
+        >
+          ↑{neighborPillText('callers', callerCount)}
+        </button>
+      )}
+      {calleeCount > 0 && (
+        <button
+          type="button"
+          className="code-map__node-affordance"
+          aria-label={neighborPillLabel('callees', calleeCount, node.name)}
+          onMouseDown={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onShowNeighbors(node.id, 'callees');
+          }}
+        >
+          ↓{neighborPillText('callees', calleeCount)}
+        </button>
+      )}
+    </>
+  );
+}
+
+// P2-4: the neighbour-trace panel's row cap — same render-layer-only
+// reasoning as `MAX_RENDERED_AMBIGUOUS_CANDIDATES`: a hub Node can have
+// hundreds of callers, so only the first rows render, with an explicit
+// "Showing the first N of M" line. The map highlight and view fit still
+// cover every neighbour.
+export const MAX_RENDERED_NEIGHBORS = 50;
+
+/**
+ * P2-4: the step panel for a `'neighbors'` Path Trace state — the same
+ * panel and `path-trace-stack-row` rows a `'found'` path uses, minus the hop
+ * numbers/indent, in a `<ul>` (a 1-hop fan has no order of descent). Each
+ * row navigates via `onNavigate` (`navigateToNode`, LOD-aware, as a path
+ * step does); the origin's name in the heading does too, so the user can get
+ * back after jumping to a neighbour. Only the first `MAX_RENDERED_NEIGHBORS`
+ * rows are resolved and rendered. Hookless, so it's testable by walking its
+ * element tree.
+ */
+export function NeighborTraceSteps({
+  originId,
+  originName,
+  direction,
+  neighborIds,
+  resolveNode,
+  onNavigate,
+  onDismiss,
+}: {
+  originId: string;
+  originName: string;
+  direction: NeighborDirection;
+  neighborIds: readonly string[];
+  resolveNode: (id: string) => { name: string; file: string | undefined };
+  onNavigate: (id: string) => void;
+  onDismiss: () => void;
+}) {
+  const heading = neighborTraceHeading(originName, direction, neighborIds.length);
+  const shownIds = neighborIds.slice(0, MAX_RENDERED_NEIGHBORS);
+  return (
+    <div className="code-map__path-trace-steps-panel" role="region" aria-label={heading}>
+      {/* The origin's identifier stays monospace (Epic 1's visual floor). */}
+      <p className="code-map__path-trace-neighbors-heading">
+        {direction === 'callers' ? 'Callers' : 'Callees'} of{' '}
+        <button
+          type="button"
+          className="code-map__path-trace-neighbors-origin"
+          aria-label={`Go to ${originName}`}
+          onClick={() => onNavigate(originId)}
+        >
+          <code>{originName}</code>
+        </button>{' '}
+        ({neighborIds.length})
+      </p>
+      <ul className="code-map__path-trace-steps">
+        {shownIds.map((id) => {
+          const neighbor = resolveNode(id);
+          return (
+            <li key={id}>
+              <button type="button" className="code-map__path-trace-stack-row" onClick={() => onNavigate(id)}>
+                <span className="code-map__path-trace-stack-row-text">
+                  <code className="code-map__path-trace-stack-row-name">{neighbor.name}</code>
+                  {neighbor.file && <span className="code-map__path-trace-stack-row-module">{neighbor.file}</span>}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {neighborIds.length > MAX_RENDERED_NEIGHBORS && (
+        <p className="code-map__path-trace-candidates-truncated">
+          Showing the first {MAX_RENDERED_NEIGHBORS} of {neighborIds.length}. All of them are highlighted on the map.
+        </p>
+      )}
+      <button type="button" className="code-map__path-trace-dismiss" onClick={onDismiss}>
+        Dismiss
+      </button>
+    </div>
+  );
+}
 
 function layoutNodes(
   nodes: CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
-  onNavigate: (id: string) => void,
+  onShowNeighbors: (originId: string, direction: NeighborDirection) => void,
   onOpenSource: (node: CodeMapNode) => void,
   adjacency: NodeAdjacency,
   noSummaryBackendAvailable: boolean,
@@ -590,12 +822,10 @@ function layoutNodes(
       data: {
         node,
         onActivate,
-        onNavigate,
+        onShowNeighbors,
         onOpenSource,
         callerCount: entry?.callers.length ?? 0,
-        firstCallerId: entry?.callers[0],
         calleeCount: entry?.callees.length ?? 0,
-        firstCalleeId: entry?.callees[0],
         noSummaryBackendAvailable,
         cloudSelectedNoKey,
         showDeterministicSignals,
@@ -628,7 +858,7 @@ function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
  * endpoint is focused (e.g. the very first edge click of a session).
  */
 // Story 1.9 (Phase 2): a stable, reused-across-renders empty Set for
-// `pathHighlightNodeIds`/`pathHighlightEdgeKeys` outside a `'found'` result
+// `pathTraceHighlight`'s Sets outside a `'found'`/`'neighbors'` result
 // — a fresh `new Set()` every render would still be referentially new each
 // time (defeating the `useMemo`s that return it), so it's declared once at
 // module scope instead.
@@ -644,7 +874,7 @@ const EMPTY_LOD_RESULT: ComputeLODResult = { fullNodeIds: new Set(), clusters: [
 const EMPTY_FLOW_NODES: CodeMapAnyFlowNode[] = [];
 const EMPTY_FLOW_EDGES: FlowEdge[] = [];
 
-/** Consecutive-pair key for `pathHighlightEdgeKeys` (Story 1.9, Phase 2) — matches `toFlowEdges`'s own `id` separator. */
+/** Edge key for `pathTraceHighlight`'s `edgeKeys` (Story 1.9, Phase 2) — matches `toFlowEdges`'s own `id` separator. */
 function pathEdgeKey(source: string, target: string): string {
   return `${source}→${target}`;
 }
@@ -1023,12 +1253,10 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
   const {
     node,
     onActivate,
-    onNavigate,
+    onShowNeighbors,
     onOpenSource,
     callerCount,
-    firstCallerId,
     calleeCount,
-    firstCalleeId,
     noSummaryBackendAvailable,
     cloudSelectedNoKey,
     showDeterministicSignals,
@@ -1158,36 +1386,15 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           Flow's own node-drag/selection handling is what the mousedown stop
           guards against. */}
       <div className="code-map__node-affordances">
-        {callerCount > 0 && firstCallerId !== undefined && (
-          <button
-            type="button"
-            className="code-map__node-affordance"
-            aria-label={`${callerCount} called by, go to a caller`}
-            onMouseDown={(event) => event.stopPropagation()}
-            onKeyDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              onNavigate(firstCallerId);
-            }}
-          >
-            ↑{callerCount} called by
-          </button>
-        )}
-        {calleeCount > 0 && firstCalleeId !== undefined && (
-          <button
-            type="button"
-            className="code-map__node-affordance"
-            aria-label={`${calleeCount} calls, go to a callee`}
-            onMouseDown={(event) => event.stopPropagation()}
-            onKeyDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              onNavigate(firstCalleeId);
-            }}
-          >
-            ↓{calleeCount} calls
-          </button>
-        )}
+        {/* P2-4: each pill draws a 1-hop neighbour trace (origin + every
+            neighbour in that direction + the edges between them) rather
+            than jumping to the first neighbour only. */}
+        <NodeNeighborPills
+          node={node}
+          callerCount={callerCount}
+          calleeCount={calleeCount}
+          onShowNeighbors={onShowNeighbors}
+        />
         {/* P0-1 (2026-09-24): the Source pill. Activating the card itself
             now opens Node Detail (the IA row's "Node detail | Click/select
             any Node"), so source viewing gets its own affordance rather
@@ -1532,8 +1739,9 @@ export interface CodeMapSurfaces {
    */
   pathTraceInput: boolean;
   /**
-   * The Path Trace RESULT surfaces — the found route's step list, the
-   * disambiguation candidate list, and the no-path/error notices.
+   * The Path Trace RESULT surfaces — the found route's step list, P2-4's
+   * neighbour-trace panel, the disambiguation candidate list, and the
+   * no-path/error notices.
    *
    * Tied to `canvas`, NOT to `pathTraceInput`, and that is deliberate: every
    * one of them describes or acts on a route drawn across the canvas (a
@@ -2489,9 +2697,10 @@ export function CodeMap({
 
   // `navigateToNode` needs `flowNodesById`/`flowNodes` (built later, from
   // this same render's `layoutNodes` call) to resolve a target's laid-out
-  // position — but every Node's `data.onNavigate` (the caller/callee
-  // affordance) is itself threaded through that same `layoutNodes` call,
-  // a direct circular dependency. Broken the same way `sourceRequestIdRef`
+  // position — and the Node Detail panel, path-trace step rows and the
+  // toolbar all hold it before that render's `flowNodesById` exists (the
+  // caller/callee pills used to be threaded through `layoutNodes` as
+  // `data.onNavigate` too, until P2-4 gave them `onShowNeighbors`). Broken the same way `sourceRequestIdRef`
   // breaks its own timing race: a ref holding the real implementation,
   // synced via an effect below, behind a stable wrapper (identity never
   // changes) so neither `flowNodes`' memoization nor `onEdgeClick`/the
@@ -2499,6 +2708,14 @@ export function CodeMap({
   const navigateToNodeImplRef = useRef<(id: string) => void>(() => {});
   const navigateToNode = useCallback((id: string) => {
     navigateToNodeImplRef.current(id);
+  }, []);
+  // P2-4: the Node card pills' `onShowNeighbors` — the same stable-wrapper-
+  // over-a-ref shape as `navigateToNode` just above, for the same reason:
+  // the real implementation needs `adjacency`/`fitViewToPath` (declared
+  // later), but a changing callback identity here would re-run `layoutNodes`.
+  const showNeighborsImplRef = useRef<(originId: string, direction: NeighborDirection) => void>(() => {});
+  const showNeighbors = useCallback((originId: string, direction: NeighborDirection) => {
+    showNeighborsImplRef.current(originId, direction);
   }, []);
 
   const loadCodeMap = useCallback(() => {
@@ -3332,7 +3549,7 @@ export function CodeMap({
         ? layoutNodes(
             fetchState.nodes,
             activateNode,
-            navigateToNode,
+            showNeighbors,
             openSourceForNode,
             adjacency,
             noSummaryBackendAvailable,
@@ -3346,7 +3563,7 @@ export function CodeMap({
     [
       fetchState,
       activateNode,
-      navigateToNode,
+      showNeighbors,
       openSourceForNode,
       adjacency,
       noSummaryBackendAvailable,
@@ -3439,20 +3656,10 @@ export function CodeMap({
   // rendered nodes/edges. Empty (never recreated) outside `'found'` so the
   // highlight clears the instant a new search starts or a prior result is
   // superseded — no separate cleanup step needed.
-  const pathHighlightNodeIds = useMemo<ReadonlySet<string>>(
-    () => (pathTrace.status === 'found' ? new Set(pathTrace.path) : EMPTY_ID_SET),
-    [pathTrace],
-  );
-  const pathHighlightEdgeKeys = useMemo<ReadonlySet<string>>(() => {
-    if (pathTrace.status !== 'found') {
-      return EMPTY_ID_SET;
-    }
-    const keys = new Set<string>();
-    for (let i = 0; i < pathTrace.path.length - 1; i += 1) {
-      keys.add(pathEdgeKey(pathTrace.path[i]!, pathTrace.path[i + 1]!));
-    }
-    return keys;
-  }, [pathTrace]);
+  // P2-4: derived by the pure `pathTraceHighlight` (a `'neighbors'` trace
+  // reads its stored snapshot, highlighted like `'found'`).
+  const pathHighlight = useMemo(() => pathTraceHighlight(pathTrace), [pathTrace]);
+  const pathHighlightNodeIds = pathHighlight.nodeIds;
 
   // Story 3.2 (Phase 2): the combined blast radius's own highlight Set —
   // mirrors `pathHighlightNodeIds`'s own Set-typed, `EMPTY_ID_SET`-outside-
@@ -3593,7 +3800,11 @@ export function CodeMap({
         // same-pair `IMPORTS`/`USAGE` edge from getting highlighted just
         // because it happens to share (source, target) with a real path
         // step.
-        if (edge.label === 'CALLS' && pathHighlightEdgeKeys.has(pathEdgeKey(edge.source, edge.target))) {
+        // P2-4: `isPathHighlightEdge` keeps that CALLS-only rule for a
+        // `'found'` path, but lets a `'neighbors'` trace highlight its real
+        // connecting edge whatever its kind (the adjacency it came from
+        // counts every kind).
+        if (isPathHighlightEdge(pathHighlight, edge)) {
           return { ...edge, className: `${edge.className ?? ''} code-map__edge--path-highlight`.trim() };
         }
         // DESIGN.md `canvas-edge-highlighted`: an accent-colored variant for
@@ -3620,7 +3831,7 @@ export function CodeMap({
     expandCluster,
     flowEdges,
     pathHighlightNodeIds,
-    pathHighlightEdgeKeys,
+    pathHighlight,
     blastRadiusNodeIds,
     changedNodeIds,
   ]);
@@ -3834,6 +4045,29 @@ export function CodeMap({
   );
 
   /**
+   * P2-4: a Node card pill's 1-hop neighbour trace. Replaces whatever Path
+   * Trace state is showing (a search result, or another pill's trace) and
+   * fits the view to the origin plus its neighbours, as `'found'` does.
+   * Bumping `pathTraceRequestIdRef` means a search still in flight can't
+   * land on top of it afterwards — the pill is the newer intent.
+   */
+  const showNeighborsImpl = useCallback(
+    (originId: string, direction: NeighborDirection) => {
+      const trace = neighborTrace(adjacency, originId, direction);
+      if (trace.neighborIds.length === 0) {
+        return;
+      }
+      pathTraceRequestIdRef.current += 1;
+      setPathTrace({ status: 'neighbors', originId, direction, ...trace });
+      fitViewToPath(trace.nodeIds);
+    },
+    [adjacency, fitViewToPath],
+  );
+  useEffect(() => {
+    showNeighborsImplRef.current = showNeighborsImpl;
+  }, [showNeighborsImpl]);
+
+  /**
    * The shared "run a trace, apply the result" round trip (Story 1.9, Phase
    * 3 extraction — Phase 2 had this inlined directly in
    * `handlePathTraceSubmit` below, but a disambiguation-candidate click
@@ -3967,6 +4201,13 @@ export function CodeMap({
     },
     [],
   );
+
+  // P2-4: the neighbour trace's own Dismiss. Not a Path Trace search result,
+  // so there is no traced query to log (Story 1.9 Phase 4's sink records
+  // search dismissals only) — it just clears.
+  const handleDismissNeighborTrace = useCallback(() => {
+    setPathTrace({ status: 'idle' });
+  }, []);
 
   const closeSourceView = useCallback(() => {
     // Invalidate any in-flight `openInEditor` request the same way a fresh
@@ -4754,6 +4995,21 @@ export function CodeMap({
                   Dismiss
                 </button>
               </div>
+            )}
+
+            {pathTrace.status === 'neighbors' && (
+              <NeighborTraceSteps
+                originId={pathTrace.originId}
+                originName={flowNodesById.get(pathTrace.originId)?.data.node.name ?? pathTrace.originId}
+                direction={pathTrace.direction}
+                neighborIds={pathTrace.neighborIds}
+                resolveNode={(id) => {
+                  const node = flowNodesById.get(id)?.data.node;
+                  return { name: node?.name ?? id, file: node?.file };
+                }}
+                onNavigate={navigateToNode}
+                onDismiss={handleDismissNeighborTrace}
+              />
             )}
             </>
           )}
