@@ -97,7 +97,7 @@ import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
 
-type FetchState =
+export type FetchState =
   | { status: 'loading' }
   | { status: 'ready'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
   | { status: 'error'; message: string };
@@ -177,7 +177,7 @@ type PathTraceState =
  * checks (`layoutNodes`' new `changedNodeIds` parameter, mirroring
  * `pathHighlightNodeIds`'s own Set-typed precedent), never the array itself.
  */
-type DiffScopeState =
+export type DiffScopeState =
   | { status: 'idle' }
   | { status: 'loading' }
   | { status: 'resolved'; resolvedBaseRef: string; nodeIds: Set<string> }
@@ -187,12 +187,12 @@ type DiffScopeState =
   | { status: 'error'; message: string };
 
 /**
- * The three non-happy-path `DiffScopeState` statuses that each replace the
- * map with their own distinct Actionable Notice (Boundaries & Constraints) —
- * named here once so both the notice-gating check and `formatDiffScopeNotice`
- * below share one literal list rather than risking the two drifting apart.
+ * The three non-happy-path `DiffScopeState` statuses that each show their own
+ * distinct Actionable Notice above the map, never in its place — named here
+ * once so `resolvePrReviewView` and `formatDiffScopeNotice` below share one
+ * literal list rather than risking the two drifting apart.
  */
-type DiffScopeNoticeStatus = 'no-changes' | 'not-a-git-repo' | 'no-base-ref-resolvable';
+export type DiffScopeNoticeStatus = 'no-changes' | 'not-a-git-repo' | 'no-base-ref-resolvable';
 
 /**
  * One specific, concrete sentence per non-happy-path state (UX & Interaction
@@ -1530,6 +1530,18 @@ export interface CodeMapSurfaces {
 }
 
 /**
+ * P1-5 + P1-6: "there is a real, showable map here" — a loaded fetch with at
+ * least one Node. Deliberately says nothing about PR Review's diff-scope
+ * notices: those explain a PR Review result and render ABOVE the map, so they
+ * never take the canvas, the Back/Forward history or Path Trace away with
+ * them. Only a fetch error or an empty map (their own notices, no canvas to
+ * draw a route on) make this false.
+ */
+export function hasShowableMap(fetchState: FetchState): boolean {
+  return fetchState.status === 'ready' && fetchState.nodes.length > 0;
+}
+
+/**
  * P0-2b: the asymmetry at the heart of this spec, resolved in one place so it
  * cannot be collapsed back by accident.
  *
@@ -1552,6 +1564,86 @@ export function resolveCodeMapSurfaces(mode: CodeMapMode, mapIsRenderable: boole
     pathTraceInput: mapIsRenderable,
     pathTraceResult: canvas,
   };
+}
+
+/** What `CodeMap` renders for the current mode, fetch and PR Review diff scope. */
+export interface PrReviewView {
+  /**
+   * The diff-scope Actionable Notice to show above the map, or `null` for
+   * none. Non-null only in PR Review Mode, with a showable map, for one of
+   * the three `DiffScopeNoticeStatus` results.
+   */
+  noticeStatus: DiffScopeNoticeStatus | null;
+  /** Which surfaces are on — see `CodeMapSurfaces`. */
+  surfaces: CodeMapSurfaces;
+}
+
+/**
+ * P1-5 + P1-6: the one derivation `CodeMap` reads for "is there a PR Review
+ * notice" and "which surfaces are on", kept together so the invariant between
+ * them is pinned in one place: a diff-scope notice is an ANNOTATION on the
+ * map, not a replacement for it. The notice status is not an input to
+ * `surfaces` — with a showable map, PR Review keeps its canvas (and the
+ * Back/Forward history over it), the Path Trace input and the Path Trace
+ * results whatever the diff scope reports, so a benign "no changes" never
+ * looks like the project was lost and search stays reachable.
+ *
+ * Without a showable map (loading, fetch error, empty map) there is no notice
+ * either: those states have their own, more fundamental notice and no canvas.
+ * `diffScopeState` survives a mode switch, so the notice is also gated on
+ * `mode` — a `'no-changes'` left over from PR Review shows nothing in Code
+ * Map Mode.
+ */
+export function resolvePrReviewView(
+  mode: CodeMapMode,
+  fetchState: FetchState,
+  diffScopeState: DiffScopeState,
+): PrReviewView {
+  const showable = hasShowableMap(fetchState);
+  const noticeStatus =
+    mode === 'prReview' &&
+    showable &&
+    (diffScopeState.status === 'no-changes' ||
+      diffScopeState.status === 'not-a-git-repo' ||
+      diffScopeState.status === 'no-base-ref-resolvable')
+      ? diffScopeState.status
+      : null;
+  return { noticeStatus, surfaces: resolveCodeMapSurfaces(mode, showable) };
+}
+
+/**
+ * P1-5 + P1-6: the id of the PR Review notice's live region, which the
+ * base-ref input names in `aria-describedby`. A module-scope constant rather
+ * than a `useId`, so `PrReviewDiffScopeNoticeRegion` stays hookless (the same
+ * convention `HealthAuditClusterGrid` follows); `CodeMap` mounts once.
+ */
+export const PR_REVIEW_NOTICE_ID = 'code-map-pr-review-notice';
+
+/**
+ * P1-5 + P1-6: the diff-scope Actionable Notice's sentence, or nothing for a
+ * `null` status. MUST STAY HOOKLESS: `CodeMap.prReviewNotice.test.ts` calls
+ * it directly, with no renderer.
+ */
+export function PrReviewDiffScopeNotice({ status }: { status: DiffScopeNoticeStatus | null }) {
+  if (status === null) {
+    return null;
+  }
+  return <p className="code-map__pr-review-status">{formatDiffScopeNotice(status)}</p>;
+}
+
+/**
+ * P1-5 + P1-6: the notice's `role="status"` live region. Always mounted
+ * inside the PR Review block, with only its content changing — a live region
+ * that appears together with its text is often not announced. The notice
+ * inside it is gated on `status`. MUST STAY HOOKLESS, same as
+ * `PrReviewDiffScopeNotice`.
+ */
+export function PrReviewDiffScopeNoticeRegion({ status }: { status: DiffScopeNoticeStatus | null }) {
+  return (
+    <div id={PR_REVIEW_NOTICE_ID} className="code-map__pr-review-notice-region" role="status">
+      {status !== null && <PrReviewDiffScopeNotice status={status} />}
+    </div>
+  );
 }
 
 /**
@@ -3912,38 +4004,14 @@ export function CodeMap({
   // unmounts it), same defense-in-depth reasoning as those two.
   const pathTraceIsSearching = pathTrace.status === 'searching';
 
-  // Story 3.1 (Phase 2): which (if any) of the three non-happy-path
-  // Actionable Notice states currently applies — `null` whenever the map
-  // itself should render normally (not in PR Review Mode at all, or a
-  // `'resolved'`/`'idle'`/`'loading'`/`'error'` diff scope, none of which
-  // replace the map: `'error'` renders inline in the toolbar instead, same
-  // convention `pathTrace.status === 'error'` already uses just above).
-  // Hoisted here (mirrors `pathTraceIsSearching`'s own hoist-before-return
-  // reasoning) so both the notice-gating and the `<ReactFlow>`-gating checks
-  // below share one derivation.
-  const prReviewNoticeStatus: DiffScopeNoticeStatus | null =
-    mode === 'prReview' &&
-    (diffScopeState.status === 'no-changes' ||
-      diffScopeState.status === 'not-a-git-repo' ||
-      diffScopeState.status === 'no-base-ref-resolvable')
-      ? diffScopeState.status
-      : null;
-
-  // Review finding (Blind Hunter): `fetchState.status === 'ready' &&
-  // fetchState.nodes.length > 0 && prReviewNoticeStatus === null` was
-  // repeated verbatim across three separate gates (the `<ReactFlow>` canvas
-  // itself, the history toolbar, the Path Trace toolbar) — a future edit to
-  // one copy could silently drift from the other two. Named once here,
-  // mirroring `pathTraceIsSearching`/`prReviewNoticeStatus`'s own
-  // hoist-before-return convention just above.
-  //
-  // P0-2b: still one derivation, but no longer one gate. Health Audit Mode
-  // swaps the canvas for its own surface while keeping search, so every gate
-  // below reads a named property of `resolveCodeMapSurfaces`' one record —
-  // which is where that asymmetry is stated, and what a test pins.
-  const mapIsRenderable =
-    fetchState.status === 'ready' && fetchState.nodes.length > 0 && prReviewNoticeStatus === null;
-  const surfaces = resolveCodeMapSurfaces(mode, mapIsRenderable);
+  // The PR Review notice (if any) and which surfaces are on, from one pure
+  // derivation (`resolvePrReviewView`) that a test pins. The canvas, the
+  // history toolbar and Path Trace each read a named property of `surfaces`
+  // rather than restating the condition, so no copy can drift. The notice
+  // annotates the map; it never gates a surface. A diff-scope `'error'` is
+  // not a notice status: it renders inline in the PR Review toolbar, same
+  // convention as `pathTrace.status === 'error'`.
+  const { noticeStatus: prReviewNoticeStatus, surfaces } = resolvePrReviewView(mode, fetchState, diffScopeState);
 
   // P0-2b: `reactFlowInstanceRef` is written once, in `handleInit`, and was
   // never cleared because before this spec the canvas only ever unmounted with
@@ -3961,7 +4029,7 @@ export function CodeMap({
   // Story 3.2 (Phase 2): the stepper's own upper bound — "its own 'further'"
   // (Always: "the stepper's upper bound is the maximum hop distance actually
   // present in the result"), `0` whenever there's no resolved blast radius to
-  // bound at all. Hoisted here (mirrors `mapIsRenderable`'s own
+  // bound at all. Hoisted here (mirrors `surfaces`' own
   // hoist-before-return reasoning) as a plain number so the "+" button's
   // `disabled` check and its `onClick` handler below can both close over it
   // without re-narrowing `blastRadiusState.status` inside a nested callback.
@@ -3979,8 +4047,9 @@ export function CodeMap({
           whenever `mode === 'prReview'`, independent of `fetchState`
           entirely (Boundaries & Constraints: "the base-ref input/trigger
           stays visible alongside the notice"), so it survives every
-          notice/map state below it, including the three Actionable Notices
-          that replace the map further down. Positioned top-center (its own
+          notice/map state below it. The three diff-scope Actionable Notices
+          render inside this block, under the input, so they sit above the
+          map rather than in its place. Positioned top-center (its own
           `.code-map__pr-review`, absolute + `z-index: 5`, styles.css) —
           every other corner is already claimed (`.code-map__history-
           toolbar` top-right, `.code-map__path-trace` top-left,
@@ -3988,9 +4057,8 @@ export function CodeMap({
           own `Panel`, `<Controls>`'s default bottom-left) — and rendered as
           a plain absolutely-positioned sibling here, not inside `<ReactFlow>`
           via its own `Panel` the way the signal toggles are: a `Panel` only
-          exists while `<ReactFlow>` itself is mounted, which the three
-          failure-state notices below deliberately replace instead of
-          rendering alongside. */}
+          exists while `<ReactFlow>` itself is mounted, which the fetch-error
+          and empty-map notices below replace. */}
       {mode === 'prReview' && (
         <div className="code-map__pr-review">
           <form
@@ -4007,6 +4075,7 @@ export function CodeMap({
               value={baseRefInput}
               onChange={(event) => setBaseRefInput(event.target.value)}
               disabled={projectPath === null || diffScopeState.status === 'loading'}
+              aria-describedby={prReviewNoticeStatus !== null ? PR_REVIEW_NOTICE_ID : undefined}
             />
             <button
               type="submit"
@@ -4017,6 +4086,24 @@ export function CodeMap({
               {diffScopeState.status === 'loading' ? 'Computing…' : 'Compute diff scope'}
             </button>
           </form>
+
+          {/* Story 3.1 (Phase 2): the three non-happy-path diff-scope
+              Actionable Notices — each its own distinct sentence
+              (`formatDiffScopeNotice`), shown ABOVE the map, directly under
+              the base-ref input that resolves it (which names it in
+              `aria-describedby`), never in the map's place. The canvas,
+              Back/Forward history and Path Trace all stay: a benign "no
+              changes" must not look like the project was lost, and search is
+              always reachable. "Never an empty map with no explanation"
+              (UX-DR15) holds because the map is not empty; with no resolved
+              scope it carries no changed-Node or blast-radius treatment.
+              `prReviewNoticeStatus` is `null` without a showable map — a
+              fetch failure/empty map has its own notice below. The live
+              region is always mounted; only its content changes. The line
+              uses the toolbar's status-line styling, not the full-canvas
+              `.code-map__notice`, which would cover the canvas and swallow
+              its clicks. */}
+          <PrReviewDiffScopeNoticeRegion status={prReviewNoticeStatus} />
 
           {/* Review finding (Blind Hunter): the `'idle'` state (before the
               user's first trigger click) previously rendered nothing at
@@ -4135,13 +4222,9 @@ export function CodeMap({
           {/* `DiffScopeResult['error']` reuses the same inline
               `notice notice--error` convention `pathTrace.status ===
               'error'` already uses just below in this file, rather than the
-              full-canvas `.code-map__notice` reserved for the three
-              enumerated non-happy-path states above (Boundaries &
-              Constraints only names those three as map-replacing) — a
-              genuine subprocess/`git` failure here still needs to surface
-              somewhere (NFR4: no silent failure), but never blocks the
-              still-otherwise-interactive map the way the three explicit
-              result states do. */}
+              full-canvas `.code-map__notice` — a genuine subprocess/`git`
+              failure here still needs to surface somewhere (NFR4: no silent
+              failure), but never blocks the still-interactive map. */}
           {diffScopeState.status === 'error' && (
             <p className="notice notice--error" role="alert">
               {diffScopeState.message}
@@ -4188,21 +4271,6 @@ export function CodeMap({
       {fetchState.status === 'ready' && fetchState.nodes.length === 0 && (
         <div className="code-map__notice" role="status">
           This project has no map-eligible Nodes (no Function/Interface/Type/Module found).
-        </div>
-      )}
-
-      {/* Story 3.1 (Phase 2): the three non-happy-path diff-scope Actionable
-          Notices — each its own distinct sentence (`formatDiffScopeNotice`),
-          replacing the map in place (Boundaries & Constraints: "never an
-          empty map with no explanation", UX-DR15) exactly the way the
-          empty-map notice just above already does for its own condition.
-          Gated on `fetchState.status === 'ready' && ... > 0` too — an
-          underlying fetch failure/empty map already has its own, more
-          fundamental notice above; this one only applies once there's a
-          real map that PR Review Mode is choosing not to show. */}
-      {mode === 'prReview' && fetchState.status === 'ready' && fetchState.nodes.length > 0 && prReviewNoticeStatus !== null && (
-        <div className="code-map__notice" role="status">
-          <p>{formatDiffScopeNotice(prReviewNoticeStatus)}</p>
         </div>
       )}
 
@@ -4364,11 +4432,10 @@ export function CodeMap({
         // Story 1.4 Code Map: "New lightweight Back/Forward toolbar ...
         // disabled at either end of history" — renderer-local chrome over
         // the ephemeral `history` state, never persisted/IPC'd (AD-2
-        // restated). Story 3.1 (Phase 2): also gated on `prReviewNoticeStatus
-        // === null` — this floats over the canvas `<ReactFlow>` itself
-        // renders, which one of the three PR-Review Actionable Notices above
-        // replaces entirely; without this gate, Back/Forward would float
-        // over a notice with no map underneath it to traverse.
+        // restated). Gated on `surfaces.canvas`, the same flag as the
+        // `<ReactFlow>` it floats over, so Back/Forward never renders
+        // without a map underneath to traverse. A PR Review diff-scope
+        // notice does not gate it: that notice sits above the map.
         <div className="code-map__history-toolbar" role="toolbar" aria-label="Map traversal history">
           <button type="button" onClick={goBack} disabled={history.index <= 0} aria-label="Back">
             ← Back
@@ -4396,9 +4463,9 @@ export function CodeMap({
         // above (Boundaries & Constraints: "never a `role="dialog"`
         // overlay ... must stay usable while the map is still interacted
         // with"). Positioned opposite the history toolbar (top-left vs.
-        // top-right) so the two never overlap. Story 3.1 (Phase 2): also
-        // gated on `prReviewNoticeStatus === null`, same reasoning as the
-        // history toolbar's own matching gate just above.
+        // top-right) so the two never overlap. A PR Review diff-scope notice
+        // does not gate it — search stays reachable in exactly those
+        // states.
         <div className="code-map__path-trace">
           <form
             className="code-map__path-trace-toolbar"

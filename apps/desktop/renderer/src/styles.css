@@ -2092,7 +2092,12 @@ code,
    (review finding, Blind Hunter): a long resolved ref name (e.g. a long
    remote-tracking branch) had no defined wrapping behavior inside this
    fixed-width container. */
-.code-map__pr-review-resolved {
+/* P1-5 + P1-6: `.code-map__pr-review-status` is the diff-scope Actionable
+   Notice's line (no changes / not a git repo / no base ref) — a neutral name,
+   since those are not "resolved" results, sharing this status-line styling
+   until P1-7 restyles Actionable Notices. */
+.code-map__pr-review-resolved,
+.code-map__pr-review-status {
   margin: 0;
   padding: 0.3rem 0.6rem;
   border-radius: 0;
@@ -2102,6 +2107,29 @@ code,
   font-size: 11px;
   text-align: center;
   overflow-wrap: break-word;
+}
+
+/* The notice's line wraps inside the PR Review block and never exceeds its
+   width (`.code-map__pr-review`: `min(360px, 100vw - 1.5rem)`), so a long
+   sentence grows the block downward rather than sideways across the Path
+   Trace panel (top-left) or the history toolbar (top-right). */
+.code-map__pr-review-status {
+  box-sizing: border-box;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* The always-mounted `role="status"` region the notice renders into. Empty,
+   it would still take a flex `gap` slot in `.code-map__pr-review`; the
+   negative margin cancels that so an empty region adds no space. It stays
+   in the layout (never `display: none`) so assistive tech keeps tracking it
+   as a live region. */
+.code-map__pr-review-notice-region {
+  width: 100%;
+}
+
+.code-map__pr-review-notice-region:empty {
+  margin-top: -0.5rem;
 }
 
 /* Story 3.2 (Phase 2): the combined blast radius's own status/stepper block
