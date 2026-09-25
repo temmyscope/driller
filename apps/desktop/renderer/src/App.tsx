@@ -12,6 +12,18 @@ import type {
   RecentProject,
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
+import {
+  INITIAL_FRAME_MAP_STATE,
+  applyMapReportToFrame,
+  applyProjectClosedToFrame,
+  applyProjectOpenedToFrame,
+  deriveFooterBar,
+  deriveTitle,
+  footerAvailability,
+  frameMapFor,
+  type FrameMapState,
+  type MapFooterState,
+} from './appFrame';
 import { CodeMap, type CodeMapMode } from './CodeMap';
 import { ModeSwitcher } from './ModeSwitcher';
 import { Settings } from './Settings';
@@ -181,6 +193,14 @@ export function App() {
   // the pre-load screen has rendered, rather than falling to <body> when the
   // Close button unmounts.
   const focusOpenFolderAfterCloseRef = useRef(false);
+  // P2-3: the open project's map state, reported by `CodeMap`'s `onMapState`,
+  // for the frame's footer bar. Every transition is a pure function in
+  // appFrame.ts: a report for any project but the current one is dropped, and
+  // a switch or Close resets it, so no project ever shows another's counts.
+  const [frameMap, setFrameMap] = useState<FrameMapState>(INITIAL_FRAME_MAP_STATE);
+  const handleMapState = useCallback((reportPath: string | null, state: MapFooterState) => {
+    setFrameMap((current) => applyMapReportToFrame(current, currentProjectPathRef.current, reportPath, state));
+  }, []);
   const openFolderButtonRef = useRef<HTMLButtonElement | null>(null);
 
   /**
@@ -394,6 +414,9 @@ export function App() {
                 );
           setMode(wasAlreadyInRecentProjects ? 'codeMap' : 'healthAudit');
         }
+        // P2-3: the previous project's map state never labels this one (a
+        // no-op when the same project is re-selected).
+        setFrameMap((current) => applyProjectOpenedToFrame(current, result.project.path));
         // Synchronous, not just via the ref-sync effect below: a status
         // push for this project (main sends the index-start request as
         // part of producing this very result) could in principle reach
@@ -526,6 +549,7 @@ export function App() {
     currentProjectPathRef.current = null;
     setCurrentProjectPath(null);
     commitSessionMap(applyProjectClosedToSessionMap(sessionMapRef.current));
+    setFrameMap(applyProjectClosedToFrame);
     setGraphServiceStatus(null);
     setNotice(null);
     setHardwareAdvisories(new Set());
@@ -534,6 +558,12 @@ export function App() {
     setMode('codeMap');
     focusOpenFolderAfterCloseRef.current = true;
   }, [commitSessionMap]);
+
+  // P2-3: the window title follows the titlebar.
+  const title = deriveTitle({ currentProjectPath });
+  useEffect(() => {
+    document.title = title;
+  }, [title]);
 
   // P0-3: after Close, the button that had focus is gone — hand focus to
   // "Open a folder", the first control of the Recent Projects screen.
@@ -678,14 +708,23 @@ export function App() {
   // once, rather than leaving CodeMap to re-derive the same priority rule.
   const noSummaryBackendAvailable = !cloudSelectedNoKey && localUnusable && !hasCloudKey;
 
+  // P2-3: the one frame's text — all rules live in appFrame.ts.
+  const footerBar = deriveFooterBar({
+    currentProjectPath,
+    isOpening,
+    availability: footerAvailability(graphServiceStatus, currentProjectPath),
+    map: frameMapFor(frameMap, currentProjectPath),
+    mode,
+  });
+
   return (
-    <main className={`app${showMap ? ' app--map' : ''}`}>
+    // P2-3: one frame on both screens — titlebar, a body (the landing column
+    // or the map), the existing status footers, then the footer bar. Only the
+    // body scrolls.
+    <main className="app">
       <header className="app__header">
         <div className="app__header-text">
-          <h1 className="app__title">driller</h1>
-          {!showMap && (
-            <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
-          )}
+          <h1 className="app__title">{title}</h1>
         </div>
         {/* Story 3.1 (Phase 2): the mode switcher — always visible in the
             header, enabled once a project is open (see `ModeSwitcher.tsx`). */}
@@ -715,95 +754,98 @@ export function App() {
       </header>
 
       {!showMap && (
-        <>
-          <section className="open-folder" aria-label="Open a project folder">
-            <button
-              ref={openFolderButtonRef}
-              type="button"
-              className="open-folder__button"
-              onClick={handleOpenFolder}
-              disabled={isOpening}
-            >
-              {isOpening ? 'Opening…' : 'Open a folder'}
-            </button>
+        <div className="app__body">
+          <div className="app__column">
+            <p className="app__subtitle">A browsable, honestly-indexed Code Map for a local codebase.</p>
+            <section className="open-folder" aria-label="Open a project folder">
+              <button
+                ref={openFolderButtonRef}
+                type="button"
+                className="open-folder__button"
+                onClick={handleOpenFolder}
+                disabled={isOpening}
+              >
+                {isOpening ? 'Opening…' : 'Open a folder'}
+              </button>
 
-            {notice?.kind === 'not-a-git-repo' && (
-              <ActionableNotice tone="warning" role="status">
-                <code>{notice.path}</code> is not a git repository. Choose another folder.
-              </ActionableNotice>
-            )}
-            {notice?.kind === 'error' && (
-              <ActionableNotice tone="error" role="alert">
-                {notice.message}
-              </ActionableNotice>
-            )}
-          </section>
-
-          {!isLoadingRecents && hasRecentProjects && (
-            <section className="recent-projects" aria-label="Recent projects">
-              <h2 className="recent-projects__heading">Recent Projects</h2>
-              <ul className="recent-projects__list">
-                {recentProjects!.map((project) => (
-                  <li key={project.path} className="recent-projects__item">
-                    <button
-                      type="button"
-                      className="recent-projects__open"
-                      onClick={() => handleOpenRecent(project.path)}
-                      disabled={isOpening}
-                    >
-                      <span className="recent-projects__name">{project.name}</span>
-                      <span className="recent-projects__path"><code>{project.path}</code></span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              {notice?.kind === 'not-a-git-repo' && (
+                <ActionableNotice tone="warning" role="status">
+                  <code>{notice.path}</code> is not a git repository. Choose another folder.
+                </ActionableNotice>
+              )}
+              {notice?.kind === 'error' && (
+                <ActionableNotice tone="error" role="alert">
+                  {notice.message}
+                </ActionableNotice>
+              )}
             </section>
-          )}
-        </>
-      )}
 
-      {showMap && (
-        // P0-3: the map-level Actionable Notice (icon + one sentence + at most
-        // one action) whenever the map isn't live — always mounted with the
-        // map (a live region only reliably announces a change it already
-        // existed for), empty and collapsed while live. "Refreshing" and
-        // "degraded" are deliberately different states: a normal re-index
-        // must not read as a failure. A rejected Retry shows here too, since
-        // the pre-load screen that used to host it isn't on screen.
-        <div className="session-notice" role="status">
-          {sessionView.availability === 'refreshing' && (
-            <ActionableNotice tone="progress">
-              Re-indexing — the map shows the last completed index until it finishes.
-            </ActionableNotice>
-          )}
-          {sessionView.availability === 'degraded' && (
-            <DegradedSessionNotice showRetry={sessionView.showRetry} onRetry={handleRetryGraphService} />
-          )}
-          {/* No nested `role="alert"` — the enclosing `role="status"` region
-              announces it. */}
-          {notice?.kind === 'error' && (
-            <ActionableNotice tone="error">{notice.message}</ActionableNotice>
-          )}
+            {!isLoadingRecents && hasRecentProjects && (
+              <section className="recent-projects" aria-label="Recent projects">
+                <h2 className="recent-projects__heading">Recent Projects</h2>
+                <ul className="recent-projects__list">
+                  {recentProjects!.map((project) => (
+                    <li key={project.path} className="recent-projects__item">
+                      <button
+                        type="button"
+                        className="recent-projects__open"
+                        onClick={() => handleOpenRecent(project.path)}
+                        disabled={isOpening}
+                      >
+                        <span className="recent-projects__name">{project.name}</span>
+                        <span className="recent-projects__path"><code>{project.path}</code></span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+          </div>
         </div>
       )}
 
       {showMap && (
-        <section className="app__map" aria-label="Code Map">
-          {/* `projectPath` (review finding, Medium) lets CodeMap reject a
-              stale `graphService:summaryProgress` message for a project the
-              user has since navigated away from — reliably non-null here:
-              `showMap` requires `currentProjectPath` to equal the
-              non-null `loadedProjectPath` (P0-3). */}
-          <CodeMap
-            projectPath={currentProjectPath}
-            noSummaryBackendAvailable={noSummaryBackendAvailable}
-            cloudSelectedNoKey={cloudSelectedNoKey}
-            mode={mode}
-            onRequestCodeMapMode={handleRequestCodeMapMode}
-            graphServiceAvailable={graphServiceLive}
-            dataVersion={sessionMap.dataVersion}
-          />
-        </section>
+        <div className="app__body app__body--map">
+          {/* P0-3: the map-level Actionable Notice (icon + one sentence + at
+              most one action) whenever the map isn't live — always mounted
+              with the map (a live region only reliably announces a change it
+              already existed for), empty and collapsed while live.
+              "Refreshing" and "degraded" are deliberately different states: a
+              normal re-index must not read as a failure. A rejected Retry
+              shows here too, since the pre-load screen that used to host it
+              isn't on screen. */}
+          <div className="session-notice" role="status">
+            {sessionView.availability === 'refreshing' && (
+              <ActionableNotice tone="progress">
+                Re-indexing — the map shows the last completed index until it finishes.
+              </ActionableNotice>
+            )}
+            {sessionView.availability === 'degraded' && (
+              <DegradedSessionNotice showRetry={sessionView.showRetry} onRetry={handleRetryGraphService} />
+            )}
+            {/* No nested `role="alert"` — the enclosing `role="status"` region
+                announces it. */}
+            {notice?.kind === 'error' && <ActionableNotice tone="error">{notice.message}</ActionableNotice>}
+          </div>
+
+          <section className="app__map" aria-label="Code Map">
+            {/* `projectPath` (review finding, Medium) lets CodeMap reject a
+                stale `graphService:summaryProgress` message for a project the
+                user has since navigated away from — reliably non-null here:
+                `showMap` requires `currentProjectPath` to equal the
+                non-null `loadedProjectPath` (P0-3). */}
+            <CodeMap
+              projectPath={currentProjectPath}
+              noSummaryBackendAvailable={noSummaryBackendAvailable}
+              cloudSelectedNoKey={cloudSelectedNoKey}
+              mode={mode}
+              onRequestCodeMapMode={handleRequestCodeMapMode}
+              graphServiceAvailable={graphServiceLive}
+              dataVersion={sessionMap.dataVersion}
+              onMapState={handleMapState}
+            />
+          </section>
+        </div>
       )}
 
       {showServiceFooters && graphServiceStatus && (
@@ -907,6 +949,15 @@ export function App() {
             <span aria-hidden="true">⚠</span> {formatPrBotToolNotFound(bot)}
           </p>
         ))}
+      </footer>
+
+      {/* P2-3: the tmux-style status line — facts only (see appFrame.ts).
+          Labelled but deliberately not a live region: state changes are
+          announced by `session-notice` and the status footers above, and
+          re-announcing counts on every refresh would be noise. */}
+      <footer className="app__footerbar" aria-label="Status line">
+        <span className="app__footerbar-left">{footerBar.left}</span>
+        <span className="app__footerbar-right">{footerBar.right}</span>
       </footer>
 
       {isSettingsOpen && (

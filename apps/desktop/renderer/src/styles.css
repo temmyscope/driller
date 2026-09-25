@@ -101,14 +101,69 @@ code,
   border: 0;
 }
 
+/* P2-3: one terminal-native frame on both screens (DESIGN.md, the
+   terminal-native mockup) — a full-width titlebar, a body, the status footers
+   and the tmux-style footer bar. The frame is exactly the window height: only
+   `.app__body` scrolls, so the titlebar and footer bar stay put. */
+/* `overflow: hidden` clips nothing that should escape: Settings is
+   `position: fixed` against the viewport, and the Code Map's overlays are
+   absolute inside `.code-map`, which sits inside the body. */
 .app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* The landing screen's body: scrolls when the Recent Projects list outgrows
+   a short window. `min-height: 0` lets a flex child shrink below its content. */
+.app__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* The landing content keeps its centred 720px column inside the frame. */
+.app__column {
   max-width: 720px;
   margin: 0 auto;
   padding: 4rem 1.5rem 2rem;
   display: flex;
   flex-direction: column;
   gap: 2rem;
-  min-height: 100%;
+}
+
+/* The map screen's body: the map fills it and pans/zooms itself, so the body
+   never scrolls. */
+.app__body--map {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* DESIGN.md `footerbar`: `panel-alt` chrome, a 1px top border, 6px 14px,
+   10.5px, `text-mute`, a left and a right span. */
+.app__footerbar {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 6px 14px;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  background: var(--panel-alt);
+  border-top: 1px solid var(--border);
+}
+
+.app__footerbar-left {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app__footerbar-right {
+  flex-shrink: 0;
 }
 
 .app__title {
@@ -117,16 +172,22 @@ code,
 }
 
 .app__subtitle {
-  margin: 0.25rem 0 0;
+  margin: 0;
   color: var(--text-mute);
   font-size: 11px;
 }
 
+/* P2-3: the titlebar — full width on both screens, `panel-alt` chrome with
+   a 1px bottom border (formerly map-screen only). */
 .app__header {
+  flex-shrink: 0;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
+  padding: 0.5rem 1.5rem;
+  background: var(--panel-alt);
+  border-bottom: 1px solid var(--border);
 }
 
 .app__settings-button {
@@ -594,11 +655,11 @@ code,
 }
 
 .graph-service-status {
-  margin-top: auto;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding-top: 1rem;
+  padding: 0.5rem 1.5rem;
   border-top: 1px solid var(--border);
   font-size: 11px;
 }
@@ -662,10 +723,11 @@ code,
  * merged line that would conflate indexing and model-readiness at a glance.
  */
 .model-status {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding-top: 0.5rem;
+  padding: 0 1.5rem 0.5rem;
   font-size: 11px;
 }
 
@@ -687,7 +749,8 @@ code,
  * comment on this element explains why there's no happy-path counterpart).
  */
 .mcp-server-status {
-  padding-top: 0.5rem;
+  flex-shrink: 0;
+  padding: 0 1.5rem 0.5rem;
 }
 
 /*
@@ -699,10 +762,11 @@ code,
  * without conflating with either indexing or model-download status.
  */
 .hardware-advisory {
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
-  padding-top: 0.5rem;
+  padding: 0 1.5rem 0.5rem;
   font-size: 11px;
 }
 
@@ -714,7 +778,7 @@ code,
  * cleared, e.g. by a fresh project open).
  */
 .hardware-advisory:empty {
-  padding-top: 0;
+  padding: 0;
   gap: 0;
 }
 
@@ -738,15 +802,16 @@ code,
  * rather than conflated with either).
  */
 .app__pr-bot-tool-notice {
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
-  padding-top: 0.5rem;
+  padding: 0 1.5rem 0.5rem;
   font-size: 11px;
 }
 
 .app__pr-bot-tool-notice:empty {
-  padding-top: 0;
+  padding: 0;
   gap: 0;
 }
 
@@ -762,54 +827,9 @@ code,
 
 /*
  * Story 1.3 (Phase 1): once indexed, the Code Map is the only landing view
- * (FR3) — the shell drops its narrow centered-column layout in favor of a
- * full-bleed map, with the status badge demoted to a slim persistent footer
- * rather than the main content.
+ * (FR3). P2-3: the frame (titlebar, status footers, footer bar) is the same
+ * on both screens — only the body differs (`.app__body--map`).
  */
-.app--map {
-  max-width: none;
-  padding: 0;
-  gap: 0;
-}
-
-.app--map .app__header {
-  padding: 0.5rem 1.5rem;
-  border-bottom: 1px solid var(--border);
-}
-
-.app--map .app__title {
-  font-size: 11px;
-}
-
-.app--map .graph-service-status {
-  margin-top: 0;
-  padding: 0.5rem 1.5rem;
-}
-
-.app--map .model-status {
-  padding: 0 1.5rem 0.5rem;
-}
-
-.app--map .mcp-server-status {
-  padding: 0 1.5rem 0.5rem;
-}
-
-.app--map .hardware-advisory {
-  padding: 0 1.5rem 0.5rem;
-}
-
-.app--map .hardware-advisory:empty {
-  padding: 0;
-}
-
-.app--map .app__pr-bot-tool-notice {
-  padding: 0 1.5rem 0.5rem;
-}
-
-.app--map .app__pr-bot-tool-notice:empty {
-  padding: 0;
-}
-
 .app__map {
   flex: 1;
   min-height: 0;

@@ -101,6 +101,7 @@ import {
 } from './ActionableNotice';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
+import { mapFooterState, type MapFooterState } from './appFrame';
 
 export type FetchState =
   | { status: 'loading' }
@@ -2197,6 +2198,14 @@ export interface CodeMapProps {
    * refresh.
    */
   dataVersion: number;
+  /**
+   * P2-3: reports the map's state (`mapFooterState`: loading, error, or ready
+   * with its Node and edge totals) up to `App.tsx` for the frame's footer bar
+   * on every `fetchState` change — load, Retry, refresh, failure — tagged
+   * with `projectPath` so `App.tsx` can drop a report about a project that is
+   * no longer open.
+   */
+  onMapState: (projectPath: string | null, state: MapFooterState) => void;
 }
 
 /** P0-3: the `title` every Graph-Service-backed action carries while it's disabled for not being live. */
@@ -2256,8 +2265,19 @@ export function CodeMap({
   onRequestCodeMapMode,
   graphServiceAvailable,
   dataVersion,
+  onMapState,
 }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
+  // P2-3: report every `fetchState` change, not just count changes — a Retry
+  // or reopen can land a map with the same totals, and loading → error must
+  // retract the counts. `App.tsx` dedups identical reports.
+  const onMapStateRef = useRef(onMapState);
+  useEffect(() => {
+    onMapStateRef.current = onMapState;
+  }, [onMapState]);
+  useEffect(() => {
+    onMapStateRef.current(projectPath, mapFooterState(fetchState));
+  }, [projectPath, fetchState]);
   // P0-3: read by `refreshCodeMap`'s async settle to tell whether a completed
   // map is on screen to fall back to.
   const fetchStateRef = useRef<FetchState>(fetchState);
