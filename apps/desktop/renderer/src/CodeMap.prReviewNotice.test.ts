@@ -21,8 +21,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
+import { ACTIONABLE_NOTICE_GLYPHS, ACTIONABLE_NOTICE_SPOKEN_PREFIX } from './ActionableNotice';
 import {
   type CodeMapMode,
+  DIFF_SCOPE_NOTICE_TONES,
   type DiffScopeNoticeStatus,
   type DiffScopeState,
   type FetchState,
@@ -187,9 +189,30 @@ describe('PrReviewDiffScopeNotice', () => {
     assert.equal(new Set(sentences).size, NOTICE_STATUSES.length, 'sentences are distinct');
   });
 
-  it('uses the neutral status-line class, not the "resolved" one', () => {
-    const [line] = renderTree(PrReviewDiffScopeNotice({ status: 'no-changes' }));
-    assert.equal(line?.props.className, 'code-map__pr-review-status');
+  it('renders the shared Actionable Notice shape, not the "resolved" status line (P1-7)', () => {
+    for (const status of NOTICE_STATUSES) {
+      const elements = renderTree(PrReviewDiffScopeNotice({ status }));
+      const tone = DIFF_SCOPE_NOTICE_TONES[status];
+      const root = elements.find((element) => element.type === 'div');
+      assert.equal(root?.props.className, `actionable-notice actionable-notice--${tone}`);
+      const glyph = elements.find((element) => element.props.className === 'actionable-notice__glyph');
+      assert.equal(glyph && textOf(glyph), ACTIONABLE_NOTICE_GLYPHS[tone]);
+      assert.equal(
+        elements.some((element) => element.props.className === 'actionable-notice__action'),
+        false,
+        'no action slot: the base-ref toolbar is the next action',
+      );
+      assert.equal(
+        elements.some((element) => element.props.className === 'code-map__pr-review-resolved'),
+        false,
+      );
+    }
+  });
+
+  it('marks "no changes" as info and the two blocking states as warnings', () => {
+    assert.equal(DIFF_SCOPE_NOTICE_TONES['no-changes'], 'info');
+    assert.equal(DIFF_SCOPE_NOTICE_TONES['not-a-git-repo'], 'warning');
+    assert.equal(DIFF_SCOPE_NOTICE_TONES['no-base-ref-resolvable'], 'warning');
   });
 });
 
@@ -215,6 +238,15 @@ describe('PrReviewDiffScopeNoticeRegion', () => {
   it('carries the notice sentence for each status', () => {
     for (const status of NOTICE_STATUSES) {
       assert.equal(textOf(region(status)), textOf(PrReviewDiffScopeNotice({ status })));
+    }
+  });
+
+  it('speaks the tone prefix before a warning sentence, and none for info (P1-7)', () => {
+    for (const status of NOTICE_STATUSES) {
+      const text = textOf(region(status));
+      const glyph = ACTIONABLE_NOTICE_GLYPHS[DIFF_SCOPE_NOTICE_TONES[status]];
+      const prefix = ACTIONABLE_NOTICE_SPOKEN_PREFIX[DIFF_SCOPE_NOTICE_TONES[status]];
+      assert.ok(text.startsWith(prefix === null ? glyph : `${glyph}${prefix} `), text);
     }
   });
 });

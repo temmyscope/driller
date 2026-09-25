@@ -48,6 +48,7 @@ import type {
   PrBotIngestionResult,
   ProjectScopeConfig,
 } from '@driller/ipc-contracts';
+import { ActionableNotice } from './ActionableNotice';
 
 interface SettingsProps {
   onClose: () => void;
@@ -773,18 +774,23 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
         </header>
 
         {loadError && (
-          <div className="notice notice--error" role="alert">
-            <p>{loadError}</p>
-            {/* Without this, a failed initial `getBackendConfig()` fetch
-                left `config` permanently `null` for the rest of this panel
-                session — the whole backend-choice/key-entry body below
-                never rendered again, only this raw error text (review
-                finding, Medium). Reuses refetchConfig, the same call the
-                initial mount effect makes. */}
-            <button type="button" onClick={refetchConfig}>
-              Retry
-            </button>
-          </div>
+          <ActionableNotice
+            tone="error"
+            role="alert"
+            // Without this Retry, a failed initial `getBackendConfig()` fetch
+            // left `config` permanently `null` for the rest of this panel
+            // session — the whole backend-choice/key-entry body below never
+            // rendered again, only this raw error text (review finding,
+            // Medium). Reuses refetchConfig, the same call the initial mount
+            // effect makes.
+            action={
+              <button type="button" onClick={refetchConfig} aria-label="Retry loading the backend setting">
+                Retry
+              </button>
+            }
+          >
+            {loadError}
+          </ActionableNotice>
         )}
 
         {config && (
@@ -816,10 +822,10 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
             {config.activeBackend === 'cloud' && (
               <section className="settings-panel__cloud-key" aria-label="Cloud API key">
                 {config.isLinuxInsecureBackend && (
-                  <p className="notice notice--warning" role="status">
+                  <ActionableNotice tone="warning" role="status">
                     This machine has no secure OS keystore available. A stored key would have
                     weaker protection than usual.
-                  </p>
+                  </ActionableNotice>
                 )}
 
                 {config.hasCloudKey && keyEntry.kind !== 'warning' && keyInput.length === 0 && (
@@ -851,18 +857,23 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
                 </button>
 
                 {keyEntry.kind === 'warning' && (
-                  <div className="notice notice--warning" role="alert">
-                    <p>{keyEntry.message}</p>
-                    <button type="button" onClick={handleAcknowledgeInsecureStorage}>
-                      Store anyway
-                    </button>
-                  </div>
+                  <ActionableNotice
+                    tone="warning"
+                    role="alert"
+                    action={
+                      <button type="button" onClick={handleAcknowledgeInsecureStorage}>
+                        Store anyway
+                      </button>
+                    }
+                  >
+                    {keyEntry.message}
+                  </ActionableNotice>
                 )}
 
                 {keyEntry.kind === 'error' && (
-                  <p className="notice notice--error" role="alert">
+                  <ActionableNotice tone="error" role="alert">
                     {keyEntry.message}
-                  </p>
+                  </ActionableNotice>
                 )}
               </section>
             )}
@@ -870,14 +881,23 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
         )}
 
         {editorPreferenceLoadError && (
-          <div className="notice notice--error" role="alert">
-            <p>{editorPreferenceLoadError}</p>
-            {/* Same "retry the exact fetch that failed" convention as the
-                backend-config load-error notice above. */}
-            <button type="button" onClick={refetchEditorPreference}>
-              Retry
-            </button>
-          </div>
+          <ActionableNotice
+            tone="error"
+            role="alert"
+            // Same "retry the exact fetch that failed" convention as the
+            // backend-config load-error notice above.
+            action={
+              <button
+                type="button"
+                onClick={refetchEditorPreference}
+                aria-label="Retry loading the editor preference"
+              >
+                Retry
+              </button>
+            }
+          >
+            {editorPreferenceLoadError}
+          </ActionableNotice>
         )}
 
         {editorPreference && (
@@ -915,9 +935,9 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
             </label>
 
             {editorPreferenceSaveError && (
-              <p className="notice notice--error" role="alert">
+              <ActionableNotice tone="error" role="alert">
                 {editorPreferenceSaveError}
-              </p>
+              </ActionableNotice>
             )}
           </fieldset>
         )}
@@ -937,12 +957,17 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
           )}
 
           {projectPath !== null && prBotConfigLoadError && (
-            <div className="notice notice--error" role="alert">
-              <p>{prBotConfigLoadError}</p>
-              <button type="button" onClick={refetchPrBotConfig}>
-                Retry
-              </button>
-            </div>
+            <ActionableNotice
+              tone="error"
+              role="alert"
+              action={
+                <button type="button" onClick={refetchPrBotConfig} aria-label="Retry loading the PR-bot settings">
+                  Retry
+                </button>
+              }
+            >
+              {prBotConfigLoadError}
+            </ActionableNotice>
           )}
 
           {projectPath !== null &&
@@ -965,18 +990,23 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
                   </label>
 
                   {disclosure.kind === 'confirming' && (
-                    <div className="notice notice--warning" role="alert">
-                      <p>{prBotDisclosureText(id)}</p>
-                      <button type="button" onClick={() => handlePrBotConfirm(id)}>
-                        Enable {label}
-                      </button>
-                    </div>
+                    <ActionableNotice
+                      tone="warning"
+                      role="alert"
+                      action={
+                        <button type="button" onClick={() => handlePrBotConfirm(id)}>
+                          Enable {label}
+                        </button>
+                      }
+                    >
+                      {prBotDisclosureText(id)}
+                    </ActionableNotice>
                   )}
 
                   {disclosure.kind === 'error' && (
-                    <p className="notice notice--error" role="alert">
+                    <ActionableNotice tone="error" role="alert">
                       {disclosure.message}
-                    </p>
+                    </ActionableNotice>
                   )}
 
                   {/* Story 2.3 (Phase 4): "Run ingestion now" — only ever
@@ -995,16 +1025,16 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
                       >
                         {ingestionRun[id].kind === 'running' ? 'Running…' : 'Run ingestion now'}
                       </button>
-                      {formatIngestionRunState(ingestionRun[id]) !== null && (
-                        <p
-                          className={`settings-panel__pr-bot-ingestion-status${
-                            ingestionRun[id].kind === 'error' ? ' notice notice--error' : ''
-                          }`}
-                          role={ingestionRun[id].kind === 'error' ? 'alert' : 'status'}
-                        >
-                          {formatIngestionRunState(ingestionRun[id])}
-                        </p>
-                      )}
+                      {formatIngestionRunState(ingestionRun[id]) !== null &&
+                        (ingestionRun[id].kind === 'error' ? (
+                          <ActionableNotice tone="error" role="alert">
+                            {formatIngestionRunState(ingestionRun[id])}
+                          </ActionableNotice>
+                        ) : (
+                          <p className="settings-panel__pr-bot-ingestion-status" role="status">
+                            {formatIngestionRunState(ingestionRun[id])}
+                          </p>
+                        ))}
                     </div>
                   )}
                 </div>
@@ -1022,12 +1052,17 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
           )}
 
           {projectPath !== null && projectScopeLoadError && (
-            <div className="notice notice--error" role="alert">
-              <p>{projectScopeLoadError}</p>
-              <button type="button" onClick={refetchProjectScope}>
-                Retry
-              </button>
-            </div>
+            <ActionableNotice
+              tone="error"
+              role="alert"
+              action={
+                <button type="button" onClick={refetchProjectScope} aria-label="Retry loading the indexing scope">
+                  Retry
+                </button>
+              }
+            >
+              {projectScopeLoadError}
+            </ActionableNotice>
           )}
 
           {projectPath !== null && projectScope && (
@@ -1051,9 +1086,9 @@ export function Settings({ onClose, onBackendSwitched, projectPath, onIngestionR
                 {projectScopeSaving ? 'Saving…' : 'Save'}
               </button>
               {projectScopeSaveError && (
-                <p className="notice notice--error" role="alert">
+                <ActionableNotice tone="error" role="alert">
                   {projectScopeSaveError}
-                </p>
+                </ActionableNotice>
               )}
             </>
           )}

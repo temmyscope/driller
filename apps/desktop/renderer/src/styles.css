@@ -416,44 +416,13 @@ code,
   cursor: default;
 }
 
-/* The error variant (`ingestionRun[id].kind === 'error'`) instead composes
-   the existing `.notice.notice--error` classes (Settings.tsx applies both
-   alongside this one) for its background/border/color — this rule only
-   covers the plain, non-error status text's own size/color. */
+/* The plain, non-error ingestion status text. The error variant
+   (`ingestionRun[id].kind === 'error'`) renders an `ActionableNotice`
+   instead (P1-7). */
 .settings-panel__pr-bot-ingestion-status {
   margin: 0;
   font-size: 11px;
   color: var(--text-mute);
-}
-
-/* Generic "needs attention" notice, amber — used across Settings/App
-   chrome for moderate-severity states (a stale backend fetch, a disclosure
-   worth surfacing) that aren't one of the Code Map's own named risk-signal
-   or staleness families; those keep their own dedicated tokens
-   (`--stale-yellow`/`--risk-red`) elsewhere in this file. */
-.settings-panel .notice--warning button {
-  margin-top: 0.5rem;
-  padding: 0.3rem 0.75rem;
-  border-radius: 0;
-  border: 1px solid var(--risk-amber);
-  background: transparent;
-  color: var(--risk-amber);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-/* Retry affordance on a failed getBackendConfig() fetch (review finding,
-   Medium) — mirrors .settings-panel .notice--warning button's shape but in
-   the error notice's own color. */
-.settings-panel .notice--error button {
-  margin-top: 0.5rem;
-  padding: 0.3rem 0.75rem;
-  border-radius: 0;
-  border: 1px solid var(--risk-red);
-  background: transparent;
-  color: var(--risk-red);
-  font-size: 11px;
-  cursor: pointer;
 }
 
 .open-folder {
@@ -479,24 +448,83 @@ code,
   cursor: default;
 }
 
-.notice {
+/* P1-7: the one Actionable Notice shape (ActionableNotice.tsx), per
+   DESIGN.md `actionable-notice`: a 2px left rule on `panel-alt`, 10px 16px
+   padding, `text` for the sentence at 10.5px. The rule is `accent` for
+   info/progress, amber for warning, red for error — the glyph (never colour
+   alone) is the shape cue. A grid keeps a long sentence wrapping beside the
+   glyph rather than under it, and `minmax(0, 1fr)` lets it shrink below its
+   longest word so nothing overflows a narrow window. */
+.actionable-notice {
+  --actionable-notice-rule: var(--accent);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 8px;
+  box-sizing: border-box;
+  max-width: 100%;
   margin: 0;
-  padding: 0.5rem 0.75rem;
+  padding: 10px 16px;
   border-radius: 0;
+  border-left: 2px solid var(--actionable-notice-rule);
+  background: var(--panel-alt);
+  color: var(--text);
   font-size: 10.5px;
   line-height: 1.45;
+  text-align: left;
 }
 
-.notice--warning {
-  background: color-mix(in srgb, var(--risk-amber) 15%, transparent);
-  color: var(--risk-amber);
-  border: 1px solid var(--risk-amber);
+.actionable-notice--warning {
+  --actionable-notice-rule: var(--risk-amber);
 }
 
-.notice--error {
-  background: color-mix(in srgb, var(--risk-red) 15%, transparent);
-  color: var(--risk-red);
-  border: 1px solid var(--risk-red);
+.actionable-notice--error {
+  --actionable-notice-rule: var(--risk-red);
+}
+
+.actionable-notice__glyph {
+  color: var(--actionable-notice-rule);
+  font-weight: 600;
+}
+
+.actionable-notice__text {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.actionable-notice__action {
+  display: flex;
+  align-items: baseline;
+}
+
+.actionable-notice__action button {
+  padding: 0.15rem 0.6rem;
+  border-radius: 0;
+  border: 1px solid var(--actionable-notice-rule);
+  background: transparent;
+  color: var(--text);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.actionable-notice__action button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--actionable-notice-rule) 15%, transparent);
+}
+
+.actionable-notice__action button:disabled {
+  opacity: 0.6;
+}
+
+/* Zero-specificity wrapper so a more specific cursor rule (e.g.
+   `.code-map__action--service-unavailable:disabled`'s `not-allowed`) wins. */
+:where(.actionable-notice__action) button:disabled {
+  cursor: default;
+}
+
+.actionable-notice__action button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .recent-projects__heading {
@@ -634,39 +662,14 @@ code,
 }
 
 /*
- * Story 5.2: the MCP listener's own degraded-state notice — mirrors
+ * Story 5.2: the footer row holding the MCP listener's degraded-state
+ * Actionable Notice (P1-7) — mirrors
  * `.model-status`'s layout (its own separate footer row, not sharing the
  * class), rendered only for the `'unavailable'` case (App.tsx's own doc
  * comment on this element explains why there's no happy-path counterpart).
  */
 .mcp-server-status {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
   padding-top: 0.5rem;
-  font-size: 11px;
-}
-
-/*
- * Review finding (Low): deliberately plain text, not `.badge` — `.badge` is
- * a pill (`border-radius: 999px`) sized for a short single-line label like
- * "Graph Service running," not a variable-length full sentence, which would
- * wrap awkwardly inside a pill shape.
- */
-.mcp-server-status__message {
-  color: var(--risk-red);
-  font-size: 10.5px;
-  line-height: 1.45;
-}
-
-.mcp-server-status__retry {
-  padding: 0.25rem 0.75rem;
-  border-radius: 0;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text);
-  font-size: 11px;
-  cursor: pointer;
 }
 
 /*
@@ -1010,7 +1013,7 @@ code,
    no key" Actionable Notices, rendered per-Node in place of the ordinary
    pending state (CodeMap.tsx). A generic backend/setup notice — amber, the
    same "moderate concern" hue this file's other non-signal-family warnings
-   use (`.notice--warning`), not Coverage Gap's dedicated red or
+   use (`.actionable-notice--warning`), not Coverage Gap's dedicated red or
    Staleness's dedicated yellow, since this isn't either of those two named
    signal families. */
 .code-map__node-summary--notice {
@@ -2092,12 +2095,7 @@ code,
    (review finding, Blind Hunter): a long resolved ref name (e.g. a long
    remote-tracking branch) had no defined wrapping behavior inside this
    fixed-width container. */
-/* P1-5 + P1-6: `.code-map__pr-review-status` is the diff-scope Actionable
-   Notice's line (no changes / not a git repo / no base ref) — a neutral name,
-   since those are not "resolved" results, sharing this status-line styling
-   until P1-7 restyles Actionable Notices. */
-.code-map__pr-review-resolved,
-.code-map__pr-review-status {
+.code-map__pr-review-resolved {
   margin: 0;
   padding: 0.3rem 0.6rem;
   border-radius: 0;
@@ -2109,15 +2107,11 @@ code,
   overflow-wrap: break-word;
 }
 
-/* The notice's line wraps inside the PR Review block and never exceeds its
-   width (`.code-map__pr-review`: `min(360px, 100vw - 1.5rem)`), so a long
-   sentence grows the block downward rather than sideways across the Path
-   Trace panel (top-left) or the history toolbar (top-right). */
-.code-map__pr-review-status {
-  box-sizing: border-box;
-  max-width: 100%;
-  overflow-wrap: anywhere;
-}
+/* P1-7: the diff-scope notice (no changes / not a git repo / no base ref) is
+   an `.actionable-notice`, whose `max-width: 100%` and `overflow-wrap:
+   anywhere` keep a long sentence inside the PR Review block
+   (`min(360px, 100vw - 1.5rem)`), growing it downward rather than sideways
+   across the Path Trace panel or the history toolbar. */
 
 /* The always-mounted `role="status"` region the notice renders into. Empty,
    it would still take a flex `gap` slot in `.code-map__pr-review`; the
@@ -2421,8 +2415,8 @@ code,
    Replaces Story 1.8's `.code-map__node-affordance--details` rules, whose
    pill this change removed. Hover uses the same
    `color-mix(in srgb, <hue> N%, transparent)` fill formula those rules (and
-   `.notice--warning`) already use, so hover gives real visible feedback
-   rather than repeating the base border/color values. */
+   `.actionable-notice__action button`) use, so hover gives real visible
+   feedback rather than repeating the base border/color values. */
 .code-map__node-affordance--source {
   border-color: var(--accent-dim);
   color: var(--accent);
@@ -2588,10 +2582,10 @@ code,
 }
 
 /*
- * P0-3: the map-level Actionable Notice shown above the Code Map whenever the
- * Graph Service isn't live (App.tsx `session-notice`). Reuses the shared
- * `.notice` tokens; `:empty` collapses it to zero height while live, but
- * never `display: none` — that would drop the always-mounted `role="status"`
+ * P0-3: the always-mounted `role="status"` region above the Code Map
+ * (App.tsx `session-notice`) that contains the map-level Actionable Notices
+ * (`.actionable-notice`) whenever the Graph Service isn't live. `:empty`
+ * collapses it to zero height while live, but never `display: none` — that would drop the always-mounted `role="status"`
  * region from the accessibility tree and risk its first message going
  * unannounced.
  */
@@ -2606,23 +2600,6 @@ code,
 .session-notice:empty {
   padding: 0;
   border-bottom: 0;
-}
-
-.notice--info {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--text);
-  border: 1px solid var(--border);
-}
-
-.session-notice__retry {
-  margin-left: 0.25rem;
-  padding: 0.15rem 0.6rem;
-  border-radius: 0;
-  border: 1px solid currentColor;
-  background: transparent;
-  color: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
 }
 
 .app__close-project-button {
@@ -2643,8 +2620,7 @@ code,
   color: var(--text);
 }
 
-.app__close-project-button:focus-visible,
-.session-notice__retry:focus-visible {
+.app__close-project-button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -2667,13 +2643,3 @@ code,
   max-width: min(40rem, calc(100% - 2rem));
 }
 
-.code-map__refresh-retry {
-  margin-left: 0.25rem;
-  padding: 0.15rem 0.6rem;
-  border-radius: 0;
-  border: 1px solid currentColor;
-  background: transparent;
-  color: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
-}

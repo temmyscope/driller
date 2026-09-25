@@ -59,9 +59,8 @@
  * `renderedNodes`/`renderedEdges` memo below, the view fits to show the
  * whole route (`reactFlowInstanceRef`), and an ordered, clickable step list
  * renders alongside it — each entry re-using `navigateToNode` (Story 1.4),
- * never a new traversal mechanism. `no-path-found`/`error` reuse this
- * file's existing ad hoc notice conventions rather than a new shared Notice
- * component (Design Notes).
+ * never a new traversal mechanism. `no-path-found`/`error` render through
+ * the shared `ActionableNotice` shape (P1-7).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
@@ -94,6 +93,12 @@ import type {
   SummaryStatus,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
+import {
+  ACTIONABLE_NOTICE_GLYPHS,
+  ACTIONABLE_NOTICE_SPOKEN_PREFIX,
+  ActionableNotice,
+  type ActionableNoticeTone,
+} from './ActionableNotice';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
 
@@ -213,6 +218,17 @@ function formatDiffScopeNotice(status: DiffScopeNoticeStatus): string {
       return 'No base ref could be resolved automatically (no upstream tracking branch or local main/master found) — enter one explicitly above.';
   }
 }
+
+/**
+ * P1-7: each diff-scope notice's Actionable Notice tone. "No changes" is a
+ * plain fact about the diff (info); the other two block PR Review (warning),
+ * matching App.tsx's own not-a-git-repo warning.
+ */
+export const DIFF_SCOPE_NOTICE_TONES: Readonly<Record<DiffScopeNoticeStatus, ActionableNoticeTone>> = {
+  'no-changes': 'info',
+  'not-a-git-repo': 'warning',
+  'no-base-ref-resolvable': 'warning',
+};
 
 /**
  * Story 3.2 (Phase 2): the combined blast-radius expansion's own state —
@@ -1628,7 +1644,7 @@ export function PrReviewDiffScopeNotice({ status }: { status: DiffScopeNoticeSta
   if (status === null) {
     return null;
   }
-  return <p className="code-map__pr-review-status">{formatDiffScopeNotice(status)}</p>;
+  return <ActionableNotice tone={DIFF_SCOPE_NOTICE_TONES[status]}>{formatDiffScopeNotice(status)}</ActionableNotice>;
 }
 
 /**
@@ -2193,6 +2209,44 @@ const GRAPH_SERVICE_UNAVAILABLE_TITLE =
  * these `cursor: not-allowed`.
  */
 const SERVICE_UNAVAILABLE_CLASS = 'code-map__action--service-unavailable';
+
+/**
+ * P0-3 + P1-7: the failed-refresh Actionable Notice — the last completed map
+ * stays mounted beneath it. Its Retry re-runs only the refresh and is named
+ * "Retry the map refresh" so it never shares an accessible name with the
+ * degraded-session Retry (App.tsx `DegradedSessionNotice`). Disabled, with
+ * the shared title, while the Graph Service isn't live. MUST STAY HOOKLESS:
+ * `ActionableNotice.test.ts` calls it directly.
+ */
+export function RefreshErrorNotice({
+  graphServiceAvailable,
+  message,
+  onRetry,
+}: {
+  graphServiceAvailable: boolean;
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <ActionableNotice
+      tone="warning"
+      action={
+        <button
+          type="button"
+          className={graphServiceAvailable ? undefined : SERVICE_UNAVAILABLE_CLASS}
+          onClick={onRetry}
+          disabled={!graphServiceAvailable}
+          title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
+          aria-label="Retry the map refresh"
+        >
+          Retry
+        </button>
+      }
+    >
+      Couldn&rsquo;t refresh the map — showing the last completed index ({message}).
+    </ActionableNotice>
+  );
+}
 
 export function CodeMap({
   projectPath,
@@ -4208,27 +4262,27 @@ export function CodeMap({
                 </div>
               </div>
             )}
-          {/* `BlastRadiusExpansionResult['error']` reuses the same inline
-              `notice notice--error` convention `DiffScopeResult['error']`
-              just above already uses (I/O Matrix: "`expandBlastRadius`
+          {/* `BlastRadiusExpansionResult['error']` renders as an inline
+              error `ActionableNotice`, the same shape the
+              `DiffScopeResult['error']` notice just below uses (I/O Matrix: "`expandBlastRadius`
               fails ... inline error notice in the PR Review toolbar, mirrors
               `diffScopeState`'s own error notice"). */}
           {diffScopeState.status === 'resolved' && blastRadiusState.status === 'error' && (
-            <p className="notice notice--error" role="alert">
+            <ActionableNotice tone="error" role="alert">
               {blastRadiusState.message}
-            </p>
+            </ActionableNotice>
           )}
 
-          {/* `DiffScopeResult['error']` reuses the same inline
-              `notice notice--error` convention `pathTrace.status ===
-              'error'` already uses just below in this file, rather than the
+          {/* `DiffScopeResult['error']` renders as an inline error
+              `ActionableNotice`, the same shape the `pathTrace.status ===
+              'error'` notice further down this file uses, rather than the
               full-canvas `.code-map__notice` — a genuine subprocess/`git`
               failure here still needs to surface somewhere (NFR4: no silent
               failure), but never blocks the still-interactive map. */}
           {diffScopeState.status === 'error' && (
-            <p className="notice notice--error" role="alert">
+            <ActionableNotice tone="error" role="alert">
               {diffScopeState.message}
-            </p>
+            </ActionableNotice>
           )}
         </div>
       )}
@@ -4238,18 +4292,11 @@ export function CodeMap({
           `loadCodeMap`'s full reset of viewport and history. */}
       {refreshError !== null && fetchState.status === 'ready' && (
         <div className="code-map__refresh-error" role="status">
-          <p className="notice notice--warning">
-            <span aria-hidden="true">⚠</span> Couldn&rsquo;t refresh the map — showing the last completed index ({refreshError}).{' '}
-            <button
-              type="button"
-              className={`code-map__refresh-retry${graphServiceAvailable ? '' : ` ${SERVICE_UNAVAILABLE_CLASS}`}`}
-              onClick={refreshCodeMap}
-              disabled={!graphServiceAvailable}
-              title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
-            >
-              Retry
-            </button>
-          </p>
+          <RefreshErrorNotice
+            graphServiceAvailable={graphServiceAvailable}
+            message={refreshError}
+            onRetry={refreshCodeMap}
+          />
         </div>
       )}
 
@@ -4261,7 +4308,11 @@ export function CodeMap({
 
       {fetchState.status === 'error' && (
         <div className="code-map__notice code-map__notice--error" role="alert">
-          <p>Couldn&rsquo;t load the Code Map: {fetchState.message}</p>
+          <p>
+            <span aria-hidden="true">{ACTIONABLE_NOTICE_GLYPHS.error}</span>{' '}
+            <span className="visually-hidden">{`${ACTIONABLE_NOTICE_SPOKEN_PREFIX.error} `}</span>
+            Couldn&rsquo;t load the Code Map: {fetchState.message}
+          </p>
           <button type="button" onClick={loadCodeMap}>
             Retry
           </button>
@@ -4507,18 +4558,17 @@ export function CodeMap({
               clickable route list over the cluster grid. See `CodeMapSurfaces`. */}
           {surfaces.pathTraceResult && (
             <>
-            {/* `no-path-found`/`error` reuse this file's existing ad hoc
-                notice convention (Design Notes) — the same compact
-                `notice`/`notice--*` treatment the Node Detail panel's own
-                Regenerate error already uses, rather than the full-canvas
+            {/* `no-path-found`/`error` use the shared `ActionableNotice`
+                shape (P1-7) — the same one the Node Detail panel's own
+                Regenerate error uses, rather than the full-canvas
                 `.code-map__notice` reserved above for a whole-map-replacing
                 state (loading/fetch-error/empty-map): this notice sits
                 alongside a still-interactive map, never over it. */}
             {pathTrace.status === 'no-path-found' && (
               <div className="code-map__path-trace-dismissable-notice">
-                <p className="notice notice--warning" role="status">
+                <ActionableNotice tone="info" role="status">
                   No path found for that query.
-                </p>
+                </ActionableNotice>
                 {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
                     the panel to `idle` — also driller's first clear-search
                     affordance, resolving Phase 2's deferred gap. */}
@@ -4532,9 +4582,9 @@ export function CodeMap({
               </div>
             )}
             {pathTrace.status === 'error' && (
-              <p className="notice notice--error" role="alert">
+              <ActionableNotice tone="error" role="alert">
                 {pathTrace.message}
-              </p>
+              </ActionableNotice>
             )}
 
             {pathTrace.status === 'ambiguous' && (
@@ -4557,9 +4607,9 @@ export function CodeMap({
               // untouched exact-id tier) — never a new "resume" IPC
               // parameter (Never).
               <div className="code-map__path-trace-steps-panel" role="region" aria-label="Multiple matches — pick one">
-                <p className="notice notice--warning" role="status">
+                <ActionableNotice tone="info" role="status">
                   Multiple matches found — pick one to trace:
-                </p>
+                </ActionableNotice>
                 <ol className="code-map__path-trace-steps">
                   {/* Review fix: render-layer cap (`MAX_RENDERED_AMBIGUOUS_CANDIDATES`,
                       see its own doc comment above) — `pathTrace.candidates`
@@ -4881,9 +4931,9 @@ export function CodeMap({
                 </button>
               )}
               {regenerateState.kind === 'error' && (
-                <p className="notice notice--error" role="alert">
+                <ActionableNotice tone="error" role="alert">
                   {regenerateState.message}
-                </p>
+                </ActionableNotice>
               )}
             </div>
           </div>

@@ -11,6 +11,7 @@ import type {
   ProjectOpenResult,
   RecentProject,
 } from '@driller/ipc-contracts';
+import { ActionableNotice } from './ActionableNotice';
 import { CodeMap, type CodeMapMode } from './CodeMap';
 import { Settings } from './Settings';
 import {
@@ -55,6 +56,30 @@ type Mode = CodeMapMode;
  */
 function normalizePathForComparisonLocal(projectPath: string): string {
   return projectPath.replace(/[\\/]+$/, '').toLowerCase();
+}
+
+/**
+ * P1-7: the degraded-session Actionable Notice — the Graph Service is down.
+ * Its Retry is named "Retry the Graph Service" so it never shares an
+ * accessible name with the map-refresh Retry (P0-3 follow-up). MUST STAY
+ * HOOKLESS: `ActionableNotice.test.ts` calls it directly.
+ */
+export function DegradedSessionNotice({ showRetry, onRetry }: { showRetry: boolean; onRetry: () => void }) {
+  return (
+    <ActionableNotice
+      tone="warning"
+      action={
+        showRetry ? (
+          <button type="button" onClick={onRetry} aria-label="Retry the Graph Service">
+            Retry
+          </button>
+        ) : undefined
+      }
+    >
+      The Graph Service is unavailable — the map shows the last completed index, and Path Trace, diff scope and
+      Regenerate are unavailable until it recovers.
+    </ActionableNotice>
+  );
 }
 
 export function App() {
@@ -736,14 +761,14 @@ export function App() {
             </button>
 
             {notice?.kind === 'not-a-git-repo' && (
-              <p className="notice notice--warning" role="status">
+              <ActionableNotice tone="warning" role="status">
                 <code>{notice.path}</code> is not a git repository. Choose another folder.
-              </p>
+              </ActionableNotice>
             )}
             {notice?.kind === 'error' && (
-              <p className="notice notice--error" role="alert">
+              <ActionableNotice tone="error" role="alert">
                 {notice.message}
-              </p>
+              </ActionableNotice>
             )}
           </section>
 
@@ -780,30 +805,17 @@ export function App() {
         // the pre-load screen that used to host it isn't on screen.
         <div className="session-notice" role="status">
           {sessionView.availability === 'refreshing' && (
-            <p className="notice notice--info">
-              <span aria-hidden="true">↻</span> Re-indexing — the map shows the last completed index until it finishes.
-            </p>
+            <ActionableNotice tone="progress">
+              Re-indexing — the map shows the last completed index until it finishes.
+            </ActionableNotice>
           )}
           {sessionView.availability === 'degraded' && (
-            <p className="notice notice--warning">
-              <span aria-hidden="true">⚠</span> The Graph Service is unavailable — the map shows the last completed
-              index, and Path Trace, diff scope and Regenerate are unavailable until it recovers.
-              {sessionView.showRetry && (
-                <>
-                  {' '}
-                  <button type="button" className="session-notice__retry" onClick={handleRetryGraphService}>
-                    Retry
-                  </button>
-                </>
-              )}
-            </p>
+            <DegradedSessionNotice showRetry={sessionView.showRetry} onRetry={handleRetryGraphService} />
           )}
           {/* No nested `role="alert"` — the enclosing `role="status"` region
               announces it. */}
           {notice?.kind === 'error' && (
-            <p className="notice notice--error">
-              <span aria-hidden="true">✕</span> {notice.message}
-            </p>
+            <ActionableNotice tone="error">{notice.message}</ActionableNotice>
           )}
         </div>
       )}
@@ -860,18 +872,23 @@ export function App() {
           surface). Its own `handleRetryMcpServer` (review finding, Critical
           — NOT `handleRetryGraphService`, whose default no-op-if-alive
           behavior would do nothing here) forces an actual subprocess
-          respawn via `restartGraphService(true)`. A plain-text message, not
-          `.badge` (review finding, Low): that class is a pill sized for
-          short single-line labels, and this notice's message is a
-          variable-length sentence that would wrap awkwardly inside one. */}
+          respawn via `restartGraphService(true)`. Rendered as a warning
+          `ActionableNotice` (P1-7), never `.badge` — a pill sized for short
+          labels, not a variable-length sentence — with its Retry named
+          "Retry the agent query surface" so it never shares an accessible
+          name with the other Retry buttons. */}
       {mcpServerStatus && mcpServerStatus.state === 'unavailable' && (
         <footer className="mcp-server-status" role="status">
-          <span className="mcp-server-status__message">
+          <ActionableNotice
+            tone="warning"
+            action={
+              <button type="button" onClick={handleRetryMcpServer} aria-label="Retry the agent query surface">
+                Retry
+              </button>
+            }
+          >
             Agent-Facing Query Surface unavailable: {mcpServerStatus.message}
-          </span>
-          <button type="button" className="mcp-server-status__retry" onClick={handleRetryMcpServer}>
-            Retry
-          </button>
+          </ActionableNotice>
         </footer>
       )}
 
