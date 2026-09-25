@@ -197,6 +197,24 @@ code,
   outline-offset: 2px;
 }
 
+/* P2-2: disabled until a project is open — muted, no pointer affordance.
+   Driven by `aria-disabled` (the radios stay focusable so the hint is heard). */
+.mode-switcher__option:has(input[aria-disabled='true']) {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.mode-switcher__option input[aria-disabled='true'] {
+  cursor: default;
+}
+
+.mode-switcher__hint {
+  color: var(--text-mute);
+  font-size: 10.5px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
 /*
  * Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
  * surface. A right-docked overlay, matching the Code Map's own source panel

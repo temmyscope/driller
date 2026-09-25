@@ -91,6 +91,16 @@ export function isStatusForCurrentProject(
   return !('path' in status) || status.path === currentProjectPath;
 }
 
+/**
+ * P2-2: the header mode switcher is enabled whenever a project is open —
+ * including while it is still indexing, before its map has loaded — and
+ * disabled on the landing screen, where the first-open mode rule would
+ * otherwise overwrite any pick.
+ */
+export function modeSwitcherEnabled({ currentProjectPath }: Pick<SessionViewInput, 'currentProjectPath'>): boolean {
+  return currentProjectPath !== null;
+}
+
 export interface SessionMapState {
   /** The project whose map has loaded; `null` means no map is mounted. */
   loadedProjectPath: string | null;

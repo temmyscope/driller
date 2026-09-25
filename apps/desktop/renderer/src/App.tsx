@@ -13,6 +13,7 @@ import type {
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
 import { CodeMap, type CodeMapMode } from './CodeMap';
+import { ModeSwitcher } from './ModeSwitcher';
 import { Settings } from './Settings';
 import {
   INITIAL_SESSION_MAP_STATE,
@@ -23,6 +24,7 @@ import {
   applyStatusToSessionMap,
   deriveSessionView,
   isStatusForCurrentProject,
+  modeSwitcherEnabled,
   type SessionMapState,
 } from './sessionView';
 
@@ -527,6 +529,9 @@ export function App() {
     setGraphServiceStatus(null);
     setNotice(null);
     setHardwareAdvisories(new Set());
+    // P2-2: with no project open the (disabled) switcher shows Code Map, not
+    // the closed project's mode; the first-open rule picks again on open.
+    setMode('codeMap');
     focusOpenFolderAfterCloseRef.current = true;
   }, [commitSessionMap]);
 
@@ -683,54 +688,8 @@ export function App() {
           )}
         </div>
         {/* Story 3.1 (Phase 2): the mode switcher — always visible in the
-            header regardless of `showMap` (Always: "mode is first-class
-            state, never a settings toggle", UX-DR9), mirroring
-            `.settings-panel__radio`'s existing radio-group precedent (a
-            native `<input type="radio">` group, not a custom control) but
-            laid out inline rather than inside a `<fieldset>`'s own
-            block-level legend, which would take visible space this header
-            row doesn't have. `role="radiogroup"`/`aria-label` gives it the
-            same accessible group semantics a `<fieldset>`/`<legend>` pair
-            would, matching the `role="toolbar" aria-label=...` convention
-            `CodeMap.tsx`'s own floated chrome already uses for an inline
-            control group with no room for a visible group label. */}
-        <div className="mode-switcher" role="radiogroup" aria-label="View mode">
-          <label className="mode-switcher__option">
-            <input
-              type="radio"
-              name="mode"
-              value="codeMap"
-              checked={mode === 'codeMap'}
-              onChange={() => setMode('codeMap')}
-            />
-            Code Map
-          </label>
-          <label className="mode-switcher__option">
-            <input
-              type="radio"
-              name="mode"
-              value="prReview"
-              checked={mode === 'prReview'}
-              onChange={() => setMode('prReview')}
-            />
-            PR Review Mode
-          </label>
-          {/* Story 4.1: Health Audit Mode is now a real, reachable third
-              option — wired like its `codeMap`/`prReview` siblings above
-              (no more `disabled`/`readOnly`/hardcoded `checked={false}`/
-              "Coming soon" text, since Epic 4 now has an actual
-              implementation to switch into). */}
-          <label className="mode-switcher__option">
-            <input
-              type="radio"
-              name="mode"
-              value="healthAudit"
-              checked={mode === 'healthAudit'}
-              onChange={() => setMode('healthAudit')}
-            />
-            Health Audit Mode
-          </label>
-        </div>
+            header, enabled once a project is open (see `ModeSwitcher.tsx`). */}
+        <ModeSwitcher mode={mode} enabled={modeSwitcherEnabled({ currentProjectPath })} onChange={setMode} />
         {/* P0-3: reachable whenever a project is open — including while it
             is still indexing on the pre-load screen — and the only route back
             to Recent Projects once its map has loaded. */}

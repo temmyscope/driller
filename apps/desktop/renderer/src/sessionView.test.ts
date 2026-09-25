@@ -17,9 +17,11 @@ import {
   applyStatusToSessionMap,
   deriveSessionView,
   isStatusForCurrentProject,
+  modeSwitcherEnabled,
   resolveRefreshOutcome,
   type SessionAvailability,
   type SessionMapState,
+  type SessionViewInput,
 } from './sessionView';
 
 const PROJECT = '/repo/a';
@@ -309,5 +311,22 @@ describe('resolveRefreshOutcome', () => {
       }),
       { kind: 'replace-with-error', message: 'down' },
     );
+  });
+});
+
+describe('modeSwitcherEnabled (P2-2)', () => {
+  it('is disabled with no project open', () => {
+    const input: SessionViewInput = { currentProjectPath: null, loadedProjectPath: null, status: null };
+    assert.equal(modeSwitcherEnabled(input), false);
+  });
+
+  it('is enabled once a project is open, before its map has loaded', () => {
+    const input: SessionViewInput = { currentProjectPath: PROJECT, loadedProjectPath: null, status: null };
+    assert.equal(modeSwitcherEnabled(input), true);
+  });
+
+  it('is enabled once the map has loaded', () => {
+    const input: SessionViewInput = { currentProjectPath: PROJECT, loadedProjectPath: PROJECT, status: null };
+    assert.equal(modeSwitcherEnabled(input), true);
   });
 });
