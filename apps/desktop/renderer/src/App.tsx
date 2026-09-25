@@ -104,6 +104,13 @@ export function App() {
   // Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
   // surface, opened via the gear-icon button in the header below.
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  // P2-5: Settings opened from the empty map's "Edit indexing scope" focuses
+  // the scope field; opened from the titlebar it doesn't.
+  const [settingsFocusProjectScope, setSettingsFocusProjectScope] = useState(false);
+  const handleOpenSettingsForScope = useCallback(() => {
+    setSettingsFocusProjectScope(true);
+    setIsSettingsOpen(true);
+  }, []);
   const [graphServiceStatus, setGraphServiceStatus] =
     useState<GraphServiceStatusMessage | null>(null);
   // The local-model download/verify status (Story 1.5 Phase 1, AD-18) — a
@@ -499,7 +506,14 @@ export function App() {
     [applyOpenResult, reportUnexpectedError],
   );
 
-  const handleRetryGraphService = useCallback(() => {
+  /**
+   * The Graph Service Retry: restarts the subprocess if it died and re-sends
+   * the index request (`restartGraphService()`, no force). Resolves whether
+   * the restart went out; a rejection is reported to the error notice.
+   * P2-5: shared by the degraded-session/footer Retry and the empty map's
+   * Re-index, which uses the result to end its pending state.
+   */
+  const restartGraphServiceForRetry = useCallback((): Promise<boolean> => {
     // A restart respawns the Graph Service subprocess with fresh module
     // state (review finding, Medium) — any advisory shown before Retry
     // belonged to the pre-restart session and must not linger on screen
@@ -510,8 +524,18 @@ export function App() {
     // P0-3: a previous Retry's failure is superseded by this attempt. Only an
     // `error` notice — e.g. a `not-a-git-repo` one is unrelated and stays.
     setNotice((current) => (current?.kind === 'error' ? null : current));
-    window.driller.restartGraphService().catch(reportUnexpectedError);
+    return window.driller.restartGraphService().then(
+      (result) => result.ok,
+      (error: unknown) => {
+        reportUnexpectedError(error);
+        return false;
+      },
+    );
   }, [reportUnexpectedError]);
+
+  const handleRetryGraphService = useCallback(() => {
+    void restartGraphServiceForRetry();
+  }, [restartGraphServiceForRetry]);
 
   /**
    * P1-3: the model-status footer's Retry — retries only the local-model
@@ -745,7 +769,10 @@ export function App() {
         <button
           type="button"
           className="app__settings-button"
-          onClick={() => setIsSettingsOpen(true)}
+          onClick={() => {
+            setSettingsFocusProjectScope(false);
+            setIsSettingsOpen(true);
+          }}
           aria-label="Settings"
           title="Settings"
         >
@@ -843,6 +870,8 @@ export function App() {
               graphServiceAvailable={graphServiceLive}
               dataVersion={sessionMap.dataVersion}
               onMapState={handleMapState}
+              onOpenSettings={handleOpenSettingsForScope}
+              onReindex={restartGraphServiceForRetry}
             />
           </section>
         </div>
@@ -966,8 +995,11 @@ export function App() {
           onIngestionResult={handleIngestionResult}
           onBackendSwitched={handleBackendSwitched}
           onProjectScopeApplied={handleProjectScopeApplied}
+          focusProjectScope={settingsFocusProjectScope}
           onClose={() => {
             setIsSettingsOpen(false);
+            // P2-5: the scope-field focus request belongs to one open only.
+            setSettingsFocusProjectScope(false);
             // Story 1.6 (Phase 2): the backend choice/key may have just
             // changed inside Settings — refresh `backendConfig` so
             // `noSummaryBackendAvailable`/`cloudSelectedNoKey` reflect it

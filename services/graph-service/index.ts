@@ -1366,11 +1366,14 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // Bug fix (2026-09-23): filtered post-normalization (cheaper — avoids
     // `filterCodeMapToScope`'s own internal normalize-for-match-test running
     // twice) — see `filterCodeMapToScope`'s own doc comment.
+    // P2-5: captured once, so the scope reported with the map is exactly the
+    // one this filter call used.
+    const appliedScope = [...activeIncludedPaths];
     const { nodes: normalizedNodes, edges } = filterCodeMapToScope(
       projectRoot,
       normalizedNodesUnfiltered,
       rawEdges,
-      activeIncludedPaths,
+      appliedScope,
     );
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
     // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
@@ -1403,7 +1406,22 @@ async function handleGetCodeMapRequest(): Promise<void> {
       blastRadiusAdjacency,
       coverage,
     );
-    postCodeMapMessage({ type: 'graphService:codeMap', nodes: nodesWithRiskSignals, edges });
+    // P2-5: how many Nodes the scope filter removed — reported with the map
+    // (and the scope that removed them) so an empty map can say the scope hid
+    // everything. Counted over the same set the map shows: `fetchCodeMap`
+    // returns only map-eligible Nodes (`CODE_MAP_NODES_QUERY`'s
+    // Function/Interface/Type/Module label filter), and every step after the
+    // scope filter maps 1:1, so `nodesWithRiskSignals.length ===
+    // normalizedNodes.length` and "this project's N Nodes" is never
+    // overcounted with non-eligible ones.
+    const hiddenByScope = normalizedNodesUnfiltered.length - normalizedNodes.length;
+    postCodeMapMessage({
+      type: 'graphService:codeMap',
+      nodes: nodesWithRiskSignals,
+      edges,
+      hiddenByScope,
+      appliedScope,
+    });
     // Review round (patch): passes `nodesWithRiskSignals`, not
     // `normalizedNodes` — `startSummaryGenerationForProject` caches its
     // argument into the module-level `activeCodeMapNodes` (its own doc

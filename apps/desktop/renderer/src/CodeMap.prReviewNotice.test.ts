@@ -45,12 +45,14 @@ const SHOWABLE: FetchState = {
   status: 'ready',
   nodes: [{ id: 'src/a.ts#a', name: 'a' } as unknown as ReadyNode],
   edges: [],
+  hiddenByScope: 0,
+  appliedScope: [],
 };
 
 const NOT_SHOWABLE: Record<string, FetchState> = {
   loading: { status: 'loading' },
   error: { status: 'error', message: 'boom' },
-  empty: { status: 'ready', nodes: [], edges: [] },
+  empty: { status: 'ready', nodes: [], edges: [], hiddenByScope: 0, appliedScope: [] },
 };
 
 const NOTICE_STATUSES: DiffScopeNoticeStatus[] = ['no-changes', 'not-a-git-repo', 'no-base-ref-resolvable'];

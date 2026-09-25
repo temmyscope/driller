@@ -899,11 +899,18 @@ code,
   line-height: 1.45;
 }
 
+/* P2-5: the empty-map Actionable Notice, centred on the empty canvas. */
+.code-map__notice > .actionable-notice {
+  max-width: min(40rem, 100%);
+}
+
 .code-map__notice--error {
   color: var(--risk-red);
 }
 
-.code-map__notice button {
+/* Direct child only: an Actionable Notice inside (P2-5's empty-map notice)
+   keeps its own action-button styling. */
+.code-map__notice > button {
   padding: 0.4rem 1rem;
   border-radius: 0;
   border: 1px solid var(--border);

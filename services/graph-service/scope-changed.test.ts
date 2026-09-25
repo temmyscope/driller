@@ -61,6 +61,8 @@ interface Posted {
   state?: string;
   nodes?: { file: string }[];
   message?: string;
+  hiddenByScope?: number;
+  appliedScope?: string[];
 }
 
 const port = new EventEmitter() as EventEmitter & { postMessage: (message: Posted) => void };
@@ -91,8 +93,8 @@ async function waitFor<T>(find: () => T | undefined, what: string): Promise<T> {
 const statusesSince = (from: number): string[] =>
   posted.slice(from).flatMap((message) => (message.type === undefined && message.state ? [message.state] : []));
 
-/** Posts `getCodeMap` and resolves with the reply's Node files. */
-async function fetchMapFiles(): Promise<string[]> {
+/** Posts `getCodeMap` and resolves with the `graphService:codeMap` reply. */
+async function fetchMap(): Promise<Posted> {
   const from = posted.length;
   send({ type: 'graphService:getCodeMap' });
   const reply = await waitFor(
@@ -103,7 +105,12 @@ async function fetchMapFiles(): Promise<string[]> {
     'a Code Map reply',
   );
   assert.equal(reply.type, 'graphService:codeMap', reply.message);
-  return (reply.nodes ?? []).map((node) => node.file);
+  return reply;
+}
+
+/** Posts `getCodeMap` and resolves with the reply's Node files. */
+async function fetchMapFiles(): Promise<string[]> {
+  return ((await fetchMap()).nodes ?? []).map((node) => node.file);
 }
 
 /** Posts an index request and resolves once its `indexed` (or `error`) status lands. */
@@ -133,6 +140,27 @@ describe('graphService:scopeChanged through index.ts', () => {
     send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
     assert.deepEqual(await fetchMapFiles(), ALL);
     assert.deepEqual(statusesSince(from), []);
+  });
+
+  it('P2-5: reports how many Nodes the scope filter removed, and the scope it used', async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    const unscoped = await fetchMap();
+    assert.equal(unscoped.hiddenByScope, 0);
+    assert.deepEqual(unscoped.appliedScope, []);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web', 'app'] });
+    const scoped = await fetchMap();
+    // 2 hidden: `d` (docs/c.ts) and `x` (webapp/d.ts — a sibling folder that
+    // only shares the `web` prefix); `w` (web/a.ts) and `a` (app/b.ts) stay.
+    assert.equal(scoped.hiddenByScope, 2);
+    assert.deepEqual(scoped.appliedScope, ['web', 'app']);
+    // A scope that matches nothing (a typo) hides every Node.
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['wbe'] });
+    const empty = await fetchMap();
+    assert.deepEqual(empty.nodes, []);
+    assert.equal(empty.hiddenByScope, ALL.length);
+    assert.deepEqual(empty.appliedScope, ['wbe']);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    assert.deepEqual(await fetchMapFiles(), ALL);
   });
 
   it('ignores a malformed scopeChanged', async () => {

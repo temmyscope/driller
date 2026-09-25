@@ -578,7 +578,25 @@ export interface CodeMapEdge {
  * state, since the backend genuinely has nothing more to say.
  */
 export type CodeMapResult =
-  | { status: 'ok'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
+  | {
+      status: 'ok';
+      nodes: CodeMapNode[];
+      edges: CodeMapEdge[];
+      /**
+       * P2-5: how many Nodes the project's indexing scope filter removed from
+       * this map (`filterCodeMapToScope`) — 0 when no scope is set. Lets the
+       * renderer tell "the scope hid everything" apart from "the project has
+       * no map-eligible Nodes" when `nodes` is empty.
+       */
+      hiddenByScope: number;
+      /**
+       * P2-5: the indexing scope the Graph Service actually filtered this map
+       * with (its `activeIncludedPaths` at filter time) — `[]` means no scope.
+       * Carried with the map so the empty-map notice names the scope that
+       * produced it, never a persisted value that may not have applied yet.
+       */
+      appliedScope: string[];
+    }
   | { status: 'error'; message: string };
 
 /**
@@ -629,7 +647,13 @@ export interface GraphServiceGetCodeMapRequest {
  * than `state` so main can route the two without ambiguity.
  */
 export type GraphServiceCodeMapMessage =
-  | { type: 'graphService:codeMap'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
+  | {
+      type: 'graphService:codeMap';
+      nodes: CodeMapNode[];
+      edges: CodeMapEdge[];
+      hiddenByScope: number;
+      appliedScope: string[];
+    }
   | { type: 'graphService:codeMapError'; message: string };
 
 // ---------------------------------------------------------------------------

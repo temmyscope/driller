@@ -75,6 +75,7 @@ import {
   setActiveBackend,
   setCloudApiKey,
 } from './backend-settings';
+import { toOkCodeMapResult } from './code-map-reply';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
@@ -785,11 +786,16 @@ function spawnGraphService(): void {
         | McpServerStatusMessage,
     ) => {
       if (isCodeMapMessage(message)) {
-        settlePendingCodeMapRequest(
-          message.type === 'graphService:codeMap'
-            ? { status: 'ok', nodes: message.nodes, edges: message.edges }
-            : { status: 'error', message: message.message },
-        );
+        if (message.type === 'graphService:codeMap') {
+          // P2-5: the scope fields are validated here, at the process boundary.
+          const { result, replaced } = toOkCodeMapResult(message);
+          if (replaced.length > 0) {
+            console.warn(`Code Map reply had malformed ${replaced.join(' and ')}; replaced with the no-scope default.`);
+          }
+          settlePendingCodeMapRequest(result);
+        } else {
+          settlePendingCodeMapRequest({ status: 'error', message: message.message });
+        }
         return;
       }
       if (isRegenerateNodeResultMessage(message)) {

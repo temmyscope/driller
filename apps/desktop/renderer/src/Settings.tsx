@@ -79,6 +79,11 @@ interface SettingsProps {
    */
   onProjectScopeApplied: () => void;
   /**
+   * P2-5: true when Settings was opened from the empty map's "Edit indexing
+   * scope" — the scope field takes focus once it has loaded.
+   */
+  focusProjectScope?: boolean;
+  /**
    * Absolute, OS-native path of the currently open project, or `null` when
    * none is open (Story 2.3, Phase 1) — PR-bot opt-in is per-project, so
    * this is the one piece of state this component needs from its caller
@@ -276,9 +281,22 @@ export function Settings({
   onClose,
   onBackendSwitched,
   onProjectScopeApplied,
+  focusProjectScope = false,
   projectPath,
   onIngestionResult,
 }: SettingsProps) {
+  // P2-5: opened from the empty map's "Edit indexing scope", the scope
+  // field (or, if the scope failed to load, its Retry) takes focus when it
+  // mounts after the async load — once per open: the ref stops a later
+  // remount (a reload of the scope) from pulling focus back.
+  const scopeFocusDoneRef = useRef(false);
+  const focusScopeOnce = useCallback((element: HTMLElement | null) => {
+    if (element === null || scopeFocusDoneRef.current) {
+      return;
+    }
+    scopeFocusDoneRef.current = true;
+    element.focus();
+  }, []);
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
@@ -1177,7 +1195,12 @@ export function Settings({
               tone="error"
               role="alert"
               action={
-                <button type="button" onClick={refetchProjectScope} aria-label="Retry loading the indexing scope">
+                <button
+                  ref={focusProjectScope ? focusScopeOnce : undefined}
+                  type="button"
+                  onClick={refetchProjectScope}
+                  aria-label="Retry loading the indexing scope"
+                >
                   Retry
                 </button>
               }
@@ -1196,6 +1219,7 @@ export function Settings({
               <label className="settings-panel__project-scope-label">
                 Included subfolders
                 <input
+                  ref={focusProjectScope ? focusScopeOnce : undefined}
                   type="text"
                   value={projectScopeInput}
                   disabled={projectScopeSaving}

@@ -193,7 +193,7 @@ function refetchLoadedMap(state: SessionMapState): SessionMapState {
 // ---------------------------------------------------------------------------
 
 export type CodeMapFetchReply =
-  | { kind: 'ok'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
+  | { kind: 'ok'; nodes: CodeMapNode[]; edges: CodeMapEdge[]; hiddenByScope: number; appliedScope: string[] }
   | { kind: 'failed'; message: string };
 
 export type NodeDetailRefresh =
@@ -205,7 +205,15 @@ export type RefreshOutcome =
   /** A newer load/refresh superseded this reply — apply nothing. */
   | { kind: 'ignore' }
   /** Swap in the fresh data (viewport/history untouched) and update Node Detail. */
-  | { kind: 'apply'; nodes: CodeMapNode[]; edges: CodeMapEdge[]; nodeDetail: NodeDetailRefresh }
+  | {
+      kind: 'apply';
+      nodes: CodeMapNode[];
+      edges: CodeMapEdge[];
+      /** P2-5: both carried through from the reply for the empty-map notice. */
+      hiddenByScope: number;
+      appliedScope: string[];
+      nodeDetail: NodeDetailRefresh;
+    }
   /** The refresh failed but a completed map is on screen: keep it, and say the refresh failed. */
   | { kind: 'keep-with-error'; message: string }
   /** The refresh failed with no completed map to fall back to: show the full error state. */
@@ -241,5 +249,12 @@ export function resolveRefreshOutcome({
     const fresh = reply.nodes.find((node) => node.id === openDetailNodeId);
     nodeDetail = fresh === undefined ? { kind: 'close' } : { kind: 'repoint', node: fresh };
   }
-  return { kind: 'apply', nodes: reply.nodes, edges: reply.edges, nodeDetail };
+  return {
+    kind: 'apply',
+    nodes: reply.nodes,
+    edges: reply.edges,
+    hiddenByScope: reply.hiddenByScope,
+    appliedScope: reply.appliedScope,
+    nodeDetail,
+  };
 }

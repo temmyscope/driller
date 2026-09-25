@@ -238,7 +238,7 @@ describe('session map transitions', () => {
 });
 
 describe('resolveRefreshOutcome', () => {
-  const ok = { kind: 'ok' as const, nodes: [node('n1'), node('n2')], edges: [] };
+  const ok = { kind: 'ok' as const, nodes: [node('n1'), node('n2')], edges: [], hiddenByScope: 3, appliedScope: ['web'] };
 
   it('ignores a reply superseded by a newer load or refresh', () => {
     assert.deepEqual(
@@ -260,7 +260,22 @@ describe('resolveRefreshOutcome', () => {
   it('ok with Node Detail closed: new data, detail unchanged', () => {
     assert.deepEqual(
       resolveRefreshOutcome({ requestId: 3, latestRequestId: 3, reply: ok, hasReadyData: true, openDetailNodeId: null }),
-      { kind: 'apply', nodes: ok.nodes, edges: [], nodeDetail: { kind: 'unchanged' } },
+      {
+        kind: 'apply',
+        nodes: ok.nodes,
+        edges: [],
+        hiddenByScope: 3,
+        appliedScope: ['web'],
+        nodeDetail: { kind: 'unchanged' },
+      },
+    );
+  });
+
+  it('P2-5: an empty map emptied by the scope keeps hiddenByScope and appliedScope through a refresh', () => {
+    const emptied = { kind: 'ok' as const, nodes: [], edges: [], hiddenByScope: 229, appliedScope: ['wbe'] };
+    assert.deepEqual(
+      resolveRefreshOutcome({ requestId: 4, latestRequestId: 4, reply: emptied, hasReadyData: true, openDetailNodeId: 'n1' }),
+      { kind: 'apply', nodes: [], edges: [], hiddenByScope: 229, appliedScope: ['wbe'], nodeDetail: { kind: 'close' } },
     );
   });
 

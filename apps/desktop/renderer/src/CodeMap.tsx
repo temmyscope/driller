@@ -105,7 +105,15 @@ import { mapFooterState, type MapFooterState } from './appFrame';
 
 export type FetchState =
   | { status: 'loading' }
-  | { status: 'ready'; nodes: CodeMapNode[]; edges: CodeMapEdge[] }
+  | {
+      status: 'ready';
+      nodes: CodeMapNode[];
+      edges: CodeMapEdge[];
+      /** P2-5: Nodes the indexing scope filter removed (`CodeMapResult.hiddenByScope`). */
+      hiddenByScope: number;
+      /** P2-5: the scope that filter used (`CodeMapResult.appliedScope`); `[]` means none. */
+      appliedScope: string[];
+    }
   | { status: 'error'; message: string };
 
 type SourceViewState =
@@ -2414,6 +2422,18 @@ export interface CodeMapProps {
    * no longer open.
    */
   onMapState: (projectPath: string | null, state: MapFooterState) => void;
+  /**
+   * P2-5: the empty-map scope notice's "Edit indexing scope" — `App.tsx`
+   * opens Settings (focused on the scope field).
+   */
+  onOpenSettings: () => void;
+  /**
+   * P2-5: the genuinely-empty-map notice's "Re-index" — the Graph Service
+   * Retry path (`restartGraphService()`, no force), which re-sends the index
+   * request. Resolves `false` when the restart failed or was rejected (App
+   * has already reported it), so the button's pending state can end.
+   */
+  onReindex: () => Promise<boolean>;
 }
 
 /** P0-3: the `title` every Graph-Service-backed action carries while it's disabled for not being live. */
@@ -2465,6 +2485,130 @@ export function RefreshErrorNotice({
   );
 }
 
+/**
+ * P2-5: which empty-map notice a `ready` map with zero Nodes gets. The Graph
+ * Service reports how many Nodes its scope filter removed
+ * (`hiddenByScope`), so "the scope hid everything" (most likely a typo like
+ * `wbe`) is told apart from "the project genuinely has none".
+ */
+export type EmptyMapCase = { kind: 'scope-hid-everything'; hiddenCount: number } | { kind: 'no-map-eligible-nodes' };
+
+export function chooseEmptyMapCase(hiddenByScope: number): EmptyMapCase {
+  return hiddenByScope > 0 ? { kind: 'scope-hid-everything', hiddenCount: hiddenByScope } : { kind: 'no-map-eligible-nodes' };
+}
+
+/**
+ * P2-5: the scope case's one sentence. `appliedScope` is the scope the Graph
+ * Service filtered this very map with (`CodeMapResult.appliedScope`), so it
+ * never names a scope that didn't produce the map; `[]` omits the list.
+ */
+export function emptyMapScopeSentence(appliedScope: readonly string[], hiddenCount: number): string {
+  const scope = appliedScope.length > 0 ? ` (${appliedScope.join(', ')})` : '';
+  const nodes = hiddenCount === 1 ? '1 Node' : `${hiddenCount} Nodes`;
+  return `The indexing scope${scope} matches none of this project's ${nodes}.`;
+}
+
+export const EMPTY_MAP_NO_NODES_SENTENCE =
+  'This project has no map-eligible Nodes (no Function/Interface/Type/Module found).';
+
+/** P2-5: what was on screen when Re-index was clicked. */
+export interface ReindexClickSnapshot {
+  fetchState: FetchState;
+  refreshError: string | null;
+}
+
+/**
+ * P2-5: a Re-index stays pending only while the screen still shows what it
+ * showed at the click — any new `fetchState` (the re-index's refresh landed)
+ * or a new refresh error ends it. A failed or rejected restart ends it by
+ * clearing the snapshot.
+ */
+export function isReindexPending(
+  click: ReindexClickSnapshot | null,
+  current: { fetchState: FetchState; refreshError: string | null },
+): boolean {
+  return click !== null && click.fetchState === current.fetchState && click.refreshError === current.refreshError;
+}
+
+/**
+ * P2-5: the Re-index button's state. Disabled while the Graph Service is
+ * down (P0-3's unavailable treatment) or while a Re-index is already
+ * pending — a second click would only stack another restart.
+ */
+export function reindexButtonState({
+  graphServiceAvailable,
+  reindexPending,
+}: {
+  graphServiceAvailable: boolean;
+  reindexPending: boolean;
+}): { label: string; disabled: boolean; className: string | undefined; title: string | undefined } {
+  return {
+    label: reindexPending ? 'Re-indexing…' : 'Re-index',
+    disabled: reindexPending || !graphServiceAvailable,
+    className: graphServiceAvailable ? undefined : SERVICE_UNAVAILABLE_CLASS,
+    title: graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE,
+  };
+}
+
+/**
+ * P2-5: the empty-map Actionable Notice — one sentence, exactly one action.
+ * Scope hid everything → "Edit indexing scope" (opens Settings); otherwise →
+ * "Re-index" (the Graph Service Retry path; see `reindexButtonState`). No
+ * role of its own: the call site wraps it in a `role="status"` region, and
+ * live regions must not nest. MUST STAY HOOKLESS:
+ * `CodeMap.emptyMap.test.ts` calls it directly.
+ */
+export function EmptyMapNotice({
+  hiddenByScope,
+  appliedScope,
+  graphServiceAvailable,
+  reindexPending,
+  onOpenSettings,
+  onReindex,
+}: {
+  hiddenByScope: number;
+  appliedScope: readonly string[];
+  graphServiceAvailable: boolean;
+  reindexPending: boolean;
+  onOpenSettings: () => void;
+  onReindex: () => void;
+}) {
+  const emptyCase = chooseEmptyMapCase(hiddenByScope);
+  if (emptyCase.kind === 'scope-hid-everything') {
+    return (
+      <ActionableNotice
+        tone="info"
+        action={
+          <button type="button" onClick={onOpenSettings}>
+            Edit indexing scope
+          </button>
+        }
+      >
+        {emptyMapScopeSentence(appliedScope, emptyCase.hiddenCount)}
+      </ActionableNotice>
+    );
+  }
+  const reindex = reindexButtonState({ graphServiceAvailable, reindexPending });
+  return (
+    <ActionableNotice
+      tone="info"
+      action={
+        <button
+          type="button"
+          className={reindex.className}
+          onClick={onReindex}
+          disabled={reindex.disabled}
+          title={reindex.title}
+        >
+          {reindex.label}
+        </button>
+      }
+    >
+      {EMPTY_MAP_NO_NODES_SENTENCE}
+    </ActionableNotice>
+  );
+}
+
 export function CodeMap({
   projectPath,
   noSummaryBackendAvailable,
@@ -2474,6 +2618,8 @@ export function CodeMap({
   graphServiceAvailable,
   dataVersion,
   onMapState,
+  onOpenSettings,
+  onReindex,
 }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   // P2-3: report every `fetchState` change, not just count changes — a Retry
@@ -2495,6 +2641,21 @@ export function CodeMap({
   // P0-3: a failed `refreshCodeMap` — shown as a map-level notice over the
   // still-mounted last completed map, never by replacing it.
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  // P2-5: the empty map's Re-index is pending from its click until the next
+  // `fetchState` change, a refresh error, or a failed/rejected restart — the
+  // snapshot records what was on screen at the click (`isReindexPending`).
+  const [reindexClick, setReindexClick] = useState<ReindexClickSnapshot | null>(null);
+  const reindexPending = isReindexPending(reindexClick, { fetchState, refreshError });
+  const handleReindex = useCallback(() => {
+    const snapshot: ReindexClickSnapshot = { fetchState, refreshError };
+    setReindexClick(snapshot);
+    void onReindex().then((ok) => {
+      if (!ok) {
+        // Only end the pending state this click started.
+        setReindexClick((current) => (current === snapshot ? null : current));
+      }
+    });
+  }, [fetchState, refreshError, onReindex]);
   const [sourceView, setSourceView] = useState<SourceViewState>({ status: 'closed' });
   // Story 1.10 (Phase 2): the source overlay's "Open in external editor"
   // button state — kept separate from `sourceView` itself (the overlay's
@@ -2790,7 +2951,13 @@ export function CodeMap({
       import('./devFixture')
         .then(({ generateSyntheticCodeMap }) => {
           const synthetic = generateSyntheticCodeMap(fixtureNodeCount, DEV_FIXTURE_EDGE_FANOUT);
-          setFetchState({ status: 'ready', nodes: synthetic.nodes, edges: synthetic.edges });
+          setFetchState({
+            status: 'ready',
+            nodes: synthetic.nodes,
+            edges: synthetic.edges,
+            hiddenByScope: 0,
+            appliedScope: [],
+          });
         })
         .catch((error: unknown) => {
           setFetchState({
@@ -2807,7 +2974,13 @@ export function CodeMap({
           return;
         }
         if (result.status === 'ok') {
-          setFetchState({ status: 'ready', nodes: result.nodes, edges: result.edges });
+          setFetchState({
+            status: 'ready',
+            nodes: result.nodes,
+            edges: result.edges,
+            hiddenByScope: result.hiddenByScope,
+            appliedScope: result.appliedScope,
+          });
         } else {
           setFetchState({ status: 'error', message: result.message });
         }
@@ -2881,7 +3054,13 @@ export function CodeMap({
           setFetchState({ status: 'error', message: outcome.message });
           return;
         case 'apply':
-          setFetchState({ status: 'ready', nodes: outcome.nodes, edges: outcome.edges });
+          setFetchState({
+            status: 'ready',
+            nodes: outcome.nodes,
+            edges: outcome.edges,
+            hiddenByScope: outcome.hiddenByScope,
+            appliedScope: outcome.appliedScope,
+          });
           if (outcome.nodeDetail.kind === 'close') {
             updateNodeDetail({ status: 'closed' });
             setRegenerateState({ kind: 'idle' });
@@ -2896,7 +3075,13 @@ export function CodeMap({
       .then((result) => {
         settle(
           result.status === 'ok'
-            ? { kind: 'ok', nodes: result.nodes, edges: result.edges }
+            ? {
+                kind: 'ok',
+                nodes: result.nodes,
+                edges: result.edges,
+                hiddenByScope: result.hiddenByScope,
+                appliedScope: result.appliedScope,
+              }
             : { kind: 'failed', message: result.message },
         );
       })
@@ -4582,7 +4767,14 @@ export function CodeMap({
 
       {fetchState.status === 'ready' && fetchState.nodes.length === 0 && (
         <div className="code-map__notice" role="status">
-          This project has no map-eligible Nodes (no Function/Interface/Type/Module found).
+          <EmptyMapNotice
+            hiddenByScope={fetchState.hiddenByScope}
+            appliedScope={fetchState.appliedScope}
+            graphServiceAvailable={graphServiceAvailable}
+            reindexPending={reindexPending}
+            onOpenSettings={onOpenSettings}
+            onReindex={handleReindex}
+          />
         </div>
       )}
 
