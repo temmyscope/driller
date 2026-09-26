@@ -78,6 +78,7 @@ import {
   type NodeProps,
   type OnMove,
   type ReactFlowInstance,
+  useStoreApi,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type {
@@ -284,6 +285,14 @@ type BlastRadiusState =
 const NODE_COLUMN_GAP = 260;
 const NODE_ROW_GAP = 110;
 
+// FIX-1: a Node card's size when `@xyflow/react` hasn't measured it (a card
+// still folded into an LOD cluster has no DOM, so no `measured` size). An
+// estimate of the rendered `.code-map__node` card (min-width 160px plus
+// padding, identifier + one-line summary + signal strip), used only to find
+// the card's centre for `routeFitRequest`'s anchor; a measured size wins.
+const NODE_CARD_FALLBACK_WIDTH = 200;
+const NODE_CARD_FALLBACK_HEIGHT = 80;
+
 // `@xyflow/react`'s own default `minZoom` is 0.5 — found, via this story's
 // live CDP verification, to silently clamp `fitView`'s computed zoom for
 // EVERY map size (a 10,000-Node fixture's natural fit zoom is ~0.05, but it
@@ -310,7 +319,24 @@ const MIN_ZOOM_REAL = 0.1;
 // gates full rendering on `viewportBounds` (review finding — see
 // `map/lod/index.ts`'s doc comment): crossing this threshold only promotes
 // Nodes actually on screen, never the whole dataset at once.
-const LOD_ZOOM_THRESHOLD = 0.2;
+export const LOD_ZOOM_THRESHOLD = 0.2;
+
+// FIX-1: the lowest zoom a Path Trace / neighbour-trace fit may land at.
+// `LOD_ZOOM_THRESHOLD` plus a margin, so float drift and `quantizeZoomBand`'s
+// banding can never drop the fitted view back under the threshold (where
+// every card collapses into cluster dots and the highlighted route vanishes).
+export const ROUTE_MIN_READABLE_ZOOM = 0.25;
+
+// The map's zoom ceiling: passed to `<ReactFlow maxZoom>` below and used as
+// `routeViewport`'s cap, so a route fit can't disagree with the map. 2 is
+// `@xyflow/react`'s own default, i.e. what the map allowed before FIX-1.
+const MAP_MAX_ZOOM = 2;
+
+// `fitBounds`' own default padding (`options.padding ?? 0.1`): a fraction
+// that shrinks the usable viewport to `size / (1 + padding)`. `fitViewToPath`
+// folds it into the bounds it hands `routeViewport`, so a compact route fits
+// exactly as it did before FIX-1.
+const ROUTE_FIT_PADDING = 0.1;
 
 // A single spatial-grid cell can cover an enormous share of the map at
 // extreme zoom-out (live CDP verification found a single cluster holding
@@ -353,7 +379,7 @@ const FIXTURE_NODE_COUNT_MAX = 50_000;
 // decision in `computeLOD` is never blurred by banding. Pan is quantized
 // separately, as a fraction of the current (banded) viewport size, so
 // dragging less than a quarter-viewport doesn't trigger a recompute either.
-function quantizeZoomBand(zoom: number, threshold: number): number {
+export function quantizeZoomBand(zoom: number, threshold: number): number {
   const safeZoom = Math.max(zoom, 1e-6);
   const power = Math.floor(Math.log2(safeZoom / threshold));
   return threshold * 2 ** power;
@@ -469,6 +495,194 @@ function resolveZoomToRevealNode({
   // own `zoom >= threshold` check once the viewport is centered on the
   // target (guaranteeing `bucketInView`).
   return threshold;
+}
+
+interface Point {
+  x: number;
+  y: number;
+}
+interface Size {
+  width: number;
+  height: number;
+}
+interface Rect extends Point, Size {}
+
+export interface RouteViewportParams {
+  bounds: Rect;
+  anchor: Point;
+  viewport: Size;
+  minReadableZoom: number;
+  maxZoom: number;
+}
+
+const isFiniteNumber = (value: number) => Number.isFinite(value);
+
+/**
+ * FIX-1: the viewport a traced route is fitted to. Same maths as
+ * `fitBounds` (centre the bounds at `min(width / bounds.width, height /
+ * bounds.height)`, capped at `maxZoom`; padding is the caller's job, folded
+ * into `bounds`) as long as that zoom stays readable. A route that only fits
+ * below `minReadableZoom` would render as cluster dots, so the zoom is
+ * clamped to the floor and the view centres on `anchor` (the centre of the
+ * route's first Node: the entry point, or a neighbour trace's origin)
+ * instead; `clamped` tells the step panel to say the route extends past the
+ * view.
+ *
+ * Zero-size bounds (a single-Node route) divide to `Infinity`, which the
+ * `maxZoom` cap turns into a plain centre-on-it at `maxZoom` (the spec's
+ * single-Node row). An unusable viewport (zero, negative or non-finite) or
+ * non-finite/negative bounds can't be fitted, so they get the safe clamped
+ * view on the anchor — never a NaN. The floor itself never exceeds
+ * `maxZoom`.
+ */
+export function routeViewport({
+  bounds,
+  anchor,
+  viewport,
+  minReadableZoom,
+  maxZoom,
+}: RouteViewportParams): { x: number; y: number; zoom: number; clamped: boolean } {
+  const floor = Math.min(minReadableZoom, maxZoom);
+  const viewportUsable =
+    isFiniteNumber(viewport.width) && isFiniteNumber(viewport.height) && viewport.width > 0 && viewport.height > 0;
+  const halfWidth = viewportUsable ? viewport.width / 2 : 0;
+  const halfHeight = viewportUsable ? viewport.height / 2 : 0;
+  const boundsUsable =
+    [bounds.x, bounds.y, bounds.width, bounds.height].every(isFiniteNumber) && bounds.width >= 0 && bounds.height >= 0;
+  if (viewportUsable && boundsUsable) {
+    const fitZoom = Math.min(maxZoom, viewport.width / bounds.width, viewport.height / bounds.height);
+    if (fitZoom >= floor) {
+      const centerX = bounds.x + bounds.width / 2;
+      const centerY = bounds.y + bounds.height / 2;
+      return { x: halfWidth - centerX * fitZoom, y: halfHeight - centerY * fitZoom, zoom: fitZoom, clamped: false };
+    }
+  }
+  const anchorX = isFiniteNumber(anchor.x) ? anchor.x : 0;
+  const anchorY = isFiniteNumber(anchor.y) ? anchor.y : 0;
+  return { x: halfWidth - anchorX * floor, y: halfHeight - anchorY * floor, zoom: floor, clamped: true };
+}
+
+/**
+ * FIX-1: what `fitViewToPath` should do for `path`, as a pure decision.
+ * `positionsById` holds each route Node's absolute (world) top-left
+ * position; `cardSize` is the first Node's card size (measured, or the
+ * fallback constants), used to anchor on that card's centre rather than its
+ * top-left corner.
+ *
+ * - `null`: none of the route's Nodes has a position (nothing to fit).
+ * - `{ fallback }`: the container isn't measured, so the caller uses
+ *   `fitBounds` with these (unpadded — `fitBounds` pads itself) bounds, and
+ *   the anchor for clamping its result up to the floor.
+ * - `{ params }`: `routeViewport`'s input, with `fitBounds`' default 10%
+ *   padding folded into the bounds so an unclamped fit lands exactly where
+ *   `fitBounds` used to put it.
+ */
+export function routeFitRequest(
+  path: readonly string[],
+  positionsById: ReadonlyMap<string, Point>,
+  cardSize: Size,
+  containerSize: Size,
+): { fallback: { bounds: Rect; anchor: Point } } | { params: RouteViewportParams } | null {
+  const positions = path
+    .map((id) => positionsById.get(id))
+    .filter((position): position is Point => position !== undefined);
+  if (positions.length === 0) {
+    return null;
+  }
+  // Review fix: `Math.min(...positions.map(...))`-style spread has a
+  // practical engine argument-count ceiling well under this app's own
+  // validated 10,000-Node scale (Story 1.3 Phase 2) — a large enough
+  // `found` path would throw a `RangeError` here. `.reduce()` has no
+  // such limit.
+  const firstPosition = positions[0]!;
+  const minX = positions.reduce((min, position) => Math.min(min, position.x), firstPosition.x);
+  const maxX = positions.reduce((max, position) => Math.max(max, position.x), firstPosition.x);
+  const minY = positions.reduce((min, position) => Math.min(min, position.y), firstPosition.y);
+  const maxY = positions.reduce((max, position) => Math.max(max, position.y), firstPosition.y);
+  // Padded by roughly one Node card's own footprint on each side (the
+  // same `NODE_COLUMN_GAP`/`NODE_ROW_GAP` grid spacing `layoutNodes`
+  // lays every card out on) so a card sitting exactly at the bounding
+  // box's edge isn't clipped flush against the viewport border.
+  const bounds = {
+    x: minX - NODE_COLUMN_GAP / 2,
+    y: minY - NODE_ROW_GAP / 2,
+    width: maxX - minX + NODE_COLUMN_GAP,
+    height: maxY - minY + NODE_ROW_GAP,
+  };
+  // The route's first Node: a `found` path's entry point, or a neighbour
+  // trace's origin (`neighborTrace` puts it first).
+  const first = (path[0] !== undefined ? positionsById.get(path[0]) : undefined) ?? firstPosition;
+  const anchor = { x: first.x + cardSize.width / 2, y: first.y + cardSize.height / 2 };
+  const measured =
+    isFiniteNumber(containerSize.width) &&
+    isFiniteNumber(containerSize.height) &&
+    containerSize.width > 0 &&
+    containerSize.height > 0;
+  if (!measured) {
+    return { fallback: { bounds, anchor } };
+  }
+  const paddedWidth = bounds.width * (1 + ROUTE_FIT_PADDING);
+  const paddedHeight = bounds.height * (1 + ROUTE_FIT_PADDING);
+  return {
+    params: {
+      bounds: {
+        x: bounds.x - (paddedWidth - bounds.width) / 2,
+        y: bounds.y - (paddedHeight - bounds.height) / 2,
+        width: paddedWidth,
+        height: paddedHeight,
+      },
+      anchor,
+      viewport: { width: containerSize.width, height: containerSize.height },
+      minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
+      maxZoom: MAP_MAX_ZOOM,
+    },
+  };
+}
+
+/** FIX-1: the last route fit — which route array it was for, and whether it clamped. */
+export interface RouteFit {
+  route: readonly string[];
+  clamped: boolean;
+}
+
+/**
+ * FIX-1: whether the step panel should say the route extends past the view.
+ * Only while the showing trace is the one that was fitted: compared by
+ * reference against the exact array `fitViewToPath` was handed (`found`'s
+ * `path`, `neighbors`' `nodeIds`), so any reset or new trace — a different
+ * object — drops the line.
+ */
+export function isRouteClamped(routeFit: RouteFit | null, pathTrace: PathTraceState): boolean {
+  if (routeFit === null || !routeFit.clamped) {
+    return false;
+  }
+  if (pathTrace.status === 'found') {
+    return routeFit.route === pathTrace.path;
+  }
+  if (pathTrace.status === 'neighbors') {
+    return routeFit.route === pathTrace.nodeIds;
+  }
+  return false;
+}
+
+/**
+ * FIX-1: the extends-beyond line's text. When the step list is also capped
+ * (a neighbour trace past `MAX_RENDERED_NEIGHBORS`), the cap folds into the
+ * same sentence rather than a second line.
+ */
+export function routeExtendsBeyondText(listed?: { shown: number; total: number }): string {
+  return listed
+    ? `The route extends beyond the view — use the steps to follow it (first ${listed.shown} of ${listed.total} listed).`
+    : 'The route extends beyond the view — use the steps to follow it.';
+}
+
+/** FIX-1: the muted extends-beyond line, shared by both step panels. Hookless. */
+export function RouteExtendsBeyondLine({ listed }: { listed?: { shown: number; total: number } }) {
+  return (
+    <p className="code-map__path-trace-candidates-truncated" role="status">
+      {routeExtendsBeyondText(listed)}
+    </p>
+  );
 }
 
 /**
@@ -749,6 +963,7 @@ export function NeighborTraceSteps({
   resolveNode,
   onNavigate,
   onDismiss,
+  routeClamped = false,
 }: {
   originId: string;
   originName: string;
@@ -757,6 +972,8 @@ export function NeighborTraceSteps({
   resolveNode: (id: string) => { name: string; file: string | undefined };
   onNavigate: (id: string) => void;
   onDismiss: () => void;
+  /** FIX-1: `routeViewport` clamped the fit, so the fan runs past the view. */
+  routeClamped?: boolean;
 }) {
   const heading = neighborTraceHeading(originName, direction, neighborIds.length);
   const shownIds = neighborIds.slice(0, MAX_RENDERED_NEIGHBORS);
@@ -790,12 +1007,140 @@ export function NeighborTraceSteps({
           );
         })}
       </ul>
-      {neighborIds.length > MAX_RENDERED_NEIGHBORS && (
-        <p className="code-map__path-trace-candidates-truncated">
-          Showing the first {MAX_RENDERED_NEIGHBORS} of {neighborIds.length}. All of them are highlighted on the map.
-        </p>
+      {routeClamped ? (
+        <RouteExtendsBeyondLine
+          {...(neighborIds.length > MAX_RENDERED_NEIGHBORS
+            ? { listed: { shown: MAX_RENDERED_NEIGHBORS, total: neighborIds.length } }
+            : {})}
+        />
+      ) : (
+        neighborIds.length > MAX_RENDERED_NEIGHBORS && (
+          <p className="code-map__path-trace-candidates-truncated">
+            Showing the first {MAX_RENDERED_NEIGHBORS} of {neighborIds.length}. All of them are highlighted on the map.
+          </p>
+        )
       )}
       <button type="button" className="code-map__path-trace-dismiss" onClick={onDismiss}>
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+/** FIX-1: the slice of `@xyflow/react`'s store `fitViewToPath` reads. */
+type FlowStoreSize = { getState: () => { width: number; height: number } };
+
+/**
+ * FIX-1: hands `<CodeMap>` a handle on `@xyflow/react`'s store. `CodeMap`
+ * renders `<ReactFlow>` itself (no `ReactFlowProvider` above it), so only a
+ * child of `<ReactFlow>` can reach the store; this one renders nothing.
+ */
+function ReactFlowStoreBridge({ storeRef }: { storeRef: { current: FlowStoreSize | null } }) {
+  const store = useStoreApi();
+  useEffect(() => {
+    storeRef.current = store;
+    return () => {
+      storeRef.current = null;
+    };
+  }, [store, storeRef]);
+  return null;
+}
+
+/**
+ * Story 1.9 (Phase 2): the step panel for a `'found'` Path Trace state —
+ * extracted (FIX-1) as a hookless component, like `NeighborTraceSteps`, so a
+ * test can walk its element tree. `resolveNode` returns the id itself as the
+ * name when a Node can't be resolved.
+ */
+export function FoundTraceSteps({
+  path,
+  resolveNode,
+  onNavigate,
+  onDismiss,
+  routeClamped = false,
+}: {
+  path: readonly string[];
+  resolveNode: (id: string) => { name: string; file: string | undefined };
+  onNavigate: (id: string) => void;
+  onDismiss: () => void;
+  /** FIX-1: `routeViewport` clamped the fit, so the route runs past the view. */
+  routeClamped?: boolean;
+}) {
+  return (
+    // Boundaries & Constraints (UX-DR10): "leaves the
+    // highlight/step list visible for further stepping" — clicking
+    // an entry only re-centers the map via `navigateToNode`, it
+    // never closes/collapses this panel.
+    //
+    // DESIGN.md `path-trace-stack-row` (this pass): dense-profiler's
+    // own indented call-stack visual — hop circle, tree-indent
+    // glyph, identifier, module — replacing the old flat numbered-
+    // pill/name row. Deliberately no duration/timing field (Never:
+    // driller resolves paths statically and never executes code;
+    // dense-profiler's own per-hop duration would be fabricated
+    // data here — see that token's own DESIGN.md comment).
+    <div className="code-map__path-trace-steps-panel" role="region" aria-label="Traced path steps">
+      <ol className="code-map__path-trace-steps">
+        {path.map((id, index) => {
+          const node = resolveNode(id);
+          return (
+            // Review fix: `id` alone isn't guaranteed unique — nothing
+            // rules out a real graph shape producing a path that
+            // revisits the same Node id twice — so the index is
+            // folded into the key too.
+            <li key={`${id}-${index}`}>
+              <button
+                type="button"
+                className="code-map__path-trace-stack-row"
+                onClick={() => onNavigate(id)}
+              >
+                <span className="code-map__path-trace-hop-circle" aria-hidden="true">
+                  {index + 1}
+                </span>
+                {/* The entry point (index 0) has nothing to descend
+                    from, so it carries no indent connector — every
+                    hop after it does, indented one further step
+                    than the last (dense-profiler's own "indented
+                    call-stack" visual, Design Notes).
+                    Review fix (Blind Hunter + Edge Case Hunter,
+                    independently): `(index - 1) * 8` put hop 1 (the
+                    first indented row) at 0px, visually flush with
+                    the unindented entry point — off by one. `index *
+                    8` fixes that (hop 1 → 8px, hop 2 → 16px, ...).
+                    Capped at 8 levels (64px) so a very long traced
+                    path can't push the row's text out of this fixed-
+                    width panel — depth beyond that stops being
+                    legible anyway, so no further indent is lost
+                    information, just a plateau. */}
+                {index > 0 && (
+                  <span
+                    className="code-map__path-trace-indent"
+                    aria-hidden="true"
+                    style={{ marginLeft: `${Math.min(index * 8, 64)}px` }}
+                  >
+                    └─
+                  </span>
+                )}
+                <span className="code-map__path-trace-stack-row-text">
+                  <code className="code-map__path-trace-stack-row-name">{node.name}</code>
+                  {node.file && (
+                    <span className="code-map__path-trace-stack-row-module">{node.file}</span>
+                  )}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+      {routeClamped && <RouteExtendsBeyondLine />}
+      {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
+          the panel to `idle` — also driller's first clear-search
+          affordance, resolving Phase 2's deferred gap. */}
+      <button
+        type="button"
+        className="code-map__path-trace-dismiss"
+        onClick={onDismiss}
+      >
         Dismiss
       </button>
     </div>
@@ -2969,6 +3314,28 @@ export function CodeMap({
   // resolved to.
   const [pathQuery, setPathQuery] = useState('');
   const [pathTrace, setPathTrace] = useState<PathTraceState>({ status: 'idle' });
+  // FIX-1: whether `fitViewToPath` had to clamp the last route fit to
+  // `ROUTE_MIN_READABLE_ZOOM`. Keyed by the fitted route's own array (the
+  // same `path`/`nodeIds` reference `pathTrace` stores), so it only counts
+  // while that exact trace is showing: every reset or new trace replaces
+  // `pathTrace` with a different object and the flag falls away with it.
+  // The flag also clears the first time the user pans/zooms or the
+  // container resizes (`clearRouteClamp`), so the line only ever describes
+  // the fitted view itself.
+  const [routeFit, setRouteFit] = useState<RouteFit | null>(null);
+  const routeClamped = isRouteClamped(routeFit, pathTrace);
+  const clearRouteClamp = useCallback(() => {
+    setRouteFit((previous) => (previous?.clamped ? { ...previous, clamped: false } : previous));
+  }, []);
+  // FIX-1: the unmeasured-viewport fallback's warning fires once per mount.
+  const routeFitFallbackWarnedRef = useRef(false);
+  // FIX-1: bumped per route fit, so a `fitBounds` fallback that settles
+  // after a newer fit started doesn't clamp over it.
+  const routeFitSeqRef = useRef(0);
+  // FIX-1: `@xyflow/react`'s store (via `ReactFlowStoreBridge`, rendered
+  // inside `<ReactFlow>`), read only for its measured `width`/`height` when
+  // this component's own ResizeObserver hasn't reported yet.
+  const reactFlowStoreRef = useRef<FlowStoreSize | null>(null);
   // Story 2.1 (Phase 3): the deterministic risk-signal layer's own toggle —
   // a renderer-local `useState`, no persistence, no IPC round trip (Boundaries
   // & Constraints, UX-DR21). Defaults to visible/on (EXPERIENCE.md: the
@@ -3115,6 +3482,10 @@ export function CodeMap({
   // — the other half of translating `viewport` into world-space bounds.
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+  // FIX-1: the same size as a ref, so `fitViewToPath` reads the latest value
+  // without depending on it (a resize must never re-create — and so never
+  // re-trigger — the route fit and throw away the user's own pan/zoom).
+  const containerSizeRef = useRef({ width: 0, height: 0 });
   // Clusters the user has clicked/activated to expand (Boundaries &
   // Constraints: "Clicking a cluster removes it from the cluster set for
   // this render"). A cluster's `id` is derived from its current
@@ -3896,6 +4267,20 @@ export function CodeMap({
     setViewport(nextViewport);
   }, []);
 
+  // FIX-1: the user's own pan/zoom gesture moves the view off the fitted
+  // one. `event` is null for a programmatic move (`setViewport`/`setCenter`/
+  // `fitBounds`), so the fit's own animation never clears the flag. The
+  // `<Controls>` buttons move programmatically too, so they clear it through
+  // their own callbacks instead.
+  const handleMoveStart = useCallback<OnMove>(
+    (event) => {
+      if (event) {
+        clearRouteClamp();
+      }
+    },
+    [clearRouteClamp],
+  );
+
   // Tracks the `<ReactFlow>` container's own pixel size — the other input
   // (alongside `viewport`) `computeLOD`'s `viewportBounds` is derived from.
   useEffect(() => {
@@ -3909,11 +4294,17 @@ export function CodeMap({
         return;
       }
       const { width, height } = entry.contentRect;
+      const previous = containerSizeRef.current;
+      if (previous.width !== width || previous.height !== height) {
+        // FIX-1: a resized view is no longer the fitted one.
+        clearRouteClamp();
+      }
+      containerSizeRef.current = { width, height };
       setContainerSize({ width, height });
     });
     observer.observe(el);
     return () => observer.disconnect();
-  }, []);
+  }, [clearRouteClamp]);
 
   // Dev-only per-frame timing (Code Map's Profiling methodology): a CDP
   // harness drives synthetic pan/zoom against the fixture and reads
@@ -4205,12 +4596,11 @@ export function CodeMap({
     // object is reused across renders/clusters.
     // Only applied to a full (non-clustered) rendered card — a path Node
     // still folded into an unexpanded LOD cluster has no card of its own to
-    // mark. `fitViewToPath` zooming in on just the path's own tight bounding
-    // box makes this a non-issue in practice (a real repo's default view
-    // already exceeds `LOD_ZOOM_THRESHOLD` per this file's own live-verified
-    // numbers above, and fitting to a small path subset only zooms in
-    // further); the 10,000-Node dev fixture is the only case where a path
-    // Node could plausibly still be clustered post-fit.
+    // mark. FIX-1: once a route fit settles, the zoom is at or above
+    // `ROUTE_MIN_READABLE_ZOOM` (a sprawling route's fit — measured at 0.14
+    // live — clamps to that floor on the route's first Node instead; the
+    // unmeasured-viewport `fitBounds` fallback is lifted to it after its
+    // animation), so the route's on-screen Nodes render as cards post-fit.
     //
     // Story 3.2 (Phase 2): renamed from `withPathHighlight` and extended to
     // also thread the blast-radius highlight's own `className` onto the same
@@ -4469,6 +4859,18 @@ export function CodeMap({
     setHistory((previous) => ({ ...previous, index: nextIndex }));
   }, [history, centerOnNode]);
 
+  // FIX-1: the map's measured size — this component's ResizeObserver first,
+  // then `@xyflow/react`'s store — or 0×0 when neither has measured yet.
+  // Reads refs only, so it is stable across renders.
+  const measuredViewportSize = useCallback((): { width: number; height: number } => {
+    const own = containerSizeRef.current;
+    if (own.width > 0 && own.height > 0) {
+      return own;
+    }
+    const store = reactFlowStoreRef.current?.getState();
+    return { width: store?.width ?? 0, height: store?.height ?? 0 };
+  }, []);
+
   /**
    * Story 1.9 (Phase 2): fits the viewport to show every Node in a `found`
    * path at once (Boundaries & Constraints: "an off-screen highlight isn't
@@ -4481,6 +4883,13 @@ export function CodeMap({
    * unexpanded LOD cluster wouldn't be in that store yet, so `fitView`
    * alone could silently fail to include it. `fitBounds` has no such
    * requirement — it just needs the raw rectangle.
+   *
+   * FIX-1: `routeFitRequest` + `routeViewport` decide the target viewport,
+   * applied with `setViewport` — a route that would only fit below
+   * `ROUTE_MIN_READABLE_ZOOM` is clamped to that floor and anchored on the
+   * centre of its first Node's card, and `routeFit` records the clamp for
+   * the step panel. With no measured size at all it falls back to
+   * `fitBounds`, then lifts that result to the floor once it settles.
    */
   const fitViewToPath = useCallback(
     (path: string[]) => {
@@ -4489,37 +4898,68 @@ export function CodeMap({
         console.warn('CodeMap: tracePath found a path but the ReactFlow instance is not ready yet.');
         return;
       }
-      const positions = path
-        .map((id) => flowNodesById.get(id)?.position)
-        .filter((position): position is { x: number; y: number } => position !== undefined);
-      if (positions.length === 0) {
+      const seq = ++routeFitSeqRef.current;
+      // Absolute positions: `internals.positionAbsolute` when the card is in
+      // `@xyflow/react`'s store (it accounts for a `parentId`, though
+      // `layoutNodes` never sets one), else the laid-out world position
+      // (a card folded into an LOD cluster isn't in the store).
+      const positionsById = new Map<string, { x: number; y: number }>();
+      for (const id of path) {
+        const position = instance.getInternalNode(id)?.internals.positionAbsolute ?? flowNodesById.get(id)?.position;
+        if (position) {
+          positionsById.set(id, position);
+        }
+      }
+      const firstMeasured = path[0] !== undefined ? instance.getInternalNode(path[0])?.measured : undefined;
+      const cardSize =
+        firstMeasured?.width && firstMeasured.height
+          ? { width: firstMeasured.width, height: firstMeasured.height }
+          : { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT };
+      const request = routeFitRequest(path, positionsById, cardSize, measuredViewportSize());
+      if (request === null) {
         return;
       }
-      // Review fix: `Math.min(...positions.map(...))`-style spread has a
-      // practical engine argument-count ceiling well under this app's own
-      // validated 10,000-Node scale (Story 1.3 Phase 2) — a large enough
-      // `found` path would throw a `RangeError` here. `.reduce()` has no
-      // such limit.
-      const firstPosition = positions[0]!;
-      const minX = positions.reduce((min, position) => Math.min(min, position.x), firstPosition.x);
-      const maxX = positions.reduce((max, position) => Math.max(max, position.x), firstPosition.x);
-      const minY = positions.reduce((min, position) => Math.min(min, position.y), firstPosition.y);
-      const maxY = positions.reduce((max, position) => Math.max(max, position.y), firstPosition.y);
-      // Padded by roughly one Node card's own footprint on each side (the
-      // same `NODE_COLUMN_GAP`/`NODE_ROW_GAP` grid spacing `layoutNodes`
-      // lays every card out on) so a card sitting exactly at the bounding
-      // box's edge isn't clipped flush against the viewport border.
-      instance.fitBounds(
-        {
-          x: minX - NODE_COLUMN_GAP / 2,
-          y: minY - NODE_ROW_GAP / 2,
-          width: maxX - minX + NODE_COLUMN_GAP,
-          height: maxY - minY + NODE_ROW_GAP,
-        },
-        { duration: 300 },
-      );
+      if ('params' in request) {
+        const next = routeViewport(request.params);
+        setRouteFit({ route: path, clamped: next.clamped });
+        void instance.setViewport({ x: next.x, y: next.y, zoom: next.zoom }, { duration: 300 });
+        return;
+      }
+      // FIX-1 (I/O Matrix: viewport not measured yet): neither this
+      // component's ResizeObserver nor `@xyflow/react`'s store has a size, so
+      // fall back to the pre-FIX-1 `fitBounds` — then, once it settles, lift
+      // its zoom to the readable floor on the anchor if it landed below.
+      //
+      // `console.warn` rather than `window.driller.logDiagnosticEvent`: that
+      // AD-21 sink's `DiagnosticLogEntry` is a closed union with one member
+      // (`'path-trace-dismissed'`) that main validates, so logging this would
+      // mean a new IPC contract event type — out of FIX-1's scope.
+      if (!routeFitFallbackWarnedRef.current) {
+        routeFitFallbackWarnedRef.current = true;
+        console.warn('CodeMap: fitting a traced route before the map viewport was measured; using fitBounds.');
+      }
+      const { bounds, anchor } = request.fallback;
+      setRouteFit({ route: path, clamped: false });
+      void instance.fitBounds(bounds, { duration: 300 }).then(() => {
+        if (routeFitSeqRef.current !== seq || reactFlowInstanceRef.current !== instance) {
+          return;
+        }
+        if (instance.getViewport().zoom >= ROUTE_MIN_READABLE_ZOOM) {
+          return;
+        }
+        // Anchored as a clamped `routeViewport` result would be: the floor,
+        // centred on the anchor in whatever size has been measured by now.
+        const size = measuredViewportSize();
+        const zoom = Math.min(ROUTE_MIN_READABLE_ZOOM, MAP_MAX_ZOOM);
+        setRouteFit({ route: path, clamped: true });
+        void instance.setViewport(
+          { x: size.width / 2 - anchor.x * zoom, y: size.height / 2 - anchor.y * zoom, zoom },
+          { duration: 300 },
+        );
+      });
     },
-    [flowNodesById],
+    // FIX-1: deliberately not `containerSize` — see `containerSizeRef`.
+    [flowNodesById, measuredViewportSize],
   );
 
   /**
@@ -5104,6 +5544,8 @@ export function CodeMap({
           onEdgeClick={handleEdgeClick}
           onInit={handleInit}
           onMove={handleMove}
+          onMoveStart={handleMoveStart}
+          maxZoom={MAP_MAX_ZOOM}
           // Without this, `@xyflow/react`'s default `minZoom` (0.5) clamps
           // `fitView` (and manual zoom-out) well above `LOD_ZOOM_THRESHOLD`
           // at any map size — found via live CDP verification. Only fixture
@@ -5129,7 +5571,13 @@ export function CodeMap({
               exists for either); the canvas background itself is set via
               `.code-map .react-flow` in styles.css, not here. */}
           <Background gap={40} color="var(--border)" />
-          <Controls showInteractive={false} />
+          <Controls
+            showInteractive={false}
+            onZoomIn={clearRouteClamp}
+            onZoomOut={clearRouteClamp}
+            onFitView={clearRouteClamp}
+          />
+          <ReactFlowStoreBridge storeRef={reactFlowStoreRef} />
           {/* Story 2.1 (Phase 3): driller's first custom map-level control —
               a `Panel`-hosted checkbox toggling the whole deterministic
               `riskSignals` layer's visibility (Boundaries & Constraints:
@@ -5391,82 +5839,16 @@ export function CodeMap({
             )}
 
             {pathTrace.status === 'found' && (
-              // Boundaries & Constraints (UX-DR10): "leaves the
-              // highlight/step list visible for further stepping" — clicking
-              // an entry only re-centers the map via `navigateToNode`, it
-              // never closes/collapses this panel.
-              //
-              // DESIGN.md `path-trace-stack-row` (this pass): dense-profiler's
-              // own indented call-stack visual — hop circle, tree-indent
-              // glyph, identifier, module — replacing the old flat numbered-
-              // pill/name row. Deliberately no duration/timing field (Never:
-              // driller resolves paths statically and never executes code;
-              // dense-profiler's own per-hop duration would be fabricated
-              // data here — see that token's own DESIGN.md comment).
-              <div className="code-map__path-trace-steps-panel" role="region" aria-label="Traced path steps">
-                <ol className="code-map__path-trace-steps">
-                  {pathTrace.path.map((id, index) => {
-                    const node = flowNodesById.get(id)?.data.node;
-                    return (
-                      // Review fix: `id` alone isn't guaranteed unique — nothing
-                      // rules out a real graph shape producing a path that
-                      // revisits the same Node id twice — so the index is
-                      // folded into the key too.
-                      <li key={`${id}-${index}`}>
-                        <button
-                          type="button"
-                          className="code-map__path-trace-stack-row"
-                          onClick={() => navigateToNode(id)}
-                        >
-                          <span className="code-map__path-trace-hop-circle" aria-hidden="true">
-                            {index + 1}
-                          </span>
-                          {/* The entry point (index 0) has nothing to descend
-                              from, so it carries no indent connector — every
-                              hop after it does, indented one further step
-                              than the last (dense-profiler's own "indented
-                              call-stack" visual, Design Notes).
-                              Review fix (Blind Hunter + Edge Case Hunter,
-                              independently): `(index - 1) * 8` put hop 1 (the
-                              first indented row) at 0px, visually flush with
-                              the unindented entry point — off by one. `index *
-                              8` fixes that (hop 1 → 8px, hop 2 → 16px, ...).
-                              Capped at 8 levels (64px) so a very long traced
-                              path can't push the row's text out of this fixed-
-                              width panel — depth beyond that stops being
-                              legible anyway, so no further indent is lost
-                              information, just a plateau. */}
-                          {index > 0 && (
-                            <span
-                              className="code-map__path-trace-indent"
-                              aria-hidden="true"
-                              style={{ marginLeft: `${Math.min(index * 8, 64)}px` }}
-                            >
-                              └─
-                            </span>
-                          )}
-                          <span className="code-map__path-trace-stack-row-text">
-                            <code className="code-map__path-trace-stack-row-name">{node?.name ?? id}</code>
-                            {node?.file && (
-                              <span className="code-map__path-trace-stack-row-module">{node.file}</span>
-                            )}
-                          </span>
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ol>
-                {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
-                    the panel to `idle` — also driller's first clear-search
-                    affordance, resolving Phase 2's deferred gap. */}
-                <button
-                  type="button"
-                  className="code-map__path-trace-dismiss"
-                  onClick={() => handleDismissPathTrace('found')}
-                >
-                  Dismiss
-                </button>
-              </div>
+              <FoundTraceSteps
+                path={pathTrace.path}
+                resolveNode={(id) => {
+                  const node = flowNodesById.get(id)?.data.node;
+                  return { name: node?.name ?? id, file: node?.file };
+                }}
+                onNavigate={navigateToNode}
+                onDismiss={() => handleDismissPathTrace('found')}
+                routeClamped={routeClamped}
+              />
             )}
 
             {pathTrace.status === 'neighbors' && (
@@ -5481,6 +5863,7 @@ export function CodeMap({
                 }}
                 onNavigate={navigateToNode}
                 onDismiss={handleDismissNeighborTrace}
+                routeClamped={routeClamped}
               />
             )}
             </>
