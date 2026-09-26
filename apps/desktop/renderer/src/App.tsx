@@ -25,6 +25,8 @@ import {
   type MapFooterState,
 } from './appFrame';
 import { CodeMap, type CodeMapMode } from './CodeMap';
+import { createMenuOpenFolderHandler } from './menuOpenFolder';
+import { openModalLayers } from './modalStack';
 import { ModeSwitcher } from './ModeSwitcher';
 import { Settings } from './Settings';
 import {
@@ -481,6 +483,30 @@ export function App() {
       setIsOpening(false);
     }
   }, [applyOpenResult, reportUnexpectedError]);
+
+  // P2-9: File ▸ Open Folder… (Cmd/Ctrl+O) runs the same flow as the Open a
+  // folder button, on the landing screen only — the not-a-git-repo and error
+  // notices it can produce render only there. It's ignored while a project is
+  // open, while a modal is open, or while an open is already in flight
+  // (the handler's own flag for menu-started opens, `isOpening` for
+  // button-started ones). The refs are synced in an effect, never during
+  // render, so the subscription registers once.
+  const menuOpenBlockedRef = useRef(false);
+  const handleOpenFolderRef = useRef(handleOpenFolder);
+  useEffect(() => {
+    menuOpenBlockedRef.current = isOpening || currentProjectPath !== null;
+    handleOpenFolderRef.current = handleOpenFolder;
+  }, [isOpening, currentProjectPath, handleOpenFolder]);
+  useEffect(() => {
+    const handleMenuOpenFolder = createMenuOpenFolderHandler({
+      isBlocked: () => menuOpenBlockedRef.current || openModalLayers().length > 0,
+      open: () => handleOpenFolderRef.current(),
+    });
+    const unsubscribe = window.driller.onMenuOpenFolder(() => {
+      void handleMenuOpenFolder();
+    });
+    return unsubscribe;
+  }, []);
 
   const handleOpenRecent = useCallback(
     async (path: string) => {

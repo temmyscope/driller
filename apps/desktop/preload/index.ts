@@ -40,6 +40,23 @@ import {
   type SummaryProgressMessage,
 } from '@driller/ipc-contracts';
 
+// P2-9: main waits for `did-finish-load` before sending `menu:openFolder`
+// (e.g. a Cmd+O that created the window on macOS), but React's subscribing
+// effect can still run after that. This listener is registered before any
+// page script runs, and holds one request until a subscriber arrives, so
+// it's never dropped.
+const menuOpenFolderSubscribers = new Set<() => void>();
+let menuOpenFolderPending = false;
+ipcRenderer.on(IpcChannels.menuOpenFolder, () => {
+  if (menuOpenFolderSubscribers.size === 0) {
+    menuOpenFolderPending = true;
+    return;
+  }
+  for (const subscriber of menuOpenFolderSubscribers) {
+    subscriber();
+  }
+});
+
 const drillerApi: DrillerApi = {
   openFolder: (): Promise<ProjectOpenResult> =>
     ipcRenderer.invoke(IpcChannels.projectOpen),
@@ -105,6 +122,19 @@ const drillerApi: DrillerApi = {
     ipcRenderer.on(IpcChannels.mcpServerStatus, listener);
     return () => {
       ipcRenderer.removeListener(IpcChannels.mcpServerStatus, listener);
+    };
+  },
+
+  // P2-9: the menu's Open Folder… (Cmd/Ctrl+O) — no payload. See the
+  // buffered listener below for why this isn't a plain `ipcRenderer.on`.
+  onMenuOpenFolder: (callback: () => void) => {
+    menuOpenFolderSubscribers.add(callback);
+    if (menuOpenFolderPending) {
+      menuOpenFolderPending = false;
+      queueMicrotask(callback);
+    }
+    return () => {
+      menuOpenFolderSubscribers.delete(callback);
     };
   },
 

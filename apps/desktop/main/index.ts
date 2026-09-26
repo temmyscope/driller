@@ -19,6 +19,7 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  Menu,
   shell,
   utilityProcess,
   type UtilityProcess,
@@ -75,6 +76,7 @@ import {
   setActiveBackend,
   setCloudApiKey,
 } from './backend-settings';
+import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection } from './app-menu';
 import { toOkCodeMapResult } from './code-map-reply';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
@@ -84,6 +86,7 @@ import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
 import { getProjectScope, setProjectScope } from './project-scope-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
+import { uiSettings } from './ui-settings-store';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -2189,8 +2192,14 @@ function registerIpcHandlers(): void {
 // Window creation (AD-11 security baseline)
 // ---------------------------------------------------------------------------
 
-const createWindow = () => {
-  mainWindow = new BrowserWindow({
+// P2-9: whether the main window's page has finished loading (and so has
+// subscribed to `menu:openFolder`), and whether a menu Open Folder… is
+// waiting for that. Reset whenever the page (re)starts loading.
+let mainWindowLoaded = false;
+let pendingMenuOpenFolder = false;
+
+const createWindow = (): BrowserWindow => {
+  const win = new BrowserWindow({
     width: 1100,
     height: 720,
     webPreferences: {
@@ -2198,28 +2207,116 @@ const createWindow = () => {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // P2-9: open at the remembered zoom, with no 100% flash first.
+      zoomFactor: uiSettings.getZoomFactor(),
     },
   });
+  mainWindow = win;
+  mainWindowLoaded = false;
 
   // AD-11 security baseline: renderer content never gets to open new
   // Electron-hosted windows (e.g. via target="_blank" or window.open()).
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  win.webContents.on('did-start-loading', () => {
+    mainWindowLoaded = false;
+  });
+
+  // P2-9: reapply the persisted zoom on every load (including a renderer
+  // reload), and pin visual (pinch) zoom so it can't bypass the 80–200%
+  // clamp. Then deliver a menu Open Folder… that arrived while loading.
+  win.webContents.on('did-finish-load', () => {
+    if (win.webContents.isDestroyed()) {
+      return;
+    }
+    win.webContents.setZoomFactor(uiSettings.getZoomFactor());
+    win.webContents.setVisualZoomLevelLimits(1, 1).catch(() => undefined);
+    mainWindowLoaded = true;
+    if (pendingMenuOpenFolder) {
+      pendingMenuOpenFolder = false;
+      win.webContents.send(IpcChannels.menuOpenFolder);
+    }
+  });
+
+  // P2-9: zoom keys the menu accelerators can't cover (Cmd/Ctrl+Plus, the
+  // numpad) and Ctrl+wheel/pinch zoom all go through the same clamped,
+  // persisted handler as the menu. `preventDefault` also stops a matching
+  // menu accelerator from firing a second time.
+  win.webContents.on('before-input-event', (event, input) => {
+    const direction = zoomDirectionForInput(input, process.platform);
+    if (direction) {
+      event.preventDefault();
+      handleZoom(direction);
+    }
+  });
+  win.webContents.on('zoom-changed', (_event, zoomDirection) => {
+    handleZoom(zoomDirection);
+  });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+    win.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
   } else {
-    mainWindow.loadFile(
+    win.loadFile(
       path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
     );
   }
 
-  mainWindow.on('closed', () => {
-    mainWindow = null;
+  win.on('closed', () => {
+    if (mainWindow === win) {
+      mainWindow = null;
+      mainWindowLoaded = false;
+      pendingMenuOpenFolder = false;
+    }
   });
+
+  return win;
 };
+
+// ---------------------------------------------------------------------------
+// Application menu (P2-9): explicit File / Edit / View / Window, bounded and
+// persisted zoom, and Cmd/Ctrl+O into the renderer's open-folder flow.
+// ---------------------------------------------------------------------------
+
+/** Zoom reads from and applies to the main window only — never another focused window. */
+function handleZoom(direction: ZoomDirection): void {
+  const win = mainWindow;
+  if (!win || win.webContents.isDestroyed()) {
+    return;
+  }
+  const next = uiSettings.setZoomFactor(nextZoomFactor(win.webContents.getZoomFactor(), direction));
+  win.webContents.setZoomFactor(next);
+}
+
+/**
+ * Asks the renderer to run its open-folder flow (it owns `isOpening` and
+ * the result notices). With no window left (macOS), creates one; while the
+ * page is still loading, the request waits for `did-finish-load` so it never
+ * reaches a page that hasn't subscribed yet. Repeats while waiting collapse
+ * into one.
+ */
+function handleMenuOpenFolder(): void {
+  const win = mainWindow && !mainWindow.webContents.isDestroyed() ? mainWindow : createWindow();
+  if (mainWindowLoaded) {
+    win.webContents.send(IpcChannels.menuOpenFolder);
+  } else {
+    pendingMenuOpenFolder = true;
+  }
+}
+
+function installAppMenu(): void {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate(
+      buildAppMenu(
+        { onOpenFolder: handleMenuOpenFolder, onZoom: handleZoom },
+        { platform: process.platform, isPackaged: app.isPackaged },
+      ),
+    ),
+  );
+}
 
 app.on('ready', () => {
   registerIpcHandlers();
+  installAppMenu();
   createWindow();
 });
 

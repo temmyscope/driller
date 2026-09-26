@@ -1475,6 +1475,7 @@ export const IpcChannels = {
   diagnosticLog: 'diagnostic:log',
   diffScopeCompute: 'diffScope:compute',
   blastRadiusExpand: 'blastRadius:expand',
+  menuOpenFolder: 'menu:openFolder',
 } as const;
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels];
@@ -1559,6 +1560,11 @@ export interface DrillerApi {
    * an unsubscribe function.
    */
   onMcpServerStatus: (callback: (message: McpServerStatusMessage) => void) => () => void;
+  /**
+   * Subscribes to the application menu's File ▸ Open Folder… (Cmd/Ctrl+O,
+   * P2-9). Returns an unsubscribe function.
+   */
+  onMenuOpenFolder: (callback: () => void) => () => void;
   /**
    * Fetches the Code Map (Nodes + call/dependency edges) for the most
    * recently `indexed` project. Called once per successful `indexed` state
