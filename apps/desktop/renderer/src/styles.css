@@ -1859,29 +1859,98 @@ code,
   gap: 0.5rem;
 }
 
-/* DESIGN.md `path-trace-search`: the "trace>" prompt is `{colors.accent}`
-   (JSX/placeholder copy, not this rule); `input-color` is
-   `{colors.text-mute}`. The input's own background follows this file's
-   "floated toolbar chrome = panel-alt" convention (see
-   `.code-map__history-toolbar` above). */
-.code-map__path-trace-input {
+/* DESIGN.md `path-trace-search` (P3-8): one bordered field — a `<label>`
+   wrapping the input, so it clicks as one control — holding the accent
+   "trace>" prompt (`.code-map__path-trace-prompt`, rendered by
+   `PathTraceSearchRow` in CodeMap.tsx), the blinking block cursor, and the
+   borderless input. The field's background follows this file's "floated
+   toolbar chrome = panel-alt" convention (see `.code-map__history-toolbar`
+   above). Typed text is `{colors.text}` and the placeholder
+   `{colors.text-mute}` (DESIGN.md's `input-color`), so the two never read
+   alike. The focus ring stays keyboard-only: it follows the input's
+   `:focus-visible`, not the field's `:focus-within`. */
+.code-map__path-trace-field {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   padding: 0.4rem 0.6rem;
-  border-radius: 0;
   border: 1px solid var(--border);
   background: var(--panel-alt);
-  color: var(--text-mute);
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   font-size: 11px;
+  cursor: text;
 }
 
-.code-map__path-trace-input:focus-visible {
+.code-map__path-trace-field:has(.code-map__path-trace-input:focus-visible) {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
-.code-map__path-trace-input:disabled {
+.code-map__path-trace-field:has(.code-map__path-trace-input:disabled) {
   opacity: 0.6;
+  cursor: default;
+}
+
+.code-map__path-trace-prompt {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.code-map__path-trace-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  outline: none;
+}
+
+.code-map__path-trace-input::placeholder {
+  color: var(--text-mute);
+  opacity: 1;
+}
+
+/* The block cursor — the direction's only motion (DESIGN.md Do's and Don'ts):
+   one character cell (1ch x 1.2em, DESIGN.md's 7x13px at this size) of
+   `{colors.accent}` with the mockup's 1.1s `steps(1)` blink, sitting right
+   after the prompt where typing starts (`trace> █ placeholder`). Hidden when
+   the input is focused (the native caret takes over), non-empty, or disabled;
+   not rendered at all while the Graph Service is down (CodeMap.tsx). */
+.code-map__path-trace-cursor {
+  flex-shrink: 0;
+  width: 1ch;
+  height: 1.2em;
+  background: var(--accent);
+  animation: code-map-path-trace-blink 1.1s steps(1) infinite;
+}
+
+.code-map__path-trace-field:has(.code-map__path-trace-input:focus) .code-map__path-trace-cursor,
+.code-map__path-trace-field:has(.code-map__path-trace-input:not(:placeholder-shown)) .code-map__path-trace-cursor,
+.code-map__path-trace-field:has(.code-map__path-trace-input:disabled) .code-map__path-trace-cursor {
+  display: none;
+}
+
+@keyframes code-map-path-trace-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* Reduced motion: the cursor stays, as a steady block. */
+@media (prefers-reduced-motion: reduce) {
+  .code-map__path-trace-cursor {
+    animation: none;
+  }
 }
 
 .code-map__path-trace-toolbar button {

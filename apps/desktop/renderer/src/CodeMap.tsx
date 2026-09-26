@@ -2908,6 +2908,86 @@ const GRAPH_SERVICE_UNAVAILABLE_TITLE =
 const SERVICE_UNAVAILABLE_CLASS = 'code-map__action--service-unavailable';
 
 /**
+ * P3-8: the Path Trace placeholder. Shorter than DESIGN.md's "Path Trace —
+ * e.g. ..." copy (review round 1): the `trace>` prompt already says what the
+ * field is, and the long form was truncated in the 320px search box. It uses
+ * no example names from the mockup project, which driller can't know.
+ */
+export const PATH_TRACE_PLACEHOLDER = 'function name or entry point';
+
+/**
+ * P3-8: the Path Trace search row — DESIGN.md `path-trace-search`'s accent
+ * `trace>` prompt, the blinking block cursor, then the input, reading
+ * `trace> █ placeholder` when idle. The field is a `<label>` wrapping the
+ * input, so clicking the prompt or padding focuses it. Both decorations are
+ * `aria-hidden`; the input's own `aria-label` stays its accessible name.
+ *
+ * Cursor visibility: not rendered at all while the Graph Service is down;
+ * otherwise styles.css hides it (via `:has()` on the field) whenever the input
+ * is focused (the native caret takes over), non-empty, or disabled.
+ *
+ * HOOKLESS on purpose: `CodeMap.pathTraceSearch.test.ts` renders it by calling
+ * it as a plain function, and a hook here would break that test with a
+ * dispatcher error. The search flow (value, change, submit, the disabled
+ * rules, the button's label and unavailable title/class) is the pre-P3-8
+ * inline form's; the placeholder copy and the form's `role` changed.
+ */
+export function PathTraceSearchRow({
+  query,
+  onQueryChange,
+  onSubmit,
+  searching,
+  graphServiceAvailable,
+}: {
+  query: string;
+  onQueryChange: (query: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  searching: boolean;
+  graphServiceAvailable: boolean;
+}) {
+  return (
+    <form
+      className="code-map__path-trace-toolbar"
+      role="search"
+      aria-label="Search a traced path"
+      onSubmit={onSubmit}
+    >
+      <label className="code-map__path-trace-field">
+        <span className="code-map__path-trace-prompt" aria-hidden="true">
+          trace&gt;
+        </span>
+        {graphServiceAvailable && <span className="code-map__path-trace-cursor" aria-hidden="true" />}
+        <input
+          type="text"
+          className="code-map__path-trace-input"
+          placeholder={PATH_TRACE_PLACEHOLDER}
+          aria-label="Path Trace query"
+          spellCheck={false}
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          disabled={searching}
+        />
+      </label>
+      {/* I/O Matrix: "Second submit while a search is in flight ...
+          No-op — input/button disabled until the first resolves" —
+          the `disabled` attributes here are belt-and-suspenders on
+          top of `handlePathTraceSubmit`'s own no-op guard. */}
+      <button
+        type="submit"
+        disabled={searching || !graphServiceAvailable}
+        title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
+        className={graphServiceAvailable ? undefined : SERVICE_UNAVAILABLE_CLASS}
+      >
+        {searching ? 'Searching…' : 'Trace'}
+      </button>
+    </form>
+  );
+}
+
+/**
  * P2-12: the ids of Node Detail's section headings, referenced by each
  * section's `aria-labelledby`. Constants rather than `useId` so
  * `NodeDetailBody` stays hookless — only one Node Detail panel is ever open.
@@ -5699,34 +5779,13 @@ export function CodeMap({
         // does not gate it — search stays reachable in exactly those
         // states.
         <div className="code-map__path-trace">
-          <form
-            className="code-map__path-trace-toolbar"
-            role="toolbar"
-            aria-label="Search a traced path"
+          <PathTraceSearchRow
+            query={pathQuery}
+            onQueryChange={setPathQuery}
             onSubmit={handlePathTraceSubmit}
-          >
-            <input
-              type="text"
-              className="code-map__path-trace-input"
-              placeholder="Trace a path from an entry point…"
-              aria-label="Path Trace query"
-              value={pathQuery}
-              onChange={(event) => setPathQuery(event.target.value)}
-              disabled={pathTrace.status === 'searching'}
-            />
-            {/* I/O Matrix: "Second submit while a search is in flight ...
-                No-op — input/button disabled until the first resolves" —
-                the `disabled` attributes here are belt-and-suspenders on
-                top of `handlePathTraceSubmit`'s own no-op guard. */}
-            <button
-              type="submit"
-              disabled={pathTrace.status === 'searching' || !graphServiceAvailable}
-              title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
-              className={graphServiceAvailable ? undefined : SERVICE_UNAVAILABLE_CLASS}
-            >
-              {pathTrace.status === 'searching' ? 'Searching…' : 'Trace'}
-            </button>
-          </form>
+            searching={pathTrace.status === 'searching'}
+            graphServiceAvailable={graphServiceAvailable}
+          />
 
           {/* P0-2b: the RESULT surfaces, gated on `pathTraceResult` — which
               tracks the canvas, not the input above. Every one of them
