@@ -63,7 +63,7 @@
  * the shared `ActionableNotice` shape (P1-7).
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Background,
   Controls,
@@ -140,7 +140,7 @@ export type NodeDetailState = { status: 'closed' } | { status: 'open'; node: Cod
  * `KeyEntryState` shape (a similar "idle/in-flight/error" async-action
  * pattern), simplified: no `'warning'` state exists for this action.
  */
-type RegenerateState = { kind: 'idle' | 'regenerating' } | { kind: 'error'; message: string };
+export type RegenerateState = { kind: 'idle' | 'regenerating' } | { kind: 'error'; message: string };
 
 /**
  * The source overlay's "Open in external editor" affordance state (Story
@@ -1025,7 +1025,7 @@ const MAX_RENDERED_INGESTED_FINDINGS = 3;
  * honors, passed as one object so a second surface can't silently honor a
  * subset of them.
  */
-type RiskSignalFamilyToggles = {
+export type RiskSignalFamilyToggles = {
   showDeterministicSignals: boolean;
   showLlmJudgment: boolean;
   showIngestedFindings: boolean;
@@ -1993,6 +1993,119 @@ export function nodeDetailSummaryAction(
   }
 }
 
+/**
+ * P2-12: Node Detail's module line — the directory of the Node's `file`, with
+ * its trailing slash (`billing/pay.ts` → `billing/`), or `null` for a file at
+ * the project root, whose module line is omitted rather than rendered empty.
+ * Defensive about the path's shape even though AD-19 promises POSIX-relative:
+ * backslashes become `/`, a leading `./` or `/` and a trailing `/` are
+ * ignored, so it never returns `./` or the whole path.
+ */
+export function nodeModuleLine(file: string): string | null {
+  const normalized = file
+    .replace(/\\/g, '/')
+    .replace(/^(?:\.\/|\/)+/, '')
+    .replace(/\/+$/, '');
+  const lastSlash = normalized.lastIndexOf('/');
+  return lastSlash > 0 ? normalized.slice(0, lastSlash + 1) : null;
+}
+
+/**
+ * P2-12: Node Detail's Location line — "<file> — lines <start>–<end>", or
+ * "<file> — line N" for a one-line range. An inverted range is shown
+ * min–max; a non-positive or non-finite line falls back to the file alone
+ * rather than printing a nonsense range.
+ */
+export function formatNodeLocation(file: string, startLine: number, endLine: number): string {
+  const valid = (line: number) => Number.isFinite(line) && line > 0;
+  if (!valid(startLine) || !valid(endLine)) {
+    return file;
+  }
+  const first = Math.min(startLine, endLine);
+  const last = Math.max(startLine, endLine);
+  return first === last ? `${file} — line ${first}` : `${file} — lines ${first}–${last}`;
+}
+
+/**
+ * P2-12: the muted suffix after a Node's name in the Node Detail head — `()`
+ * for a callable (`Function`) Node, nothing for a Type, Interface or Module.
+ */
+export function nodeNameSuffix(kind: CodeMapNode['kind']): string {
+  switch (kind) {
+    case 'Function':
+      return '()';
+    case 'Interface':
+    case 'Type':
+    case 'Module':
+      return '';
+    default: {
+      // Exhaustive: a new `CodeMapNodeKind` member fails to compile here. At
+      // runtime an unknown kind arriving over IPC gets no suffix.
+      const unknownKind: never = kind;
+      void unknownKind;
+      return '';
+    }
+  }
+}
+
+/**
+ * P2-12: the Node Detail head — module line, name (+ muted `()` for a
+ * Function) and the "[esc] close" button. Hookless so
+ * `CodeMap.nodeDetail.test.ts` can render it as a plain function.
+ *
+ * The `()` sits outside the truncating name span so a long name never
+ * ellipsizes it away; both truncating lines carry their full text as
+ * `title`. The close button's accessible name is its visible text plus a
+ * visually hidden " Node detail" (label-in-name, as Settings' close).
+ */
+export function NodeDetailHead({ node, onClose }: { node: CodeMapNode; onClose: () => void }) {
+  const moduleLine = nodeModuleLine(node.file);
+  const suffix = nodeNameSuffix(node.kind);
+  return (
+    <div className="code-map__node-detail-head">
+      <div className="code-map__node-detail-title">
+        {moduleLine !== null && (
+          <div className="code-map__node-detail-module" title={moduleLine}>
+            {moduleLine}
+          </div>
+        )}
+        <code className="code-map__node-detail-name">
+          <span className="code-map__node-detail-name-text" title={node.name}>
+            {node.name}
+          </span>
+          {suffix !== '' && <span className="code-map__node-detail-paren">{suffix}</span>}
+        </code>
+      </div>
+      <button type="button" className="code-map__node-detail-close" onClick={onClose}>
+        [esc] close<span className="visually-hidden"> Node detail</span>
+      </button>
+    </div>
+  );
+}
+
+/**
+ * P2-12: how many of a Node's risk signals the map-level overlay toggles are
+ * hiding — the signals in a family whose toggle is off (a blank LLM judgment,
+ * which never renders anyway, is not counted). Lets the Risk Overlay section
+ * tell "nothing to show" apart from "hidden by the toggles".
+ */
+export function countToggleHiddenSignals(signals: RiskSignal[], toggles: RiskSignalFamilyToggles): number {
+  let hidden = 0;
+  if (!toggles.showDeterministicSignals) {
+    hidden += selectDeterministicSignals(signals).length;
+  }
+  if (!toggles.showLlmJudgment) {
+    const judgment = selectLlmJudgmentSignal(signals);
+    if (judgment !== undefined && judgment.judgment.trim().length > 0) {
+      hidden += 1;
+    }
+  }
+  if (!toggles.showIngestedFindings) {
+    hidden += selectIngestedSignals(signals).length;
+  }
+  return hidden;
+}
+
 /** P0-2b: the cluster-list cap's own remainder. See `formatRemainingNodes`. */
 export function formatRemainingClusters(remainingClusterCount: number): string {
   return `+${remainingClusterCount} more module${remainingClusterCount === 1 ? '' : 's'}`;
@@ -2448,6 +2561,184 @@ const GRAPH_SERVICE_UNAVAILABLE_TITLE =
  * these `cursor: not-allowed`.
  */
 const SERVICE_UNAVAILABLE_CLASS = 'code-map__action--service-unavailable';
+
+/**
+ * P2-12: the ids of Node Detail's section headings, referenced by each
+ * section's `aria-labelledby`. Constants rather than `useId` so
+ * `NodeDetailBody` stays hookless — only one Node Detail panel is ever open.
+ */
+export const NODE_DETAIL_SECTION_HEADING_IDS = {
+  summary: 'code-map-node-detail-summary-heading',
+  riskOverlay: 'code-map-node-detail-risk-overlay-heading',
+  staleness: 'code-map-node-detail-staleness-heading',
+  location: 'code-map-node-detail-location-heading',
+} as const;
+
+export interface NodeDetailBodyProps {
+  node: CodeMapNode;
+  toggles: RiskSignalFamilyToggles;
+  cloudSelectedNoKey: boolean;
+  noSummaryBackendAvailable: boolean;
+  /** `nodeDetailSummaryAction(node.summaryStatus)` — `null` offers no action. */
+  summaryAction: { label: string; busyLabel: string } | null;
+  regenerateState: RegenerateState;
+  graphServiceAvailable: boolean;
+  onRegenerate: () => void;
+}
+
+/**
+ * P2-12: Node Detail's scrolling body — the mockup's labelled, divided
+ * sections in the order Summary → Risk Overlay → Staleness → Location.
+ * Presentation only: every state, action and handler is the one the panel
+ * already had, passed in. Hookless so `CodeMap.nodeDetail.test.ts` can render
+ * it as a plain function.
+ */
+export function NodeDetailBody({
+  node,
+  toggles,
+  cloudSelectedNoKey,
+  noSummaryBackendAvailable,
+  summaryAction,
+  regenerateState,
+  graphServiceAvailable,
+  onRegenerate,
+}: NodeDetailBodyProps) {
+  const ids = NODE_DETAIL_SECTION_HEADING_IDS;
+  const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
+  const toggleHiddenCount = signalsVisible ? 0 : countToggleHiddenSignals(node.riskSignals, toggles);
+
+  // Honest staleness (P2-12 review): "Not stale." only asserts freshness for
+  // a summary that exists. A pending / coverage-gap Node has none.
+  let staleness: { className: string; content: ReactNode };
+  if (node.stale === true) {
+    staleness = {
+      className: 'code-map__node-detail-staleness code-map__node-detail-staleness--stale',
+      content: (
+        <>
+          <span aria-hidden="true">⏳</span> Summary may be stale — source changed since generation
+        </>
+      ),
+    };
+  } else if (node.summaryStatus === 'ready') {
+    staleness = { className: 'code-map__node-detail-staleness', content: 'Not stale.' };
+  } else {
+    staleness = {
+      className: 'code-map__node-detail-staleness code-map__node-detail-staleness--none',
+      content: 'No summary yet.',
+    };
+  }
+
+  return (
+    <div className="code-map__node-detail-body">
+      <section className="code-map__node-detail-section" aria-labelledby={ids.summary}>
+        <h3 id={ids.summary} className="code-map__node-detail-label">
+          Summary
+        </h3>
+        {node.summaryStatus === 'ready' &&
+          (node.summary !== undefined ? (
+            <p className="code-map__node-detail-summary">{node.summary}</p>
+          ) : (
+            <p className="code-map__node-detail-empty">No summary text.</p>
+          ))}
+        {/* P0-1: the same three non-`'ready'` summary states the card itself
+            renders — same classes, same icons, same copy as the card: a Node
+            that reads "Coverage gap — no summary" on the map must not read as
+            a silent blank when opened. */}
+        {node.summaryStatus === 'coverage-gap' && (
+          <p className="code-map__node-summary code-map__node-summary--coverage-gap">
+            <span aria-hidden="true">⚠</span> Coverage gap — no summary
+          </p>
+        )}
+        {node.summaryStatus === 'pending' && cloudSelectedNoKey && (
+          <p className="code-map__node-summary code-map__node-summary--notice" role="status">
+            <span aria-hidden="true">☁</span> Cloud is selected but no API key is set — add one in Settings.
+          </p>
+        )}
+        {node.summaryStatus === 'pending' && !cloudSelectedNoKey && noSummaryBackendAvailable && (
+          <p className="code-map__node-summary code-map__node-summary--notice" role="status">
+            <span aria-hidden="true">⚠</span> No summary backend is available — check Settings.
+          </p>
+        )}
+        {node.summaryStatus === 'pending' && !cloudSelectedNoKey && !noSummaryBackendAvailable && (
+          <p className="code-map__node-summary code-map__node-summary--pending" role="status">
+            Summary pending…
+          </p>
+        )}
+      </section>
+      {/* P0-1: the Node's risk signals, rendered by the exact same
+          `NodeRiskSignalSections` the card uses — one implementation, so
+          glyphs, labels, chips, severity ordering, cap and the three map-level
+          family toggles are identical here by construction. P2-12: the
+          section is always present; when nothing renders it says whether the
+          Node has no signals or the overlay toggles are hiding them. */}
+      <section className="code-map__node-detail-section" aria-labelledby={ids.riskOverlay}>
+        <h3 id={ids.riskOverlay} className="code-map__node-detail-label">
+          Risk Overlay
+        </h3>
+        {signalsVisible ? (
+          <div className="code-map__node-detail-signals">
+            <NodeRiskSignalSections signals={node.riskSignals} toggles={toggles} />
+          </div>
+        ) : (
+          <p className="code-map__node-detail-empty">
+            {toggleHiddenCount > 0
+              ? `${toggleHiddenCount} signal${toggleHiddenCount === 1 ? '' : 's'} hidden by the overlay toggles.`
+              : 'No risk signals shown.'}
+          </p>
+        )}
+      </section>
+      <section className="code-map__node-detail-section" aria-labelledby={ids.staleness}>
+        <h3 id={ids.staleness} className="code-map__node-detail-label">
+          Staleness
+        </h3>
+        {/* One persistent `role="status"` element whose content changes, so
+            the flip after a successful regenerate (stale → "Not stale.") is
+            announced. Same "never color-only" treatment as the card's own
+            staleness note: the icon and exact copy carry the signal. No
+            generated-at time — the Node record carries none. */}
+        <p className={staleness.className} role="status">
+          {staleness.content}
+        </p>
+        {/* P0-1 (2026-09-24): the summary action is offered only where it can
+            succeed — the service rejects a `'coverage-gap'` Node outright.
+            P1-2: a `'pending'` Node gets it too, worded "Generate summary" —
+            a Node whose generation failed stays `'pending'` for the whole
+            session, so this is its only way to retry (e.g. after adding a
+            cloud key). Same `regenerateNode` IPC either way. P2-12: a quiet
+            outlined chip; the "↻" is decorative, so the accessible name stays
+            exactly the label. */}
+        {summaryAction && (
+          <button
+            type="button"
+            className={`code-map__node-detail-regenerate${graphServiceAvailable ? '' : ` ${SERVICE_UNAVAILABLE_CLASS}`}`}
+            onClick={onRegenerate}
+            disabled={regenerateState.kind === 'regenerating' || !graphServiceAvailable}
+            title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
+          >
+            <span aria-hidden="true">↻ </span>
+            {regenerateState.kind === 'regenerating' ? summaryAction.busyLabel : summaryAction.label}
+          </button>
+        )}
+        {regenerateState.kind === 'error' && (
+          <ActionableNotice tone="error" role="alert">
+            {regenerateState.message}
+          </ActionableNotice>
+        )}
+      </section>
+      <section
+        className="code-map__node-detail-section code-map__node-detail-section--location"
+        aria-labelledby={ids.location}
+      >
+        <h3 id={ids.location} className="code-map__node-detail-label">
+          Location
+        </h3>
+        <p className="code-map__node-detail-location">
+          <code>{formatNodeLocation(node.file, node.startLine, node.endLine)}</code>
+        </p>
+      </section>
+    </div>
+  );
+}
 
 /**
  * P0-3 + P1-7: the failed-refresh Actionable Notice — the last completed map
@@ -5293,117 +5584,41 @@ export function CodeMap({
           {...nodeDetailScrimProps}
         >
           <div className="code-map__node-detail-panel">
-            <div className="code-map__node-detail-header">
-              <code>{nodeDetail.node.name}</code>
-              <button type="button" onClick={closeNodeDetail} aria-label="Close Node detail">
-                ×
-              </button>
-            </div>
-            <div className="code-map__node-detail-body">
-              <p className="code-map__node-detail-location">
-                <code>
-                  {nodeDetail.node.file}:{nodeDetail.node.startLine}-{nodeDetail.node.endLine}
-                </code>
-              </p>
-              {nodeDetail.node.summaryStatus === 'ready' && nodeDetail.node.summary !== undefined && (
-                <p className="code-map__node-detail-summary">{nodeDetail.node.summary}</p>
-              )}
-              {/* P0-1: the same three non-`'ready'` summary states the card
-                  itself renders — reachable here for the first time now that
-                  activation (not a stale-only pill) is what opens this
-                  panel. Same classes, same icons, same copy as the card: a
-                  Node that reads "Coverage gap — no summary" on the map must
-                  not read as a silent blank when opened. */}
-              {nodeDetail.node.summaryStatus === 'coverage-gap' && (
-                <p className="code-map__node-summary code-map__node-summary--coverage-gap">
-                  <span aria-hidden="true">⚠</span> Coverage gap — no summary
-                </p>
-              )}
-              {nodeDetail.node.summaryStatus === 'pending' && cloudSelectedNoKey && (
-                <p className="code-map__node-summary code-map__node-summary--notice" role="status">
-                  <span aria-hidden="true">☁</span> Cloud is selected but no API key is set — add one in
-                  Settings.
-                </p>
-              )}
-              {nodeDetail.node.summaryStatus === 'pending' && !cloudSelectedNoKey && noSummaryBackendAvailable && (
-                <p className="code-map__node-summary code-map__node-summary--notice" role="status">
-                  <span aria-hidden="true">⚠</span> No summary backend is available — check Settings.
-                </p>
-              )}
-              {nodeDetail.node.summaryStatus === 'pending' &&
-                !cloudSelectedNoKey &&
-                !noSummaryBackendAvailable && (
-                  <p className="code-map__node-summary code-map__node-summary--pending" role="status">
-                    Summary pending…
-                  </p>
-                )}
-              {/* Same "never color-only" treatment as the card's own
-                  staleness note (Accessibility Floor) — the icon and exact
-                  copy carry the signal, not color alone. Disappears the
-                  moment a successful regenerate replaces `nodeDetail.node`
-                  with one that has `stale: false`. */}
-              {nodeDetail.node.stale === true && (
-                <p className="code-map__node-staleness" role="status">
-                  <span aria-hidden="true">⏳</span> Summary may be stale — source changed since generation
-                </p>
-              )}
-              {/* P0-1: the Node's risk signals, rendered by the exact same
-                  `NodeRiskSignalSections` the card uses — one implementation,
-                  so the glyphs, labels, chip markup, severity ordering, cap
-                  and all three map-level family toggles are identical here by
-                  construction rather than by a second copy staying in sync.
-                  The whole section (heading included) is omitted when nothing
-                  would render, never an empty container. */}
-              {hasVisibleRiskSignals(nodeDetail.node.riskSignals, riskSignalToggles) && (
-                <section className="code-map__node-detail-signals" aria-label="Risk signals">
-                  <h3 className="code-map__node-detail-signals-heading">Risk signals</h3>
-                  <NodeRiskSignalSections
-                    signals={nodeDetail.node.riskSignals}
-                    toggles={riskSignalToggles}
-                  />
-                </section>
-              )}
-              {/* P0-1: the one-click source action this panel's IA row
-                  promises — reuses `openSourceForNode` unchanged, at this
-                  Node's exact range. Closes the panel on the way: both
-                  overlays are `z-index: 10` and this one renders after the
-                  source overlay in the DOM, so leaving it open would hide
-                  the very source view the action just opened. */}
-              <button
-                type="button"
-                className="code-map__node-detail-source"
-                onClick={() => {
-                  const target = nodeDetail.node;
-                  closeNodeDetail();
-                  openSourceForNode(target);
-                }}
-              >
-                View source
-              </button>
-              {/* P0-1 (2026-09-24): the summary action is offered only where
-                  it can succeed — the service rejects a `'coverage-gap'`
-                  Node outright. P1-2: a `'pending'` Node gets it too, worded
-                  "Generate summary" — a Node whose generation failed stays
-                  `'pending'` for the whole session, so this is its only way
-                  to retry (e.g. after adding a cloud key). Same
-                  `regenerateNode` IPC either way. */}
-              {nodeDetailAction && (
-                <button
-                  type="button"
-                  className={`code-map__node-detail-regenerate${graphServiceAvailable ? '' : ` ${SERVICE_UNAVAILABLE_CLASS}`}`}
-                  onClick={handleRegenerate}
-                  disabled={regenerateState.kind === 'regenerating' || !graphServiceAvailable}
-                  title={graphServiceAvailable ? undefined : GRAPH_SERVICE_UNAVAILABLE_TITLE}
-                >
-                  {regenerateState.kind === 'regenerating' ? nodeDetailAction.busyLabel : nodeDetailAction.label}
-                </button>
-              )}
-              {regenerateState.kind === 'error' && (
-                <ActionableNotice tone="error" role="alert">
-                  {regenerateState.message}
-                </ActionableNotice>
-              )}
-            </div>
+            <NodeDetailHead node={nodeDetail.node} onClose={closeNodeDetail} />
+            {/* P2-12: the mockup's composition — labelled, divided sections
+                scrolling between the head above and the pinned View source
+                footer below. Presentation only (see `NodeDetailBody`). */}
+            <NodeDetailBody
+              node={nodeDetail.node}
+              toggles={riskSignalToggles}
+              cloudSelectedNoKey={cloudSelectedNoKey}
+              noSummaryBackendAvailable={noSummaryBackendAvailable}
+              summaryAction={nodeDetailAction}
+              regenerateState={regenerateState}
+              graphServiceAvailable={graphServiceAvailable}
+              onRegenerate={handleRegenerate}
+            />
+            {/* P0-1: the one-click source action this panel's IA row
+                promises — reuses `openSourceForNode` unchanged, at this
+                Node's exact range. Closes the panel on the way: both
+                overlays are `z-index: 10` and this one renders after the
+                source overlay in the DOM, so leaving it open would hide the
+                very source view the action just opened. P2-12: pinned as the
+                panel's full-width footer, outside the scrolling body, so it
+                stays one click away however long the summary. Still "View
+                source" — it opens the in-app viewer, not the external
+                editor the mockup's wording names. */}
+            <button
+              type="button"
+              className="code-map__node-detail-source"
+              onClick={() => {
+                const target = nodeDetail.node;
+                closeNodeDetail();
+                openSourceForNode(target);
+              }}
+            >
+              View source
+            </button>
           </div>
         </div>
       )}

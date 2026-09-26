@@ -22,47 +22,7 @@ import {
   reindexButtonState,
   type FetchState,
 } from './CodeMap';
-
-interface RenderedElement {
-  type: string | ((props: Record<string, unknown>) => unknown);
-  props: Record<string, unknown>;
-}
-
-function isRenderedElement(value: unknown): value is RenderedElement {
-  return typeof value === 'object' && value !== null && '$$typeof' in value && 'type' in value && 'props' in value;
-}
-
-function childrenOf(element: RenderedElement): unknown {
-  return typeof element.type === 'function' ? element.type(element.props) : element.props.children;
-}
-
-function renderTree(node: unknown, out: RenderedElement[] = []): RenderedElement[] {
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      renderTree(child, out);
-    }
-    return out;
-  }
-  if (!isRenderedElement(node)) {
-    return out;
-  }
-  out.push(node);
-  renderTree(childrenOf(node), out);
-  return out;
-}
-
-function textOf(node: unknown): string {
-  if (typeof node === 'string' || typeof node === 'number') {
-    return String(node);
-  }
-  if (Array.isArray(node)) {
-    return node.map(textOf).join('');
-  }
-  if (!isRenderedElement(node)) {
-    return '';
-  }
-  return textOf(childrenOf(node));
-}
+import { renderTree, textOf, type RenderedElement } from './testRender';
 
 function byClass(elements: RenderedElement[], className: string): RenderedElement | undefined {
   return elements.find((element) => element.props.className === className);

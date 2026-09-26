@@ -22,53 +22,11 @@ import {
   neighborTraceHeading,
   pathTraceHighlight,
 } from './CodeMap';
+import { renderTree, textOf, type RenderedElement } from './testRender';
 
 // ---------------------------------------------------------------------------
-// Element-tree walking (same approach as `CodeMap.healthAuditRow.test.ts`)
+// Element-tree walking (`renderTree`/`textOf` from `./testRender`)
 // ---------------------------------------------------------------------------
-
-interface RenderedElement {
-  type: string | ((props: Record<string, unknown>) => unknown);
-  props: Record<string, unknown>;
-}
-
-function isRenderedElement(value: unknown): value is RenderedElement {
-  return typeof value === 'object' && value !== null && '$$typeof' in value && 'type' in value && 'props' in value;
-}
-
-function childrenOf(element: RenderedElement): unknown {
-  return typeof element.type === 'function' ? element.type(element.props) : element.props.children;
-}
-
-/** Every element the tree produces, function components invoked, depth first. */
-function renderTree(node: unknown, out: RenderedElement[] = []): RenderedElement[] {
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      renderTree(child, out);
-    }
-    return out;
-  }
-  if (!isRenderedElement(node)) {
-    return out;
-  }
-  out.push(node);
-  renderTree(childrenOf(node), out);
-  return out;
-}
-
-/** Concatenated text under `node`. */
-function textOf(node: unknown): string {
-  if (typeof node === 'string' || typeof node === 'number') {
-    return String(node);
-  }
-  if (Array.isArray(node)) {
-    return node.map(textOf).join('');
-  }
-  if (!isRenderedElement(node)) {
-    return '';
-  }
-  return textOf(childrenOf(node));
-}
 
 const byClass = (elements: RenderedElement[], className: string) =>
   elements.filter((element) => element.props.className === className);

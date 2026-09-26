@@ -16,49 +16,7 @@ import { describe, it } from 'node:test';
 import type { BackendConfig } from '@driller/ipc-contracts';
 
 import { CloudKeyBlock, SettingsTitlebar, type CloudKeyBlockProps, type KeyEntryState } from './Settings';
-
-interface RenderedElement {
-  type: unknown;
-  props: Record<string, unknown>;
-}
-
-function isRenderedElement(value: unknown): value is RenderedElement {
-  return typeof value === 'object' && value !== null && '$$typeof' in value && 'type' in value && 'props' in value;
-}
-
-function childrenOf(element: RenderedElement): unknown {
-  return typeof element.type === 'function'
-    ? (element.type as (props: Record<string, unknown>) => unknown)(element.props)
-    : element.props.children;
-}
-
-function renderTree(node: unknown, out: RenderedElement[] = []): RenderedElement[] {
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      renderTree(child, out);
-    }
-    return out;
-  }
-  if (!isRenderedElement(node)) {
-    return out;
-  }
-  out.push(node);
-  renderTree(childrenOf(node), out);
-  return out;
-}
-
-function textOf(node: unknown): string {
-  if (typeof node === 'string' || typeof node === 'number') {
-    return String(node);
-  }
-  if (Array.isArray(node)) {
-    return node.map(textOf).join('');
-  }
-  if (!isRenderedElement(node)) {
-    return '';
-  }
-  return textOf(childrenOf(node));
-}
+import { renderTree, textOf, type RenderedElement } from './testRender';
 
 function buttonNamed(elements: RenderedElement[], name: string): RenderedElement | undefined {
   return elements.find((element) => element.type === 'button' && textOf(element) === name);

@@ -16,51 +16,9 @@ import { describe, it } from 'node:test';
 
 import type { CodeMapMode } from './CodeMap';
 import { MODE_SWITCHER_HINT_ID, MODE_SWITCHER_LABELS, MODE_SWITCHER_OPTIONS, ModeSwitcher } from './ModeSwitcher';
+import { renderTree, textOf, type RenderedElement } from './testRender';
 
 type Mode = CodeMapMode;
-
-interface RenderedElement {
-  type: unknown;
-  props: Record<string, unknown>;
-}
-
-function isRenderedElement(value: unknown): value is RenderedElement {
-  return typeof value === 'object' && value !== null && '$$typeof' in value && 'type' in value && 'props' in value;
-}
-
-function childrenOf(element: RenderedElement): unknown {
-  return typeof element.type === 'function'
-    ? (element.type as (props: Record<string, unknown>) => unknown)(element.props)
-    : element.props.children;
-}
-
-function renderTree(node: unknown, out: RenderedElement[] = []): RenderedElement[] {
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      renderTree(child, out);
-    }
-    return out;
-  }
-  if (!isRenderedElement(node)) {
-    return out;
-  }
-  out.push(node);
-  renderTree(childrenOf(node), out);
-  return out;
-}
-
-function textOf(node: unknown): string {
-  if (typeof node === 'string' || typeof node === 'number') {
-    return String(node);
-  }
-  if (Array.isArray(node)) {
-    return node.map(textOf).join('');
-  }
-  if (!isRenderedElement(node)) {
-    return '';
-  }
-  return textOf(childrenOf(node));
-}
 
 const ALL_MODES = MODE_SWITCHER_OPTIONS.map((option) => option.value);
 

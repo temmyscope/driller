@@ -2146,9 +2146,9 @@ code,
    `ambiguous` results (never `searching`/`idle`/`error`). Follows
    `.code-map__path-trace-toolbar button`'s own bordered-chrome button shape
    (this file's closest precedent for a small secondary action floated over
-   the map) rather than the primary `.code-map__node-detail-regenerate`
-   treatment — Dismiss is a low-emphasis "done with this" action, not a
-   primary async one. */
+   the map) rather than a filled primary-action treatment such as
+   `.open-folder__button` — Dismiss is a low-emphasis "done with this"
+   action, not a primary async one. */
 .code-map__path-trace-dismissable-notice {
   display: flex;
   align-items: center;
@@ -2617,143 +2617,231 @@ code,
   z-index: 10;
 }
 
+/* P2-12: the panel takes `mockups/node-detail.html`'s composition — 400px
+   (max 90vw), a `--border-strong` left edge, and a flex column whose body
+   scrolls between the fixed head and the pinned View source footer. */
 .code-map__node-detail-panel {
-  width: min(420px, 90vw);
+  width: min(400px, 90vw);
   height: 100%;
   background: var(--panel);
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--border-strong);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
-.code-map__node-detail-header {
+/* The head: module line over the Node's name, "[esc] close" top-right. */
+.code-map__node-detail-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 0.5rem;
-  padding: 0.75rem 1rem;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  font-size: 11px;
+  flex-shrink: 0;
 }
 
-.code-map__node-detail-header code {
-  font-size: 13px;
-  font-weight: 600;
+.code-map__node-detail-title {
+  min-width: 0;
+}
+
+/* DESIGN.md "text-mute for ... module paths" at `{typography.meta}`. */
+.code-map__node-detail-module {
+  margin-bottom: 3px;
+  font-size: 9.5px;
+  color: var(--text-mute);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.code-map__node-detail-header button {
+.code-map__node-detail-name {
+  display: flex;
+  min-width: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* Only the identifier truncates; the `()` after it never shrinks, so a long
+   name can't ellipsize the callable marker away. */
+.code-map__node-detail-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The callable marker after a Function's name — muted, regular weight, so
+   it reads as punctuation rather than part of the identifier. */
+.code-map__node-detail-paren {
+  flex-shrink: 0;
+  font-weight: 400;
+  color: var(--text-mute);
+}
+
+.code-map__node-detail-close {
+  flex-shrink: 0;
+  padding: 0;
   background: transparent;
   border: none;
   color: var(--text-mute);
-  font-size: 11px;
-  line-height: 1;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
   cursor: pointer;
-  flex-shrink: 0;
 }
 
+.code-map__node-detail-close:hover {
+  color: var(--text-dim);
+}
+
+.code-map__node-detail-close:focus-visible,
+.code-map__node-detail-regenerate:focus-visible,
+.code-map__node-detail-source:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The scrolling body between head and footer. `min-height: 0` lets the
+   flex child shrink below its content so it scrolls instead of pushing the
+   footer out of the panel. */
 .code-map__node-detail-body {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  padding: 1rem;
   overflow-y: auto;
 }
 
-/* The file/line location — DESIGN.md's own "module path lines" use case
-   for `{typography.meta}` sizing, and Colors' "text-dim for ... module
-   paths" for color. */
-.code-map__node-detail-location {
-  margin: 0;
-  font-size: 9.5px;
-  font-weight: 700;
-  color: var(--text-dim);
+/* One labelled, divided section — Summary, Risk Overlay, Staleness,
+   Location, in that order (CodeMap.tsx). */
+.code-map__node-detail-section {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
 }
 
-/* DESIGN.md Colors: "text-dim for summaries" — this is the same real
-   generated-summary text `.code-map__node-summary` shows inline on the
-   card itself, just expanded here; both now share the one color DESIGN.md
-   assigns that content, in place of the old system's inconsistent
-   per-surface choice (inline card: muted gray; this detail panel: full
-   `--text`). */
+/* Location is last: no divider, and it takes the leftover height so the
+   footer sits at the panel's bottom edge. */
+.code-map__node-detail-section--location {
+  flex: 1 0 auto;
+  border-bottom: none;
+}
+
+/* A quiet section label, not a document heading. */
+.code-map__node-detail-label {
+  margin: 0 0 6px;
+  font-size: 9.5px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+
+/* DESIGN.md Colors: "text-dim for summaries" — the same generated-summary
+   text the card shows, expanded here at the mockup's reading size. */
 .code-map__node-detail-summary {
   margin: 0;
-  font-size: 10.5px;
-  line-height: 1.45;
+  font-size: 11px;
+  line-height: 1.6;
   color: var(--text-dim);
 }
 
-/* Originally mirrored `.settings-panel__save`'s filled primary-action styling
-   (Settings.tsx — the closest precedent for a single-button async-action
-   affordance in this codebase) rather than inventing a new button treatment.
-   Since P2-11 that Settings button is outlined; this one stays filled. */
-.code-map__node-detail-regenerate {
-  align-self: flex-start;
-  padding: 0.5rem 1rem;
-  border-radius: 0;
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.code-map__node-detail-regenerate:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-/* P0-1 (2026-09-24): the Node Detail panel's risk-signals section. A plain
-   labelled stack — the signal rows inside it are rendered by the same
-   `NodeRiskSignalSections` the card uses, so they bring their own
+/* The Risk Overlay's signal rows bring their own card styling
    (`.code-map__node-signal-strip` / `.code-map__llm-judgment` /
-   `.code-map__ingested-findings`) styling with them and nothing is
-   re-specified here. Only the section's own spacing and its heading need
-   rules, and both reuse existing tokens/sizes — no new visual language.
-   Never rendered at all for a Node with no visible signals (CodeMap.tsx
-   gates this at the JSX level, not with `display: none` here). */
+   `.code-map__ingested-findings`); this wrapper only stacks them. */
 .code-map__node-detail-signals {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
 }
 
-/* Same `{typography.meta}` size/weight/color as
-   `.code-map__node-detail-location` above — this is a quiet section label,
-   not a document heading, and the two must not compete. */
-.code-map__node-detail-signals-heading {
+.code-map__node-detail-empty {
   margin: 0;
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-size: 10.5px;
+  line-height: 1.45;
   color: var(--text-dim);
 }
 
-/* The panel's "View source" action: the secondary counterpart to
-   `.code-map__node-detail-regenerate`'s primary filled treatment — same
-   geometry and type, outlined rather than filled, so the panel has one
-   visually primary action, not two. The `--accent` outline matches the
-   card's own Source pill, keeping one colour for "go to source" across both
-   surfaces. */
-.code-map__node-detail-source {
-  align-self: flex-start;
-  padding: 0.5rem 1rem;
+/* The Staleness section's one persistent `role="status"` line: "Not stale."
+   in `--text-dim`; the stale line in Staleness's own `--stale-yellow`
+   (DESIGN.md: "the Staleness Indicator exclusively") at 10.5px, scoped here
+   rather than borrowing the card's `.code-map__node-staleness`; "No summary
+   yet." muted, since there is no summary to be fresh or stale. */
+.code-map__node-detail-staleness {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.code-map__node-detail-staleness--stale {
+  color: var(--stale-yellow);
+}
+
+.code-map__node-detail-staleness--none {
+  color: var(--text-mute);
+}
+
+/* The summary action as the mockup's quiet outlined chip. Busy, disabled
+   and service-unavailable behaviour is unchanged (CodeMap.tsx). */
+.code-map__node-detail-regenerate {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 8px;
   border-radius: 0;
-  border: 1px solid var(--accent-dim);
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.code-map__node-detail-regenerate:hover:not(:disabled) {
+  border-color: var(--text-mute);
+  color: var(--text-dim);
+}
+
+/* Disabled (busy, or Graph Service down) reads as a dashed outline rather
+   than an opacity fade on already-muted text, which would drop it below
+   legible contrast. `.code-map__action--service-unavailable:disabled` later
+   in this file still wins with `not-allowed` for the service-down case. */
+.code-map__node-detail-regenerate:disabled {
+  border-style: dashed;
+  cursor: default;
+}
+
+.code-map__node-detail-section .actionable-notice {
+  margin-top: 8px;
+}
+
+/* 10.5px `--text-dim` per the mockup's Location line. */
+.code-map__node-detail-location {
+  margin: 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+/* The pinned footer: "View source", full width inside 16px margins, a 1px
+   `--accent` outline and `--accent` text — the card's Source pill colour,
+   one colour for "go to source" across both surfaces. */
+.code-map__node-detail-source {
+  flex-shrink: 0;
+  margin: 0 16px 16px;
+  padding: 9px 12px;
+  border-radius: 0;
+  border: 1px solid var(--accent);
   background: transparent;
   color: var(--accent);
-  font-weight: 600;
+  font: inherit;
   font-size: 11px;
+  text-align: center;
   cursor: pointer;
 }
 
 .code-map__node-detail-source:hover {
-  border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
