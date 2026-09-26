@@ -1082,11 +1082,21 @@ code,
    navigation, not every mouse click. DESIGN.md `focus-ring`: `2px solid
    {colors.accent}` — the pre-existing `--accent`-keyed convention at every
    `:focus-visible` site in this file; no separate edit needed beyond the
-   `:root` value swap above (Boundaries & Constraints). */
+   `:root` value swap above (Boundaries & Constraints).
+
+   P3-12: a changed Node's (or changed cluster's) own treatment is already
+   an accent border plus a 1px accent ring, so the old `2px solid accent`
+   outline stacked a third identical accent line on it and "focused"
+   vanished into "changed". Keyboard focus on these two canvas elements
+   gets its own treatment instead (a deliberate exception to the accent
+   convention): a `--text`-coloured outline, offset 3px so it sits clear of
+   the 1px ring with a visible gap — border, ring and focus stay three
+   distinguishable layers. Applied to every Node card (and cluster), changed
+   or not, so focus reads the same everywhere on the canvas. */
 .code-map__node:focus-visible,
 .code-map__cluster:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: 2px solid var(--text);
+  outline-offset: 3px;
 }
 
 .code-map__node-kind {
@@ -1512,6 +1522,36 @@ code,
 .code-map__cluster--zoom {
   border-style: solid;
   border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* P3-11: a cluster holding at least one changed Node (PR Review) carries the
+   changed-Node accent — the same border + 1px ring as
+   `.code-map__node--changed` — so a zoomed-out map still shows where the
+   change is, and its outgoing edges keep `--changed-source`. Never
+   colour-only: `.code-map__cluster-changed` below is visible text, and the
+   accessible name ends ", N changed". */
+.code-map__cluster--changed {
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* P3-11: a cluster that is both too large to expand (`--zoom`) and holds a
+   changed Node. The two rules above tie on specificity and both set an
+   accent border, so this pins the combination explicitly: the zoom
+   cluster's own markers (accent text, the "zoom in" label) plus the changed
+   ring and the "N changed" label — each state still has its own cue. */
+.code-map__cluster--zoom.code-map__cluster--changed {
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  color: var(--accent);
+}
+
+.code-map__cluster-changed {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
   color: var(--accent);
 }
 

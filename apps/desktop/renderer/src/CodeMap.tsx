@@ -1234,6 +1234,301 @@ function pathEdgeKey(source: string, target: string): string {
   return `${source}→${target}`;
 }
 
+/**
+ * P3-11: whether an edge whose RENDERED source is `renderedSourceId` leaves a
+ * changed Node. True when that id is itself a changed Node, or when it is an
+ * unexpanded LOD cluster (a key of `clusterMembers`) with at least one
+ * changed member. Without the cluster half, a changed Node folded into a
+ * cluster loses its `code-map__edge--changed-source` accent the moment the
+ * user zooms out, because the rendered source is then the cluster's id.
+ *
+ * Pure: `clusterMembers` holds only the clusters actually rendered as a
+ * cluster card (expanded clusters render their members as cards instead).
+ */
+export function isChangedSource(
+  renderedSourceId: string,
+  changedNodeIds: ReadonlySet<string>,
+  clusterMembers: ReadonlyMap<string, readonly string[]>,
+): boolean {
+  if (changedNodeIds.has(renderedSourceId)) {
+    return true;
+  }
+  const members = clusterMembers.get(renderedSourceId);
+  return members !== undefined && members.some((id) => changedNodeIds.has(id));
+}
+
+/** P3-11: how many of a cluster's members are changed Nodes. `0` outside PR Review (empty set). */
+export function changedMemberCount(memberIds: readonly string[], changedNodeIds: ReadonlySet<string>): number {
+  if (changedNodeIds.size === 0) {
+    return 0;
+  }
+  let count = 0;
+  for (const id of memberIds) {
+    if (changedNodeIds.has(id)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/** P3-11: the marker `ClusterEdgeData.kind` carries; `edgeNodeEndpoints` trusts only data carrying it. */
+export const CHANGED_CLUSTER_EDGE = 'changed-cluster';
+
+/** P3-11: `label` of a synthetic edge standing in for real edges of more than one kind. */
+export const MIXED_EDGE_LABEL = 'mixed';
+
+/** One real (Node → Node) edge a synthetic cluster edge stands in for. */
+export interface NodePair {
+  source: string;
+  target: string;
+  /** The real edge's kind (`CodeMapEdgeKind`), as `toFlowEdges` put it on `label`. */
+  kind: string | undefined;
+}
+
+/**
+ * P3-11: `FlowEdge.data` on a synthetic changed-cluster edge. `nodePairs` is
+ * every real edge collapsed into it, in input order, so a click can resolve
+ * to a real Node id (a cluster id must never reach `navigateToNode`, AD-2)
+ * and the path highlight can test the real endpoints.
+ */
+export interface ClusterEdgeData extends Record<string, unknown> {
+  kind: typeof CHANGED_CLUSTER_EDGE;
+  nodePairs: NodePair[];
+}
+
+function clusterEdgeData(edge: Pick<FlowEdge, 'data'>): ClusterEdgeData | undefined {
+  const data = edge.data;
+  if (
+    data !== undefined &&
+    data.kind === CHANGED_CLUSTER_EDGE &&
+    Array.isArray(data.nodePairs) &&
+    data.nodePairs.length > 0
+  ) {
+    return data as ClusterEdgeData;
+  }
+  return undefined;
+}
+
+/**
+ * P3-11: the real Node pairs an edge stands for — every collapsed pair of a
+ * synthetic changed-cluster edge, or the edge's own endpoints otherwise.
+ */
+export function edgeNodePairs(edge: Pick<FlowEdge, 'source' | 'target' | 'data' | 'label'>): NodePair[] {
+  const data = clusterEdgeData(edge);
+  if (data !== undefined) {
+    return data.nodePairs;
+  }
+  return [{ source: edge.source, target: edge.target, kind: typeof edge.label === 'string' ? edge.label : undefined }];
+}
+
+/** P3-11: an edge's (first) real Node endpoints — see `edgeNodePairs`. */
+export function edgeNodeEndpoints(edge: Pick<FlowEdge, 'source' | 'target' | 'data' | 'label'>): {
+  source: string;
+  target: string;
+} {
+  const [first] = edgeNodePairs(edge);
+  return first !== undefined ? { source: first.source, target: first.target } : { source: edge.source, target: edge.target };
+}
+
+/**
+ * P3-11: the edges leaving a changed Node that have at least one end folded
+ * into an unexpanded LOD cluster — a clustered changed source (target a card
+ * or a cluster), or a changed card whose target is clustered. The ordinary
+ * edge path drops every edge with a clustered endpoint (no rendered Node to
+ * attach to), so without these a zoomed-out PR Review loses those edges.
+ *
+ * Deliberately narrow — only edges whose real source is changed — so Code
+ * Map Mode and every other edge render exactly as before. Each edge is
+ * re-anchored on its rendered endpoints, de-duplicated per rendered pair
+ * (every collapsed real pair kept in `data.nodePairs`), and never drawn when
+ * both ends fold into the same cluster. A collapsed edge keeps its kind's
+ * `label` and class when every real edge shares it, and is labelled
+ * `MIXED_EDGE_LABEL` with no kind class otherwise. `memberToCluster` needs
+ * entries only for the clustered ends of changed-source edges (see
+ * `assembleRenderedEdges`); `visibleNodeIds` is every Node rendered as a card.
+ */
+export function changedClusterEdges(
+  edges: readonly FlowEdge[],
+  changedNodeIds: ReadonlySet<string>,
+  memberToCluster: ReadonlyMap<string, string>,
+  visibleNodeIds: ReadonlySet<string>,
+): FlowEdge[] {
+  if (changedNodeIds.size === 0 || memberToCluster.size === 0) {
+    return [];
+  }
+  const groups = new Map<string, { source: string; target: string; pairs: NodePair[] }>();
+  for (const edge of edges) {
+    if (!changedNodeIds.has(edge.source) || edge.source === edge.target) {
+      continue;
+    }
+    const sourceCluster = memberToCluster.get(edge.source);
+    const targetCluster = memberToCluster.get(edge.target);
+    if (sourceCluster === undefined && targetCluster === undefined) {
+      continue;
+    }
+    const renderedSource = sourceCluster ?? (visibleNodeIds.has(edge.source) ? edge.source : undefined);
+    const renderedTarget = targetCluster ?? (visibleNodeIds.has(edge.target) ? edge.target : undefined);
+    if (renderedSource === undefined || renderedTarget === undefined || renderedSource === renderedTarget) {
+      continue;
+    }
+    const key = pathEdgeKey(renderedSource, renderedTarget);
+    const pair: NodePair = {
+      source: edge.source,
+      target: edge.target,
+      kind: typeof edge.label === 'string' ? edge.label : undefined,
+    };
+    const group = groups.get(key);
+    if (group) {
+      group.pairs.push(pair);
+    } else {
+      groups.set(key, { source: renderedSource, target: renderedTarget, pairs: [pair] });
+    }
+  }
+  const out: FlowEdge[] = [];
+  for (const [key, group] of groups) {
+    const kinds = new Set(group.pairs.map((pair) => pair.kind));
+    const [onlyKind] = kinds;
+    const sharedKind = kinds.size === 1 ? onlyKind : undefined;
+    const data: ClusterEdgeData = { kind: CHANGED_CLUSTER_EDGE, nodePairs: group.pairs };
+    out.push({
+      id: `${CHANGED_CLUSTER_EDGE}:${key}`,
+      source: group.source,
+      target: group.target,
+      label: sharedKind ?? MIXED_EDGE_LABEL,
+      // The changed-source accent is threaded on by `highlightEdge`, through
+      // `isChangedSource`, like every other edge.
+      className:
+        sharedKind !== undefined ? `code-map__edge code-map__edge--${sharedKind.toLowerCase()}` : 'code-map__edge',
+      data,
+    });
+  }
+  return out;
+}
+
+/**
+ * The rendered-edge class threading (Story 1.9 Phase 2's path highlight,
+ * then DESIGN.md `canvas-edge-highlighted`), pure so P3-11's cluster case is
+ * testable.
+ *
+ * Path highlight first, and it wins: only a `CALLS` edge can be part of a
+ * traced `'found'` path (`traceCallPath` walks `CALLS` only), so a same-pair
+ * `IMPORTS`/`USAGE` edge never highlights just because it shares (source,
+ * target) with a real step. P2-4: `isPathHighlightEdge` keeps that CALLS-only
+ * rule for `'found'`, but lets a `'neighbors'` trace highlight its real
+ * connecting edge whatever its kind (the adjacency it came from counts every
+ * kind). P3-11: tested on the edge's real Node pairs and their kinds
+ * (`edgeNodePairs`), so a synthetic cluster edge carrying a traced step is
+ * path-highlighted too.
+ *
+ * Then the changed-source accent (`canvas-edge-highlighted`, an accent
+ * stroke on any edge leaving a changed Node in PR Review Mode) — distinct
+ * from the traced route's trace-cyan stroke (that token's own note: "Path
+ * Trace routes use path-trace-route instead"), so the two never share an
+ * edge. `changedNodeIds` is empty outside PR Review Mode, so this is a no-op
+ * everywhere else. P3-11: `isChangedSource` also counts a rendered cluster
+ * source with a changed member.
+ */
+export function highlightEdge(
+  edge: FlowEdge,
+  pathHighlight: PathHighlight,
+  changedNodeIds: ReadonlySet<string>,
+  clusterMembers: ReadonlyMap<string, readonly string[]>,
+): FlowEdge {
+  const onPath = edgeNodePairs(edge).some((pair) =>
+    isPathHighlightEdge(pathHighlight, { source: pair.source, target: pair.target, label: pair.kind }),
+  );
+  if (onPath) {
+    return { ...edge, className: `${edge.className ?? ''} code-map__edge--path-highlight`.trim() };
+  }
+  if (isChangedSource(edge.source, changedNodeIds, clusterMembers)) {
+    return { ...edge, className: `${edge.className ?? ''} code-map__edge--changed-source`.trim() };
+  }
+  return edge;
+}
+
+export interface AssembleRenderedEdgesParams {
+  flowEdges: readonly FlowEdge[];
+  /** `computeLOD`'s clusters; those in `expandedClusterIds` render as cards and are skipped here. */
+  clusters: readonly Cluster[];
+  expandedClusterIds: ReadonlySet<string>;
+  /** Every Node rendered as a card (including an expanded cluster's members). */
+  visibleNodeIds: ReadonlySet<string>;
+  changedNodeIds: ReadonlySet<string>;
+  pathHighlight: PathHighlight;
+}
+
+/**
+ * The rendered edge list for the canvas. An edge whose endpoint is folded
+ * into an (unexpanded) cluster has no rendered Node to attach to, so it is
+ * filtered out rather than left for `@xyflow/react` to warn about (thousands
+ * of warnings at 10,000-Node scale) — except, P3-11, an edge leaving a
+ * changed Node, which `changedClusterEdges` re-anchors on its cluster(s).
+ * Every edge then goes through `highlightEdge`.
+ *
+ * 10,000-Node budget: nothing cluster-related is built unless some changed
+ * Node's edge has a clustered end, and `memberToCluster` only ever holds
+ * those ends (never every clustered Node).
+ */
+export function assembleRenderedEdges({
+  flowEdges,
+  clusters,
+  expandedClusterIds,
+  visibleNodeIds,
+  changedNodeIds,
+  pathHighlight,
+}: AssembleRenderedEdgesParams): FlowEdge[] {
+  const cardEdges = flowEdges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target));
+  const clusterMembers = new Map<string, readonly string[]>();
+  let synthetic: FlowEdge[] = [];
+  if (changedNodeIds.size > 0) {
+    // The clustered ends of changed-source edges — checked `has(source)`
+    // first, so an unchanged edge costs one Set lookup.
+    const clusteredEnds = new Set<string>();
+    for (const edge of flowEdges) {
+      if (!changedNodeIds.has(edge.source)) {
+        continue;
+      }
+      if (!visibleNodeIds.has(edge.source)) {
+        clusteredEnds.add(edge.source);
+      }
+      if (!visibleNodeIds.has(edge.target)) {
+        clusteredEnds.add(edge.target);
+      }
+    }
+    if (clusteredEnds.size > 0) {
+      const memberToCluster = new Map<string, string>();
+      for (const cluster of clusters) {
+        if (expandedClusterIds.has(cluster.id)) {
+          continue;
+        }
+        clusterMembers.set(cluster.id, cluster.nodeIds);
+        for (const nodeId of cluster.nodeIds) {
+          if (clusteredEnds.has(nodeId)) {
+            memberToCluster.set(nodeId, cluster.id);
+          }
+        }
+      }
+      synthetic = changedClusterEdges(flowEdges, changedNodeIds, memberToCluster, visibleNodeIds);
+    }
+  }
+  return cardEdges.concat(synthetic).map((edge) => highlightEdge(edge, pathHighlight, changedNodeIds, clusterMembers));
+}
+
+/**
+ * P3-11: which real Node an edge click navigates to. A synthetic cluster
+ * edge resolves on the collapsed pair touching `focusedNodeId` if there is
+ * one, else its first pair — always a real Node id, never a cluster id.
+ */
+export function edgeClickTarget(
+  edge: Pick<FlowEdge, 'source' | 'target' | 'data' | 'label'>,
+  focusedNodeId: string | null,
+): string {
+  const pairs = edgeNodePairs(edge);
+  const pair =
+    pairs.find((candidate) => candidate.source === focusedNodeId || candidate.target === focusedNodeId) ?? pairs[0];
+  return resolveEdgeClickTarget(pair ?? { source: edge.source, target: edge.target }, focusedNodeId);
+}
+
 function resolveEdgeClickTarget(edge: { source: string; target: string }, focusedNodeId: string | null): string {
   if (focusedNodeId === edge.source) {
     return edge.target;
@@ -1802,7 +2097,12 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
  * (`HealthAuditClusterGrid`).
  */
 type CodeMapClusterFlowNode = FlowNode<
-  { cluster: Cluster; onExpand: (cluster: Cluster) => void },
+  {
+    cluster: Cluster;
+    onExpand: (cluster: Cluster) => void;
+    /** P3-11: members that are changed Nodes (PR Review). `0` renders no changed marker. */
+    changedCount: number;
+  },
   'codeMapCluster'
 >;
 
@@ -2708,19 +3008,33 @@ export function HealthAuditClusterGrid({
   );
 }
 
-function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
-  const { cluster, onExpand } = data;
+/**
+ * P3-11: a cluster card's accessible name. A cluster holding changed Nodes
+ * (PR Review) appends ", N changed" so the marker is never colour-only.
+ */
+export function clusterAriaLabel(nodeCount: number, willZoomInsteadOfExpand: boolean, changedCount: number): string {
+  const base = willZoomInsteadOfExpand
+    ? `Cluster of ${nodeCount} nodes, too many to expand — zoom in`
+    : `Cluster of ${nodeCount} nodes, expand`;
+  return changedCount > 0 ? `${base}, ${changedCount} changed` : base;
+}
+
+export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
+  const { cluster, onExpand, changedCount } = data;
   const willZoomInsteadOfExpand = cluster.nodeIds.length > CLUSTER_EXPAND_MAX;
+  const classNames = ['code-map__cluster'];
+  if (willZoomInsteadOfExpand) {
+    classNames.push('code-map__cluster--zoom');
+  }
+  if (changedCount > 0) {
+    classNames.push('code-map__cluster--changed');
+  }
   return (
     <div
-      className={`code-map__cluster${willZoomInsteadOfExpand ? ' code-map__cluster--zoom' : ''}`}
+      className={classNames.join(' ')}
       tabIndex={0}
       role="button"
-      aria-label={
-        willZoomInsteadOfExpand
-          ? `Cluster of ${cluster.nodeIds.length} nodes, too many to expand — zoom in`
-          : `Cluster of ${cluster.nodeIds.length} nodes, expand`
-      }
+      aria-label={clusterAriaLabel(cluster.nodeIds.length, willZoomInsteadOfExpand, changedCount)}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
@@ -2731,6 +3045,11 @@ function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
       <Handle type="target" position={Position.Left} />
       <span className="code-map__cluster-count">{cluster.nodeIds.length}</span>
       <span className="code-map__cluster-label">{willZoomInsteadOfExpand ? 'zoom in' : 'nodes'}</span>
+      {changedCount > 0 && (
+        <span className="code-map__cluster-changed" aria-hidden="true">
+          {changedCount} changed
+        </span>
+      )}
       <Handle type="source" position={Position.Right} />
     </div>
   );
@@ -4765,50 +5084,27 @@ export function CodeMap({
         }
         continue;
       }
+      // P3-11: PR Review's changed marker (`0` everywhere else).
+      const changedCount = changedMemberCount(cluster.nodeIds, changedNodeIds);
       const clusterNode: CodeMapClusterFlowNode = {
         id: cluster.id,
         type: 'codeMapCluster',
         position: cluster.position,
-        data: { cluster, onExpand: expandCluster },
+        data: { cluster, onExpand: expandCluster, changedCount },
       };
       nodes.push(clusterNode);
     }
 
-    // An edge whose endpoint is folded into an (unexpanded) cluster has no
-    // rendered Node to attach to — filtered out here rather than left for
-    // `@xyflow/react` to warn about a missing source/target, which would
-    // also mean thousands of console warnings at 10,000-Node scale.
-    const edges = flowEdges
-      .filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
-      .map((edge) => {
-        // Story 1.9 (Phase 2): only a `CALLS` edge can be part of a traced
-        // path (`traceCallPath` walks `CALLS` only) — `edge.label` carries
-        // the same `CodeMapEdgeKind` `toFlowEdges` set it from, so checking
-        // it here (rather than re-deriving from `className`) keeps a
-        // same-pair `IMPORTS`/`USAGE` edge from getting highlighted just
-        // because it happens to share (source, target) with a real path
-        // step.
-        // P2-4: `isPathHighlightEdge` keeps that CALLS-only rule for a
-        // `'found'` path, but lets a `'neighbors'` trace highlight its real
-        // connecting edge whatever its kind (the adjacency it came from
-        // counts every kind).
-        if (isPathHighlightEdge(pathHighlight, edge)) {
-          return { ...edge, className: `${edge.className ?? ''} code-map__edge--path-highlight`.trim() };
-        }
-        // DESIGN.md `canvas-edge-highlighted`: an accent-colored variant for
-        // any edge leaving a changed Node (PR Review Mode) — distinct from
-        // the path-highlight variant just above, which is reserved for a
-        // traced route's own trace-cyan stroke (that token's own `note`
-        // field: "Path Trace routes use path-trace-route instead"). Checked
-        // second, after the path-highlight branch, so the two never both
-        // apply to the same edge — `changedNodeIds` is empty outside PR
-        // Review Mode (see its own declaration above), so this is a no-op
-        // everywhere else.
-        if (changedNodeIds.has(edge.source)) {
-          return { ...edge, className: `${edge.className ?? ''} code-map__edge--changed-source`.trim() };
-        }
-        return edge;
-      });
+    // P3-11: see `assembleRenderedEdges` — card-to-card edges, plus a
+    // changed Node's edges re-anchored on a cluster, all highlight-threaded.
+    const edges = assembleRenderedEdges({
+      flowEdges,
+      clusters: lodResult.clusters,
+      expandedClusterIds,
+      visibleNodeIds,
+      changedNodeIds,
+      pathHighlight,
+    });
 
     return { renderedNodes: nodes, renderedEdges: edges };
   }, [
@@ -4933,7 +5229,12 @@ export function CodeMap({
 
   const handleEdgeClick: EdgeMouseHandler<FlowEdge> = useCallback(
     (_event, edge) => {
-      navigateToNode(resolveEdgeClickTarget(edge, focusedNodeIdRef.current));
+      // P3-11: a synthetic cluster edge's rendered endpoints include a
+      // cluster id, which must never reach `navigateToNode` — resolve on the
+      // real Node pair it stands in for. `navigateToNode` → `centerOnNode`
+      // is LOD-aware (`resolveZoomToRevealNode`), so a folded target is
+      // zoomed into view as a card.
+      navigateToNode(edgeClickTarget(edge, focusedNodeIdRef.current));
     },
     [navigateToNode],
   );
