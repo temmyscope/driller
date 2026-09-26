@@ -19,6 +19,9 @@ import {
   ROUTE_MIN_READABLE_ZOOM,
   type PathTraceState,
   type RouteFit,
+  type CallTreeInput,
+  type FoundPathTrace,
+  callTreeOrder,
   isRouteClamped,
   quantizeZoomBand,
   routeExtendsBeyondText,
@@ -26,6 +29,9 @@ import {
   routeViewport,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
+
+/** The trace props `FoundTraceSteps` takes — the same `FoundPathTrace` fields the component's own props use. */
+type FoundTrace = Pick<FoundPathTrace, 'path' | 'parents' | 'depths'>;
 
 const EPSILON = 1e-9;
 const near = (actual: number, expected: number, message?: string) =>
@@ -203,7 +209,7 @@ describe('routeFitRequest', () => {
 
 describe('isRouteClamped', () => {
   const path = ['a', 'b'];
-  const found: PathTraceState = { status: 'found', path };
+  const found: PathTraceState = { status: 'found', path, parents: { a: null, b: 'a' }, depths: { a: 0, b: 1 } };
   const nodeIds = ['o', 'x'];
   const neighborIds = ['x'];
   const neighbors: PathTraceState = {
@@ -247,6 +253,8 @@ describe('FoundTraceSteps extends-beyond line', () => {
     renderTree(
       FoundTraceSteps({
         path: ['entry', 'leaf'],
+        parents: { entry: null, leaf: 'entry' },
+        depths: { entry: 0, leaf: 1 },
         resolveNode: (id) => ({ name: id, file: undefined }),
         onNavigate: () => {},
         onDismiss: () => {},
@@ -269,6 +277,252 @@ describe('FoundTraceSteps extends-beyond line', () => {
   it('still lists every step', () => {
     const rows = render(true).filter((element) => element.props.className === 'code-map__path-trace-stack-row');
     assert.equal(rows.length, 2);
+  });
+});
+
+// FIX-2: the step list renders the call tree in depth-first order.
+describe('FoundTraceSteps call tree', () => {
+  const INDENT = 'code-map__path-trace-indent';
+  const CALLER = 'code-map__path-trace-stack-row-caller';
+  const ROW = 'code-map__path-trace-stack-row';
+  const NAME = 'code-map__path-trace-stack-row-name';
+
+  const render = (trace: FoundTrace) =>
+    renderTree(
+      FoundTraceSteps({
+        ...trace,
+        resolveNode: (id) => ({ name: `fn_${id}`, file: undefined }),
+        onNavigate: () => {},
+        onDismiss: () => {},
+      }),
+    );
+
+  /** Per row, in document order: its name, indent px (0 = no connector), and "called by" note ('' = none). */
+  const rowsOf = (trace: FoundTrace) =>
+    render(trace)
+      .filter((element) => element.props.className === ROW)
+      .map((row) => {
+        const inner = renderTree(row.props.children);
+        const indent = inner.find((element) => element.props.className === INDENT);
+        const caller = inner.find((element) => element.props.className === CALLER);
+        return {
+          name: textOf(inner.find((element) => element.props.className === NAME)),
+          indent: indent ? Number.parseInt(String((indent.props.style as { marginLeft: string }).marginLeft), 10) : 0,
+          calledBy: caller ? textOf(caller) : '',
+        };
+      });
+
+  const SIBLINGS: FoundTrace = {
+    // E calls A and B; A calls C → BFS path [E, A, B, C].
+    path: ['E', 'A', 'B', 'C'],
+    parents: { E: null, A: 'E', B: 'E', C: 'A' },
+    depths: { E: 0, A: 1, B: 1, C: 2 },
+  };
+
+  it('renders rows in depth-first tree order: C under A, B back at A’s level naming its caller', () => {
+    assert.deepEqual(rowsOf(SIBLINGS), [
+      { name: 'fn_E', indent: 0, calledBy: '' },
+      { name: 'fn_A', indent: 8, calledBy: '' },
+      { name: 'fn_C', indent: 16, calledBy: '' },
+      // B follows C but is called by E: same indent as A, caller named.
+      { name: 'fn_B', indent: 8, calledBy: 'called by fn_E' },
+    ]);
+  });
+
+  it('nests the lists so B is not inside A’s subtree', () => {
+    const elements = render(SIBLINGS);
+    const itemNames = (li: RenderedElement) =>
+      renderTree(li.props.children)
+        .filter((element) => element.props.className === NAME)
+        .map((element) => textOf(element));
+    const items = elements.filter((element) => element.type === 'li');
+    const byFirstName = new Map(items.map((li) => [itemNames(li)[0], itemNames(li)]));
+    assert.deepEqual(byFirstName.get('fn_E'), ['fn_E', 'fn_A', 'fn_C', 'fn_B']);
+    assert.deepEqual(byFirstName.get('fn_A'), ['fn_A', 'fn_C']);
+    assert.deepEqual(byFirstName.get('fn_B'), ['fn_B']);
+  });
+
+  it('has no hop numbers and labels the region "Call tree"', () => {
+    const elements = render(SIBLINGS);
+    assert.equal(elements.filter((element) => element.props.className === 'code-map__path-trace-hop-circle').length, 0);
+    const region = elements.find((element) => element.props.role === 'region');
+    assert.equal(region?.props['aria-label'], 'Call tree');
+  });
+
+  it('renders a linear chain as a descending chain with no caller notes', () => {
+    assert.deepEqual(
+      rowsOf({ path: ['E', 'A', 'B'], parents: { E: null, A: 'E', B: 'A' }, depths: { E: 0, A: 1, B: 2 } }),
+      [
+        { name: 'fn_E', indent: 0, calledBy: '' },
+        { name: 'fn_A', indent: 8, calledBy: '' },
+        { name: 'fn_B', indent: 16, calledBy: '' },
+      ],
+    );
+  });
+
+  it('renders a leaf entry as a single unindented row', () => {
+    assert.deepEqual(rowsOf({ path: ['E'], parents: { E: null }, depths: { E: 0 } }), [
+      { name: 'fn_E', indent: 0, calledBy: '' },
+    ]);
+  });
+
+  it('caps the indent at 64px and names the caller on every row from depth 8', () => {
+    const ids = Array.from({ length: 11 }, (_, index) => `n${index}`);
+    const rows = rowsOf(chain(ids));
+    assert.deepEqual(
+      rows.map((row) => row.indent),
+      [0, 8, 16, 24, 32, 40, 48, 56, 64, 64, 64],
+    );
+    assert.deepEqual(
+      rows.map((row) => row.calledBy),
+      ['', '', '', '', '', '', '', '', 'called by fn_n7', 'called by fn_n8', 'called by fn_n9'],
+    );
+  });
+});
+
+/** A linear chain ids[0] → ids[1] → … as a found trace. */
+function chain(ids: string[]): FoundTrace {
+  const parents: Record<string, string | null> = {};
+  const depths: Record<string, number> = {};
+  ids.forEach((id, index) => {
+    parents[id] = index === 0 ? null : ids[index - 1]!;
+    depths[id] = index;
+  });
+  return { path: ids, parents, depths };
+}
+
+describe('callTreeOrder', () => {
+  const rows = (input: CallTreeInput) => callTreeOrder(input).map(({ id, depth, calledBy }) => ({ id, depth, calledBy }));
+
+  /** Runs `fn` with console.warn captured; returns the warnings. */
+  function warningsDuring(fn: () => void): string[] {
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (message: unknown) => {
+      warnings.push(String(message));
+    };
+    try {
+      fn();
+    } finally {
+      console.warn = original;
+    }
+    return warnings;
+  }
+
+  it('orders depth-first, children by sorted id, not BFS', () => {
+    assert.deepEqual(
+      rows({
+        path: ['E', 'A', 'B', 'C'],
+        parents: { E: null, A: 'E', B: 'E', C: 'A' },
+        depths: { E: 0, A: 1, B: 1, C: 2 },
+      }),
+      [
+        { id: 'E', depth: 0, calledBy: null },
+        { id: 'A', depth: 1, calledBy: null },
+        { id: 'C', depth: 2, calledBy: null },
+        { id: 'B', depth: 1, calledBy: 'E' },
+      ],
+    );
+  });
+
+  it('sorts children by id even when path lists them otherwise', () => {
+    assert.deepEqual(
+      rows({ path: ['E', 'b', 'a'], parents: { E: null, b: 'E', a: 'E' }, depths: { E: 0, b: 1, a: 1 } }).map((r) => r.id),
+      ['E', 'a', 'b'],
+    );
+  });
+
+  it('accepts the engine’s null-prototype records', () => {
+    const parents = Object.assign(Object.create(null) as Record<string, string | null>, { E: null, A: 'E' });
+    const depths = Object.assign(Object.create(null) as Record<string, number>, { E: 0, A: 1 });
+    assert.deepEqual(rows({ path: ['E', 'A'], parents, depths }), [
+      { id: 'E', depth: 0, calledBy: null },
+      { id: 'A', depth: 1, calledBy: null },
+    ]);
+  });
+
+  it('missing parents: a flat list in path order, no caller notes, logged once', () => {
+    const input = { path: ['E', 'A', 'B'], depths: { E: 0, A: 1, B: 1 } };
+    let result: ReturnType<typeof rows> = [];
+    const warnings = warningsDuring(() => {
+      result = rows(input);
+      rows(input);
+    });
+    assert.deepEqual(result, [
+      { id: 'E', depth: 0, calledBy: null },
+      { id: 'A', depth: 0, calledBy: null },
+      { id: 'B', depth: 0, calledBy: null },
+    ]);
+    assert.equal(warnings.length, 1);
+  });
+
+  it('missing depths: derived as the parent’s depth + 1, logged once', () => {
+    const input = { path: ['E', 'A', 'B', 'C'], parents: { E: null, A: 'E', B: 'E', C: 'A' } };
+    let result: ReturnType<typeof rows> = [];
+    const warnings = warningsDuring(() => {
+      result = rows(input);
+      rows(input);
+    });
+    assert.deepEqual(
+      result.map((row) => [row.id, row.depth]),
+      [
+        ['E', 0],
+        ['A', 1],
+        ['C', 2],
+        ['B', 1],
+      ],
+    );
+    assert.equal(warnings.length, 1);
+  });
+
+  it('a depth that disagrees with the parent chain is re-derived, never trusted', () => {
+    const warnings = warningsDuring(() => {
+      assert.deepEqual(
+        rows({ path: ['E', 'A'], parents: { E: null, A: 'E' }, depths: { E: 0, A: 5 } }).map((row) => row.depth),
+        [0, 1],
+      );
+    });
+    assert.equal(warnings.length, 1);
+  });
+
+  it('a self-parent or a parent outside path makes that Node a root', () => {
+    const warnings = warningsDuring(() => {
+      assert.deepEqual(
+        rows({
+          path: ['E', 'A', 'B'],
+          parents: { E: null, A: 'A', B: 'ghost' },
+          depths: { E: 0, A: 1, B: 1 },
+        }),
+        [
+          { id: 'E', depth: 0, calledBy: null },
+          { id: 'A', depth: 0, calledBy: null },
+          { id: 'B', depth: 0, calledBy: null },
+        ],
+      );
+    });
+    assert.ok(warnings.length >= 1);
+  });
+
+  it('a parent cycle unreachable from the entry still renders every Node once', () => {
+    warningsDuring(() => {
+      const result = rows({ path: ['E', 'A', 'B'], parents: { E: null, A: 'B', B: 'A' }, depths: { E: 0, A: 1, B: 1 } });
+      assert.deepEqual(result.map((row) => row.id).sort(), ['A', 'B', 'E']);
+      assert.equal(result[0]!.id, 'E');
+    });
+  });
+
+  it('FoundTraceSteps renders a found state missing parents/depths without throwing', () => {
+    warningsDuring(() => {
+      const elements = renderTree(
+        FoundTraceSteps({
+          ...({ path: ['E', 'A'] } as unknown as FoundTrace),
+          resolveNode: (id) => ({ name: id, file: undefined }),
+          onNavigate: () => {},
+          onDismiss: () => {},
+        }),
+      );
+      assert.equal(elements.filter((element) => element.props.className === 'code-map__path-trace-stack-row').length, 2);
+    });
   });
 });
 

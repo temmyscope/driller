@@ -47,10 +47,13 @@ export interface PathTraceEdge {
  * Result of a Path Trace attempt — an explicit result state (AD-13's broader
  * pattern), never null/undefined/an ambiguous empty list standing in for
  * "no match":
- *  - `'found'`: `path` is the ordered list of Node ids the BFS visited,
- *    entry first. A Node with zero outgoing `CALLS` edges still produces a
- *    valid single-element `found` path (Always) — `'no-path-found'` is
- *    reserved exclusively for zero query matches (Always).
+ *  - `'found'`: `path` is every Node id the BFS reached, in visit order,
+ *    entry first — the call-reachable set, not a single chain. `parents`
+ *    and `depths` (FIX-2) carry the BFS tree: the caller each Node was
+ *    first reached from, and its hop distance from the entry. A Node with
+ *    zero outgoing `CALLS` edges still produces a valid single-element
+ *    `found` result (Always) — `'no-path-found'` is reserved exclusively
+ *    for zero query matches (Always).
  *  - `'ambiguous'` (Story 1.9, Phase 3): the query matched more than one
  *    Node at the tier that resolves it (see `resolveEntryNode`'s doc
  *    comment for the per-tier resolution rule) — `candidates` is that
@@ -64,7 +67,27 @@ export interface PathTraceEdge {
  *    user-facing text.
  */
 export type PathTraceResult =
-  | { status: 'found'; path: string[] }
+  | {
+      status: 'found';
+      /**
+       * Every reached Node id in BFS visit order, entry first. It is NOT a
+       * chain: consecutive entries are often sibling callees, never
+       * caller→callee by construction. The name `path` predates FIX-2 and
+       * stays for backward compatibility with the IPC renderer and the
+       * `trace_path` agent consumers; read `parents` for who calls whom, and
+       * never build edges from consecutive `path` pairs.
+       */
+      path: string[];
+      /**
+       * FIX-2: the BFS tree behind `path` — each reached Node's id maps to
+       * the Node it was FIRST discovered from (the entry maps to `null`).
+       * Null-prototype object, so a Node id can never collide with an
+       * `Object.prototype` key.
+       */
+      parents: Record<string, string | null>;
+      /** FIX-2: each reached Node's hop distance from the entry in the BFS tree (entry = 0). Null-prototype, like `parents`. */
+      depths: Record<string, number>;
+    }
   | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
   | { status: 'error'; message: string };
@@ -146,6 +169,13 @@ export function traceCallPath(
   const visited = new Set<string>([entry.id]);
   const path: string[] = [entry.id];
   const queue: string[] = [entry.id];
+  // FIX-2: the BFS tree, recorded at first discovery (the same moment a Node
+  // joins `path`), so it's exactly as deterministic as `path` itself.
+  // Null-prototype (no `__proto__`/`constructor` collisions with a Node id).
+  const parents: Record<string, string | null> = Object.create(null) as Record<string, string | null>;
+  const depths: Record<string, number> = Object.create(null) as Record<string, number>;
+  parents[entry.id] = null;
+  depths[entry.id] = 0;
 
   while (queue.length > 0) {
     // Non-null: `queue.length > 0` just guarded this shift.
@@ -164,10 +194,14 @@ export function traceCallPath(
       visited.add(target);
       path.push(target);
       queue.push(target);
+      parents[target] = current;
+      // Non-null: `current` was dequeued, so its depth was recorded when it
+      // was discovered (or it's the entry, recorded above).
+      depths[target] = depths[current]! + 1;
     }
   }
 
-  return { status: 'found', path };
+  return { status: 'found', path, parents, depths };
 }
 
 /**

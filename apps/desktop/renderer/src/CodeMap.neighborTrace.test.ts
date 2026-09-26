@@ -14,6 +14,7 @@ import {
   MAX_RENDERED_NEIGHBORS,
   NeighborTraceSteps,
   NodeNeighborPills,
+  callEdgesOf,
   type NodeAdjacency,
   type PathTraceState,
   isPathHighlightEdge,
@@ -85,15 +86,131 @@ describe('pathTraceHighlight', () => {
     ...neighborTrace(adjacency, 'o', 'callers'),
   };
 
-  it('highlights a found path: its Nodes and consecutive-pair edges, CALLS only', () => {
-    const highlight = pathTraceHighlight({ status: 'found', path: ['a', 'o', 'x'] });
+  it('highlights a found chain: its Nodes and its real CALLS edges', () => {
+    const highlight = pathTraceHighlight(
+      { status: 'found', path: ['a', 'o', 'x'], parents: { a: null, o: 'a', x: 'o' }, depths: { a: 0, o: 1, x: 2 } },
+      [
+        { source: 'a', target: 'o' },
+        { source: 'o', target: 'x' },
+      ],
+    );
     assert.deepEqual([...highlight.nodeIds], ['a', 'o', 'x']);
     assert.deepEqual([...highlight.edgeKeys], ['a→o', 'o→x']);
     assert.equal(highlight.callsOnly, true);
   });
 
+  // FIX-2 contract guard: `path` is BFS visit order, not a chain. Sibling
+  // callees are consecutive in `path` but never call each other, so a
+  // consecutive-pair key must never appear — only real CALLS edges do.
+  it('highlights exactly the real CALLS edges among reached Nodes, never consecutive path pairs', () => {
+    // E calls A and B; A calls C → path [E, A, B, C].
+    const highlight = pathTraceHighlight(
+      {
+        status: 'found',
+        path: ['E', 'A', 'B', 'C'],
+        parents: { E: null, A: 'E', B: 'E', C: 'A' },
+        depths: { E: 0, A: 1, B: 1, C: 2 },
+      },
+      [
+        { source: 'E', target: 'A' },
+        { source: 'E', target: 'B' },
+        { source: 'A', target: 'C' },
+        // An edge leaving the reached set never highlights.
+        { source: 'C', target: 'outside' },
+        { source: 'elsewhere', target: 'E' },
+      ],
+    );
+    assert.deepEqual([...highlight.edgeKeys].sort(), ['A→C', 'E→A', 'E→B']);
+    // The consecutive pairs A→B and B→C are not calls.
+    assert.equal(highlight.edgeKeys.has('A→B'), false);
+    assert.equal(highlight.edgeKeys.has('B→C'), false);
+    assert.equal(isPathHighlightEdge(highlight, { source: 'A', target: 'B', label: 'CALLS' }), false);
+    assert.equal(isPathHighlightEdge(highlight, { source: 'E', target: 'B', label: 'CALLS' }), true);
+  });
+
+  it('lights non-tree calls on fan-in (serviceB→repository), not sibling pairs', () => {
+    // fixtures/path-trace-basic: repository is first reached via serviceA,
+    // but serviceB really calls it too.
+    const path = ['handleRequest', 'serviceA', 'serviceB', 'repository', 'cacheLookup'];
+    const highlight = pathTraceHighlight(
+      {
+        status: 'found',
+        path,
+        parents: {
+          handleRequest: null,
+          serviceA: 'handleRequest',
+          serviceB: 'handleRequest',
+          repository: 'serviceA',
+          cacheLookup: 'repository',
+        },
+        depths: { handleRequest: 0, serviceA: 1, serviceB: 1, repository: 2, cacheLookup: 3 },
+      },
+      [
+        { source: 'handleRequest', target: 'serviceA' },
+        { source: 'handleRequest', target: 'serviceB' },
+        { source: 'serviceA', target: 'repository' },
+        { source: 'serviceB', target: 'repository' },
+        { source: 'repository', target: 'cacheLookup' },
+        { source: 'cacheLookup', target: 'repository' },
+      ],
+    );
+    assert.equal(highlight.edgeKeys.has('serviceB→repository'), true);
+    assert.equal(highlight.edgeKeys.has('cacheLookup→repository'), true);
+    assert.equal(highlight.edgeKeys.has('serviceA→serviceB'), false);
+    // A consecutive pair appears only when it is itself a real call; the
+    // sibling pair serviceA→serviceB never does.
+    const realCalls = new Set([
+      'handleRequest→serviceA',
+      'handleRequest→serviceB',
+      'serviceA→repository',
+      'serviceB→repository',
+      'repository→cacheLookup',
+      'cacheLookup→repository',
+    ]);
+    assert.deepEqual([...highlight.edgeKeys].sort(), [...realCalls].sort());
+    for (let i = 0; i < path.length - 1; i += 1) {
+      const consecutive = `${path[i]}→${path[i + 1]}`;
+      assert.equal(highlight.edgeKeys.has(consecutive), realCalls.has(consecutive), consecutive);
+    }
+    assert.equal(highlight.edgeKeys.size, 6);
+  });
+
+  it('highlights no self-edge on a cycle, and nothing for a leaf entry', () => {
+    const cycle = pathTraceHighlight(
+      { status: 'found', path: ['E', 'A'], parents: { E: null, A: 'E' }, depths: { E: 0, A: 1 } },
+      [
+        { source: 'E', target: 'A' },
+        { source: 'A', target: 'E' },
+        { source: 'E', target: 'E' },
+      ],
+    );
+    assert.deepEqual([...cycle.edgeKeys].sort(), ['A→E', 'E→A']);
+    const leaf = pathTraceHighlight({ status: 'found', path: ['E'], parents: { E: null }, depths: { E: 0 } }, [
+      { source: 'X', target: 'E' },
+    ]);
+    assert.deepEqual([...leaf.nodeIds], ['E']);
+    assert.equal(leaf.edgeKeys.size, 0);
+  });
+
+  it('does not throw on a found state missing parents/depths — the highlight needs neither', () => {
+    const malformed = { status: 'found', path: ['E', 'A'] } as unknown as PathTraceState;
+    const highlight = pathTraceHighlight(malformed, [{ source: 'E', target: 'A' }]);
+    assert.deepEqual([...highlight.edgeKeys], ['E→A']);
+  });
+
+  it('callEdgesOf keeps only CALLS edges', () => {
+    assert.deepEqual(
+      callEdgesOf([
+        { source: 'a', target: 'b', kind: 'CALLS' },
+        { source: 'a', target: 'c', kind: 'IMPORTS' },
+        { source: 'a', target: 'd', kind: 'USAGE' },
+      ]),
+      [{ source: 'a', target: 'b' }],
+    );
+  });
+
   it('highlights a neighbour trace from its stored snapshot, any edge kind', () => {
-    const highlight = pathTraceHighlight(neighbors);
+    const highlight = pathTraceHighlight(neighbors, []);
     assert.deepEqual([...highlight.nodeIds], ['o', 'b', 'a', 'c']);
     assert.deepEqual([...highlight.edgeKeys], ['b→o', 'a→o', 'c→o']);
     assert.equal(highlight.callsOnly, false);
@@ -107,14 +224,14 @@ describe('pathTraceHighlight', () => {
       nodeIds: ['o', 'q'],
       edgeKeys: ['o→q'],
       neighborIds: ['q'],
-    });
+    }, []);
     assert.deepEqual([...highlight.nodeIds], ['o', 'q']);
     assert.deepEqual([...highlight.edgeKeys], ['o→q']);
   });
 
   it('highlights nothing while idle (or searching)', () => {
     for (const state of [{ status: 'idle' }, { status: 'searching' }] as PathTraceState[]) {
-      const highlight = pathTraceHighlight(state);
+      const highlight = pathTraceHighlight(state, []);
       assert.equal(highlight.nodeIds.size, 0);
       assert.equal(highlight.edgeKeys.size, 0);
     }
@@ -122,20 +239,25 @@ describe('pathTraceHighlight', () => {
 
   describe('isPathHighlightEdge', () => {
     it("highlights a neighbour trace's connecting edge whatever its kind", () => {
-      const highlight = pathTraceHighlight(neighbors);
+      const highlight = pathTraceHighlight(neighbors, []);
       for (const label of ['CALLS', 'IMPORTS', 'USAGE']) {
         assert.equal(isPathHighlightEdge(highlight, { source: 'b', target: 'o', label }), true, label);
       }
     });
 
     it('does not highlight an edge the neighbour trace does not contain', () => {
-      const highlight = pathTraceHighlight(neighbors);
+      const highlight = pathTraceHighlight(neighbors, []);
       assert.equal(isPathHighlightEdge(highlight, { source: 'o', target: 'b', label: 'CALLS' }), false);
       assert.equal(isPathHighlightEdge(highlight, { source: 'o', target: 'x', label: 'CALLS' }), false);
     });
 
     it('keeps a found path CALLS-only', () => {
-      const highlight = pathTraceHighlight({ status: 'found', path: ['a', 'o'] });
+      const highlight = pathTraceHighlight({
+        status: 'found',
+        path: ['a', 'o'],
+        parents: { a: null, o: 'a' },
+        depths: { a: 0, o: 1 },
+      }, [{ source: 'a', target: 'o' }]);
       assert.equal(isPathHighlightEdge(highlight, { source: 'a', target: 'o', label: 'CALLS' }), true);
       assert.equal(isPathHighlightEdge(highlight, { source: 'a', target: 'o', label: 'IMPORTS' }), false);
     });

@@ -30,7 +30,7 @@ import {
 } from './CodeMap';
 
 const NO_CLUSTERS: ReadonlyMap<string, readonly string[]> = new Map();
-const NO_PATH = pathTraceHighlight({ status: 'idle' });
+const NO_PATH = pathTraceHighlight({ status: 'idle' }, []);
 const CHANGED = 'code-map__edge--changed-source';
 const PATH = 'code-map__edge--path-highlight';
 
@@ -198,7 +198,12 @@ describe('highlightEdge', () => {
   const clusters = new Map([['cluster:A', ['a', 'x']]]);
 
   it('lets the path highlight win on a synthetic edge on a found path (real endpoints, CALLS only)', () => {
-    const found = pathTraceHighlight({ status: 'found', path: ['a', 'v'] });
+    const found = pathTraceHighlight({
+      status: 'found',
+      path: ['a', 'v'],
+      parents: { a: null, v: 'a' },
+      depths: { a: 0, v: 1 },
+    }, [{ source: 'a', target: 'v' }]);
     const [calls] = changedClusterEdges([edge('a', 'v')], new Set(['a']), memberToCluster, new Set(['v']));
     assert.ok(calls);
     const out = highlightEdge(calls, found, new Set(['a']), clusters);
@@ -226,7 +231,7 @@ describe('highlightEdge', () => {
       nodeIds: ['a', 'v'],
       edgeKeys: ['a→v'],
       neighborIds: ['v'],
-    });
+    }, []);
     const [imports] = changedClusterEdges(
       [edge('a', 'v', 'IMPORTS')],
       new Set(['a']),

@@ -216,6 +216,39 @@ function jsonToolResult(result: unknown): { content: [{ type: 'text'; text: stri
 }
 
 /**
+ * Registers the `trace_path` tool (Story 5.1, Phase 2) on `server` —
+ * extracted (FIX-2) so a test can capture and invoke the exact registered
+ * handler without binding the listener. The handler serializes
+ * `computePathTraceResult` as-is, so agents get the same `parents`/`depths`
+ * tree the renderer draws (AD-13).
+ */
+export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): void {
+  server.registerTool(
+    'trace_path',
+    {
+      title: 'Trace the call tree from an entry Node',
+      // FIX-2: the result is the reachable call TREE, not a single path —
+      // `path` is BFS visit order (consecutive entries are often siblings),
+      // so agents must read `parents`/`depths` for who calls whom, exactly
+      // as the renderer's highlight and step list do (AD-13).
+      description:
+        "Trace the call tree reachable from a query-resolved entry Node through driller's Code Map, via CALLS edges only (breadth-first, each Node visited once). The result is the reachable call tree from the entry, not a single path. " +
+        "On 'found', `path` lists every reached Node id in breadth-first visit order, entry first; consecutive entries are often sibling callees, not caller and callee. " +
+        '`parents` maps each reached Node id to the caller it was first reached from (the entry maps to null); use it for who calls whom. ' +
+        '`depths` maps each reached Node id to its hop distance from the entry (entry = 0). ' +
+        'Returns the exact same PathTraceResult the human-facing UI renders for the identical query: an explicit result state (found/ambiguous/no-path-found/error), never collapsed into a generic success/failure.',
+      inputSchema: z.object({
+        query: z
+          .string()
+          .min(1, 'query must not be empty.')
+          .describe('The Path Trace query — matched against Node id first, then name, then a name substring.'),
+      }),
+    },
+    async ({ query }) => jsonToolResult(await computePathTraceResult(query)),
+  );
+}
+
+/**
  * Builds the `McpServer`, registers all five tools (`lookup_node` plus
  * Phase 2's `trace_path`/`expand_blast_radius`/`compute_diff_scope`/
  * `get_coverage_summary`), and starts the `127.0.0.1`-bound HTTP listener —
@@ -303,21 +336,7 @@ export function startMcpServer(
   // external agent must state which project it's querying, same as the
   // renderer does.
 
-  server.registerTool(
-    'trace_path',
-    {
-      title: 'Trace a call path',
-      description:
-        "Trace a deterministic call path from a query-resolved entry Node through driller's Code Map, via CALLS edges only. Returns the exact same PathTraceResult the human-facing UI's Path Trace would get for the identical query — an explicit result state (found/ambiguous/no-path-found/error), never collapsed into a generic success/failure.",
-      inputSchema: z.object({
-        query: z
-          .string()
-          .min(1, 'query must not be empty.')
-          .describe('The Path Trace query — matched against Node id first, then name, then a name substring.'),
-      }),
-    },
-    async ({ query }) => jsonToolResult(await computePathTraceResult(query)),
-  );
+  registerTracePathTool(server);
 
   server.registerTool(
     'expand_blast_radius',

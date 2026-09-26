@@ -50,10 +50,30 @@ sort coincides with the files' natural reading order below — the order shown
 is guaranteed by code, not an assumption about backend edge ordering that
 happens to hold today.
 
+`path` is the reachable set in BFS visit order, not a chain: consecutive
+entries are often siblings (`serviceA`, `serviceB` both called by
+`handleRequest`). FIX-2 added `parents` (the caller each Node was FIRST
+reached from; the entry maps to `null`) and `depths` (hops from the entry in
+that tree). The step list renders that tree depth-first, children sorted by
+id, and the map highlights every real `CALLS` edge among the reached Nodes —
+including non-tree ones such as `serviceB -> repository` and the
+`cacheLookup -> repository` back-edge — never consecutive `path` pairs.
+
 ### `"handleRequest"`
 
 ```
-{ status: 'found', path: [handleRequest, serviceA, serviceB, repository, cacheLookup] }
+{
+  status: 'found',
+  path: [handleRequest, serviceA, serviceB, repository, cacheLookup],
+  parents: {
+    handleRequest: null,
+    serviceA: handleRequest,
+    serviceB: handleRequest,
+    repository: serviceA,
+    cacheLookup: repository,
+  },
+  depths: { handleRequest: 0, serviceA: 1, serviceB: 1, repository: 2, cacheLookup: 3 },
+}
 ```
 
 BFS order: `handleRequest` is the entry; its two outgoing `CALLS` edges (to
@@ -65,10 +85,25 @@ fixture's qualified names coincides with source order) are visited next;
 back to `repository` is a no-op (already visited, cycle terminates). Five
 Nodes total, each exactly once.
 
+Call tree (step list rows, depth-first):
+
+```
+handleRequest
+  serviceA
+    repository
+      cacheLookup
+  serviceB            (called by handleRequest)
+```
+
 ### `"cacheLookup"` (the cyclic entry)
 
 ```
-{ status: 'found', path: [cacheLookup, repository] }
+{
+  status: 'found',
+  path: [cacheLookup, repository],
+  parents: { cacheLookup: null, repository: cacheLookup },
+  depths: { cacheLookup: 0, repository: 1 },
+}
 ```
 
 BFS order: `cacheLookup` is the entry; its one outgoing `CALLS` edge (to

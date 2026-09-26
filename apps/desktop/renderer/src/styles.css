@@ -2176,31 +2176,30 @@ code,
   outline-offset: -2px;
 }
 
-/* The hop circle — DESIGN.md `hop-circle-background`/`hop-circle-color`:
-   `{colors.trace-cyan}` fill, the AA-verified dark-ink pairing Path Trace's
-   own route/stack-row tokens share (`#04211f`), matching
-   `{components.path-trace-route}`'s own hop-pill pair exactly. */
-.code-map__path-trace-hop-circle {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.25rem;
-  height: 1.25rem;
-  border-radius: 999px;
-  background: var(--trace-cyan);
-  color: #04211f;
-  font-size: 9.5px;
-  font-weight: 700;
+/* FIX-2: the `found` call tree renders as nested lists (structure for
+   assistive tech); the nested levels add no spacing of their own — the
+   indent glyph's `margin-left` carries the visual depth. Every row keeps its
+   divider, since a nested list's last row is not the panel's last row. */
+.code-map__path-trace-tree-children {
+  margin: 0.15rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.code-map__path-trace-tree li:last-child .code-map__path-trace-stack-row {
+  border-bottom: 1px solid var(--border);
 }
 
 /* The tree-indent glyph — DESIGN.md `indent-glyph`: "└─, {colors.text-mute}".
-   One glyph per row after the first hop (the entry point has nothing to
-   descend from); each subsequent row's own `margin-left` grows by one
+   One glyph per non-root row (the entry point has nothing to descend
+   from); each subsequent row's own `margin-left` grows by one
    `{spacing.2}` (8px) step so the list reads as a descending call stack,
    not a flat run of identical connectors — dense-profiler's own resolved
-   visual (Design Notes), expressed here via the row's index rather than a
-   new persisted field. */
+   visual (Design Notes). FIX-2: the step is the row's real call-tree depth,
+   never its index, so sibling callees line up. */
 .code-map__path-trace-indent {
   flex-shrink: 0;
   color: var(--text-mute);
@@ -2220,6 +2219,23 @@ code,
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* FIX-2: "called by X" — names a row's real caller when it isn't the row
+   directly above (or past the indent cap), so the list never implies a call
+   that doesn't exist. Same muted meta treatment as the module line
+   (`{typography.meta}`, 9.5px/700); X itself is a `<code>`. A block, so the
+   ellipsis actually truncates inside the row's column. */
+.code-map__path-trace-stack-row-caller {
+  display: block;
+  min-width: 0;
+  margin-top: 0.1rem;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-mute);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

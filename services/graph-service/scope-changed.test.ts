@@ -29,13 +29,19 @@ export function stopCbmDaemon() {}
 export async function indexRepository() {
   const gate = globalThis.__scopeTestIndexGate;
   if (gate) await gate;
-  return { nodes: 4, edges: 2, project: 'stub-project' };
+  return { nodes: 4, edges: 3, project: 'stub-project' };
 }
 const node = (id, file) => ({ id, name: id, file, startLine: 1, endLine: 2, kind: 'Function', summaryStatus: 'pending', riskSignals: [] });
 export async function fetchCodeMap() {
   return {
     nodes: [node('w', 'web/a.ts'), node('a', 'app/b.ts'), node('d', 'docs/c.ts'), node('x', 'webapp/d.ts')],
-    edges: [{ source: 'w', target: 'a', kind: 'CALLS' }, { source: 'a', target: 'd', kind: 'CALLS' }],
+    // FIX-2: w calls a AND d, and a calls d too — so BFS reaches d first
+    // from w (a sibling of a, not a's callee in the tree).
+    edges: [
+      { source: 'w', target: 'a', kind: 'CALLS' },
+      { source: 'a', target: 'd', kind: 'CALLS' },
+      { source: 'w', target: 'd', kind: 'CALLS' },
+    ],
   };
 }
 `);
@@ -58,6 +64,8 @@ export function resolve(specifier, context, nextResolve) {
 
 interface Posted {
   type?: string;
+  requestId?: number;
+  result?: unknown;
   state?: string;
   nodes?: { file: string }[];
   message?: string;
@@ -161,6 +169,49 @@ describe('graphService:scopeChanged through index.ts', () => {
     assert.deepEqual(empty.appliedScope, ['wbe']);
     send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
     assert.deepEqual(await fetchMapFiles(), ALL);
+  });
+
+  // FIX-2 / AD-13: the renderer's IPC Path Trace and the agent surface's
+  // `trace_path` (which JSON-serializes `computePathTraceResult` as-is) get
+  // the same BFS tree — siblings are siblings on both surfaces.
+  it('FIX-2: IPC pathTrace and the registered trace_path handler return the same call tree', async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    // Settled: the next fetch sees the cleared scope (messages are handled in order).
+    assert.deepEqual(await fetchMapFiles(), ALL);
+    // w calls a and d; d is a SIBLING of a (reached from w), not a's callee.
+    const expected = {
+      status: 'found',
+      path: ['w', 'a', 'd'],
+      parents: { w: null, a: 'w', d: 'w' },
+      depths: { w: 0, a: 1, d: 1 },
+    };
+    const from = posted.length;
+    send({ type: 'graphService:pathTrace', query: 'w', requestId: 4242 });
+    const reply = await waitFor(
+      () => posted.slice(from).find((message) => message.type === 'graphService:pathTraceResult' && message.requestId === 4242),
+      'a pathTraceResult',
+    );
+    // The engine's records are null-prototype; compare their JSON (what
+    // crosses both the IPC boundary and the MCP wire).
+    assert.deepEqual(JSON.parse(JSON.stringify(reply.result)), expected);
+
+    // The agent surface: capture the handler `registerTracePathTool` really
+    // registers and invoke it (no listener is bound).
+    const { registerTracePathTool } = await import('./mcp-server');
+    let handler: ((args: { query: string }) => Promise<{ content: { type: string; text: string }[] }>) | undefined;
+    let description = '';
+    registerTracePathTool({
+      registerTool: (name: string, config: { description?: string }, cb: typeof handler) => {
+        assert.equal(name, 'trace_path');
+        description = config.description ?? '';
+        handler = cb;
+      },
+    } as unknown as Parameters<typeof registerTracePathTool>[0]);
+    assert.ok(handler);
+    const toolResult = await handler({ query: 'w' });
+    assert.deepEqual(JSON.parse(toolResult.content[0]!.text), expected);
+    assert.match(description, /call tree/);
+    assert.match(description, /not a single path/);
   });
 
   it('ignores a malformed scopeChanged', async () => {
