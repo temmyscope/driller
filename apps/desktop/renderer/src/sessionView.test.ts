@@ -15,10 +15,12 @@ import {
   applyProjectClosedToSessionMap,
   applyProjectOpenedToSessionMap,
   applyStatusToSessionMap,
+  degradedNoticeRetryShown,
   deriveSessionView,
   isStatusForCurrentProject,
   modeSwitcherEnabled,
   resolveRefreshOutcome,
+  statusLineRetryVisible,
   type SessionAvailability,
   type SessionMapState,
   type SessionViewInput,
@@ -343,5 +345,30 @@ describe('modeSwitcherEnabled (P2-2)', () => {
   it('is enabled once the map has loaded', () => {
     const input: SessionViewInput = { currentProjectPath: PROJECT, loadedProjectPath: PROJECT, status: null };
     assert.equal(modeSwitcherEnabled(input), true);
+  });
+});
+
+describe('one Graph Service Retry (FIX-3)', () => {
+  const statuses: (GraphServiceStatusMessage | null)[] = [null, ...Object.values(status)];
+
+  it('shows exactly one Retry whenever one is needed, and none otherwise — with or without a map', () => {
+    for (const loadedProjectPath of [PROJECT, null]) {
+      for (const current of statuses) {
+        const view = deriveSessionView({ currentProjectPath: PROJECT, loadedProjectPath, status: current });
+        const shown = Number(degradedNoticeRetryShown(view)) + Number(statusLineRetryVisible(view));
+        assert.equal(shown, view.showRetry ? 1 : 0, `${current?.state ?? 'no status'}, map ${loadedProjectPath ? 'loaded' : 'not loaded'}`);
+      }
+    }
+  });
+
+  it("puts it on the notice once the map is on screen, and on the status line before", () => {
+    for (const key of ['exited', 'error'] as const) {
+      const withMap = deriveSessionView({ currentProjectPath: PROJECT, loadedProjectPath: PROJECT, status: status[key] });
+      assert.equal(degradedNoticeRetryShown(withMap), true, key);
+      assert.equal(statusLineRetryVisible(withMap), false, key);
+      const preLoad = deriveSessionView({ currentProjectPath: PROJECT, loadedProjectPath: null, status: status[key] });
+      assert.equal(degradedNoticeRetryShown(preLoad), false, key);
+      assert.equal(statusLineRetryVisible(preLoad), true, key);
+    }
   });
 });

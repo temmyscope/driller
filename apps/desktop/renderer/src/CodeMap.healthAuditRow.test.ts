@@ -60,6 +60,9 @@ import {
   type HealthClusterNode,
   formatDeterministicSignalLabel,
   groupNodesIntoHealthClusters,
+  healthRowLocation,
+  healthRowLocations,
+  qualifiedSymbolName,
   heatForRiskCount,
   riskCountForNode,
 } from './CodeMap';
@@ -309,7 +312,7 @@ function renderRow(only: CodeMapNode): {
 }
 
 /** The whole grid as it renders for `nodes`, plus the same recorder. */
-function renderGrid(nodes: CodeMapNode[]): {
+function renderGrid(nodes: CodeMapNode[], projectPath?: string | null): {
   tree: RenderedElement[];
   buttons: RenderedElement[];
   opened: CodeMapNode[];
@@ -319,6 +322,7 @@ function renderGrid(nodes: CodeMapNode[]): {
     HealthAuditClusterGrid({
       grouping: groupNodesIntoHealthClusters(nodes),
       onActivateNode: (activated) => opened.push(activated),
+      ...(projectPath !== undefined ? { projectPath } : {}),
     }),
   );
   return { tree, buttons: rowButtons(tree), opened };
@@ -496,26 +500,131 @@ describe('Health Audit row LLM judgment', () => {
 });
 
 describe('Health Audit row location line', () => {
-  // `formatCandidateLocation` strips a trailing `.${name}` off the Node id.
-  it('shows the qualified path with the trailing symbol name stripped', () => {
-    const { button } = renderRow(
-      node({ id: 'api/internal/svc.ts.charge', name: 'charge', file: 'api/internal/svc.ts' }),
+  // FIX-3: the subtitle is the Node's project-relative file path, never the
+  // qualified id — whose project-name prefix ("Users-eoyawale-Desktop-…") is
+  // what the 2026-09-26 live run saw.
+  it("shows the Node's project-relative file, not its qualified id", () => {
+    const { button, tree } = renderRow(
+      node({
+        id: 'Users-eoyawale-Desktop-projects-driller-app.apps.desktop.renderer.src.CodeMap.CodeMap',
+        name: 'CodeMap',
+        file: 'apps/desktop/renderer/src/CodeMap.tsx',
+      }),
     );
-    assert.ok(accessibleNameOf(button).startsWith('charge api/internal/svc.ts '), accessibleNameOf(button));
-  });
-
-  // The fallback branch, untested until P0-2c's review caught it: an id that
-  // does NOT end in `.${name}` is shown verbatim. A module Node whose id is
-  // its own bare name is the real case — the row then reads "charge charge",
-  // which looks like a bug and is not one, so it is pinned rather than left to
-  // be "fixed" by someone reading the render.
-  it('shows an id that does not end in the symbol name verbatim', () => {
-    const { button, tree } = renderRow(node({ id: 'charge', name: 'charge', file: 'api/svc.ts' }));
     const location = tree.find((element) => element.props.className === 'code-map__health-row-location');
 
     assert.ok(location !== undefined);
-    assert.equal(textOf(location), 'charge');
-    assert.equal(button.props.title, 'charge · charge');
+    assert.equal(textOf(location), 'apps/desktop/renderer/src/CodeMap.tsx');
+    assert.equal(button.props.title, 'CodeMap · apps/desktop/renderer/src/CodeMap.tsx');
+    assert.ok(accessibleNameOf(button).startsWith('CodeMap apps/desktop/renderer/src/CodeMap.tsx '), accessibleNameOf(button));
+  });
+
+  // Same-named Nodes from two files in one directory cluster stay distinct.
+  it('tells same-named Nodes in one module apart by file', () => {
+    const a = renderRow(node({ id: 'x.api.a.handle', name: 'handle', file: 'api/a.ts' }));
+    const b = renderRow(node({ id: 'x.api.b.handle', name: 'handle', file: 'api/b.ts' }));
+    assert.notEqual(a.button.props.title, b.button.props.title);
+  });
+});
+
+describe('healthRowLocation (FIX-3)', () => {
+  const at = (file: string, id = 'proj.api.svc.charge', name = 'charge') => ({ id, name, file });
+  const QUALIFIED = 'proj.api.svc'; // `formatCandidateLocation` of the default id
+
+  it('returns a POSIX-relative file unchanged', () => {
+    assert.equal(healthRowLocation(at('api/internal/svc.ts'), null), 'api/internal/svc.ts');
+    assert.equal(healthRowLocation(at('main.ts'), null), 'main.ts');
+  });
+
+  it('normalises backslashes and ./, /./ and doubled-slash segments', () => {
+    assert.equal(healthRowLocation(at('api\\internal\\svc.ts'), null), 'api/internal/svc.ts');
+    assert.equal(healthRowLocation(at('./api/svc.ts'), null), 'api/svc.ts');
+    assert.equal(healthRowLocation(at('api/./svc.ts'), null), 'api/svc.ts');
+    assert.equal(healthRowLocation(at('././/api//svc.ts'), null), 'api/svc.ts');
+  });
+
+  it('makes an absolute POSIX path under the project root project-relative', () => {
+    assert.equal(healthRowLocation(at('/Users/me/app/api/svc.ts'), '/Users/me/app'), 'api/svc.ts');
+    assert.equal(healthRowLocation(at('/Users/me/app/api/svc.ts'), '/Users/me/app/'), 'api/svc.ts');
+    assert.equal(healthRowLocation(at('/Users/Me/App/api/svc.ts'), '/users/me/app'), 'api/svc.ts');
+  });
+
+  it('makes an absolute Windows path under the project root project-relative', () => {
+    assert.equal(healthRowLocation(at('C:\\work\\app\\api\\svc.ts'), 'C:\\work\\app'), 'api/svc.ts');
+    assert.equal(healthRowLocation(at('c:/work/app/api/svc.ts'), 'C:\\work\\app\\'), 'api/svc.ts');
+  });
+
+  it('never shows a machine path: absolute outside the project, or with no project, falls back to the qualified id', () => {
+    assert.equal(healthRowLocation(at('/etc/other/svc.ts'), '/Users/me/app'), QUALIFIED);
+    assert.equal(healthRowLocation(at('/Users/me/application/svc.ts'), '/Users/me/app'), QUALIFIED);
+    assert.equal(healthRowLocation(at('/Users/me/app/api/svc.ts'), null), QUALIFIED);
+    assert.equal(healthRowLocation(at('D:\\x\\svc.ts'), 'C:\\work\\app'), QUALIFIED);
+    assert.equal(healthRowLocation(at('../outside/svc.ts'), '/Users/me/app'), QUALIFIED);
+  });
+
+  it("never renders '' or '/': an empty result falls back to the qualified id", () => {
+    for (const file of ['', '/', '.', './', '//', '/Users/me/app/']) {
+      const location = healthRowLocation(at(file), '/Users/me/app');
+      assert.equal(location, QUALIFIED, JSON.stringify(file));
+    }
+  });
+});
+
+describe('qualifiedSymbolName (FIX-3)', () => {
+  it("prefixes the id's qualifying segment", () => {
+    assert.equal(qualifiedSymbolName({ id: 'proj.api.a.A.handle', name: 'handle' }), 'A.handle');
+    assert.equal(qualifiedSymbolName({ id: 'handle', name: 'handle' }), 'handle');
+    assert.equal(qualifiedSymbolName({ id: '.handle', name: 'handle' }), 'handle');
+  });
+});
+
+describe('healthRowLocations (FIX-3)', () => {
+  const row = (id: string, name: string, file: string, startLine = 1) => ({ id, name, file, startLine });
+
+  it('leaves distinct rows alone', () => {
+    assert.deepEqual(
+      healthRowLocations([row('p.a.handle', 'handle', 'api/a.ts'), row('p.b.handle', 'handle', 'api/b.ts')], null),
+      ['api/a.ts', 'api/b.ts'],
+    );
+  });
+
+  it('appends the qualifying symbol when two rows share name and file', () => {
+    assert.deepEqual(
+      healthRowLocations(
+        [
+          row('p.api.a.A.handle', 'handle', 'api/a.ts'),
+          row('p.api.a.B.handle', 'handle', 'api/a.ts'),
+          row('p.api.a.other', 'other', 'api/a.ts'),
+        ],
+        null,
+      ),
+      ['api/a.ts (A.handle)', 'api/a.ts (B.handle)', 'api/a.ts'],
+    );
+  });
+
+  it('adds the start line when even the qualified names collide', () => {
+    assert.deepEqual(
+      healthRowLocations([row('p.a.A.run', 'run', 'a.ts', 3), row('p.a.A.run', 'run', 'a.ts', 40)], null),
+      ['a.ts (A.run, line 3)', 'a.ts (A.run, line 40)'],
+    );
+  });
+
+  it('renders the disambiguated lines on the grid', () => {
+    const nodes = [
+      node({ id: 'p.api.a.A.handle', name: 'handle', file: 'api/a.ts', riskSignals: signalsOfCount(2) }),
+      node({ id: 'p.api.a.B.handle', name: 'handle', file: 'api/a.ts', riskSignals: signalsOfCount(1) }),
+    ];
+    const { buttons } = renderGrid(nodes);
+    assert.deepEqual(
+      buttons.map((button) => button.props.title),
+      ['handle · api/a.ts (A.handle)', 'handle · api/a.ts (B.handle)'],
+    );
+  });
+
+  it("passes the grid's project root through, so an absolute file shows project-relative", () => {
+    const nodes = [node({ id: 'p.api.a.charge', name: 'charge', file: '/Users/me/app/api/a.ts' })];
+    assert.equal(renderGrid(nodes, '/Users/me/app').buttons[0]!.props.title, 'charge · api/a.ts');
+    assert.equal(renderGrid(nodes).buttons[0]!.props.title, 'charge · p.api.a');
   });
 });
 

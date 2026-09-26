@@ -63,7 +63,7 @@
  * the shared `ActionableNotice` shape (P1-7).
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Background,
   Controls,
@@ -104,6 +104,7 @@ import {
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
 import { diffScopeSyncTimeFor, mapFooterState, type MapFooterState } from './appFrame';
+import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
 
@@ -288,16 +289,16 @@ type BlastRadiusState =
 // No LOD/layout library yet (Design Notes: acceptable at this phase's real
 // scale) — a plain deterministic grid, roughly square, is enough to lay the
 // full fetched Node set out without overlap.
-const NODE_COLUMN_GAP = 260;
-const NODE_ROW_GAP = 110;
+export const NODE_COLUMN_GAP = 260;
+export const NODE_ROW_GAP = 110;
 
 // FIX-1: a Node card's size when `@xyflow/react` hasn't measured it (a card
 // still folded into an LOD cluster has no DOM, so no `measured` size). An
 // estimate of the rendered `.code-map__node` card (min-width 160px plus
 // padding, identifier + one-line summary + signal strip), used only to find
 // the card's centre for `routeFitRequest`'s anchor; a measured size wins.
-const NODE_CARD_FALLBACK_WIDTH = 200;
-const NODE_CARD_FALLBACK_HEIGHT = 80;
+export const NODE_CARD_FALLBACK_WIDTH = 200;
+export const NODE_CARD_FALLBACK_HEIGHT = 80;
 
 // `@xyflow/react`'s own default `minZoom` is 0.5 — found, via this story's
 // live CDP verification, to silently clamp `fitView`'s computed zoom for
@@ -336,7 +337,12 @@ export const ROUTE_MIN_READABLE_ZOOM = 0.25;
 // The map's zoom ceiling: passed to `<ReactFlow maxZoom>` below and used as
 // `routeViewport`'s cap, so a route fit can't disagree with the map. 2 is
 // `@xyflow/react`'s own default, i.e. what the map allowed before FIX-1.
-const MAP_MAX_ZOOM = 2;
+export const MAP_MAX_ZOOM = 2;
+
+// FIX-3: how many animation frames the first fit waits for a measured map
+// size before revealing the canvas unfitted (~1s at 60fps). In practice the
+// size arrives within a frame or two.
+const INITIAL_FIT_MAX_RETRIES = 60;
 
 // `fitBounds`' own default padding (`options.padding ?? 0.1`): a fraction
 // that shrinks the usable viewport to `size / (1 + padding)`. `fitViewToPath`
@@ -524,6 +530,16 @@ export interface RouteViewportParams {
 const isFiniteNumber = (value: number) => Number.isFinite(value);
 
 /**
+ * `fitBounds`' zoom for `bounds` in `viewport` (padding already folded into
+ * `bounds`), capped at `maxZoom`. Shared by `routeViewport` and FIX-3's
+ * `initialViewport` so the two can't disagree. Zero-size bounds give
+ * `Infinity`, which the cap turns into `maxZoom`.
+ */
+export function boundsFitZoom(bounds: Size, viewport: Size, maxZoom: number): number {
+  return Math.min(maxZoom, viewport.width / bounds.width, viewport.height / bounds.height);
+}
+
+/**
  * FIX-1: the viewport a traced route is fitted to. Same maths as
  * `fitBounds` (centre the bounds at `min(width / bounds.width, height /
  * bounds.height)`, capped at `maxZoom`; padding is the caller's job, folded
@@ -556,7 +572,7 @@ export function routeViewport({
   const boundsUsable =
     [bounds.x, bounds.y, bounds.width, bounds.height].every(isFiniteNumber) && bounds.width >= 0 && bounds.height >= 0;
   if (viewportUsable && boundsUsable) {
-    const fitZoom = Math.min(maxZoom, viewport.width / bounds.width, viewport.height / bounds.height);
+    const fitZoom = boundsFitZoom(bounds, viewport, maxZoom);
     if (fitZoom >= floor) {
       const centerX = bounds.x + bounds.width / 2;
       const centerY = bounds.y + bounds.height / 2;
@@ -643,6 +659,169 @@ export function routeFitRequest(
       maxZoom: MAP_MAX_ZOOM,
     },
   };
+}
+
+/**
+ * FIX-3: the cluster the first view opens on when the whole map doesn't fit
+ * at a readable zoom — the one standing in for the most Nodes. A tie goes to
+ * the smaller `id` (plain code-unit order, not `localeCompare`), so the pick
+ * never depends on `computeLOD`'s array order. `null` when there are none.
+ */
+export function densestCluster(clusters: readonly Cluster[]): Cluster | null {
+  let best: Cluster | null = null;
+  for (const cluster of clusters) {
+    if (
+      best === null ||
+      cluster.nodeIds.length > best.nodeIds.length ||
+      (cluster.nodeIds.length === best.nodeIds.length && cluster.id < best.id)
+    ) {
+      best = cluster;
+    }
+  }
+  return best;
+}
+
+/** FIX-3: what the first-view effect should do this render. */
+export type InitialFitDecision = 'fit' | 'wait' | 'done';
+
+export interface InitialFitDecisionInput {
+  /** This canvas mount (`onInit`) hasn't had its first fit yet. */
+  pending: boolean;
+  /** `onInit` has handed over a live React Flow instance. */
+  instanceReady: boolean;
+  /** The project this map is for. */
+  projectPath: string | null;
+  /** The project the last first-fit was applied for (`null` before any). */
+  fittedProjectPath: string | null;
+  /** Laid-out Nodes of the ready map (0 while loading, errored or empty). */
+  nodesCount: number;
+  /** The measured map size (`measuredViewportSize`: own ResizeObserver, else React Flow's store). */
+  size: { width: number; height: number };
+}
+
+/**
+ * FIX-3: the first-view effect's gate, as a pure decision. Armed while this
+ * canvas mount is `pending` or the project differs from the one last fitted
+ * (a project change re-arms it); an armed fit `wait`s until the instance, a
+ * non-empty laid-out map and a usable size all exist, then `fit`s once.
+ * Otherwise `done`: the one-shot fit is spent, so a refresh, scope change or
+ * resize keeps the user's own pan/zoom.
+ */
+export function initialFitDecision({
+  pending,
+  instanceReady,
+  projectPath,
+  fittedProjectPath,
+  nodesCount,
+  size,
+}: InitialFitDecisionInput): InitialFitDecision {
+  if (!pending && projectPath === fittedProjectPath) {
+    return 'done';
+  }
+  const sized = isFiniteNumber(size.width) && isFiniteNumber(size.height) && size.width > 0 && size.height > 0;
+  return instanceReady && nodesCount > 0 && sized ? 'fit' : 'wait';
+}
+
+/** FIX-3: the first-fit bookkeeping one canvas carries between renders. */
+export interface InitialFitState {
+  pending: boolean;
+  fittedProjectPath: string | null;
+}
+
+export const INITIAL_FIT_STATE: InitialFitState = { pending: false, fittedProjectPath: null };
+
+/** FIX-3: a canvas mount (`onInit`) owes a first fit. */
+export function armInitialFit(state: InitialFitState): InitialFitState {
+  return { ...state, pending: true };
+}
+
+/** FIX-3: the first fit landed for `projectPath` — spent until the next mount or project. */
+export function completeInitialFit(projectPath: string | null): InitialFitState {
+  return { pending: false, fittedProjectPath: projectPath };
+}
+
+export interface InitialViewportParams {
+  /** Every laid-out Node (`lodInputNodes`): id plus top-left world position. */
+  nodes: readonly LODInputNode[];
+  /** A Node card's size, to turn top-left positions into a footprint and a centre. */
+  cardSize: Size;
+  /** The measured map container. */
+  viewport: Size;
+  minReadableZoom: number;
+  maxZoom: number;
+  /** `LOD_ZOOM_THRESHOLD` — the clustering the whole-map fit would have shown. */
+  lodThreshold: number;
+}
+
+/**
+ * FIX-3: the viewport a project's map first opens at — never below
+ * `minReadableZoom`, so the first thing on screen is real Node cards rather
+ * than a handful of cluster dots.
+ *
+ * The whole map's footprint (every card, with `fitView`'s own 10% padding)
+ * goes through FIX-1's `routeViewport`. If that fits at a readable zoom it is
+ * the plain whole-map fit. Otherwise the view opens at the readable floor,
+ * anchored on the centre of the densest cluster (`densestCluster`) of the
+ * clustering the whole-map fit would have produced — `computeLOD` at that
+ * fit's banded zoom, the same banding the live render applies. With no
+ * cluster at all it anchors on the map's centre. `Cluster.position` is the
+ * centroid of its members' top-left positions, so the anchor adds half a card
+ * to land on the centre of the average card. The floor is
+ * `min(minReadableZoom, maxZoom)`, as in `routeViewport`, so a `maxZoom`
+ * below the readable floor caps it rather than being exceeded.
+ *
+ * `null` when there is nothing to fit or the container isn't measured yet —
+ * the caller waits rather than fitting to a 0×0 view.
+ */
+export function initialViewport({
+  nodes,
+  cardSize,
+  viewport,
+  minReadableZoom,
+  maxZoom,
+  lodThreshold,
+}: InitialViewportParams): { x: number; y: number; zoom: number; clamped: boolean } | null {
+  const first = nodes[0];
+  const measured =
+    isFiniteNumber(viewport.width) && isFiniteNumber(viewport.height) && viewport.width > 0 && viewport.height > 0;
+  if (first === undefined || !measured) {
+    return null;
+  }
+  // `.reduce()` rather than a `Math.min(...spread)` — see `routeFitRequest`.
+  const minX = nodes.reduce((min, node) => Math.min(min, node.position.x), first.position.x);
+  const maxX = nodes.reduce((max, node) => Math.max(max, node.position.x), first.position.x);
+  const minY = nodes.reduce((min, node) => Math.min(min, node.position.y), first.position.y);
+  const maxY = nodes.reduce((max, node) => Math.max(max, node.position.y), first.position.y);
+  const footprint = { x: minX, y: minY, width: maxX - minX + cardSize.width, height: maxY - minY + cardSize.height };
+  const paddedWidth = footprint.width * (1 + ROUTE_FIT_PADDING);
+  const paddedHeight = footprint.height * (1 + ROUTE_FIT_PADDING);
+  const bounds = {
+    x: footprint.x - (paddedWidth - footprint.width) / 2,
+    y: footprint.y - (paddedHeight - footprint.height) / 2,
+    width: paddedWidth,
+    height: paddedHeight,
+  };
+  const centre = { x: footprint.x + footprint.width / 2, y: footprint.y + footprint.height / 2 };
+  const params = { bounds, viewport, minReadableZoom, maxZoom };
+  const fit = routeViewport({ ...params, anchor: centre });
+  if (!fit.clamped) {
+    return fit;
+  }
+  // The whole-map fit's zoom — what `fitView` would have opened at — for the
+  // clustering the user would have seen there. `routeViewport` clamped, so
+  // it is below the floor (and is finite: the bounds include a card).
+  const fitZoom = boundsFitZoom(bounds, viewport, maxZoom);
+  const { clusters } = computeLOD({
+    nodes: [...nodes],
+    zoom: quantizeZoomBand(fitZoom, lodThreshold),
+    threshold: lodThreshold,
+    viewportBounds: bounds,
+  });
+  const densest = densestCluster(clusters);
+  const anchor = densest
+    ? { x: densest.position.x + cardSize.width / 2, y: densest.position.y + cardSize.height / 2 }
+    : centre;
+  return routeViewport({ ...params, anchor });
 }
 
 /** FIX-1: the last route fit — which route array it was for, and whether it clamped. */
@@ -1339,6 +1518,17 @@ export function FoundTraceSteps({
   );
 }
 
+/**
+ * The Code Map's grid layout: Node `index` of `nodeCount` at column
+ * `index % columns`, row `index / columns`, `ceil(sqrt(nodeCount))` columns,
+ * spaced `NODE_COLUMN_GAP`×`NODE_ROW_GAP`. The top-left of its card. Exported
+ * (FIX-3) so tests lay maps out exactly as `layoutNodes` does.
+ */
+export function layoutPosition(index: number, nodeCount: number): { x: number; y: number } {
+  const columns = Math.max(1, Math.ceil(Math.sqrt(nodeCount)));
+  return { x: (index % columns) * NODE_COLUMN_GAP, y: Math.floor(index / columns) * NODE_ROW_GAP };
+}
+
 function layoutNodes(
   nodes: CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
@@ -1356,16 +1546,12 @@ function layoutNodes(
   // `false` in every other state (Boundaries & Constraints).
   changedNodeIds: ReadonlySet<string>,
 ): CodeMapFlowNode[] {
-  const columns = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
   return nodes.map((node, index) => {
     const entry = adjacency.get(node.id);
     return {
       id: node.id,
       type: 'codeMapNode',
-      position: {
-        x: (index % columns) * NODE_COLUMN_GAP,
-        y: Math.floor(index / columns) * NODE_ROW_GAP,
-      },
+      position: layoutPosition(index, nodes.length),
       data: {
         node,
         onActivate,
@@ -1812,9 +1998,9 @@ export function formatDeterministicSignalLabel(
   const severe = signal.severity === 'severe' ? ' (severe)' : '';
   if (signal.type === 'blast-radius') {
     const hops: number = BLAST_RADIUS_DEFAULT_HOPS;
-    return `${label}: ${signal.value} Node${signal.value === 1 ? '' : 's'} within ${hops} hop${hops === 1 ? '' : 's'} (callers and callees)${severe}`;
+    return `${label}: ${formatCount(signal.value, 'Node', 'Nodes')} within ${hops} hop${hops === 1 ? '' : 's'} (callers and callees)${severe}`;
   }
-  return `${label}: ${signal.value}${severe}`;
+  return `${label}: ${formatCountNumber(signal.value)}${severe}`;
 }
 
 /**
@@ -2007,7 +2193,7 @@ export function NodeRiskSignalSections({
               >
                 {signal.severity === 'severe' && <span aria-hidden="true">{SEVERE_SIGNAL_GLYPH}</span>}
                 <span aria-hidden="true">{icon}</span>
-                {signal.value}
+                {formatCountNumber(signal.value)}
               </span>
             );
           })}
@@ -2719,6 +2905,15 @@ export function PrReviewDiffScopeNoticeRegion({ status }: { status: DiffScopeNot
 }
 
 /**
+ * PR Review's blast-radius line — "Blast radius: 1,204 Nodes within 2 hops."
+ * FIX-3: the shared count formatter, and "2 hops" (was "2-hops") to match
+ * `formatDeterministicSignalLabel`'s wording.
+ */
+export function blastRadiusSummary(nodeCount: number, depth: number): string {
+  return `Blast radius: ${formatCount(nodeCount, 'Node', 'Nodes')} within ${formatCount(depth, 'hop', 'hops')}.`;
+}
+
+/**
  * P0-5: PR Review's initial Blast Radius stepper depth for a resolved result
  * whose farthest Node is `maxDepth` hops away — `BLAST_RADIUS_DEFAULT_HOPS`
  * (the badge's own bound), clamped into the stepper's range `[1, maxDepth]`
@@ -2789,7 +2984,95 @@ export function formatHealthClusterHeat(
   totalRiskCount: number,
 ): string {
   const worst = `${heat} · ${heatCount} signal${heatCount === 1 ? '' : 's'} on its worst Node`;
-  return totalRiskCount === heatCount ? worst : `${worst}, ${totalRiskCount} in the module`;
+  return totalRiskCount === heatCount ? worst : `${worst}, ${formatCountNumber(totalRiskCount)} in the module`;
+}
+
+/** A Windows drive root (`C:/`) once backslashes are `/`. */
+const WINDOWS_ABSOLUTE = /^[A-Za-z]:\//;
+
+/**
+ * FIX-3: a Health Audit row's location line — the Node's project-relative
+ * file path (`apps/desktop/renderer/src/CodeMap.tsx`), never the qualified id
+ * (whose project-name prefix, "Users-eoyawale-Desktop-…", is what the
+ * 2026-09-26 live run saw) and never a machine path.
+ *
+ * AD-19 promises `file` is POSIX-relative, but this is defensive anyway:
+ * backslashes become `/`; empty and `.` segments are dropped (a leading
+ * `./`, a `/./`, a doubled `/`); an absolute POSIX or Windows path is made
+ * relative when it sits under `projectPath` (compared case-insensitively, as
+ * `App.tsx` compares project paths). Anything that can't become a clean
+ * project-relative path — absolute outside the project or with no project
+ * given, one with a `..` segment, or one that normalises to nothing — falls
+ * back to `formatCandidateLocation`, the qualified-id line, so a row never
+ * loses its identity or shows `''`/`/`.
+ */
+export function healthRowLocation(
+  node: Pick<CodeMapNode, 'id' | 'name' | 'file'>,
+  projectPath: string | null,
+): string {
+  let file = node.file.replace(/\\/g, '/');
+  if (file.startsWith('/') || WINDOWS_ABSOLUTE.test(file)) {
+    const root = projectPath?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
+    if (root === '' || !file.toLowerCase().startsWith(`${root.toLowerCase()}/`)) {
+      return formatCandidateLocation(node);
+    }
+    file = file.slice(root.length + 1);
+  }
+  const segments = file.split('/').filter((segment) => segment !== '' && segment !== '.');
+  if (segments.length === 0 || segments.includes('..')) {
+    return formatCandidateLocation(node);
+  }
+  return segments.join('/');
+}
+
+/**
+ * FIX-3: `Class.method`-style name for a Node — its name plus the qualified
+ * id's segment just before it (`…svc.A.handle` → `A.handle`), or the bare
+ * name when the id doesn't end in `.${name}`.
+ */
+export function qualifiedSymbolName(node: Pick<CodeMapNode, 'id' | 'name'>): string {
+  const suffix = `.${node.name}`;
+  if (!node.id.endsWith(suffix)) {
+    return node.name;
+  }
+  const prefix = node.id.slice(0, -suffix.length);
+  const qualifier = prefix.slice(prefix.lastIndexOf('.') + 1);
+  return qualifier === '' ? node.name : `${qualifier}.${node.name}`;
+}
+
+/**
+ * FIX-3: the location line for each row of one Health Audit card, in order.
+ * Normally `healthRowLocation`. Rows that would still read identically —
+ * same name AND same location, e.g. two classes' `handle` in one file — get
+ * the qualifying symbol appended ("api/a.ts (A.handle)"), and the start line
+ * as well if even that collides, so every row on a card is distinguishable.
+ */
+export function healthRowLocations(
+  nodes: readonly Pick<CodeMapNode, 'id' | 'name' | 'file' | 'startLine'>[],
+  projectPath: string | null,
+): string[] {
+  const base = nodes.map((node) => healthRowLocation(node, projectPath));
+  const keyOf = (index: number) => `${nodes[index]!.name}\u0000${base[index]!}`;
+  const rowsByKey = new Map<string, number[]>();
+  nodes.forEach((_, index) => {
+    const key = keyOf(index);
+    rowsByKey.set(key, [...(rowsByKey.get(key) ?? []), index]);
+  });
+  const locations = [...base];
+  for (const rows of rowsByKey.values()) {
+    if (rows.length < 2) {
+      continue;
+    }
+    const qualified = rows.map((index) => qualifiedSymbolName(nodes[index]!));
+    rows.forEach((index, position) => {
+      const symbol = qualified[position]!;
+      const unique = qualified.filter((other) => other === symbol).length === 1;
+      locations[index] = unique
+        ? `${base[index]!} (${symbol})`
+        : `${base[index]!} (${symbol}, line ${nodes[index]!.startLine})`;
+    });
+  }
+  return locations;
 }
 
 /**
@@ -2799,7 +3082,7 @@ export function formatHealthClusterHeat(
  * rather than by reading the JSX.
  */
 export function formatRemainingNodes(remainingNodeCount: number): string {
-  return `+${remainingNodeCount} more Node${remainingNodeCount === 1 ? '' : 's'}`;
+  return `+${formatCount(remainingNodeCount, 'more Node', 'more Nodes')}`;
 }
 
 /**
@@ -2984,11 +3267,13 @@ const HEALTH_ROW_AFFORDANCE = 'open Node detail';
  * two sets of thresholds — and a Node carrying nothing reads "healthy", which
  * is that same word, not a separate empty-state string.
  *
- * `formatCandidateLocation` supplies the row's second line: a directory
- * cluster merges every file under it, so `a.ts` and `b.ts` can both contribute
- * a `handle` and would otherwise render as two identical rows. That helper
- * already exists in this file for exactly this problem in the Path Trace
- * candidate list.
+ * `location` is the row's second line: a directory cluster merges every
+ * file under it, so `a.ts` and `b.ts` can both contribute a `handle` and
+ * would otherwise render as two identical rows. FIX-3: it is the Node's
+ * project-relative file (`healthRowLocation`), not the qualified id the Path
+ * Trace candidate list's `formatCandidateLocation` shows, and the grid
+ * computes it per card (`healthRowLocations`) so two same-named rows from
+ * one file get their qualifying symbol appended.
  *
  * P0-2c: the row is now a real control — a native `<button>` filling the
  * `<li>`, calling `onActivate` with ITS OWN `member.node` (the object, never a
@@ -3024,13 +3309,15 @@ const HEALTH_ROW_AFFORDANCE = 'open Node detail';
 export function HealthAuditClusterRow({
   member,
   onActivate,
+  location = healthRowLocation(member.node, null),
 }: {
   member: HealthClusterNode;
   onActivate: (node: CodeMapNode) => void;
+  /** FIX-3: this row's line from `healthRowLocations` (the grid passes it); defaults to the row's own `healthRowLocation`. */
+  location?: string;
 }) {
   const heat = heatForRiskCount(member.riskCount);
   const judgment = member.llmJudgment;
-  const location = formatCandidateLocation(member.node);
   return (
     <li className="code-map__health-row">
       <button
@@ -3062,7 +3349,7 @@ export function HealthAuditClusterRow({
               >
                 {signal.severity === 'severe' && <span aria-hidden="true">{SEVERE_SIGNAL_GLYPH}</span>}
                 <span aria-hidden="true">{icon}</span>
-                {signal.value}
+                {formatCountNumber(signal.value)}
               </span>
             );
           })}
@@ -3139,9 +3426,12 @@ const HEALTH_GRID_HEADING_ID = 'code-map-health-grid-heading';
 export function HealthAuditClusterGrid({
   grouping,
   onActivateNode,
+  projectPath = null,
 }: {
   grouping: HealthClusterGrouping;
   onActivateNode: (node: CodeMapNode) => void;
+  /** FIX-3: the open project's root, so `healthRowLocations` can make an absolute `file` project-relative. */
+  projectPath?: string | null;
 }) {
   return (
     <section
@@ -3153,7 +3443,12 @@ export function HealthAuditClusterGrid({
         Risk signals clustered by module
       </h2>
       <ol className="code-map__health-cards">
-        {grouping.clusters.map((cluster) => (
+        {grouping.clusters.map((cluster) => {
+          const locations = healthRowLocations(
+            cluster.nodes.map((member) => member.node),
+            projectPath,
+          );
+          return (
           <li key={cluster.directory} className="code-map__health-card">
             <h3 className="code-map__health-card-heading" title={cluster.directory}>
               <span
@@ -3182,6 +3477,7 @@ export function HealthAuditClusterGrid({
                   key={`${member.node.id}#${index}`}
                   member={member}
                   onActivate={onActivateNode}
+                  location={locations[index]}
                 />
               ))}
             </ul>
@@ -3189,7 +3485,8 @@ export function HealthAuditClusterGrid({
               <p className="code-map__health-more">{formatRemainingNodes(cluster.remainingNodeCount)}</p>
             )}
           </li>
-        ))}
+          );
+        })}
       </ol>
       {grouping.remainingClusterCount > 0 && (
         <p className="code-map__health-more code-map__health-more--clusters">
@@ -3206,9 +3503,9 @@ export function HealthAuditClusterGrid({
  */
 export function clusterAriaLabel(nodeCount: number, willZoomInsteadOfExpand: boolean, changedCount: number): string {
   const base = willZoomInsteadOfExpand
-    ? `Cluster of ${nodeCount} nodes, too many to expand — zoom in`
-    : `Cluster of ${nodeCount} nodes, expand`;
-  return changedCount > 0 ? `${base}, ${changedCount} changed` : base;
+    ? `Cluster of ${formatCount(nodeCount, 'Node', 'Nodes')}, too many to expand — zoom in`
+    : `Cluster of ${formatCount(nodeCount, 'Node', 'Nodes')}, expand`;
+  return changedCount > 0 ? `${base}, ${formatCountNumber(changedCount)} changed` : base;
 }
 
 export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
@@ -3239,7 +3536,7 @@ export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) 
       <span className="code-map__cluster-label">{willZoomInsteadOfExpand ? 'zoom in' : 'nodes'}</span>
       {changedCount > 0 && (
         <span className="code-map__cluster-changed" aria-hidden="true">
-          {changedCount} changed
+          {formatCountNumber(changedCount)} changed
         </span>
       )}
       <Handle type="source" position={Position.Right} />
@@ -3742,7 +4039,8 @@ export function chooseEmptyMapCase(hiddenByScope: number): EmptyMapCase {
  */
 export function emptyMapScopeSentence(appliedScope: readonly string[], hiddenCount: number): string {
   const scope = appliedScope.length > 0 ? ` (${appliedScope.join(', ')})` : '';
-  const nodes = hiddenCount === 1 ? '1 Node' : `${hiddenCount} Nodes`;
+  // FIX-3: the shared count formatter, so this reads "1,014 Nodes" like the footer.
+  const nodes = formatCount(hiddenCount, 'Node', 'Nodes');
   return `The indexing scope${scope} matches none of this project's ${nodes}.`;
 }
 
@@ -4116,6 +4414,25 @@ export function CodeMap({
   // rather than needing an explicit reset effect. `MAX_EXPANDED_CLUSTER_IDS`
   // is a defensive cap on top of that (review finding).
   const [expandedClusterIds, setExpandedClusterIds] = useState<Set<string>>(() => new Set());
+  // FIX-3: set by `onInit` — this canvas mount hasn't had its first fit yet.
+  // Replaces `<ReactFlow fitView>`, whose whole-map fit landed a real
+  // ~1,000-Node map below `LOD_ZOOM_THRESHOLD` as a few cluster dots; the
+  // effect after `measuredViewportSize` applies `initialViewport` once per
+  // mount instead (Health Audit unmounts the canvas, so switching back fits
+  // again, exactly as `fitView` did). `canvasInitCount` re-runs that effect.
+  // `fittedProjectPath` is the project the last first-fit was for — a
+  // project change re-arms the fit (`initialFitDecision`). `CodeMap` is in
+  // practice remounted per project (App's `showMap`), so that is defensive.
+  const initialFitRef = useRef<InitialFitState>(INITIAL_FIT_STATE);
+  const [canvasInitCount, setCanvasInitCount] = useState(0);
+  // FIX-3: the canvas stays `visibility: hidden` from `onInit` until its first
+  // fit lands, so React Flow's default viewport (zoom 1 at the origin) never
+  // paints first.
+  const [awaitingFirstFit, setAwaitingFirstFit] = useState(false);
+  // FIX-3: bounded per-frame retries while the size is still unmeasured by our
+  // own ResizeObserver — React Flow's store may measure first, and nothing
+  // else would re-run the effect when it does.
+  const [initialFitRetry, setInitialFitRetry] = useState(0);
   // Set from `onInit`; used only to zoom in on an over-`CLUSTER_EXPAND_MAX`
   // cluster (a viewport change, never a data/Graph-Service operation).
   const reactFlowInstanceRef = useRef<ReactFlowInstance<CodeMapAnyFlowNode> | null>(null);
@@ -4892,6 +5209,11 @@ export function CodeMap({
   const handleInit = useCallback((instance: ReactFlowInstance<CodeMapAnyFlowNode>) => {
     reactFlowInstanceRef.current = instance;
     setViewport(instance.getViewport());
+    // FIX-3: this canvas mount owes its first fit (see the effect below).
+    initialFitRef.current = armInitialFit(initialFitRef.current);
+    setAwaitingFirstFit(true);
+    setInitialFitRetry(0);
+    setCanvasInitCount((count) => count + 1);
   }, []);
 
   const handleMove = useCallback<OnMove>((_event, nextViewport) => {
@@ -5491,6 +5813,58 @@ export function CodeMap({
     return { width: store?.width ?? 0, height: store?.height ?? 0 };
   }, []);
 
+  // FIX-3: the first view of a mounted canvas. `initialFitDecision` gates it
+  // (instance, current project's laid-out map, measured size — own
+  // ResizeObserver, else React Flow's store); `initialViewport` computes it.
+  // A layout effect, so the fit is applied before the browser paints; the
+  // canvas is also hidden until then (`awaitingFirstFit`). The component's own
+  // `viewport` state is set explicitly too: React Flow does fire `onMove` for
+  // a programmatic `setViewport` (its pan-zoom handler skips only `internal`
+  // events), but the LOD pass must not depend on that to leave the pre-fit
+  // zoom. Instant, like the `fitView` it replaces.
+  useLayoutEffect(() => {
+    const instance = reactFlowInstanceRef.current;
+    const size = measuredViewportSize();
+    const decision = initialFitDecision({
+      pending: initialFitRef.current.pending,
+      instanceReady: instance !== null,
+      projectPath,
+      fittedProjectPath: initialFitRef.current.fittedProjectPath,
+      nodesCount: lodInputNodes.length,
+      size,
+    });
+    if (decision === 'done' || instance === null) {
+      return undefined;
+    }
+    if (decision === 'wait') {
+      if (initialFitRetry >= INITIAL_FIT_MAX_RETRIES) {
+        // Never became fittable: reveal what's there rather than leave the
+        // canvas hidden. The fit stays armed, so it still lands if it can.
+        setAwaitingFirstFit(false);
+        return undefined;
+      }
+      const frame = requestAnimationFrame(() => setInitialFitRetry((retry) => retry + 1));
+      return () => cancelAnimationFrame(frame);
+    }
+    const next = initialViewport({
+      nodes: lodInputNodes,
+      cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
+      viewport: size,
+      minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
+      maxZoom: MAP_MAX_ZOOM,
+      lodThreshold: LOD_ZOOM_THRESHOLD,
+    });
+    if (next === null) {
+      return undefined;
+    }
+    initialFitRef.current = completeInitialFit(projectPath);
+    const nextViewport = { x: next.x, y: next.y, zoom: next.zoom };
+    void instance.setViewport(nextViewport);
+    setViewport(nextViewport);
+    setAwaitingFirstFit(false);
+    return undefined;
+  }, [canvasInitCount, initialFitRetry, lodInputNodes, containerSize, measuredViewportSize, projectPath]);
+
   /**
    * Story 1.9 (Phase 2): fits the viewport to show every Node in a `found`
    * path at once (Boundaries & Constraints: "an off-screen highlight isn't
@@ -6007,8 +6381,7 @@ export function CodeMap({
             blastRadiusMaxDepth > 0 && (
               <div className="code-map__blast-radius-stepper">
                 <p className="code-map__pr-review-resolved" role="status">
-                  Blast radius: {blastRadiusNodeIds.size} Node{blastRadiusNodeIds.size === 1 ? '' : 's'} within{' '}
-                  {blastRadiusDepth}-hop{blastRadiusDepth === 1 ? '' : 's'}.
+                  {blastRadiusSummary(blastRadiusNodeIds.size, blastRadiusDepth)}
                 </p>
                 {/* Always: "one shared depth stepper for the whole combined
                     result — never per-Node" — a single control pair, not
@@ -6143,7 +6516,7 @@ export function CodeMap({
           - The dev-fixture `selectionToDetailMs` timer is likewise skipped;
             see `DrillerDevPerfWindow`'s note on what that excludes. */}
       {surfaces.healthAuditGrid && healthClusters !== null && (
-        <HealthAuditClusterGrid grouping={healthClusters} onActivateNode={openNodeDetail} />
+        <HealthAuditClusterGrid grouping={healthClusters} onActivateNode={openNodeDetail} projectPath={projectPath} />
       )}
 
       {surfaces.canvas && (
@@ -6152,7 +6525,7 @@ export function CodeMap({
         // (styles.css), but `<ReactFlow>`'s own root element still needs an
         // explicit width/height or it collapses to 0×0 and renders nothing.
         <ReactFlow<CodeMapAnyFlowNode>
-          style={{ width: '100%', height: '100%' }}
+          style={{ width: '100%', height: '100%', visibility: awaitingFirstFit ? 'hidden' : undefined }}
           nodes={renderedNodes}
           edges={renderedEdges}
           nodeTypes={nodeTypes}
@@ -6176,7 +6549,9 @@ export function CodeMap({
           // installed `@xyflow/react` (12.11.6); this phase's own code only
           // needed to build the clustering half (`computeLOD`) alongside it.
           onlyRenderVisibleElements
-          fitView
+          // FIX-3: no `fitView` — the first view comes from `initialViewport`
+          // (the effect after `measuredViewportSize`), which never opens
+          // below `ROUTE_MIN_READABLE_ZOOM`.
           colorMode="dark"
           // No editing surface (Non-Goal) — the Handles on each Node card
           // exist only so edges can attach visually; without this, they

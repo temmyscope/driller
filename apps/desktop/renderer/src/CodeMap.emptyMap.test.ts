@@ -69,6 +69,10 @@ describe('emptyMapScopeSentence', () => {
     assert.equal(emptyMapScopeSentence(['wbe'], 229), "The indexing scope (wbe) matches none of this project's 229 Nodes.");
   });
 
+  it('uses the shared thousands separator (FIX-3)', () => {
+    assert.equal(emptyMapScopeSentence([], 1014), "The indexing scope matches none of this project's 1,014 Nodes.");
+  });
+
   it('omits the list for an empty scope, and says "1 Node" in the singular', () => {
     assert.equal(emptyMapScopeSentence([], 1), "The indexing scope matches none of this project's 1 Node.");
   });

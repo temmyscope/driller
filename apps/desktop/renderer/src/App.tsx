@@ -3,7 +3,6 @@ import type {
   BackendConfig,
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
-  IndexCoverageSummary,
   McpServerStatusMessage,
   ModelStatusMessage,
   PrBotId,
@@ -12,6 +11,7 @@ import type {
   RecentProject,
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
+import { formatElapsedMs, hasCoverageGap, statusLineText } from './statusLine';
 import {
   INITIAL_FRAME_MAP_STATE,
   INITIAL_FRAME_SYNC_STATE,
@@ -27,6 +27,7 @@ import {
   footerBarRightTitle,
   frameMapFor,
   frameSyncFor,
+  mapNodesForStatusLine,
   nextSyncAgeTickMs,
   type FrameMapState,
   type FrameSyncState,
@@ -44,9 +45,12 @@ import {
   applyProjectClosedToSessionMap,
   applyProjectOpenedToSessionMap,
   applyStatusToSessionMap,
+  degradedNoticeRetryShown,
   deriveSessionView,
   isStatusForCurrentProject,
   modeSwitcherEnabled,
+  statusLineRetryVisible,
+  type SessionAvailability,
   type SessionMapState,
 } from './sessionView';
 
@@ -940,7 +944,12 @@ export function App() {
               </ActionableNotice>
             )}
             {sessionView.availability === 'degraded' && (
-              <DegradedSessionNotice showRetry={sessionView.showRetry} onRetry={handleRetryGraphService} />
+              // FIX-3: `degradedNoticeRetryShown` — the one predicate the
+              // status line's Retry is the complement of.
+              <DegradedSessionNotice
+                showRetry={degradedNoticeRetryShown(sessionView)}
+                onRetry={handleRetryGraphService}
+              />
             )}
             {/* No nested `role="alert"` — the enclosing `role="status"` region
                 announces it. */}
@@ -972,10 +981,17 @@ export function App() {
 
       {showServiceFooters && graphServiceStatus && (
         <footer className="graph-service-status" role="status">
-          <GraphServiceStatusBadge status={graphServiceStatus} />
+          <GraphServiceStatusBadge
+            status={graphServiceStatus}
+            mapNodes={mapNodesForStatusLine(frameMapFor(frameMap, currentProjectPath))}
+            availability={footerAvailability(graphServiceStatus, currentProjectPath)}
+          />
           {/* P0-3: `exited` gets Retry too — it was the one terminal state
-              that used to leave the session with no way back. */}
-          {sessionView.showRetry && (
+              that used to leave the session with no way back. FIX-3: hidden
+              while the degraded notice's own "Retry the Graph Service" is on
+              screen — both run `handleRetryGraphService`, so one button per
+              action (`statusLineRetryVisible`). */}
+          {statusLineRetryVisible(sessionView) && (
             <button type="button" className="graph-service-status__retry" onClick={handleRetryGraphService}>
               Retry
             </button>
@@ -1154,87 +1170,22 @@ function formatPrBotToolNotFound(bot: PrBotId): string {
 }
 
 /**
- * Formats a millisecond duration as a short, human-readable elapsed-time
- * string ("340ms", "12s", "4m 05s", "1h 30m") — always shown, honestly,
- * regardless of how fast or slow the underlying hardware/repo made it
- * (NFR1, AD-15).
- *
- * Renders "—" for a non-finite input (e.g. a malformed `status.at`) rather
- * than a "NaNms"-shaped string — a bad timestamp should never leak into the
- * rendered text.
- *
- * The sub-second branch checks the *rounded* value, not the raw one: a raw
- * value in `[999.5, 1000)` would otherwise take the `ms` branch and
- * `Math.round` it up to a confusing "1000ms" instead of "1s".
+ * The Graph Service status line. Its text is `statusLineText`
+ * (`statusLine.ts`); this component adds only the badge tone and the ticking
+ * elapsed span while indexing. `mapNodes` (FIX-3) is the map-eligible Node
+ * count from the same map state the footer bar reports (or `null` before the
+ * map has loaded) and `availability` the footer's, which together decide
+ * whether the `indexed` line cites "(N on the map)".
  */
-function formatElapsedMs(ms: number): string {
-  if (!Number.isFinite(ms)) {
-    return '—';
-  }
-  const roundedMs = Math.round(Math.max(0, ms));
-  if (roundedMs < 1000) {
-    return `${roundedMs}ms`;
-  }
-  const totalSeconds = Math.floor(roundedMs / 1000);
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (totalMinutes < 60) {
-    return `${totalMinutes}m ${seconds.toString().padStart(2, '0')}s`;
-  }
-  // Unreachable under the current 30-minute indexing timeout ceiling, but
-  // kept for robustness if that ceiling is ever raised independently.
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return `${hours}h ${minutes.toString().padStart(2, '0')}m`;
-}
-
-/** "1 file" / "2 files" — the coverage gap text names its unit, correctly pluralized. */
-function pluralizeFiles(count: number): string {
-  return `${count} file${count === 1 ? '' : 's'}`;
-}
-
-/** True when the backend's own reporting shows a genuine coverage gap. */
-function hasCoverageGap(coverage: IndexCoverageSummary): boolean {
-  return coverage.skippedCount > 0 || coverage.parsePartialCount > 0;
-}
-
-/**
- * Renders the coverage summary distinctly for full vs. partial coverage
- * (FR2, UX-DR11) — sourced entirely from `coverage`, never re-derived here.
- * `not_indexed` exclusions never factor in: `coverage` only ever carries the
- * genuine `skipped`/`parse_partial` gap counts.
- *
- * Full-vs-gap is keyed on `skippedCount`/`parsePartialCount` alone (via
- * `hasCoverageGap`) — never on `nodes === expectedNodes` — because
- * `expectedNodes`/`expectedEdges` are optional enrichment on
- * `IndexCoverageSummary`, not always present (see mcp-client.ts's
- * `fetchCoverage` doc comment for why). The "x of y expected" detail below
- * is appended only when the backend's response happened to include both
- * expected-count fields; its absence never blocks the full/partial verdict
- * itself.
- */
-function formatCoverage(coverage: IndexCoverageSummary, nodes: number, edges: number): string {
-  const verdict = hasCoverageGap(coverage)
-    ? [
-        coverage.parsePartialCount > 0
-          ? `${pluralizeFiles(coverage.parsePartialCount)} partially parsed`
-          : null,
-        coverage.skippedCount > 0 ? `${pluralizeFiles(coverage.skippedCount)} skipped` : null,
-      ]
-        .filter((part): part is string => part !== null)
-        .join(', ')
-    : 'full coverage';
-
-  if (coverage.expectedNodes === undefined || coverage.expectedEdges === undefined) {
-    return verdict;
-  }
-  return `${verdict} (${nodes}/${coverage.expectedNodes} nodes, ${edges}/${coverage.expectedEdges} edges expected)`;
-}
-
-function GraphServiceStatusBadge({ status }: { status: GraphServiceStatusMessage }) {
+function GraphServiceStatusBadge({
+  status,
+  mapNodes,
+  availability,
+}: {
+  status: GraphServiceStatusMessage;
+  mapNodes: number | null;
+  availability: SessionAvailability;
+}) {
   // Drives the live-ticking elapsed display while `state === 'indexing'`
   // (derived from `status.at`, no new IPC data needed) so a repo that
   // legitimately runs well past the ~3min target-scale budget still shows
@@ -1250,16 +1201,14 @@ function GraphServiceStatusBadge({ status }: { status: GraphServiceStatusMessage
     return () => clearInterval(interval);
   }, [status.state, status.at]);
 
+  const text = statusLineText(status, mapNodes, availability);
   switch (status.state) {
     case 'starting':
-      return <span className="badge badge--pending">Graph Service starting…</span>;
-    case 'alive':
-      return <span className="badge badge--ok">Graph Service running</span>;
-    case 'indexing': {
-      const elapsedMs = now - new Date(status.at).getTime();
+      return <span className="badge badge--pending">{text}</span>;
+    case 'indexing':
       return (
         <span className="badge badge--pending">
-          Indexing…{' '}
+          {text}{' '}
           {/*
            * `aria-live="off"` on just this ticking span, nested inside the
            * page's `<footer role="status">` (an implicit `aria-live="polite"`
@@ -1270,31 +1219,19 @@ function GraphServiceStatusBadge({ status }: { status: GraphServiceStatusMessage
            * `polite` region and is still announced once, since it isn't
            * inside this `off` span.
            */}
-          <span aria-live="off">({formatElapsedMs(elapsedMs)})</span>
+          <span aria-live="off">({formatElapsedMs(now - new Date(status.at).getTime())})</span>
         </span>
       );
-    }
+    case 'alive':
+      return <span className="badge badge--ok">{text}</span>;
     case 'indexed': {
       const gap = status.coverage ? hasCoverageGap(status.coverage) : false;
-      return (
-        <span className={`badge ${gap ? 'badge--warning' : 'badge--ok'}`}>
-          Indexed — {status.nodes} nodes, {status.edges} edges ·{' '}
-          {formatElapsedMs(status.elapsedMs)}
-          {status.coverage && (
-            <> · {formatCoverage(status.coverage, status.nodes, status.edges)}</>
-          )}
-        </span>
-      );
+      return <span className={`badge ${gap ? 'badge--warning' : 'badge--ok'}`}>{text}</span>;
     }
     case 'exited':
-      return <span className="badge badge--muted">Graph Service exited</span>;
+      return <span className="badge badge--muted">{text}</span>;
     case 'error':
-      return (
-        <span className="badge badge--error">
-          Graph Service unavailable: {status.message}
-          {status.elapsedMs !== undefined && <> (after {formatElapsedMs(status.elapsedMs)})</>}
-        </span>
-      );
+      return <span className="badge badge--error">{text}</span>;
   }
 }
 

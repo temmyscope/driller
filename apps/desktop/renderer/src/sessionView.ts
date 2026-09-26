@@ -92,6 +92,28 @@ export function isStatusForCurrentProject(
 }
 
 /**
+ * FIX-3: whether the degraded-session notice (`DegradedSessionNotice`, only
+ * rendered with a map on screen) offers its "Retry the Graph Service". App
+ * passes exactly this as the notice's `showRetry`, and
+ * `statusLineRetryVisible` is its complement, so the two Retries can't drift
+ * into both showing, or neither.
+ */
+export function degradedNoticeRetryShown(view: SessionView): boolean {
+  return view.showMap && view.availability === 'degraded' && view.showRetry;
+}
+
+/**
+ * FIX-3: whether the Graph Service status line shows its own Retry. Both
+ * Retries run the same restart, so the status line's is dropped whenever the
+ * notice's is on screen — one button per action. Without a map (the pre-load
+ * screen) the notice isn't rendered, so the status line's Retry is the only
+ * way back and stays.
+ */
+export function statusLineRetryVisible(view: SessionView): boolean {
+  return view.showRetry && !degradedNoticeRetryShown(view);
+}
+
+/**
  * P2-2: the header mode switcher is enabled whenever a project is open —
  * including while it is still indexing, before its map has loaded — and
  * disabled on the landing screen, where the first-open mode rule would

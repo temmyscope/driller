@@ -175,6 +175,11 @@ describe('cluster and row labelling', () => {
     assert.equal(formatRemainingClusters(1), '+1 more module');
   });
 
+  it('uses the shared thousands separator (FIX-3)', () => {
+    assert.equal(formatRemainingNodes(1014), '+1,014 more Nodes');
+    assert.equal(formatHealthClusterHeat('hot', 7, 1204), 'hot · 7 signals on its worst Node, 1,204 in the module');
+  });
+
   // Rows band their own `riskCount` through the same function the helper bands
   // `heatCount` with, so a card and its rows share one set of cut points. These
   // are `riskCountBucket`'s, unchanged — including 4, which is interior to the

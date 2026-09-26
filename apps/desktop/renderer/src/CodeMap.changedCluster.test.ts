@@ -344,9 +344,17 @@ describe('edgeClickTarget', () => {
 
 describe('clusterAriaLabel', () => {
   it('appends ", N changed" only when a member changed', () => {
-    assert.equal(clusterAriaLabel(4, false, 0), 'Cluster of 4 nodes, expand');
-    assert.equal(clusterAriaLabel(4, false, 2), 'Cluster of 4 nodes, expand, 2 changed');
-    assert.equal(clusterAriaLabel(900, true, 1), 'Cluster of 900 nodes, too many to expand — zoom in, 1 changed');
+    assert.equal(clusterAriaLabel(4, false, 0), 'Cluster of 4 Nodes, expand');
+    assert.equal(clusterAriaLabel(4, false, 2), 'Cluster of 4 Nodes, expand, 2 changed');
+    assert.equal(clusterAriaLabel(900, true, 1), 'Cluster of 900 Nodes, too many to expand — zoom in, 1 changed');
+  });
+
+  it('uses the shared count formatter (FIX-3)', () => {
+    assert.equal(clusterAriaLabel(1, false, 0), 'Cluster of 1 Node, expand');
+    assert.equal(
+      clusterAriaLabel(5200, true, 1234),
+      'Cluster of 5,200 Nodes, too many to expand — zoom in, 1,234 changed',
+    );
   });
 });
 
@@ -401,7 +409,7 @@ describe('CodeMapClusterCard', () => {
   it('marks a cluster with 2 changed members', () => {
     const root = renderClusterCard(2);
     assert.ok(String(root.props.className).split(' ').includes('code-map__cluster--changed'));
-    assert.equal(root.props['aria-label'], 'Cluster of 4 nodes, expand, 2 changed');
+    assert.equal(root.props['aria-label'], 'Cluster of 4 Nodes, expand, 2 changed');
     const marker = hostTree(root).find((el) => el.props.className === 'code-map__cluster-changed');
     assert.ok(marker);
     assert.equal(marker.props['aria-hidden'], 'true');
@@ -411,7 +419,7 @@ describe('CodeMapClusterCard', () => {
   it('carries no changed marker at 0', () => {
     const root = renderClusterCard(0);
     assert.ok(!String(root.props.className).split(' ').includes('code-map__cluster--changed'));
-    assert.equal(root.props['aria-label'], 'Cluster of 4 nodes, expand');
+    assert.equal(root.props['aria-label'], 'Cluster of 4 Nodes, expand');
     assert.equal(
       hostTree(root).some((el) => el.props.className === 'code-map__cluster-changed'),
       false,

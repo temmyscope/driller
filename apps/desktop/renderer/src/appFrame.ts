@@ -11,6 +11,7 @@
 import type { DiffScopeResult, GraphServiceStatusMessage } from '@driller/ipc-contracts';
 
 import type { CodeMapMode } from './CodeMap';
+import { formatMapCounts } from './format';
 import { deriveSessionView, isStatusForCurrentProject, type SessionAvailability } from './sessionView';
 
 // ---------------------------------------------------------------------------
@@ -304,13 +305,9 @@ export function deriveTitle({ currentProjectPath }: { currentProjectPath: string
   return `driller — ${currentProjectPath === null ? NO_PROJECT_OPEN : projectFolderName(currentProjectPath)}`;
 }
 
-function countOf(count: number, singular: string, plural: string): string {
-  return `${count.toLocaleString('en-US')} ${count === 1 ? singular : plural}`;
-}
-
-/** "229 Nodes · 359 edges" — "Node" is capitalised as the glossary term; "edge" is not one. */
-export function formatMapCounts(nodes: number, edges: number): string {
-  return `${countOf(nodes, 'Node', 'Nodes')} · ${countOf(edges, 'edge', 'edges')}`;
+/** FIX-3: the map-eligible Node count the status line may cite — only a ready map's, else `null`. */
+export function mapNodesForStatusLine(map: MapFooterState | null): number | null {
+  return map?.status === 'ready' ? map.nodes : null;
 }
 
 /**

@@ -183,6 +183,18 @@ code,
 .app__title {
   margin: 0;
   font-size: 11px;
+  /* FIX-3: a long project name ellipsises rather than wrapping the title
+     into a column or pushing Close project / the gear off-screen. The full
+     name stays in the window title (`deriveTitle`). */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* FIX-3: the title block is the one header item that gives up width. */
+.app__header-text {
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .app__subtitle {
@@ -202,6 +214,58 @@ code,
   padding: 0.5rem 1.5rem;
   background: var(--panel-alt);
   border-bottom: 1px solid var(--border);
+}
+
+/* FIX-3: when one row can't hold the title, the mode switcher, Close project
+   and the gear, the header wraps and the mode switcher (with its hint) moves
+   to its own second line; the title, Close project and the gear keep the
+   first. The breakpoint is measured, in CSS px (headless Chrome, real
+   styles): the switcher is 460px, Close project 86px, the gear 28px, the
+   padding 48px and the three 16px gaps 48px — 670px before the title — plus
+   ~160px for a short title ("driller — app") ≈ 830px. In an 1100px window
+   that is any zoom above ~130% (200% leaves a 550px viewport). Zoom changes
+   the CSS viewport width, so a viewport query tracks it exactly. Longer
+   titles ellipsise above the breakpoint rather than wrap.
+
+   ORDER-BASED LAYOUT: below the breakpoint the header's rows are made with
+   flex `order` — row 1 is every item at the default `order: 0`, then the
+   `::after` line break at `order: 1`, then the switcher row at `order: 2`. A
+   new header child lands on row 1 unless it is given an explicit `order`
+   here. (No other rule styles `.app__header::after`.) */
+@media (max-width: 832px) {
+  .app__header {
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+
+  /* The title takes whatever row 1 leaves beside Close project and the gear,
+     and ellipsises; a zero basis means it never pushes them onto a new line. */
+  .app__header-text {
+    flex: 1 1 0;
+  }
+
+  /* A zero-height, full-width flex item: the forced line break between row 1
+     and the mode switcher's row. */
+  .app__header::after {
+    content: '';
+    order: 1;
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  .mode-switcher,
+  .mode-switcher__hint {
+    order: 2;
+    margin-top: 0.5rem;
+  }
+
+  /* Belt and braces below the 550px a 200% zoom leaves: tabs wrap rather
+     than overflow. */
+  .mode-switcher {
+    flex-wrap: wrap;
+    flex-shrink: 1;
+    min-width: 0;
+  }
 }
 
 .app__settings-button {

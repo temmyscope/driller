@@ -16,7 +16,12 @@ import { describe, it } from 'node:test';
 import type { DeterministicRiskSignalType } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 
-import { NodeRiskSignalSections, formatDeterministicSignalLabel, initialBlastRadiusDepth } from './CodeMap';
+import {
+  NodeRiskSignalSections,
+  blastRadiusSummary,
+  formatDeterministicSignalLabel,
+  initialBlastRadiusDepth,
+} from './CodeMap';
 
 interface Element {
   props: Record<string, unknown>;
@@ -94,6 +99,17 @@ describe('formatDeterministicSignalLabel', () => {
     );
   });
 
+  it('uses the shared thousands separator (FIX-3)', () => {
+    assert.equal(
+      formatDeterministicSignalLabel({ type: 'blast-radius', value: 1204, severity: 'severe' }),
+      `Blast radius: 1,204 Nodes within ${hops} (callers and callees) (severe)`,
+    );
+    assert.equal(
+      formatDeterministicSignalLabel({ type: 'complexity', value: 1500, severity: 'moderate' }),
+      'Complexity: 1,500',
+    );
+  });
+
   it('falls back to the raw type string for an unknown signal type', () => {
     const unknownType = 'future-signal' as DeterministicRiskSignalType;
     assert.equal(formatDeterministicSignalLabel({ type: unknownType, value: 3, severity: 'moderate' }), 'future-signal: 3');
@@ -126,3 +142,11 @@ describe('canvas Blast Radius chip', () => {
   });
 });
 
+
+describe('blastRadiusSummary (FIX-3)', () => {
+  it('reads "within N hops", with the shared count formatter', () => {
+    assert.equal(blastRadiusSummary(4, 2), 'Blast radius: 4 Nodes within 2 hops.');
+    assert.equal(blastRadiusSummary(1, 1), 'Blast radius: 1 Node within 1 hop.');
+    assert.equal(blastRadiusSummary(1204, 3), 'Blast radius: 1,204 Nodes within 3 hops.');
+  });
+});

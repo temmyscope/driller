@@ -24,10 +24,10 @@ import {
   diffScopeSyncTimeFor,
   footerAvailability,
   footerBarRightTitle,
-  formatMapCounts,
   formatSyncAge,
   frameMapFor,
   frameSyncFor,
+  mapNodesForStatusLine,
   mapFooterState,
   nextSyncAgeTickMs,
   SYNC_AGE_MAX_TICK_MS,
@@ -166,16 +166,6 @@ describe('footerAvailability', () => {
       at: AT,
     };
     assert.equal(footerAvailability(status, PROJECT), 'live');
-  });
-});
-
-describe('formatMapCounts', () => {
-  it('singular forms', () => {
-    assert.equal(formatMapCounts(1, 1), '1 Node · 1 edge');
-  });
-
-  it('thousands separators', () => {
-    assert.equal(formatMapCounts(10000, 12345), '10,000 Nodes · 12,345 edges');
   });
 });
 
@@ -512,5 +502,17 @@ describe('footerBarRightTitle (P3-10)', () => {
     assert.equal(footerBarRightTitle({ currentProjectPath: PROJECT, mode: 'codeMap', lastSyncedAt: T }), undefined);
     assert.equal(footerBarRightTitle({ currentProjectPath: PROJECT, mode: 'healthAudit', lastSyncedAt: T }), undefined);
     assert.equal(footerBarRightTitle({ currentProjectPath: null, mode: 'prReview', lastSyncedAt: T }), undefined);
+  });
+});
+
+describe('mapNodesForStatusLine (FIX-3)', () => {
+  it("is the ready map's Node count", () => {
+    assert.equal(mapNodesForStatusLine({ status: 'ready', nodes: 1014, edges: 2371 }), 1014);
+  });
+
+  it('is null while no map is loaded', () => {
+    assert.equal(mapNodesForStatusLine(null), null);
+    assert.equal(mapNodesForStatusLine({ status: 'loading' }), null);
+    assert.equal(mapNodesForStatusLine({ status: 'error' }), null);
   });
 });
