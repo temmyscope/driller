@@ -15,3 +15,26 @@ export type BackendSwitchKind = 'reaffirm' | 'switch';
 export function backendSwitchKind(previous: CloudBackend, next: CloudBackend): BackendSwitchKind {
   return previous === next ? 'reaffirm' : 'switch';
 }
+
+/** What the Graph Service holds about the active summary backend, and the key when Cloud is active. */
+export interface BackendConfigState {
+  activeBackend: CloudBackend;
+  cloudApiKey?: string;
+}
+
+/**
+ * P2-10 (AD-4 condition 5): the backend config that replaces the held one on
+ * every `graphService:index` and `graphService:backendSwitched`. Built only
+ * from the incoming request, never merged with the previous config, so a
+ * request without `cloudApiKey` drops any key held before. A key is kept
+ * only under Cloud, and only when it's non-blank.
+ */
+export function nextBackendConfig(request: {
+  activeBackend: CloudBackend;
+  cloudApiKey?: string;
+}): BackendConfigState {
+  const { activeBackend, cloudApiKey } = request;
+  return activeBackend === 'cloud' && cloudApiKey !== undefined && cloudApiKey.trim() !== ''
+    ? { activeBackend, cloudApiKey }
+    : { activeBackend };
+}

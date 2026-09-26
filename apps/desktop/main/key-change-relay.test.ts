@@ -8,7 +8,7 @@ import { describe, it } from 'node:test';
 
 import type { BackendConfig, CloudBackend, GraphServiceBackendSwitchedRequest } from '@driller/ipc-contracts';
 
-import { relayKeyChange, shouldRelayKeyChange, type KeyChangeRelayDeps } from './key-change-relay';
+import { keyChangeMessage, relayKeyChange, shouldRelayKeyChange, type KeyChangeRelayDeps } from './key-change-relay';
 
 const OPEN = { serviceRunning: true, projectOpen: true };
 
@@ -130,5 +130,11 @@ describe('relayKeyChange', () => {
     } finally {
       console.error = originalError;
     }
+  });
+});
+
+describe('keyChangeMessage', () => {
+  it('omits a blank key, like every other send of the key hop', () => {
+    assert.deepEqual(keyChangeMessage('   '), { type: 'graphService:backendSwitched', activeBackend: 'cloud' });
   });
 });

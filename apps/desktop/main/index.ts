@@ -35,14 +35,12 @@ import {
   type DiffScopeResult,
   type EditorPreference,
   type GitDetectionResult,
-  type GraphServiceBackendSwitchedRequest,
   type GraphServiceCodeMapMessage,
   type GraphServiceComputeDiffScopeRequest,
   type GraphServiceComputeDiffScopeResultMessage,
   type GraphServiceExpandBlastRadiusRequest,
   type GraphServiceExpandBlastRadiusResultMessage,
   type GraphServiceGetCodeMapRequest,
-  type GraphServiceIndexRequest,
   type GraphServicePathTraceRequest,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
@@ -81,6 +79,7 @@ import { toOkCodeMapResult } from './code-map-reply';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
+import { buildBackendSwitchedRequest, buildIndexRequest } from './graph-service-requests';
 import { relayKeyChange } from './key-change-relay';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
@@ -916,6 +915,9 @@ function spawnGraphService(): void {
  * cloud key — decrypted here, in main, the only process with `safeStorage`
  * access (this story's Design Notes) — is included only when cloud is
  * actually active. The Graph Service never receives a key it can't use.
+ * P2-10: this is one of the two sends of AD-4's one sanctioned key hop
+ * (main → Graph Service); `buildIndexRequest` (graph-service-requests.ts)
+ * omits the key field entirely under Local or with no key stored.
  *
  * Bug fix (2026-09-23) adds `includedPaths`: this project's persisted
  * indexing-scope allowlist (project-scope-settings.ts), read fresh at the
@@ -926,15 +928,14 @@ function spawnGraphService(): void {
 function sendIndexRequest(projectPath: string): void {
   const backendConfig = getBackendConfig();
   const { includedPaths } = getProjectScope(projectPath);
-  graphService?.postMessage({
-    type: 'graphService:index',
-    path: projectPath,
-    activeBackend: backendConfig.activeBackend,
-    ...(backendConfig.activeBackend === 'cloud'
-      ? { cloudApiKey: getDecryptedCloudApiKey() }
-      : {}),
-    ...(includedPaths.length > 0 ? { includedPaths } : {}),
-  } satisfies GraphServiceIndexRequest);
+  graphService?.postMessage(
+    buildIndexRequest({
+      projectPath,
+      activeBackend: backendConfig.activeBackend,
+      includedPaths,
+      decrypt: getDecryptedCloudApiKey,
+    }),
+  );
 }
 
 /**
@@ -1878,11 +1879,9 @@ function registerIpcHandlers(): void {
     // next `graphService:index` (once a project is opened) already carries
     // this same up-to-date backend choice on its own.
     if (graphService && currentProjectPath) {
-      graphService.postMessage({
-        type: 'graphService:backendSwitched',
-        activeBackend: backend,
-        ...(backend === 'cloud' ? { cloudApiKey: getDecryptedCloudApiKey() } : {}),
-      } satisfies GraphServiceBackendSwitchedRequest);
+      graphService.postMessage(
+        buildBackendSwitchedRequest({ activeBackend: backend, decrypt: getDecryptedCloudApiKey }),
+      );
     }
   });
 

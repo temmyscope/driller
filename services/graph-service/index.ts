@@ -164,7 +164,7 @@ import type {
 // augmentation (real, present only when forked via `utilityProcess.fork`)
 // without adding a runtime dependency on the `electron` package.
 import type {} from 'electron';
-import { backendSwitchKind } from './backend-switch';
+import { backendSwitchKind, nextBackendConfig, type BackendConfigState } from './backend-switch';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
 import { computeDiffScope } from './git-diff-scope';
@@ -425,7 +425,7 @@ let advisoryPostedForDegenerateResults = false;
 // message. Defaults to `'local'` only so this module has a well-typed value
 // before the first `graphService:index` request ever arrives; that first
 // request always overwrites it before generation can start.
-let activeBackendConfig: { activeBackend: CloudBackend; cloudApiKey?: string } = {
+let activeBackendConfig: BackendConfigState = {
   activeBackend: 'local',
 };
 
@@ -1127,7 +1127,7 @@ async function handleIndexRequest(
   // for this (possibly new) project — any Node set cached from a previous
   // project must not be reused by a `graphService:backendSwitched` request
   // that's really about this new project.
-  activeBackendConfig = backendConfig;
+  activeBackendConfig = nextBackendConfig(backendConfig);
   activeCodeMapNodes = undefined;
   // Story 3.2 (Phase 1): reset alongside `activeCodeMapNodes` — same
   // never-reuse-a-since-superseded-project's-Edges reasoning (Design Notes).
@@ -2473,7 +2473,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
   // summary just to retry the Nodes that were genuinely blocked, spending
   // real Anthropic API calls regenerating summaries that already existed.
   const previousBackend = activeBackendConfig.activeBackend;
-  activeBackendConfig = backendConfig;
+  activeBackendConfig = nextBackendConfig(backendConfig);
   const nodes = activeCodeMapNodes;
   // Story 3.2 (Phase 1): `activeCodeMapEdges` is captured alongside
   // `activeCodeMapNodes` here too — the two are always set together (see

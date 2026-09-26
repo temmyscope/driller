@@ -21,6 +21,8 @@ import type {
   GraphServiceBackendSwitchedRequest,
 } from '@driller/ipc-contracts';
 
+import { buildBackendSwitchedRequest } from './graph-service-requests';
+
 export interface KeyChangeRelayInput {
   activeBackend: CloudBackend;
   serviceRunning: boolean;
@@ -36,13 +38,13 @@ export function shouldRelayKeyChange(input: KeyChangeRelayInput): boolean {
   return input.activeBackend === 'cloud' && input.serviceRunning && input.projectOpen;
 }
 
-/** The `backendSwitched` message for a key change; `cloudApiKey` is absent when no key is stored. */
+/**
+ * The `backendSwitched` message for a key change; `cloudApiKey` is absent
+ * when no (non-blank) key is stored. Built through `cloudKeyField`
+ * (graph-service-requests.ts), the one place that decides the key field.
+ */
 export function keyChangeMessage(key: string | undefined): GraphServiceBackendSwitchedRequest {
-  return {
-    type: 'graphService:backendSwitched',
-    activeBackend: 'cloud',
-    ...(key ? { cloudApiKey: key } : {}),
-  };
+  return buildBackendSwitchedRequest({ activeBackend: 'cloud', decrypt: () => key });
 }
 
 export interface KeyChangeRelayDeps {

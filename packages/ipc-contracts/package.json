@@ -9,12 +9,13 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@driller/graph-contracts": "*"
   },
   "devDependencies": {
+    "@types/node": "^24.9.0",
     "typescript": "5.9.3"
   }
 }
