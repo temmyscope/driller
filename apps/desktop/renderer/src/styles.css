@@ -277,47 +277,66 @@ code,
 }
 
 /*
- * Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
- * surface. A right-docked overlay, matching the Code Map's own source panel
- * (`.code-map__source-overlay`/`.code-map__source-panel`) rather than
- * introducing a new modal pattern.
+ * P2-11: the Settings modal takes `mockups/settings.html`'s composition
+ * (the "RESOLVED SYNTHESIS" pass): a centred 640px frame over the scrim, a
+ * `panel-alt` titlebar, borderless groups split by one `border` divider,
+ * small uppercase legends, dim/selected rows, and hints indented
+ * `--settings-indent` (22px, the mockup's) under their rows. App-only
+ * pieces (the Indexing scope group, per-bot Run ingestion, the key-removal
+ * controls and the Actionable Notices) adopt the same group / row / hint /
+ * action system. Only the body scrolls, so the
+ * titlebar stays put in a short window.
  */
 .settings-overlay {
   position: fixed;
   inset: 0;
   background: color-mix(in srgb, black 50%, transparent);
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: center;
   z-index: 20;
 }
 
 .settings-panel {
-  width: min(420px, 90vw);
-  height: 100%;
-  background: var(--panel);
-  border-left: 1px solid var(--border);
+  --settings-indent: 22px;
+  box-sizing: border-box;
+  width: min(640px, 90vw);
+  max-height: 85vh;
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
-  padding: 1rem 1.25rem 1.5rem;
-  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 0 0 1px #000, 0 20px 60px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.settings-panel:focus {
+  outline: none;
 }
 
 .settings-panel__header {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  padding: 9px 14px;
+  background: var(--panel-alt);
+  border-bottom: 1px solid var(--border);
 }
 
 .settings-panel__title {
   margin: 0;
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: normal;
+  color: var(--text);
 }
 
 .settings-panel__close {
+  margin-left: auto;
+  padding: 0;
   background: transparent;
   border: none;
   color: var(--text-mute);
+  font-family: inherit;
   font-size: 11px;
   line-height: 1;
   cursor: pointer;
@@ -327,72 +346,197 @@ code,
   color: var(--text);
 }
 
-.settings-panel__backend {
-  border: 1px solid var(--border);
-  border-radius: 0;
-  padding: 0.75rem 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
+.settings-panel__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
-.settings-panel__backend legend {
-  padding: 0 0.25rem;
+/* One group per fieldset (and per group-level load-error notice). The
+   fieldset's own `min-width: min-content` default is reset so a long row
+   can never push the modal wider than a narrow window. */
+.settings-panel__group {
+  min-width: 0;
+  margin: 0;
+  padding: 14px 18px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.settings-panel__group:last-child {
+  border-bottom: none;
+}
+
+.settings-panel__group:disabled {
+  opacity: 0.6;
+}
+
+.settings-panel__group legend {
+  float: left;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 0;
   color: var(--text-mute);
-  font-size: 11px;
+  font-size: 9.5px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
-.settings-panel__radio {
+/* `float` on the legend (above) keeps it inside the padding box like the
+   mockup's; the first row clears it. */
+.settings-panel__group legend + * {
+  clear: both;
+}
+
+.settings-panel__radio,
+.settings-panel__checkbox {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 11.5px;
   cursor: pointer;
 }
 
-/* Story 1.10 (Phase 1): the external editor preference fieldset — mirrors
-   .settings-panel__backend's own styling exactly (own class only so each
-   fieldset's border/legend rules stay independently editable). */
-.settings-panel__editor {
-  border: 1px solid var(--border);
-  border-radius: 0;
-  padding: 0.75rem 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
+.settings-panel__radio {
+  margin-bottom: 7px;
 }
 
-.settings-panel__editor legend {
-  padding: 0 0.25rem;
-  color: var(--text-mute);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+.settings-panel__checkbox {
+  margin-bottom: 6px;
 }
 
-.settings-panel__cloud-key {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.settings-panel__key-label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-  font-size: 11px;
-  color: var(--text-mute);
-}
-
-.settings-panel__key-label input {
-  padding: 0.5rem 0.6rem;
-  border-radius: 0;
-  border: 1px solid var(--border);
-  background: var(--bg);
+.settings-panel__radio:has(input:checked),
+.settings-panel__checkbox:has(input:checked) {
   color: var(--text);
-  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+.settings-panel__radio input,
+.settings-panel__checkbox input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.settings-panel__radio:has(input:disabled),
+.settings-panel__checkbox:has(input:disabled),
+.settings-panel__radio input:disabled,
+.settings-panel__checkbox input:disabled {
+  cursor: default;
+}
+
+.settings-panel__hint {
+  margin: 4px 0 0 var(--settings-indent);
+  color: var(--text-mute);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.settings-panel__hint code {
+  color: var(--text-dim);
+}
+
+/* The indented block under a group's rows — the key controls, the PR-bot
+   disclosure, per-bot Run ingestion, scope field and the notices that
+   belong to them. */
+.settings-panel__indent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 0 var(--settings-indent);
+}
+
+/* The mockup's `.key-field`: an input and its action inline, wrapping so
+   the action is never clipped in a narrow window. */
+.settings-panel__field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-panel__field-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 200px;
+  min-width: 0;
+  color: var(--text-dim);
   font-size: 11px;
+}
+
+/* The field's visible label ("API key", "Included subfolders"). */
+.settings-panel__field-text {
+  flex-shrink: 0;
+  color: var(--text-mute);
+  font-size: 10px;
+}
+
+.settings-panel__field-label input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.settings-panel__field-label input::placeholder {
+  color: var(--text-mute);
+}
+
+/* The mockup's `.action-btn`: Save key, Remove saved key, per-bot Run
+   ingestion and the scope Save. */
+.settings-panel__action {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.settings-panel__action:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* The group's primary action (Save key): accent-outlined, `accent` text. */
+.settings-panel__action--primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.settings-panel__action--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
+
+.settings-panel__action:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.settings-panel__header button:focus-visible,
+.settings-panel__body button:focus-visible,
+.settings-panel__body input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-panel__key-saved-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .settings-panel__key-saved {
@@ -401,121 +545,36 @@ code,
   font-size: 11px;
 }
 
-/* P2-6: "Key saved" with its Remove button beside it (outside the status
-   live region). A quiet secondary action, not the primary Save styling. */
-.settings-panel__key-saved-row {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
+/* The PR-bot privacy disclosure: still the P1-7 Actionable Notice (glyph,
+   spoken "Warning:", one action), sized as the mockup's `.disclosure` — the
+   amber rule on `panel-alt` at 10px — through the notice's own `className`
+   and the action's class, not its internals. The doubled class outranks
+   `.actionable-notice`, which comes later in this file. */
+.actionable-notice.settings-panel__disclosure-notice {
+  padding: 8px 12px;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
-.settings-panel__remove-key {
-  padding: 0.2rem 0.6rem;
-  border-radius: 0;
-  border: 1px solid var(--accent);
-  background: transparent;
-  color: var(--accent);
-  font-size: 11px;
-  cursor: pointer;
+/* The one Enable action: amber-outlined, amber text. */
+.settings-panel__disclosure-notice .settings-panel__disclosure-action {
+  padding: 3px 8px;
+  border: 1px solid var(--risk-amber);
+  color: var(--risk-amber);
+  font-family: inherit;
+  font-size: 10px;
 }
 
-.settings-panel__remove-key:disabled {
-  opacity: 0.6;
-  cursor: default;
+.settings-panel__pr-bot + .settings-panel__pr-bot {
+  margin-top: 4px;
 }
 
-.settings-panel__save {
-  align-self: flex-start;
-  padding: 0.5rem 1rem;
-  border-radius: 0;
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.settings-panel__save:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-/* Story 2.3 (Phase 1): the PR-bot opt-in fieldset — mirrors
-   .settings-panel__editor's border/padding/legend styling (own class only
-   so each fieldset's rules stay independently editable), plus a disabled
-   state since this is the first Settings fieldset that can be disabled
-   entirely (no project open). A wider row gap (0.75rem vs 0.5rem) is a
-   deliberate deviation, not a copy-paste miss: each row here can grow a
-   multi-line disclosure notice underneath its checkbox, unlike the
-   editor fieldset's single-line rows. */
-.settings-panel__pr-bots {
-  border: 1px solid var(--border);
-  border-radius: 0;
-  padding: 0.75rem 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.settings-panel__pr-bots:disabled {
-  opacity: 0.6;
-}
-
-.settings-panel__pr-bots legend {
-  padding: 0 0.25rem;
-  color: var(--text-mute);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.settings-panel__pr-bots-hint {
-  margin: 0;
-  color: var(--text-mute);
-  font-size: 10.5px;
-  line-height: 1.45;
-}
-
-.settings-panel__pr-bot {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.settings-panel__checkbox {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  cursor: pointer;
-}
-
-/* Story 2.3 (Phase 4): "Run ingestion now" — a secondary (bordered, not
-   filled) action, deliberately less visually loud than the primary
-   `.settings-panel__save` above, since this is a per-bot, repeatable,
-   non-destructive trigger, not a form-submit action. */
 .settings-panel__pr-bot-ingestion {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
+  margin-bottom: 6px;
 }
 
-.settings-panel__pr-bot-ingestion button {
-  padding: 0.35rem 0.75rem;
-  border-radius: 0;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.settings-panel__pr-bot-ingestion button:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.settings-panel__pr-bot-ingestion button:disabled {
-  opacity: 0.6;
-  cursor: default;
+.settings-panel__pr-bot-ingestion > .settings-panel__action {
+  align-self: flex-start;
 }
 
 /* The plain, non-error ingestion status text. The error variant
@@ -523,8 +582,9 @@ code,
    instead (P1-7). */
 .settings-panel__pr-bot-ingestion-status {
   margin: 0;
-  font-size: 11px;
   color: var(--text-mute);
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .open-folder {
@@ -2626,9 +2686,10 @@ code,
   color: var(--text-dim);
 }
 
-/* Mirrors `.settings-panel__save`'s primary-action styling (Settings.tsx —
-   the closest precedent for a single-button async-action affordance in this
-   codebase) rather than inventing a new button treatment. */
+/* Originally mirrored `.settings-panel__save`'s filled primary-action styling
+   (Settings.tsx — the closest precedent for a single-button async-action
+   affordance in this codebase) rather than inventing a new button treatment.
+   Since P2-11 that Settings button is outlined; this one stays filled. */
 .code-map__node-detail-regenerate {
   align-self: flex-start;
   padding: 0.5rem 1rem;

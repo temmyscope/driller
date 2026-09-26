@@ -51,6 +51,8 @@ export interface ActionableNoticeProps {
   action?: ActionableNoticeAction;
   /** The live-region role the call site already had, if any. */
   role?: 'status' | 'alert';
+  /** An extra class on the root, for a call site's placement/density (e.g. Settings' PR-bot disclosure). The shape itself never changes. */
+  className?: string;
 }
 
 /** Whether `action` is a real action; empty values (and a stray number) render no slot. */
@@ -61,10 +63,13 @@ function hasActionContent(action: ActionableNoticeAction | undefined): boolean {
   return typeof action !== 'number' && typeof action !== 'bigint';
 }
 
-export function ActionableNotice({ tone, children, action, role }: ActionableNoticeProps) {
+export function ActionableNotice({ tone, children, action, role, className }: ActionableNoticeProps) {
   const prefix = ACTIONABLE_NOTICE_SPOKEN_PREFIX[tone];
   return (
-    <div className={`actionable-notice actionable-notice--${tone}`} role={role}>
+    <div
+      className={`actionable-notice actionable-notice--${tone}${className ? ` ${className}` : ''}`}
+      role={role}
+    >
       <span className="actionable-notice__glyph" aria-hidden="true">
         {ACTIONABLE_NOTICE_GLYPHS[tone]}
       </span>

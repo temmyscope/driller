@@ -127,7 +127,7 @@ interface SettingsProps {
   onIngestionResult?: (bot: PrBotId, result: PrBotIngestionResult, requestedAt: number) => void;
 }
 
-type KeyEntryState =
+export type KeyEntryState =
   | { kind: 'idle' }
   | { kind: 'saving' }
   | { kind: 'warning'; message: string; pendingKey: string }
@@ -276,6 +276,160 @@ export function keyRemovedOutcome(result: ClearCloudApiKeyResult): { notice: str
         : 'Key removed.',
     notify: result.relayed,
   };
+}
+
+/**
+ * P2-11: the ids tying each Settings hint to its control or group through
+ * `aria-describedby`. One Settings panel is ever mounted, so fixed ids are
+ * unique (the same convention as `MODE_SWITCHER_HINT_ID`).
+ */
+export const SETTINGS_BACKEND_HINT_ID = 'settings-backend-hint';
+export const SETTINGS_EDITOR_HINT_ID = 'settings-editor-hint';
+export const SETTINGS_PR_BOTS_HINT_ID = 'settings-pr-bots-hint';
+export const SETTINGS_SCOPE_NO_PROJECT_HINT_ID = 'settings-scope-no-project-hint';
+export const SETTINGS_SCOPE_HINT_ID = 'settings-scope-hint';
+
+export interface SettingsTitlebarProps {
+  onClose: () => void;
+}
+
+/**
+ * P2-11: the mockup's titlebar — "Settings" and a "[esc] close" button.
+ * The button's accessible name is its visible text plus a visually hidden
+ * " settings" ("[esc] close settings"), so the name contains what is shown
+ * (WCAG 2.5.3 label-in-name) rather than an `aria-label` replacing it.
+ *
+ * MUST STAY HOOKLESS: `Settings.composition.test.ts` calls it directly.
+ */
+export function SettingsTitlebar({ onClose }: SettingsTitlebarProps) {
+  return (
+    <header className="settings-panel__header">
+      <h2 className="settings-panel__title">Settings</h2>
+      <button type="button" className="settings-panel__close" onClick={onClose}>
+        [esc] close<span className="visually-hidden"> settings</span>
+      </button>
+    </header>
+  );
+}
+
+export interface CloudKeyBlockProps {
+  config: BackendConfig;
+  keyEntry: KeyEntryState;
+  keyInput: string;
+  removingKey: boolean;
+  keyRemovedNotice: string | null;
+  keyRemoveError: string | null;
+  onKeyInputChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onSaveKey: () => void;
+  onRemoveKey: () => void;
+  onAcknowledgeInsecureStorage: () => void;
+}
+
+/**
+ * P2-11: the cloud-key controls, indented inside the backend group — lifted
+ * out of `Settings` unchanged (same conditions, guards and handlers) so the
+ * wiring is exercised by `Settings.composition.test.ts`. All state and
+ * handlers stay in `Settings`; see its header for the security invariants.
+ *
+ * MUST STAY HOOKLESS: the test calls it directly with no renderer.
+ */
+export function CloudKeyBlock({
+  config,
+  keyEntry,
+  keyInput,
+  removingKey,
+  keyRemovedNotice,
+  keyRemoveError,
+  onKeyInputChange,
+  onSaveKey,
+  onRemoveKey,
+  onAcknowledgeInsecureStorage,
+}: CloudKeyBlockProps) {
+  return (
+    <section className="settings-panel__indent" aria-label="Cloud API key">
+      {config.isLinuxInsecureBackend && (
+        <ActionableNotice tone="warning" role="status">
+          This machine has no secure OS keystore available. A stored key would have
+          weaker protection than usual.
+        </ActionableNotice>
+      )}
+
+      {config.hasCloudKey && keyEntry.kind !== 'warning' && keyInput.length === 0 && (
+        // Masked "Key saved" state — never re-displays the key
+        // itself, only that one is stored.
+        // P2-6: the Remove button sits beside the status text, not
+        // inside the live region, so it isn't re-announced.
+        <div className="settings-panel__key-saved-row">
+          <p className="settings-panel__key-saved" role="status">
+            Key saved (••••••••)
+          </p>
+          <button
+            type="button"
+            className="settings-panel__action"
+            onClick={onRemoveKey}
+            disabled={removingKey || keyEntry.kind === 'saving'}
+          >
+            {removingKey ? 'Removing…' : 'Remove saved key'}
+          </button>
+        </div>
+      )}
+
+      {keyRemovedNotice && (
+        <ActionableNotice tone="info" role="status">
+          {keyRemovedNotice}
+        </ActionableNotice>
+      )}
+
+      {keyRemoveError && (
+        <ActionableNotice tone="error" role="alert">
+          {keyRemoveError}
+        </ActionableNotice>
+      )}
+
+      <div className="settings-panel__field">
+        <label className="settings-panel__field-label">
+          <span className="settings-panel__field-text">API key</span>
+          <input
+            type="password"
+            value={keyInput}
+            onChange={onKeyInputChange}
+            placeholder={config.hasCloudKey ? 'Enter a new key to replace the saved one' : 'sk-…'}
+            autoComplete="off"
+            disabled={removingKey}
+          />
+        </label>
+
+        <button
+          type="button"
+          className="settings-panel__action settings-panel__action--primary"
+          onClick={onSaveKey}
+          disabled={keyEntry.kind === 'saving' || removingKey}
+        >
+          {keyEntry.kind === 'saving' ? 'Saving…' : 'Save key'}
+        </button>
+      </div>
+
+      {keyEntry.kind === 'warning' && (
+        <ActionableNotice
+          tone="warning"
+          role="alert"
+          action={
+            <button type="button" onClick={onAcknowledgeInsecureStorage} disabled={removingKey}>
+              Store anyway
+            </button>
+          }
+        >
+          {keyEntry.message}
+        </ActionableNotice>
+      )}
+
+      {keyEntry.kind === 'error' && (
+        <ActionableNotice tone="error" role="alert">
+          {keyEntry.message}
+        </ActionableNotice>
+      )}
+    </section>
+  );
 }
 
 export function Settings({
@@ -869,6 +1023,13 @@ export function Settings({
     setKeyEntry((current) => (current.kind === 'saving' ? current : { kind: 'idle' }));
   }, []);
 
+  // P2-11: the composition follows `mockups/settings.html` — a centred modal
+  // with a `panel-alt` titlebar, borderless groups split by one divider,
+  // indented hints, and the key / disclosure / action blocks indented under
+  // their rows. The change is presentation plus the mockup's copy (the
+  // "Local model (on-device)" label, the "PR-bot ingestion (per project)"
+  // legend, and the backend and editor hints); no behaviour, state or
+  // handler changed.
   return (
     <div className="settings-overlay" {...scrimProps}>
       <div
@@ -879,36 +1040,33 @@ export function Settings({
         aria-label="Settings"
         tabIndex={-1}
       >
-        <header className="settings-panel__header">
-          <h2 className="settings-panel__title">Settings</h2>
-          <button type="button" className="settings-panel__close" onClick={onClose} aria-label="Close Settings">
-            ×
-          </button>
-        </header>
+        <SettingsTitlebar onClose={onClose} />
 
-        {loadError && (
-          <ActionableNotice
-            tone="error"
-            role="alert"
-            // Without this Retry, a failed initial `getBackendConfig()` fetch
-            // left `config` permanently `null` for the rest of this panel
-            // session — the whole backend-choice/key-entry body below never
-            // rendered again, only this raw error text (review finding,
-            // Medium). Reuses refetchConfig, the same call the initial mount
-            // effect makes.
-            action={
-              <button type="button" onClick={refetchConfig} aria-label="Retry loading the backend setting">
-                Retry
-              </button>
-            }
-          >
-            {loadError}
-          </ActionableNotice>
-        )}
+        <div className="settings-panel__body">
+          {loadError && (
+            <div className="settings-panel__group">
+              <ActionableNotice
+                tone="error"
+                role="alert"
+                // Without this Retry, a failed initial `getBackendConfig()` fetch
+                // left `config` permanently `null` for the rest of this panel
+                // session — the whole backend-choice/key-entry body below never
+                // rendered again, only this raw error text (review finding,
+                // Medium). Reuses refetchConfig, the same call the initial mount
+                // effect makes.
+                action={
+                  <button type="button" onClick={refetchConfig} aria-label="Retry loading the backend setting">
+                    Retry
+                  </button>
+                }
+              >
+                {loadError}
+              </ActionableNotice>
+            </div>
+          )}
 
-        {config && (
-          <>
-            <fieldset className="settings-panel__backend">
+          {config && (
+            <fieldset className="settings-panel__group" aria-describedby={SETTINGS_BACKEND_HINT_ID}>
               <legend>Summary backend</legend>
               <label className="settings-panel__radio">
                 <input
@@ -918,7 +1076,7 @@ export function Settings({
                   checked={config.activeBackend === 'local'}
                   onChange={() => handleBackendChange('local')}
                 />
-                Local model
+                Local model (on-device)
               </label>
               <label className="settings-panel__radio">
                 <input
@@ -930,321 +1088,299 @@ export function Settings({
                 />
                 Cloud (bring your own key)
               </label>
+              <p className="settings-panel__hint" id={SETTINGS_BACKEND_HINT_ID}>
+                Switching regenerates summaries only — the graph index is untouched.
+              </p>
+
+              {config.activeBackend === 'cloud' && (
+                <CloudKeyBlock
+                  config={config}
+                  keyEntry={keyEntry}
+                  keyInput={keyInput}
+                  removingKey={removingKey}
+                  keyRemovedNotice={keyRemovedNotice}
+                  keyRemoveError={keyRemoveError}
+                  onKeyInputChange={handleKeyInputChange}
+                  onSaveKey={handleSaveKey}
+                  onRemoveKey={handleRemoveKey}
+                  onAcknowledgeInsecureStorage={handleAcknowledgeInsecureStorage}
+                />
+              )}
             </fieldset>
+          )}
 
-            {config.activeBackend === 'cloud' && (
-              <section className="settings-panel__cloud-key" aria-label="Cloud API key">
-                {config.isLinuxInsecureBackend && (
-                  <ActionableNotice tone="warning" role="status">
-                    This machine has no secure OS keystore available. A stored key would have
-                    weaker protection than usual.
+          {editorPreferenceLoadError && (
+            <div className="settings-panel__group">
+              <ActionableNotice
+                tone="error"
+                role="alert"
+                // Same "retry the exact fetch that failed" convention as the
+                // backend-config load-error notice above.
+                action={
+                  <button
+                    type="button"
+                    onClick={refetchEditorPreference}
+                    aria-label="Retry loading the editor preference"
+                  >
+                    Retry
+                  </button>
+                }
+              >
+                {editorPreferenceLoadError}
+              </ActionableNotice>
+            </div>
+          )}
+
+          {editorPreference && (
+            <fieldset className="settings-panel__group" aria-describedby={SETTINGS_EDITOR_HINT_ID}>
+              <legend>External editor</legend>
+              <label className="settings-panel__radio">
+                <input
+                  type="radio"
+                  name="editorPreference"
+                  value="vscode"
+                  checked={editorPreference === 'vscode'}
+                  onChange={() => handleEditorPreferenceChange('vscode')}
+                />
+                VS Code
+              </label>
+              <label className="settings-panel__radio">
+                <input
+                  type="radio"
+                  name="editorPreference"
+                  value="jetbrains"
+                  checked={editorPreference === 'jetbrains'}
+                  onChange={() => handleEditorPreferenceChange('jetbrains')}
+                />
+                JetBrains
+              </label>
+              <label className="settings-panel__radio">
+                <input
+                  type="radio"
+                  name="editorPreference"
+                  value="system-default"
+                  checked={editorPreference === 'system-default'}
+                  onChange={() => handleEditorPreferenceChange('system-default')}
+                />
+                System default
+              </label>
+              <p className="settings-panel__hint" id={SETTINGS_EDITOR_HINT_ID}>
+                Only VS Code / JetBrains jump to the exact line. System default opens the file
+                through the OS's generic association and cannot jump to a line.
+              </p>
+
+              {editorPreferenceSaveError && (
+                <div className="settings-panel__indent">
+                  <ActionableNotice tone="error" role="alert">
+                    {editorPreferenceSaveError}
                   </ActionableNotice>
-                )}
+                </div>
+              )}
+            </fieldset>
+          )}
 
-                {config.hasCloudKey && keyEntry.kind !== 'warning' && keyInput.length === 0 && (
-                  // Masked "Key saved" state — never re-displays the key
-                  // itself, only that one is stored.
-                  // P2-6: the Remove button sits beside the status text, not
-                  // inside the live region, so it isn't re-announced.
-                  <div className="settings-panel__key-saved-row">
-                    <p className="settings-panel__key-saved" role="status">
-                      Key saved (••••••••)
-                    </p>
+          {/* Story 2.3 (Phase 1): PR-bot opt-in + privacy disclosure — the
+              fieldset itself is disabled (Always: "disabled ... when no
+              project is open") via the native `disabled` attribute below,
+              which also disables every descendant checkbox/button for free;
+              this is inherently per-project, unlike every field above. */}
+          <fieldset
+            className="settings-panel__group"
+            disabled={projectPath === null}
+            aria-describedby={projectPath === null ? SETTINGS_PR_BOTS_HINT_ID : undefined}
+          >
+            <legend>PR-bot ingestion (per project)</legend>
+
+            {projectPath === null && (
+              <p className="settings-panel__hint" id={SETTINGS_PR_BOTS_HINT_ID}>
+                Open a project to configure PR-bot ingestion.
+              </p>
+            )}
+
+            {projectPath !== null && prBotConfigLoadError && (
+              <div className="settings-panel__indent">
+                <ActionableNotice
+                  tone="error"
+                  role="alert"
+                  action={
+                    <button type="button" onClick={refetchPrBotConfig} aria-label="Retry loading the PR-bot settings">
+                      Retry
+                    </button>
+                  }
+                >
+                  {prBotConfigLoadError}
+                </ActionableNotice>
+              </div>
+            )}
+
+            {projectPath !== null &&
+              prBotConfig &&
+              PR_BOTS.map(({ id, label }) => {
+                const persistedOn = isPrBotEnabled(id, prBotConfig);
+                const disclosure = prBotDisclosure[id];
+                const checked = persistedOn || disclosure.kind === 'confirming' || disclosure.kind === 'saving';
+
+                return (
+                  <div className="settings-panel__pr-bot" key={id}>
+                    <label className="settings-panel__checkbox">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={disclosure.kind === 'saving'}
+                        onChange={(event) => handlePrBotToggle(id, event)}
+                      />
+                      {label}
+                    </label>
+
+                    {/* The privacy disclosure keeps the P1-7 notice shape
+                        (glyph, spoken "Warning:", one action); only its
+                        placement and density follow the mockup's
+                        `.disclosure` block. */}
+                    {disclosure.kind === 'confirming' && (
+                      <div className="settings-panel__indent">
+                        <ActionableNotice
+                          tone="warning"
+                          role="alert"
+                          className="settings-panel__disclosure-notice"
+                          action={
+                            <button
+                              type="button"
+                              className="settings-panel__disclosure-action"
+                              onClick={() => handlePrBotConfirm(id)}
+                            >
+                              Enable {label}
+                            </button>
+                          }
+                        >
+                          {prBotDisclosureText(id)}
+                        </ActionableNotice>
+                      </div>
+                    )}
+
+                    {disclosure.kind === 'error' && (
+                      <div className="settings-panel__indent">
+                        <ActionableNotice tone="error" role="alert">
+                          {disclosure.message}
+                        </ActionableNotice>
+                      </div>
+                    )}
+
+                    {/* Story 2.3 (Phase 4): "Run ingestion now" — only ever
+                        shown next to a bot whose `enabled` is currently
+                        PERSISTED true (Boundaries & Constraints: "never for a
+                        disabled/unconfirmed bot"), so gated on `persistedOn`
+                        itself, not `checked` above (which also covers the
+                        transient confirming/saving states before enablement
+                        is actually persisted). */}
+                    {persistedOn && (
+                      <div className="settings-panel__indent settings-panel__pr-bot-ingestion">
+                        <button
+                          type="button"
+                          className="settings-panel__action"
+                          onClick={() => handleRunIngestion(id)}
+                          disabled={ingestionRun[id].kind === 'running'}
+                        >
+                          {ingestionRun[id].kind === 'running' ? 'Running…' : 'Run ingestion now'}
+                        </button>
+                        {formatIngestionRunState(ingestionRun[id]) !== null &&
+                          (ingestionRun[id].kind === 'error' ? (
+                            <ActionableNotice tone="error" role="alert">
+                              {formatIngestionRunState(ingestionRun[id])}
+                            </ActionableNotice>
+                          ) : (
+                            <p className="settings-panel__pr-bot-ingestion-status" role="status">
+                              {formatIngestionRunState(ingestionRun[id])}
+                            </p>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </fieldset>
+
+          <fieldset
+            className="settings-panel__group"
+            disabled={projectPath === null}
+            aria-describedby={projectPath === null ? SETTINGS_SCOPE_NO_PROJECT_HINT_ID : undefined}
+          >
+            <legend>Indexing scope</legend>
+
+            {projectPath === null && (
+              <p className="settings-panel__hint" id={SETTINGS_SCOPE_NO_PROJECT_HINT_ID}>
+                Open a project to restrict which subfolders are indexed.
+              </p>
+            )}
+
+            {projectPath !== null && projectScopeLoadError && (
+              <div className="settings-panel__indent">
+                <ActionableNotice
+                  tone="error"
+                  role="alert"
+                  action={
+                    <button
+                      ref={focusProjectScope ? focusScopeOnce : undefined}
+                      type="button"
+                      onClick={refetchProjectScope}
+                      aria-label="Retry loading the indexing scope"
+                    >
+                      Retry
+                    </button>
+                  }
+                >
+                  {projectScopeLoadError}
+                </ActionableNotice>
+              </div>
+            )}
+
+            {projectPath !== null && projectScope && (
+              <>
+                <p className="settings-panel__hint" id={SETTINGS_SCOPE_HINT_ID}>
+                  Comma-separated subfolders the map shows (e.g. <code>web, app, api</code>). Leave
+                  empty to show the whole project — the default. While the Graph Service is running,
+                  saving updates the map right away, without re-indexing.
+                </p>
+                <div className="settings-panel__indent">
+                  <div className="settings-panel__field">
+                    <label className="settings-panel__field-label">
+                      <span className="settings-panel__field-text">Included subfolders</span>
+                      <input
+                        ref={focusProjectScope ? focusScopeOnce : undefined}
+                        type="text"
+                        value={projectScopeInput}
+                        disabled={projectScopeSaving}
+                        onChange={(event) => {
+                          setProjectScopeInput(event.target.value);
+                          setProjectScopeSavedNotice(null);
+                        }}
+                        placeholder="web, app, api"
+                        aria-describedby={SETTINGS_SCOPE_HINT_ID}
+                      />
+                    </label>
                     <button
                       type="button"
-                      className="settings-panel__remove-key"
-                      onClick={handleRemoveKey}
-                      disabled={removingKey || keyEntry.kind === 'saving'}
+                      className="settings-panel__action"
+                      onClick={handleProjectScopeSave}
+                      disabled={projectScopeSaving}
                     >
-                      {removingKey ? 'Removing…' : 'Remove saved key'}
+                      {projectScopeSaving ? 'Saving…' : 'Save'}
                     </button>
                   </div>
-                )}
-
-                {keyRemovedNotice && (
-                  <ActionableNotice tone="info" role="status">
-                    {keyRemovedNotice}
-                  </ActionableNotice>
-                )}
-
-                {keyRemoveError && (
-                  <ActionableNotice tone="error" role="alert">
-                    {keyRemoveError}
-                  </ActionableNotice>
-                )}
-
-                <label className="settings-panel__key-label">
-                  API key
-                  <input
-                    type="password"
-                    value={keyInput}
-                    onChange={handleKeyInputChange}
-                    placeholder={config.hasCloudKey ? 'Enter a new key to replace the saved one' : 'sk-…'}
-                    autoComplete="off"
-                    disabled={removingKey}
-                  />
-                </label>
-
-                <button
-                  type="button"
-                  className="settings-panel__save"
-                  onClick={handleSaveKey}
-                  disabled={keyEntry.kind === 'saving' || removingKey}
-                >
-                  {keyEntry.kind === 'saving' ? 'Saving…' : 'Save key'}
-                </button>
-
-                {keyEntry.kind === 'warning' && (
-                  <ActionableNotice
-                    tone="warning"
-                    role="alert"
-                    action={
-                      <button type="button" onClick={handleAcknowledgeInsecureStorage} disabled={removingKey}>
-                        Store anyway
-                      </button>
-                    }
-                  >
-                    {keyEntry.message}
-                  </ActionableNotice>
-                )}
-
-                {keyEntry.kind === 'error' && (
-                  <ActionableNotice tone="error" role="alert">
-                    {keyEntry.message}
-                  </ActionableNotice>
-                )}
-              </section>
-            )}
-          </>
-        )}
-
-        {editorPreferenceLoadError && (
-          <ActionableNotice
-            tone="error"
-            role="alert"
-            // Same "retry the exact fetch that failed" convention as the
-            // backend-config load-error notice above.
-            action={
-              <button
-                type="button"
-                onClick={refetchEditorPreference}
-                aria-label="Retry loading the editor preference"
-              >
-                Retry
-              </button>
-            }
-          >
-            {editorPreferenceLoadError}
-          </ActionableNotice>
-        )}
-
-        {editorPreference && (
-          <fieldset className="settings-panel__editor">
-            <legend>External editor</legend>
-            <label className="settings-panel__radio">
-              <input
-                type="radio"
-                name="editorPreference"
-                value="vscode"
-                checked={editorPreference === 'vscode'}
-                onChange={() => handleEditorPreferenceChange('vscode')}
-              />
-              VS Code
-            </label>
-            <label className="settings-panel__radio">
-              <input
-                type="radio"
-                name="editorPreference"
-                value="jetbrains"
-                checked={editorPreference === 'jetbrains'}
-                onChange={() => handleEditorPreferenceChange('jetbrains')}
-              />
-              JetBrains
-            </label>
-            <label className="settings-panel__radio">
-              <input
-                type="radio"
-                name="editorPreference"
-                value="system-default"
-                checked={editorPreference === 'system-default'}
-                onChange={() => handleEditorPreferenceChange('system-default')}
-              />
-              System default
-            </label>
-
-            {editorPreferenceSaveError && (
-              <ActionableNotice tone="error" role="alert">
-                {editorPreferenceSaveError}
-              </ActionableNotice>
-            )}
-          </fieldset>
-        )}
-
-        {/* Story 2.3 (Phase 1): PR-bot opt-in + privacy disclosure — the
-            fieldset itself is disabled (Always: "disabled ... when no
-            project is open") via the native `disabled` attribute below,
-            which also disables every descendant checkbox/button for free;
-            this is inherently per-project, unlike every field above. */}
-        <fieldset className="settings-panel__pr-bots" disabled={projectPath === null}>
-          <legend>PR-bot ingestion</legend>
-
-          {projectPath === null && (
-            <p className="settings-panel__pr-bots-hint">
-              Open a project to configure PR-bot ingestion.
-            </p>
-          )}
-
-          {projectPath !== null && prBotConfigLoadError && (
-            <ActionableNotice
-              tone="error"
-              role="alert"
-              action={
-                <button type="button" onClick={refetchPrBotConfig} aria-label="Retry loading the PR-bot settings">
-                  Retry
-                </button>
-              }
-            >
-              {prBotConfigLoadError}
-            </ActionableNotice>
-          )}
-
-          {projectPath !== null &&
-            prBotConfig &&
-            PR_BOTS.map(({ id, label }) => {
-              const persistedOn = isPrBotEnabled(id, prBotConfig);
-              const disclosure = prBotDisclosure[id];
-              const checked = persistedOn || disclosure.kind === 'confirming' || disclosure.kind === 'saving';
-
-              return (
-                <div className="settings-panel__pr-bot" key={id}>
-                  <label className="settings-panel__checkbox">
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={disclosure.kind === 'saving'}
-                      onChange={(event) => handlePrBotToggle(id, event)}
-                    />
-                    {label}
-                  </label>
-
-                  {disclosure.kind === 'confirming' && (
-                    <ActionableNotice
-                      tone="warning"
-                      role="alert"
-                      action={
-                        <button type="button" onClick={() => handlePrBotConfirm(id)}>
-                          Enable {label}
-                        </button>
-                      }
-                    >
-                      {prBotDisclosureText(id)}
-                    </ActionableNotice>
-                  )}
-
-                  {disclosure.kind === 'error' && (
+                  {projectScopeSaveError && (
                     <ActionableNotice tone="error" role="alert">
-                      {disclosure.message}
+                      {projectScopeSaveError}
                     </ActionableNotice>
                   )}
-
-                  {/* Story 2.3 (Phase 4): "Run ingestion now" — only ever
-                      shown next to a bot whose `enabled` is currently
-                      PERSISTED true (Boundaries & Constraints: "never for a
-                      disabled/unconfirmed bot"), so gated on `persistedOn`
-                      itself, not `checked` above (which also covers the
-                      transient confirming/saving states before enablement
-                      is actually persisted). */}
-                  {persistedOn && (
-                    <div className="settings-panel__pr-bot-ingestion">
-                      <button
-                        type="button"
-                        onClick={() => handleRunIngestion(id)}
-                        disabled={ingestionRun[id].kind === 'running'}
-                      >
-                        {ingestionRun[id].kind === 'running' ? 'Running…' : 'Run ingestion now'}
-                      </button>
-                      {formatIngestionRunState(ingestionRun[id]) !== null &&
-                        (ingestionRun[id].kind === 'error' ? (
-                          <ActionableNotice tone="error" role="alert">
-                            {formatIngestionRunState(ingestionRun[id])}
-                          </ActionableNotice>
-                        ) : (
-                          <p className="settings-panel__pr-bot-ingestion-status" role="status">
-                            {formatIngestionRunState(ingestionRun[id])}
-                          </p>
-                        ))}
-                    </div>
+                  {projectScopeSavedNotice && (
+                    <ActionableNotice tone="info" role="status">
+                      {projectScopeSavedNotice}
+                    </ActionableNotice>
                   )}
                 </div>
-              );
-            })}
-        </fieldset>
-
-        <fieldset className="settings-panel__project-scope" disabled={projectPath === null}>
-          <legend>Indexing scope</legend>
-
-          {projectPath === null && (
-            <p className="settings-panel__project-scope-hint">
-              Open a project to restrict which subfolders are indexed.
-            </p>
-          )}
-
-          {projectPath !== null && projectScopeLoadError && (
-            <ActionableNotice
-              tone="error"
-              role="alert"
-              action={
-                <button
-                  ref={focusProjectScope ? focusScopeOnce : undefined}
-                  type="button"
-                  onClick={refetchProjectScope}
-                  aria-label="Retry loading the indexing scope"
-                >
-                  Retry
-                </button>
-              }
-            >
-              {projectScopeLoadError}
-            </ActionableNotice>
-          )}
-
-          {projectPath !== null && projectScope && (
-            <>
-              <p className="settings-panel__project-scope-hint">
-                Comma-separated subfolders the map shows (e.g. <code>web, app, api</code>). Leave
-                empty to show the whole project — the default. While the Graph Service is running,
-                saving updates the map right away, without re-indexing.
-              </p>
-              <label className="settings-panel__project-scope-label">
-                Included subfolders
-                <input
-                  ref={focusProjectScope ? focusScopeOnce : undefined}
-                  type="text"
-                  value={projectScopeInput}
-                  disabled={projectScopeSaving}
-                  onChange={(event) => {
-                    setProjectScopeInput(event.target.value);
-                    setProjectScopeSavedNotice(null);
-                  }}
-                  placeholder="web, app, api"
-                />
-              </label>
-              <button type="button" onClick={handleProjectScopeSave} disabled={projectScopeSaving}>
-                {projectScopeSaving ? 'Saving…' : 'Save'}
-              </button>
-              {projectScopeSaveError && (
-                <ActionableNotice tone="error" role="alert">
-                  {projectScopeSaveError}
-                </ActionableNotice>
-              )}
-              {projectScopeSavedNotice && (
-                <ActionableNotice tone="info" role="status">
-                  {projectScopeSavedNotice}
-                </ActionableNotice>
-              )}
-            </>
-          )}
-        </fieldset>
+              </>
+            )}
+          </fieldset>
+        </div>
       </div>
     </div>
   );
