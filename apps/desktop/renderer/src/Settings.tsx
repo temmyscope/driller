@@ -269,13 +269,139 @@ export const KEY_REMOVE_FAILED_MESSAGE = "Couldn't remove the saved key.";
  * is only when main actually relayed the change to a running Graph Service.
  */
 export function keyRemovedOutcome(result: ClearCloudApiKeyResult): { notice: string; notify: boolean } {
-  return {
-    notice:
-      result.config.activeBackend === 'cloud'
-        ? 'Key removed. Cloud summaries are paused until you add a key.'
-        : 'Key removed.',
-    notify: result.relayed,
-  };
+  // P3-6: no "Cloud summaries are paused…" clause any more — with Cloud
+  // active and no key, the backend group's own "Cloud selected, no key"
+  // notice (`showCloudNoKeyNotice`) already says so, above the key field.
+  return { notice: 'Key removed.', notify: result.relayed };
+}
+
+/**
+ * P3-5: the one backend label map — the switch-error sentence uses `name`,
+ * the radios read "<name> (<detail>)". Exhaustive: a new `CloudBackend`
+ * fails the `never` check at compile time.
+ */
+export function backendLabel(backend: CloudBackend): { name: string; detail: string } {
+  switch (backend) {
+    case 'local':
+      return { name: 'Local model', detail: 'on-device' };
+    case 'cloud':
+      return { name: 'Cloud', detail: 'bring your own key' };
+    default: {
+      const unreachable: never = backend;
+      throw new Error(`Unknown backend: ${String(unreachable)}`);
+    }
+  }
+}
+
+/** The backend radios, in display order. */
+export const BACKEND_CHOICES: readonly CloudBackend[] = ['local', 'cloud'];
+
+/**
+ * P3-5: a failed backend switch, kept apart from `loadError` so its action
+ * re-attempts that same switch instead of re-reading config.
+ */
+export interface BackendSwitchError {
+  backend: CloudBackend;
+  message: string;
+}
+
+/**
+ * P3-5: Electron wraps an `ipcMain.handle` rejection as "Error invoking
+ * remote method '<channel>': Error: <message>". Strips that wrapper (and
+ * the inner error's own "<Name>Error: " prefix) so the notice reads the
+ * cause only; anything else passes through unchanged.
+ */
+export function stripIpcErrorPrefix(message: string): string {
+  return message.replace(/^Error invoking remote method '[^']*': (?:[A-Za-z]*Error: )?/, '');
+}
+
+/** P3-5: a caught value's message, IPC wrapper stripped ('' for none). */
+export function ipcErrorMessage(error: unknown): string {
+  if (error === null || error === undefined) {
+    return '';
+  }
+  return stripIpcErrorPrefix(error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * P3-5: the sentence a failed backend switch shows, naming the backend it
+ * tried to switch to. An empty or missing message reads "unknown error".
+ */
+export function backendSwitchErrorText(backend: CloudBackend, message?: string | null): string {
+  const detail = stripIpcErrorPrefix(message ?? '').trim();
+  return `Couldn't switch to ${backendLabel(backend).name}: ${detail.length > 0 ? detail : 'unknown error'}`;
+}
+
+/**
+ * P3-5: where one backend-switch attempt has got to.
+ *  - `'saved'`: `setActiveBackend` resolved and the config re-read succeeded.
+ *  - `'save-failed'`: `setActiveBackend` rejected — nothing was switched.
+ *  - `'refresh-failed'`: the switch was saved, but re-reading config failed.
+ */
+export type BackendSwitchPhase = 'saved' | 'save-failed' | 'refresh-failed';
+
+export interface BackendSwitchSettle {
+  /** This attempt's sequence number. */
+  attemptId: number;
+  /** The newest attempt's sequence number when this one settled. */
+  latestAttemptId: number;
+  phase: BackendSwitchPhase;
+  backend: CloudBackend;
+  /** The failure's message (failure phases only). */
+  message?: string;
+}
+
+/**
+ * What Settings does with a settled attempt:
+ *  - `'ignore'`: a newer attempt started since — this one never sets an
+ *    error, rolls back, or replaces config.
+ *  - `'confirmed'`: take the re-read config; clear the switch error.
+ *  - `'switch-error'`: show the switch error and roll the radio back.
+ *  - `'load-error'`: the switch happened, only the re-read failed — show it
+ *    as a load error (its Retry re-reads config), no switch error, and no
+ *    rollback: the saved backend stays selected.
+ */
+export type BackendSwitchOutcome =
+  | { kind: 'ignore' }
+  | { kind: 'confirmed' }
+  | { kind: 'switch-error'; switchError: BackendSwitchError; rollback: true }
+  | { kind: 'load-error'; message: string; rollback: false };
+
+export function backendSwitchOutcome({
+  attemptId,
+  latestAttemptId,
+  phase,
+  backend,
+  message,
+}: BackendSwitchSettle): BackendSwitchOutcome {
+  if (attemptId !== latestAttemptId) {
+    return { kind: 'ignore' };
+  }
+  switch (phase) {
+    case 'saved':
+      return { kind: 'confirmed' };
+    case 'save-failed':
+      return { kind: 'switch-error', switchError: { backend, message: message ?? '' }, rollback: true };
+    case 'refresh-failed':
+      return { kind: 'load-error', message: message && message.length > 0 ? message : 'unknown error', rollback: false };
+  }
+}
+
+/** P3-6: the "Cloud selected, no key" Actionable Notice's sentence. */
+export const CLOUD_NO_KEY_NOTICE_TEXT =
+  'Cloud is selected but no API key is saved — summaries are paused until you add one.';
+
+/** P3-6: the no-key notice's id, the key input's `aria-describedby`. */
+export const CLOUD_NO_KEY_NOTICE_ID = 'settings-cloud-no-key-notice';
+
+/**
+ * P3-6: whether the backend group shows the "Cloud selected, no key" notice —
+ * the confirmed config has Cloud active and no key stored, and no switch is
+ * in flight (never on the optimistic value). Gone once a key is saved or
+ * Local is chosen.
+ */
+export function showCloudNoKeyNotice(config: BackendConfig, pendingBackend: CloudBackend | null = null): boolean {
+  return pendingBackend === null && config.activeBackend === 'cloud' && !config.hasCloudKey;
 }
 
 /**
@@ -323,6 +449,8 @@ export interface CloudKeyBlockProps {
   onSaveKey: () => void;
   onRemoveKey: () => void;
   onAcknowledgeInsecureStorage: () => void;
+  /** P3-6: the no-key notice's id while it shows, linked from the key input. */
+  keyInputDescribedBy?: string;
 }
 
 /**
@@ -344,6 +472,7 @@ export function CloudKeyBlock({
   onSaveKey,
   onRemoveKey,
   onAcknowledgeInsecureStorage,
+  keyInputDescribedBy,
 }: CloudKeyBlockProps) {
   return (
     <section className="settings-panel__indent" aria-label="Cloud API key">
@@ -396,6 +525,7 @@ export function CloudKeyBlock({
             placeholder={config.hasCloudKey ? 'Enter a new key to replace the saved one' : 'sk-…'}
             autoComplete="off"
             disabled={removingKey}
+            aria-describedby={keyInputDescribedBy}
           />
         </label>
 
@@ -432,6 +562,114 @@ export function CloudKeyBlock({
   );
 }
 
+export interface BackendRadiosProps {
+  /** The pending backend while a switch is in flight, else the confirmed one. */
+  selected: CloudBackend;
+  /** True while a switch is in flight. */
+  disabled: boolean;
+  onChange: (backend: CloudBackend) => void;
+}
+
+/**
+ * P3-5: the backend radios, labelled from `backendLabel`, disabled while a
+ * switch is in flight so attempts never overlap from the UI.
+ *
+ * MUST STAY HOOKLESS: `Settings.backendNotices.test.ts` calls it directly.
+ */
+export function BackendRadios({ selected, disabled, onChange }: BackendRadiosProps) {
+  return (
+    <>
+      {BACKEND_CHOICES.map((backend) => {
+        const { name, detail } = backendLabel(backend);
+        return (
+          <label className="settings-panel__radio" key={backend}>
+            <input
+              type="radio"
+              name="backend"
+              value={backend}
+              checked={selected === backend}
+              disabled={disabled}
+              onChange={() => onChange(backend)}
+            />
+            {`${name} (${detail})`}
+          </label>
+        );
+      })}
+    </>
+  );
+}
+
+export interface BackendConfigNoticesProps {
+  /** The confirmed config (never the optimistic value). */
+  config: BackendConfig;
+  /** The backend a switch is in flight to, else `null`. */
+  pendingBackend: CloudBackend | null;
+  switchError: BackendSwitchError | null;
+  onRetrySwitch: (backend: CloudBackend) => void;
+  onDismissSwitchError: () => void;
+}
+
+/**
+ * P3-5 + P3-6: the backend group's own notices, rendered above the key field,
+ * in this order:
+ *  - a failed switch (error). Its one next action, "Retry the switch",
+ *    re-attempts that same switch (disabled, reading "Retrying…", while an
+ *    attempt is in flight); beside it an × close control named "Dismiss" —
+ *    a close affordance, not a second next action (P1-7). Hidden once the
+ *    confirmed backend already is the one it failed to switch to.
+ *  - "Cloud selected, no key" (warning, no action: the key field sits
+ *    directly below and names this notice through `aria-describedby`).
+ *
+ * MUST STAY HOOKLESS: `Settings.backendNotices.test.ts` calls it directly.
+ */
+export function BackendConfigNotices({
+  config,
+  pendingBackend,
+  switchError,
+  onRetrySwitch,
+  onDismissSwitchError,
+}: BackendConfigNoticesProps) {
+  const visibleSwitchError = switchError !== null && switchError.backend !== config.activeBackend ? switchError : null;
+  const noKey = showCloudNoKeyNotice(config, pendingBackend);
+  if (visibleSwitchError === null && !noKey) {
+    return null;
+  }
+  const retrying = pendingBackend !== null;
+  return (
+    <div className="settings-panel__indent">
+      {visibleSwitchError && (
+        <ActionableNotice
+          tone="error"
+          role="alert"
+          action={
+            <>
+              <button
+                type="button"
+                onClick={() => onRetrySwitch(visibleSwitchError.backend)}
+                disabled={retrying}
+              >
+                {retrying ? 'Retrying…' : 'Retry the switch'}
+              </button>
+              <button type="button" aria-label="Dismiss" onClick={onDismissSwitchError}>
+                ×
+              </button>
+            </>
+          }
+        >
+          {backendSwitchErrorText(visibleSwitchError.backend, visibleSwitchError.message)}
+        </ActionableNotice>
+      )}
+      {noKey && (
+        <div id={CLOUD_NO_KEY_NOTICE_ID}>
+          <ActionableNotice tone="warning" role="status">
+            {CLOUD_NO_KEY_NOTICE_TEXT}
+          </ActionableNotice>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Settings({
   onClose,
   onBackendSwitched,
@@ -454,15 +692,32 @@ export function Settings({
   }, []);
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // P3-5: a failed backend switch — separate from `loadError`, whose Retry
+  // re-reads config. Cleared on success, on another radio change, on
+  // Dismiss, and whenever config is replaced from outside a switch (a key
+  // removal or any refetch); Settings unmounts on close, which clears it
+  // there too.
+  const [backendSwitchError, setBackendSwitchError] = useState<BackendSwitchError | null>(null);
+  // P3-5 + P3-6: the backend a switch is in flight to, else `null`. `config`
+  // only ever holds what main confirmed; the radios show `pendingBackend ??
+  // config.activeBackend`, so the optimistic value never drives a notice,
+  // and the rollback on a failed save is clearing this.
+  const [pendingBackend, setPendingBackend] = useState<CloudBackend | null>(null);
+  // P3-5: each switch attempt's sequence number — a settle from anything but
+  // the newest attempt is ignored (`backendSwitchOutcome`).
+  const backendSwitchSeqRef = useRef(0);
+  // P3-5: set by a retry, so focus moves to the checked radio once it settles
+  // (the Retry button is disabled or gone by then).
+  const focusRadioAfterRetryRef = useRef(false);
   const [keyInput, setKeyInput] = useState('');
   const [keyEntry, setKeyEntry] = useState<KeyEntryState>({ kind: 'idle' });
   // P2-6: the "Key removed." info notice, and whether a removal is in flight.
   const [keyRemovedNotice, setKeyRemovedNotice] = useState<string | null>(null);
   const [removingKey, setRemovingKey] = useState(false);
   const [keyRemoveError, setKeyRemoveError] = useState<string | null>(null);
-  // Mirrors `config` so handleBackendChange's rollback (below) can read the
-  // pre-optimistic-update value without depending on `config` itself and
-  // recreating the callback on every config change.
+  // Mirrors `config` so attemptBackendSwitch (below) can read the confirmed
+  // backend without depending on `config` itself and recreating the
+  // callback on every config change.
   const configRef = useRef<BackendConfig | null>(null);
   useEffect(() => {
     configRef.current = config;
@@ -487,6 +742,9 @@ export function Settings({
       .then((next) => {
         setConfig(next);
         setLoadError(null);
+        // P3-5: config replaced from outside a switch — a switch error no
+        // longer describes what's shown.
+        setBackendSwitchError(null);
       })
       .catch((error) => {
         setLoadError(error instanceof Error ? error.message : String(error));
@@ -806,37 +1064,105 @@ export function Settings({
   const panelRef = useRef<HTMLDivElement | null>(null);
   const scrimProps = useModalLayer({ open: true, onClose, containerRef: panelRef });
 
-  const handleBackendChange = useCallback(
-    (backend: CloudBackend) => {
-      // Optimistic, since this is a same-machine, near-instant local write;
-      // refetchConfig below confirms/corrects it on success.
-      const previousConfig = configRef.current;
+  // P3-5: the one switch path — a radio change and "Retry the switch" both
+  // call it with the backend to switch to. The save and the config re-read
+  // settle separately (`backendSwitchOutcome`): a rejected save is a failed
+  // switch (switch error + rollback); a failed re-read after a successful
+  // save is a load error only, with the saved backend kept selected.
+  const attemptBackendSwitch = useCallback(
+    (backend: CloudBackend, source: 'radio' | 'retry') => {
+      const attemptId = (backendSwitchSeqRef.current += 1);
+      const previousBackend = configRef.current?.activeBackend;
       // P2-6: a backend change makes the removal notice's wording stale.
       setKeyRemovedNotice(null);
       setKeyRemoveError(null);
-      setConfig((current) => (current ? { ...current, activeBackend: backend } : current));
-      window.driller
-        .setActiveBackend(backend)
-        .then(() => {
-          // P0-4: a genuine change (or an unknown previous value — an extra
-          // map refetch is harmless, a missed one is a parity break).
-          if (previousConfig?.activeBackend !== backend) {
-            onBackendSwitched();
-          }
-          return refetchConfig();
-        })
-        .catch((error) => {
-          setLoadError(error instanceof Error ? error.message : String(error));
-          // Roll back the optimistic update on failure (review finding,
-          // Medium) — otherwise the UI keeps showing a selection that was
-          // never actually persisted, silently diverging from real state.
-          setConfig(previousConfig);
+      if (source === 'radio') {
+        // Another radio change supersedes the last failure. A retry keeps it
+        // on screen, its button reading "Retrying…", until this settles.
+        setBackendSwitchError(null);
+      } else {
+        focusRadioAfterRetryRef.current = true;
+      }
+      setPendingBackend(backend);
+
+      const settle = (phase: BackendSwitchPhase, message?: string, next?: BackendConfig) => {
+        const outcome = backendSwitchOutcome({
+          attemptId,
+          latestAttemptId: backendSwitchSeqRef.current,
+          phase,
+          backend,
+          message,
         });
+        switch (outcome.kind) {
+          case 'ignore':
+            return;
+          case 'confirmed':
+            if (next) {
+              setConfig(next);
+            }
+            setLoadError(null);
+            setBackendSwitchError(null);
+            setPendingBackend(null);
+            return;
+          case 'switch-error':
+            // Roll back: the radios fall back to the confirmed config.
+            setBackendSwitchError(outcome.switchError);
+            setPendingBackend(null);
+            return;
+          case 'load-error':
+            // Saved, so no rollback: keep the saved backend selected.
+            setConfig((current) => (current ? { ...current, activeBackend: backend } : current));
+            setLoadError(outcome.message);
+            setBackendSwitchError(null);
+            setPendingBackend(null);
+            return;
+        }
+      };
+
+      window.driller.setActiveBackend(backend).then(
+        () => {
+          // P0-4: a genuine change (or an unknown previous value — an extra
+          // map refetch is harmless, a missed one is a parity break). In a
+          // `try`, so a throw here can't read as a failed switch.
+          if (previousBackend !== backend) {
+            try {
+              onBackendSwitched();
+            } catch (error) {
+              console.error('onBackendSwitched threw after a backend switch.', ipcErrorMessage(error));
+            }
+          }
+          window.driller.getBackendConfig().then(
+            (next) => settle('saved', undefined, next),
+            (error: unknown) => settle('refresh-failed', ipcErrorMessage(error)),
+          );
+        },
+        (error: unknown) => settle('save-failed', ipcErrorMessage(error)),
+      );
     },
-    [refetchConfig, onBackendSwitched],
+    [onBackendSwitched],
   );
 
-  // Story 1.10 (Phase 1): mirrors `handleBackendChange`'s exact
+  const handleBackendRadioChange = useCallback(
+    (backend: CloudBackend) => attemptBackendSwitch(backend, 'radio'),
+    [attemptBackendSwitch],
+  );
+  const handleRetryBackendSwitch = useCallback(
+    (backend: CloudBackend) => attemptBackendSwitch(backend, 'retry'),
+    [attemptBackendSwitch],
+  );
+  const handleDismissBackendSwitchError = useCallback(() => setBackendSwitchError(null), []);
+
+  // P3-5: once a retry settles, focus the checked backend radio — the Retry
+  // button was disabled while in flight and is gone on success.
+  useEffect(() => {
+    if (pendingBackend !== null || !focusRadioAfterRetryRef.current) {
+      return;
+    }
+    focusRadioAfterRetryRef.current = false;
+    panelRef.current?.querySelector<HTMLInputElement>('input[name="backend"]:checked')?.focus();
+  }, [pendingBackend]);
+
+  // Story 1.10 (Phase 1): follows the backend switch's original (pre-P3-5)
   // optimistic-update-plus-rollback-on-failure shape (Always, this story's
   // Boundaries & Constraints) — a same-machine, near-instant local write,
   // applied immediately and confirmed/corrected by a refetch, rolled back to
@@ -855,7 +1181,7 @@ export function Settings({
           // Roll back the optimistic update on failure — otherwise the UI
           // keeps showing a selection that was never actually persisted,
           // silently diverging from real state (same reasoning as
-          // handleBackendChange's own rollback above).
+          // attemptBackendSwitch's own rollback above).
           setEditorPreferenceState(previousEditorPreference);
         });
     },
@@ -979,6 +1305,8 @@ export function Settings({
         const { notice, notify } = keyRemovedOutcome(result);
         setConfig(result.config);
         setLoadError(null);
+        // P3-5: config replaced from outside a switch.
+        setBackendSwitchError(null);
         setKeyInput('');
         setKeyEntry({ kind: 'idle' });
         setKeyRemovedNotice(notice);
@@ -1068,31 +1396,24 @@ export function Settings({
           {config && (
             <fieldset className="settings-panel__group" aria-describedby={SETTINGS_BACKEND_HINT_ID}>
               <legend>Summary backend</legend>
-              <label className="settings-panel__radio">
-                <input
-                  type="radio"
-                  name="backend"
-                  value="local"
-                  checked={config.activeBackend === 'local'}
-                  onChange={() => handleBackendChange('local')}
-                />
-                Local model (on-device)
-              </label>
-              <label className="settings-panel__radio">
-                <input
-                  type="radio"
-                  name="backend"
-                  value="cloud"
-                  checked={config.activeBackend === 'cloud'}
-                  onChange={() => handleBackendChange('cloud')}
-                />
-                Cloud (bring your own key)
-              </label>
+              <BackendRadios
+                selected={pendingBackend ?? config.activeBackend}
+                disabled={pendingBackend !== null}
+                onChange={handleBackendRadioChange}
+              />
               <p className="settings-panel__hint" id={SETTINGS_BACKEND_HINT_ID}>
                 Switching regenerates summaries only — the graph index is untouched.
               </p>
 
-              {config.activeBackend === 'cloud' && (
+              <BackendConfigNotices
+                config={config}
+                pendingBackend={pendingBackend}
+                switchError={backendSwitchError}
+                onRetrySwitch={handleRetryBackendSwitch}
+                onDismissSwitchError={handleDismissBackendSwitchError}
+              />
+
+              {(pendingBackend ?? config.activeBackend) === 'cloud' && (
                 <CloudKeyBlock
                   config={config}
                   keyEntry={keyEntry}
@@ -1104,6 +1425,7 @@ export function Settings({
                   onSaveKey={handleSaveKey}
                   onRemoveKey={handleRemoveKey}
                   onAcknowledgeInsecureStorage={handleAcknowledgeInsecureStorage}
+                  keyInputDescribedBy={showCloudNoKeyNotice(config, pendingBackend) ? CLOUD_NO_KEY_NOTICE_ID : undefined}
                 />
               )}
             </fieldset>

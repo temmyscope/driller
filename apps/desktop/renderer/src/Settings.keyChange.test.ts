@@ -16,16 +16,18 @@ function config(activeBackend: CloudBackend): BackendConfig {
 }
 
 describe('keyRemovedOutcome', () => {
-  it('says cloud summaries are paused and notifies when Cloud is active and main relayed', () => {
+  // P3-6: the "paused until you add a key" clause moved to the backend
+  // group's "Cloud selected, no key" notice, so it isn't said twice.
+  it('says only "Key removed." and notifies when Cloud is active and main relayed', () => {
     assert.deepEqual(keyRemovedOutcome({ config: config('cloud'), relayed: true }), {
-      notice: 'Key removed. Cloud summaries are paused until you add a key.',
+      notice: 'Key removed.',
       notify: true,
     });
   });
 
-  it('keeps the paused wording but does not notify when Cloud is active and nothing was relayed', () => {
+  it('says only "Key removed." and does not notify when Cloud is active and nothing was relayed', () => {
     assert.deepEqual(keyRemovedOutcome({ config: config('cloud'), relayed: false }), {
-      notice: 'Key removed. Cloud summaries are paused until you add a key.',
+      notice: 'Key removed.',
       notify: false,
     });
   });
