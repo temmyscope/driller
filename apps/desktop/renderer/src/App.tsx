@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type {
   BackendConfig,
   GraphServiceStatusMessage,
@@ -14,14 +14,22 @@ import type {
 import { ActionableNotice } from './ActionableNotice';
 import {
   INITIAL_FRAME_MAP_STATE,
+  INITIAL_FRAME_SYNC_STATE,
+  applyDiffScopeSyncToFrame,
   applyMapReportToFrame,
   applyProjectClosedToFrame,
+  applyProjectClosedToFrameSync,
   applyProjectOpenedToFrame,
+  applyProjectOpenedToFrameSync,
   deriveFooterBar,
   deriveTitle,
   footerAvailability,
+  footerBarRightTitle,
   frameMapFor,
+  frameSyncFor,
+  nextSyncAgeTickMs,
   type FrameMapState,
+  type FrameSyncState,
   type MapFooterState,
 } from './appFrame';
 import { CodeMap, type CodeMapMode } from './CodeMap';
@@ -209,6 +217,13 @@ export function App() {
   const [frameMap, setFrameMap] = useState<FrameMapState>(INITIAL_FRAME_MAP_STATE);
   const handleMapState = useCallback((reportPath: string | null, state: MapFooterState) => {
     setFrameMap((current) => applyMapReportToFrame(current, currentProjectPathRef.current, reportPath, state));
+  }, []);
+  // P3-10: when the open project's diff scope last synced, reported by
+  // `CodeMap`'s `onDiffScopeSynced` — same drop-other-projects and
+  // reset-on-switch/Close rules as `frameMap`. Session-only, never persisted.
+  const [frameSync, setFrameSync] = useState<FrameSyncState>(INITIAL_FRAME_SYNC_STATE);
+  const handleDiffScopeSynced = useCallback((reportPath: string | null, at: number | null) => {
+    setFrameSync((current) => applyDiffScopeSyncToFrame(current, currentProjectPathRef.current, reportPath, at));
   }, []);
   const openFolderButtonRef = useRef<HTMLButtonElement | null>(null);
 
@@ -426,6 +441,7 @@ export function App() {
         // P2-3: the previous project's map state never labels this one (a
         // no-op when the same project is re-selected).
         setFrameMap((current) => applyProjectOpenedToFrame(current, result.project.path));
+        setFrameSync((current) => applyProjectOpenedToFrameSync(current, result.project.path));
         // Synchronous, not just via the ref-sync effect below: a status
         // push for this project (main sends the index-start request as
         // part of producing this very result) could in principle reach
@@ -600,6 +616,7 @@ export function App() {
     setCurrentProjectPath(null);
     commitSessionMap(applyProjectClosedToSessionMap(sessionMapRef.current));
     setFrameMap(applyProjectClosedToFrame);
+    setFrameSync(applyProjectClosedToFrameSync);
     setGraphServiceStatus(null);
     setNotice(null);
     setHardwareAdvisories(new Set());
@@ -758,6 +775,52 @@ export function App() {
   // once, rather than leaving CodeMap to re-derive the same priority rule.
   const noSummaryBackendAvailable = !cloudSelectedNoKey && localUnusable && !hasCloudKey;
 
+  // P3-10: the clock the footer's "synced …" age is measured against.
+  // Re-read in a layout effect the moment PR Review starts showing a sync
+  // time (entering PR Review, or a fresh sync) — React re-renders a layout
+  // effect's state update before the browser paints, so a returning view
+  // never paints an old age. After that it only ticks while PR Review shows
+  // a sync time and the window is visible: each tick is scheduled for the
+  // next moment the text can change (`nextSyncAgeTickMs`, at most 60s), and
+  // becoming visible again re-reads the clock at once.
+  const lastSyncedAt = frameSyncFor(frameSync, currentProjectPath);
+  const [syncClock, setSyncClock] = useState(() => Date.now());
+  const showsSyncAge = mode === 'prReview' && lastSyncedAt !== null;
+  useLayoutEffect(() => {
+    if (showsSyncAge) {
+      setSyncClock(Date.now());
+    }
+  }, [showsSyncAge, lastSyncedAt]);
+  useEffect(() => {
+    if (!showsSyncAge || lastSyncedAt === null) {
+      return undefined;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      clearTimeout(timer);
+      timer = undefined;
+      if (document.visibilityState === 'hidden') {
+        return;
+      }
+      timer = setTimeout(() => {
+        setSyncClock(Date.now());
+        schedule();
+      }, nextSyncAgeTickMs(Date.now() - lastSyncedAt));
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        setSyncClock(Date.now());
+      }
+      schedule();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    schedule();
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [showsSyncAge, lastSyncedAt]);
+
   // P2-3: the one frame's text — all rules live in appFrame.ts.
   const footerBar = deriveFooterBar({
     currentProjectPath,
@@ -765,7 +828,10 @@ export function App() {
     availability: footerAvailability(graphServiceStatus, currentProjectPath),
     map: frameMapFor(frameMap, currentProjectPath),
     mode,
+    lastSyncedAt,
+    now: syncClock,
   });
+  const footerBarRightTooltip = footerBarRightTitle({ currentProjectPath, mode, lastSyncedAt });
 
   return (
     // P2-3: one frame on both screens — titlebar, a body (the landing column
@@ -896,6 +962,7 @@ export function App() {
               graphServiceAvailable={graphServiceLive}
               dataVersion={sessionMap.dataVersion}
               onMapState={handleMapState}
+              onDiffScopeSynced={handleDiffScopeSynced}
               onOpenSettings={handleOpenSettingsForScope}
               onReindex={restartGraphServiceForRetry}
             />
@@ -1009,10 +1076,13 @@ export function App() {
       {/* P2-3: the tmux-style status line — facts only (see appFrame.ts).
           Labelled but deliberately not a live region: state changes are
           announced by `session-notice` and the status footers above, and
-          re-announcing counts on every refresh would be noise. */}
+          re-announcing counts on every refresh would be noise — and so
+          would the PR Review sync age re-rendering as it ages (P3-10). */}
       <footer className="app__footerbar" aria-label="Status line">
         <span className="app__footerbar-left">{footerBar.left}</span>
-        <span className="app__footerbar-right">{footerBar.right}</span>
+        <span className="app__footerbar-right" title={footerBarRightTooltip}>
+          {footerBar.right}
+        </span>
       </footer>
 
       {isSettingsOpen && (

@@ -164,6 +164,7 @@ code,
 
 .app__footerbar-right {
   flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .app__title {

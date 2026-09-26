@@ -102,7 +102,7 @@ import {
 } from './ActionableNotice';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
-import { mapFooterState, type MapFooterState } from './appFrame';
+import { diffScopeSyncTimeFor, mapFooterState, type MapFooterState } from './appFrame';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
 
@@ -2883,6 +2883,15 @@ export interface CodeMapProps {
    */
   onMapState: (projectPath: string | null, state: MapFooterState) => void;
   /**
+   * P3-10: reports when the diff scope last synced (epoch ms) up to
+   * `App.tsx` for the footer bar's "PR REVIEW · synced …" — a settle of
+   * `resolved`, `no-changes`, `not-a-git-repo` or `no-base-ref-resolvable`
+   * (never `error`, which keeps the previous time), or `null` once the diff
+   * scope is reset (project change, map reload, refresh after re-index) —
+   * only when a time was reported, and under the project it was for.
+   */
+  onDiffScopeSynced: (projectPath: string | null, at: number | null) => void;
+  /**
    * P2-5: the empty-map scope notice's "Edit indexing scope" — `App.tsx`
    * opens Settings (focused on the scope field).
    */
@@ -3336,6 +3345,7 @@ export function CodeMap({
   graphServiceAvailable,
   dataVersion,
   onMapState,
+  onDiffScopeSynced,
   onOpenSettings,
   onReindex,
 }: CodeMapProps) {
@@ -3463,6 +3473,26 @@ export function CodeMap({
   // a project switch (or superseded by a second trigger click) can never
   // apply its late reply over whatever the user is now looking at.
   const diffScopeRequestIdRef = useRef(0);
+  // P3-10: reports the diff scope's sync time to `App.tsx` at exactly the
+  // points `diffScopeState` settles (`diffScopeSyncTimeFor`: never on
+  // `error`) or resets. Held in a ref so a new callback identity can never
+  // re-run the `projectPath` reset effect or re-create the reload callbacks.
+  const onDiffScopeSyncedRef = useRef(onDiffScopeSynced);
+  useEffect(() => {
+    onDiffScopeSyncedRef.current = onDiffScopeSynced;
+  }, [onDiffScopeSynced]);
+  // The project whose sync time `App.tsx` currently holds from this map, so a
+  // reset reports `null` only when there is a time to clear — and under the
+  // project it was recorded for, never the one just switched to.
+  const diffScopeSyncHeldForRef = useRef<string | null>(null);
+  const clearDiffScopeSync = useCallback(() => {
+    const heldFor = diffScopeSyncHeldForRef.current;
+    if (heldFor === null) {
+      return;
+    }
+    diffScopeSyncHeldForRef.current = null;
+    onDiffScopeSyncedRef.current(heldFor, null);
+  }, []);
   // Story 3.2 (Phase 2): the combined blast-radius expansion's own result
   // state and the stepper's current depth — CodeMap-owned, same division-of-
   // responsibility reasoning as `baseRefInput`/`diffScopeState` just above.
@@ -3669,6 +3699,7 @@ export function CodeMap({
     // consistent with this phase's own no-auto-trigger design.
     setBaseRefInput('');
     setDiffScopeState({ status: 'idle' });
+    clearDiffScopeSync();
     diffScopeRequestIdRef.current += 1;
     // Story 3.2 (Phase 2, Always): "Resets to idle whenever the diff scope
     // changes ... or the project changes/reindexes — mirrors the three
@@ -3740,7 +3771,7 @@ export function CodeMap({
           message: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [fixtureNodeCount]);
+  }, [fixtureNodeCount, clearDiffScopeSync]);
 
   useEffect(() => {
     loadCodeMap();
@@ -3771,6 +3802,7 @@ export function CodeMap({
     setPathTrace({ status: 'idle' });
     pathTraceRequestIdRef.current += 1;
     setDiffScopeState({ status: 'idle' });
+    clearDiffScopeSync();
     diffScopeRequestIdRef.current += 1;
     setBlastRadiusState({ status: 'idle' });
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
@@ -3832,7 +3864,7 @@ export function CodeMap({
       .catch((error: unknown) => {
         settle({ kind: 'failed', message: error instanceof Error ? error.message : String(error) });
       });
-  }, [isDevFixtureMode, updateNodeDetail]);
+  }, [isDevFixtureMode, updateNodeDetail, clearDiffScopeSync]);
 
   // The version present at mount was already covered by `loadCodeMap` just
   // above — only a later change is a refresh.
@@ -3926,6 +3958,7 @@ export function CodeMap({
   useEffect(() => {
     setBaseRefInput('');
     setDiffScopeState({ status: 'idle' });
+    clearDiffScopeSync();
     diffScopeRequestIdRef.current += 1;
     // Story 3.2 (Phase 2, Always): same "resets whenever ... the project
     // changes" reasoning as the `diffScopeState` reset just above — a project
@@ -3936,7 +3969,7 @@ export function CodeMap({
     setBlastRadiusState({ status: 'idle' });
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     blastRadiusRequestIdRef.current += 1;
-  }, [projectPath]);
+  }, [projectPath, clearDiffScopeSync]);
 
   /**
    * Story 3.1 (Phase 2): the base-ref trigger's own click handler — the
@@ -3992,6 +4025,13 @@ export function CodeMap({
       .then((result: DiffScopeResult) => {
         if (diffScopeRequestIdRef.current !== requestId) {
           return;
+        }
+        // P3-10: every settle but `error` is a completed sync; an error
+        // keeps whatever time was held.
+        const syncedAt = diffScopeSyncTimeFor(result, Date.now());
+        if (syncedAt !== null) {
+          diffScopeSyncHeldForRef.current = projectPath;
+          onDiffScopeSyncedRef.current(projectPath, syncedAt);
         }
         switch (result.status) {
           case 'resolved':
