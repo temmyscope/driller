@@ -55,6 +55,7 @@ import type {
   ProjectScopeSaveResult,
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
+import { useModalLayer } from './useModalLayer';
 
 interface SettingsProps {
   onClose: () => void;
@@ -307,8 +308,7 @@ export function Settings({
   const [keyRemoveError, setKeyRemoveError] = useState<string | null>(null);
   // Mirrors `config` so handleBackendChange's rollback (below) can read the
   // pre-optimistic-update value without depending on `config` itself and
-  // recreating the callback (and re-subscribing the Escape-key listener)
-  // on every config change.
+  // recreating the callback on every config change.
   const configRef = useRef<BackendConfig | null>(null);
   useEffect(() => {
     configRef.current = config;
@@ -646,19 +646,11 @@ export function Settings({
     [persistPrBotEnabled],
   );
 
-  // Escape closes the Settings overlay — same keyboard-dismissal pattern
-  // already established for Story 1.3 Phase 1's source-view overlay
-  // (CodeMap.tsx's closeSourceView effect); the × button already exists,
-  // this just adds the keyboard path (review finding, Low).
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  // P2-7 + P2-8: Settings is a layer on the shared modal stack — Escape
+  // only while it is on top, Tab trapped inside, focus restored to the
+  // Settings button on close, and a press on the dimmed backdrop closes it.
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const scrimProps = useModalLayer({ open: true, onClose, containerRef: panelRef });
 
   const handleBackendChange = useCallback(
     (backend: CloudBackend) => {
@@ -878,8 +870,15 @@ export function Settings({
   }, []);
 
   return (
-    <div className="settings-overlay">
-      <div className="settings-panel" role="dialog" aria-modal="true" aria-label="Settings">
+    <div className="settings-overlay" {...scrimProps}>
+      <div
+        ref={panelRef}
+        className="settings-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Settings"
+        tabIndex={-1}
+      >
         <header className="settings-panel__header">
           <h2 className="settings-panel__title">Settings</h2>
           <button type="button" className="settings-panel__close" onClick={onClose} aria-label="Close Settings">

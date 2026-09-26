@@ -864,6 +864,20 @@ code,
   inset: 0;
 }
 
+/* P2-7 + P2-8: `.code-map` is the modal layers' focus fallback
+   (`tabIndex={-1}`), so it can hold focus — after a closed dialog's opener
+   has left the document, or from a mouse press on empty map space. No ring
+   for a mouse press; a subtle inset one when focus landed there from the
+   keyboard, so a keyboard user can still see where it went. */
+.code-map:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.code-map:focus-visible {
+  outline: 1px solid var(--accent-dim);
+  outline-offset: -1px;
+}
+
 /* DESIGN.md `canvas`: background `{colors.bg}`, a `{colors.border}` dot
    grid at the `{spacing.canvas-grid}` (40px) cell size. `@xyflow/react`'s
    own base stylesheet (`CodeMap.tsx`'s `import '@xyflow/react/dist/

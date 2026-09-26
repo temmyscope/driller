@@ -102,6 +102,8 @@ import {
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
 import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
 import { mapFooterState, type MapFooterState } from './appFrame';
+import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
+import { useModalLayer } from './useModalLayer';
 
 export type FetchState =
   | { status: 'loading' }
@@ -116,7 +118,7 @@ export type FetchState =
     }
   | { status: 'error'; message: string };
 
-type SourceViewState =
+export type SourceViewState =
   | { status: 'closed' }
   | { status: 'loading'; node: CodeMapNode }
   | { status: 'open'; node: CodeMapNode; content: string }
@@ -131,7 +133,7 @@ type SourceViewState =
  * at open time) once a regenerate succeeds, so the panel reflects the fresh
  * summary/staleness without needing a second lookup.
  */
-type NodeDetailState = { status: 'closed' } | { status: 'open'; node: CodeMapNode };
+export type NodeDetailState = { status: 'closed' } | { status: 'open'; node: CodeMapNode };
 
 /**
  * The Node Detail panel's Regenerate button state — mirrors Settings.tsx's
@@ -4458,37 +4460,22 @@ export function CodeMap({
       });
   }, []);
 
-  // Escape closes the source overlay (review finding — a real dialog needs
-  // a keyboard dismissal path, not just the × button). Only listens while
-  // the overlay is actually open.
-  useEffect(() => {
-    if (sourceView.status === 'closed') {
-      return undefined;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closeSourceView();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [sourceView.status, closeSourceView]);
-
-  // Story 1.8 (Phase 4): same Escape-dismissal pattern as the source
-  // overlay's own effect just above — only listens while the Node Detail
-  // panel is actually open.
-  useEffect(() => {
-    if (nodeDetail.status === 'closed') {
-      return undefined;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closeNodeDetail();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [nodeDetail.status, closeNodeDetail]);
+  // P2-7 + P2-8: the source overlay and Node Detail are layers on the
+  // shared modal stack (`useModalLayer`) — one Escape closes only the top
+  // layer, Tab stays inside it, focus returns to whatever opened it, and a
+  // press on a layer's own dimmed backdrop closes that layer only.
+  const sourceOverlayRef = useRef<HTMLDivElement | null>(null);
+  const sourceScrimProps = useModalLayer({
+    open: sourceOverlayOpen(sourceView),
+    onClose: closeSourceView,
+    containerRef: sourceOverlayRef,
+  });
+  const nodeDetailOverlayRef = useRef<HTMLDivElement | null>(null);
+  const nodeDetailScrimProps = useModalLayer({
+    open: nodeDetailOverlayOpen(nodeDetail),
+    onClose: closeNodeDetail,
+    containerRef: nodeDetailOverlayRef,
+  });
 
   // Review fix: a plain boolean, computed once here rather than re-reading
   // `pathTrace.status === 'searching'` inline inside the `ambiguous` JSX
@@ -4542,7 +4529,9 @@ export function CodeMap({
     nodeDetail.status === 'open' ? nodeDetailSummaryAction(nodeDetail.node.summaryStatus) : null;
 
   return (
-    <div className="code-map" ref={containerRef}>
+    // P2-7 + P2-8: the id (and `tabIndex={-1}`) make this the modal layers'
+    // focus fallback when a closed layer's opener has left the document.
+    <div className="code-map" ref={containerRef} id={MODAL_FOCUS_FALLBACK_ID} tabIndex={-1}>
       {/* Story 3.1 (Phase 2): the base-ref input + trigger — rendered
           whenever `mode === 'prReview'`, independent of `fetchState`
           entirely (Boundaries & Constraints: "the base-ref input/trigger
@@ -5208,8 +5197,16 @@ export function CodeMap({
         </div>
       )}
 
-      {sourceView.status !== 'closed' && (
-        <div className="code-map__source-overlay" role="dialog" aria-modal="true" aria-label="Node source">
+      {sourceOverlayOpen(sourceView) && (
+        <div
+          ref={sourceOverlayRef}
+          className="code-map__source-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Node source"
+          tabIndex={-1}
+          {...sourceScrimProps}
+        >
           <div className="code-map__source-panel">
             <div className="code-map__source-header">
               <code>
@@ -5285,12 +5282,15 @@ export function CodeMap({
           Because it is a sibling rather than a replacement, the grid stays
           mounted underneath while the panel is open and still holds its own
           scroll offset when the panel closes. */}
-      {nodeDetail.status === 'open' && (
+      {nodeDetailOverlayOpen(nodeDetail) && (
         <div
+          ref={nodeDetailOverlayRef}
           className="code-map__node-detail-overlay"
           role="dialog"
           aria-modal="true"
           aria-label={`Node detail: ${nodeDetail.node.name}`}
+          tabIndex={-1}
+          {...nodeDetailScrimProps}
         >
           <div className="code-map__node-detail-panel">
             <div className="code-map__node-detail-header">
