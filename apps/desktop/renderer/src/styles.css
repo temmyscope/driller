@@ -8,6 +8,9 @@
  *
  * Every color/radius/font value below traces to a named DESIGN.md token
  * (`_bmad-output/planning-artifacts/ux-designs/ux-driller-2026-09-03/DESIGN.md`).
+ * P3-13 adds `--border-control`: every outlined control and text input
+ * edges with it (≥ 3:1); `--border`/`--border-strong` are decorative only.
+ *
  * `--border-strong`/`--accent-dim` are the two new tokens with a real,
  * narrow call site today (a Node's own card edge, and the blast-radius
  * "affected" ring, respectively) — every other new token
@@ -28,6 +31,16 @@
   --panel-alt: #0c1210;
   --border: #1e2b26;
   --border-strong: #2c3f37;
+  /* P3-13 (founder decision, 2026-09-26): the control-boundary token. WCAG
+     1.4.11 wants 3:1 for a boundary that is a control's only visual cue;
+     `--border` (1.25:1) and `--border-strong` (1.64:1 against --panel) are
+     far under it, so they stay decorative only (card edges that already sit
+     on a background step, dividers, the titlebar and footer rules). This is
+     the dimmest step on the --border-strong -> --text-mute line that clears
+     3:1 against all three surfaces: 3.16:1 --bg, 3.01:1 --panel, 3.10:1
+     --panel-alt. Every outlined control and text input uses it;
+     `contrast.test.ts` parses this block and fails if it drops under 3:1. */
+  --border-control: #50675c;
   --text: #cfe0d4;
   --text-dim: #7d9488;
   /* Review fix (Blind Hunter finding, verified via computed contrast, not
@@ -195,7 +208,7 @@ code,
   flex-shrink: 0;
   padding: 0.4rem 0.6rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text-mute);
   font-size: 11px;
@@ -242,7 +255,7 @@ code,
   gap: 0.35rem;
   padding: 9px 18px;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   color: var(--text-mute);
   font-size: 11px;
   cursor: pointer;
@@ -252,6 +265,14 @@ code,
   background: var(--accent);
   color: var(--bg);
   font-weight: 600;
+}
+
+/* P3-13: the checked radio sits on the tab's own `--accent` fill, where
+   Chromium's default (system-blue) accent ring measured 1.07:1 against it.
+   A `--bg` accent draws the checked ring dark: 10.55:1 on `--accent`. The
+   unchecked ring is the platform's own #858585 (5.13:1 on `--panel-alt`). */
+.mode-switcher__option input {
+  accent-color: var(--bg);
 }
 
 .mode-switcher__option:has(input:focus-visible) {
@@ -480,7 +501,7 @@ code,
   min-width: 0;
   padding: 6px 8px;
   border-radius: 0;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text);
   font-family: inherit;
@@ -497,7 +518,7 @@ code,
   flex-shrink: 0;
   padding: 6px 10px;
   border-radius: 0;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text-dim);
   font-family: inherit;
@@ -707,12 +728,15 @@ code,
   gap: 0.5rem;
 }
 
+/* P3-13: a button, not a card — its `--panel` fill is only a 1.05:1 step
+   off `--bg`, so the edge is its only visible extent and takes
+   `--border-control` (3.16:1 on `--bg`). */
 .recent-projects__open {
   width: 100%;
   text-align: left;
   padding: 0.75rem 1rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel);
   color: var(--text);
   cursor: pointer;
@@ -791,7 +815,7 @@ code,
 .graph-service-status__retry {
   padding: 0.25rem 0.75rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text);
   font-size: 11px;
@@ -818,7 +842,7 @@ code,
 .model-status__retry {
   padding: 0.25rem 0.75rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text);
   font-size: 11px;
@@ -988,7 +1012,7 @@ code,
 .code-map__notice > button {
   padding: 0.4rem 1rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text);
   font-size: 11px;
@@ -1228,7 +1252,7 @@ code,
   font-size: 9.5px;
   font-weight: 700;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text-mute);
   cursor: pointer;
@@ -1413,7 +1437,7 @@ code,
 .code-map__history-toolbar button {
   padding: 0.4rem 0.75rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
@@ -1917,7 +1941,7 @@ code,
   align-items: center;
   gap: 0.4rem;
   padding: 0.4rem 0.6rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   font-size: 11px;
@@ -1998,7 +2022,7 @@ code,
   flex-shrink: 0;
   padding: 0.4rem 0.75rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
@@ -2269,7 +2293,7 @@ code,
   align-self: flex-start;
   padding: 0.3rem 0.6rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text-mute);
   cursor: pointer;
@@ -2329,7 +2353,7 @@ code,
   min-width: 0;
   padding: 0.4rem 0.6rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text);
   font-size: 11px;
@@ -2348,7 +2372,7 @@ code,
   flex-shrink: 0;
   padding: 0.4rem 0.75rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
@@ -2433,7 +2457,7 @@ code,
 .code-map__blast-radius-stepper-controls button {
   padding: 0.3rem 0.7rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: var(--panel-alt);
   color: var(--text);
   cursor: pointer;
@@ -2656,7 +2680,7 @@ code,
 .code-map__source-open-in-editor {
   padding: 0.35rem 0.75rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text);
   font-size: 11px;
@@ -2702,8 +2726,11 @@ code,
    `color-mix(in srgb, <hue> N%, transparent)` fill formula those rules (and
    `.actionable-notice__action button`) use, so hover gives real visible
    feedback rather than repeating the base border/color values. */
+/* P3-13: the edge no longer takes `--accent-dim` (2.84:1 against the card's
+   `--panel`, under 1.4.11's 3:1, and `accent-dim` means "affected" only); it
+   keeps the base pill's `--border-control` edge, so the accent text alone
+   carries the tint. */
 .code-map__node-affordance--source {
-  border-color: var(--accent-dim);
   color: var(--accent);
 }
 
@@ -2900,7 +2927,7 @@ code,
   margin-top: 8px;
   padding: 4px 8px;
   border-radius: 0;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text-mute);
   font: inherit;
@@ -2981,7 +3008,7 @@ code,
   margin-left: auto;
   padding: 0.4rem 0.6rem;
   border-radius: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   background: transparent;
   color: var(--text-mute);
   font-size: 11px;
