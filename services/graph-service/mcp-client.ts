@@ -30,6 +30,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { IMPORT_RESOLVED_CALL_STRATEGIES, TEST_CALLER_PATH_FRAGMENTS } from './test-evidence-strategies';
 import type { ImplementsLink } from './fold-types';
+import { SIMILAR_TO_MIN_JACCARD } from '@driller/graph-contracts';
 import type {
   CodeMapEdge,
   CodeMapEdgeKind,
@@ -75,6 +76,30 @@ export interface CodeMapFetchResult {
    * `fold-types.ts` turns them into `FoldedType.implements`.
    */
   implementsLinks?: ImplementsLink[];
+  /**
+   * P4-2 phase 4: backend `SIMILAR_TO` edges between Functions at or above
+   * `SIMILAR_TO_MIN_JACCARD`, present only when
+   * `FetchCodeMapOptions.includeSimilar` asked for it. `similar.ts` turns
+   * them into `CodeMapNode.similarTo`.
+   */
+  similarPairs?: SimilarPair[];
+}
+
+/**
+ * P4-2 phase 4: one backend `SIMILAR_TO` edge, straight off
+ * `SIMILAR_TO_QUERY`. The edge is stored once per pair; `similar.ts` reads
+ * it both ways. Everything is kept, not trusted: `attachSimilar` re-checks
+ * the score, the files and that both ends are production map Functions.
+ */
+export interface SimilarPair {
+  /** One end's `qualified_name`. */
+  source: string;
+  /** The other end's `qualified_name`. */
+  target: string;
+  /** The backend's `r.jaccard`. */
+  score: number;
+  /** The backend's `r.same_file`, set only when true. */
+  sameFile?: true;
 }
 
 /**
@@ -519,6 +544,21 @@ export const IMPLEMENTS_QUERY = `MATCH (a:Interface|Type)-[r:IMPLEMENTS]->(b:Int
 
 export const TEST_EVIDENCE_FILES_QUERY = `MATCH (t:File)-[r:TESTS_FILE]->(f:File) RETURN t.file_path AS testFile, f.file_path AS file`;
 
+// P4-2 phase 4: "Similar implementations". Property names confirmed with
+// `get_graph_schema` on the indexed driller/app project (2026-09-27):
+// `SIMILAR_TO` carries `jaccard` and `same_file` (plus `source_id`/
+// `target_id`); all 91 edges are Function→Function, stored once per pair
+// (`withTimeout`'s 5 copies give 10 edges, not 20). Live-verified: `jaccard`
+// comes back as `"1.000"`/`"0.953"` and compares numerically in WHERE
+// (`>= 0.96` drops the one 0.953 pair); `same_file` comes back as
+// `"true"`/`"false"` (70 same-file, 21 cross-file). Only the score is
+// filtered here: an older backend without `same_file` would drop every row
+// under `r.same_file = false`, so `similar.ts` excludes same-file pairs by
+// the flag and by the Nodes' own files, and re-checks the score. An unknown
+// relationship type returns `rows: 0`, so a backend without `SIMILAR_TO`
+// simply yields none. Exported for tests.
+export const SIMILAR_TO_QUERY = `MATCH (a:Function)-[r:SIMILAR_TO]->(b:Function) WHERE r.jaccard >= ${SIMILAR_TO_MIN_JACCARD} AND a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL RETURN a.qualified_name AS source, b.qualified_name AS target, r.jaccard AS jaccard, r.same_file AS sameFile`;
+
 /**
  * P4-2 phase 2: each evidence query's own bound, independent of the whole
  * fetch's `DEFAULT_TIMEOUT_MS`: evidence is a detail row, so a hung query
@@ -587,6 +627,11 @@ export interface FetchCodeMapOptions {
    * Best-effort, like test evidence: a failure leaves it empty.
    */
   includeImplements?: boolean;
+  /**
+   * P4-2 phase 4: also fetch `SIMILAR_TO_QUERY` over the same connection.
+   * Best-effort, like test evidence: a failure leaves it empty.
+   */
+  includeSimilar?: boolean;
 }
 
 async function runFetchCodeMap(
@@ -604,9 +649,11 @@ export type QueryGraphClient = Pick<Client, 'callTool'>;
 
 /**
  * Runs the Code Map's `query_graph` calls over an already-connected client:
- * nodes, edges and files (any failure throws), then — only with
- * `includeTestEvidence` — the two best-effort evidence queries. Exported
- * for tests; `evidenceTimeoutMs` is a test seam too.
+ * nodes, edges and files (any failure throws), then — only as asked — the
+ * best-effort evidence queries, in parallel, each under its own timeout:
+ * test evidence (two queries), `IMPLEMENTS` (P4-2 phase 3b) and
+ * `SIMILAR_TO` (P4-2 phase 4). Exported for tests; `evidenceTimeoutMs` is a
+ * test seam too.
  */
 export async function runCodeMapQueries(
   client: QueryGraphClient,
@@ -650,10 +697,11 @@ export async function runCodeMapQueries(
   const joinedNodes = joinHotspotChangeCounts(nodes, fileRows, options.excludeFile);
   const includeTestEvidence = options.includeTestEvidence === true;
   const includeImplements = options.includeImplements === true;
-  if (!includeTestEvidence && !includeImplements) {
+  const includeSimilar = options.includeSimilar === true;
+  if (!includeTestEvidence && !includeImplements && !includeSimilar) {
     return { nodes: joinedNodes, edges };
   }
-  const [calls, testFiles, implementsLinks] = await Promise.all([
+  const [calls, testFiles, implementsLinks, similarPairs] = await Promise.all([
     includeTestEvidence
       ? queryTestEvidence(client, project, TEST_EVIDENCE_CALLS_QUERY, parseTestCallEvidenceRow, 'test calls', evidenceTimeoutMs)
       : undefined,
@@ -663,13 +711,45 @@ export async function runCodeMapQueries(
     includeImplements
       ? queryTestEvidence(client, project, IMPLEMENTS_QUERY, parseImplementsRow, 'implements', evidenceTimeoutMs, 'Implements')
       : undefined,
+    includeSimilar
+      ? queryTestEvidence(
+          client,
+          project,
+          SIMILAR_TO_QUERY,
+          parseSimilarPairRow,
+          'SIMILAR_TO',
+          evidenceTimeoutMs,
+          'Similar implementations',
+        )
+      : undefined,
   ]);
   return {
     nodes: joinedNodes,
     edges,
     ...(calls !== undefined && testFiles !== undefined ? { testEvidence: { calls, testFiles } } : {}),
     ...(implementsLinks !== undefined ? { implementsLinks } : {}),
+    ...(similarPairs !== undefined ? { similarPairs } : {}),
   };
+}
+
+/**
+ * P4-2 phase 4: parses a `SIMILAR_TO_QUERY` row. A row without both ids or
+ * without a finite, non-negative score is dropped; the score is not checked
+ * against the threshold here (`attachSimilar` does). Exported for tests.
+ */
+export function parseSimilarPairRow(row: Record<string, string>): SimilarPair | undefined {
+  const { source, target } = row;
+  const score = toOptionalSignalValue(row.jaccard);
+  if (
+    typeof source !== 'string' ||
+    source.length === 0 ||
+    typeof target !== 'string' ||
+    target.length === 0 ||
+    score === undefined
+  ) {
+    return undefined;
+  }
+  return { source, target, score, ...(parseTestFlag(row.sameFile) ? { sameFile: true as const } : {}) };
 }
 
 /** P4-2 phase 3b: parses an `IMPLEMENTS_QUERY` row. Exported for tests. */

@@ -17,14 +17,21 @@
  * whole lines, start ≤ end. And a diff-scope reply
  * (`toValidatedDiffScopeResult`): `nodeIds`, `topLevelFiles` and
  * `changedContracts` are checked; malformed elements are dropped.
+ *
+ * P4-2 phase 4: each Node's `similarTo` is validated per element
+ * (`isSimilarImplementation`, `sanitizeNodeSimilarTo`); malformed elements
+ * are dropped and counted in `droppedSimilarTo`, and `similarToTotal` is
+ * kept consistent with what survives.
  */
 import type {
   ChangedContract,
+  CodeMapNode,
   CodeMapResult,
   DiffScopeResult,
   FoldedModule,
   FoldedType,
   GraphServiceCodeMapMessage,
+  SimilarImplementation,
   TopLevelChangedFile,
 } from '@driller/ipc-contracts';
 
@@ -131,6 +138,60 @@ export function isChangedContract(value: unknown): value is ChangedContract {
   );
 }
 
+/**
+ * P4-2 phase 4: whether `value` is a well-formed `SimilarImplementation`:
+ * non-empty string `id`/`name`/`file` and a finite `score` in [0, 1] (a
+ * jaccard). The Graph Service only sends scores at or above
+ * `SIMILAR_TO_MIN_JACCARD`; this boundary only guards the shape the renderer
+ * reads, so a lower score is not second-guessed here.
+ */
+export function isSimilarImplementation(value: unknown): value is SimilarImplementation {
+  return (
+    isRecord(value) &&
+    isString(value.id) &&
+    value.id.length > 0 &&
+    isString(value.name) &&
+    value.name.length > 0 &&
+    isString(value.file) &&
+    value.file.length > 0 &&
+    isFiniteNumber(value.score) &&
+    value.score >= 0 &&
+    value.score <= 1
+  );
+}
+
+/**
+ * P4-2 phase 4: a Node with its `similarTo` validated per element. Returns
+ * the same Node when both fields are well-formed (or both absent).
+ * Otherwise: a non-array `similarTo` counts as 1 dropped and is removed;
+ * malformed elements are dropped; when none survive, `similarTo` and
+ * `similarToTotal` are both removed. A surviving list keeps a
+ * `similarToTotal` that is an integer at least its length, else gets its
+ * length. A lone `similarToTotal` is removed. `dropped` counts removed
+ * elements.
+ */
+export function sanitizeNodeSimilarTo(node: CodeMapNode): { node: CodeMapNode; dropped: number } {
+  const raw: unknown = node.similarTo;
+  const rawTotal: unknown = node.similarToTotal;
+  if (raw === undefined && rawTotal === undefined) {
+    return { node, dropped: 0 };
+  }
+  const { similarTo: _similar, similarToTotal: _total, ...rest } = node;
+  const valid = keepValid(raw, isSimilarImplementation);
+  // A repeated id would double a row (and a React key); keep its first entry.
+  const seen = new Set<string>();
+  const kept = valid.kept.filter((entry) => !seen.has(entry.id) && seen.add(entry.id) !== undefined);
+  const dropped = valid.dropped + (valid.kept.length - kept.length);
+  if (kept.length === 0) {
+    return { node: rest, dropped };
+  }
+  const totalOk = Number.isInteger(rawTotal) && (rawTotal as number) >= kept.length;
+  if (dropped === 0 && totalOk) {
+    return { node, dropped: 0 };
+  }
+  return { node: { ...rest, similarTo: kept, similarToTotal: totalOk ? (rawTotal as number) : kept.length }, dropped };
+}
+
 /** P4-2 phase 3c: a well-formed `TopLevelChangedFile`: string `file`, a valid line range. */
 export function isTopLevelChangedFile(value: unknown): value is TopLevelChangedFile {
   return isRecord(value) && isString(value.file) && isLineRange(value.startLine, value.endLine);
@@ -212,6 +273,8 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   droppedFoldedTypes: number;
   /** P4-2 phase 3c: how many `foldedModules` elements were malformed and dropped. */
   droppedFoldedModules: number;
+  /** P4-2 phase 4: how many `similarTo` elements, across all Nodes, were malformed and dropped. */
+  droppedSimilarTo: number;
 } {
   const replaced: ReplacedCodeMapField[] = [];
   const rawHidden: unknown = message.hiddenByScope;
@@ -246,10 +309,21 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   } else {
     replaced.push('foldedModules');
   }
+  let droppedSimilarTo = 0;
+  const nodes = Array.isArray(message.nodes)
+    ? message.nodes.map((node) => {
+        if (!isRecord(node)) {
+          return node;
+        }
+        const sanitized = sanitizeNodeSimilarTo(node);
+        droppedSimilarTo += sanitized.dropped;
+        return sanitized.node;
+      })
+    : message.nodes;
   return {
     result: {
       status: 'ok',
-      nodes: message.nodes,
+      nodes,
       edges: message.edges,
       hiddenByScope,
       appliedScope,
@@ -259,5 +333,6 @@ export function toOkCodeMapResult(message: CodeMapReply): {
     replaced,
     droppedFoldedTypes,
     droppedFoldedModules,
+    droppedSimilarTo,
   };
 }

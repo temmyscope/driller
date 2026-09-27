@@ -68,6 +68,7 @@ export type {
   FoldedTypeKind,
   FoldedTypeUserKindCount,
   TypeUse,
+  SimilarImplementation,
   CodeMapEdgeKind,
   CodeMapEdge,
   DiffScopeResult,
@@ -85,6 +86,8 @@ export type {
 export {
   BLAST_RADIUS_DEFAULT_HOPS,
   FOLDED_TYPE_IPC_MAX_USED_BY,
+  SIMILAR_TO_MAX_ENTRIES,
+  SIMILAR_TO_MIN_JACCARD,
   TESTED_BY_MAX_TESTS,
 } from '@driller/graph-contracts';
 

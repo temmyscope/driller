@@ -209,6 +209,45 @@ describe('fetchProductionCodeMap', () => {
     assert.equal(askedImplements, undefined);
   });
 
+  it('P4-2 phase 4: attaches similarTo only when asked, between production Functions in different files (normalized paths)', async () => {
+    const root = '/home/u/proj-similar';
+    const nodes = [
+      node('a.withTimeout', `${root}/src/a.ts`),
+      node('b.withTimeout', `${root}/src/b.ts`),
+      // Same file as a.withTimeout once normalized (one absolute, one relative).
+      node('a.twin', 'src/a.ts'),
+      node('t.withTimeout', `${root}/src/a.test.ts`),
+      { ...node('T', `${root}/src/types.ts`), kind: 'Interface' as const },
+    ];
+    const pairs = [
+      { source: 'a.withTimeout', target: 'b.withTimeout', score: 1 },
+      { source: 'a.withTimeout', target: 'a.twin', score: 1 },
+      { source: 'a.withTimeout', target: 't.withTimeout', score: 1 },
+      { source: 'b.withTimeout', target: 'T', score: 1 },
+      { source: 'a.twin', target: 'b.withTimeout', score: 0.85 },
+    ];
+    let askedSimilar: boolean | undefined;
+    const fetch = async (project: string, timeoutMs?: number, options?: FetchCodeMapOptions) => {
+      askedSimilar = options?.includeSimilar;
+      return { ...(await fakeFetch(nodes, [])(project, timeoutMs, options)), similarPairs: pairs };
+    };
+    const result = await fetchProductionCodeMap('p', root, 'test', { fetch, includeSimilar: true });
+    assert.equal(askedSimilar, true);
+    assert.deepEqual(result.similarPairs, pairs);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    assert.deepEqual(byId.get('a.withTimeout')?.similarTo, [
+      { id: 'b.withTimeout', name: 'b.withTimeout', file: 'src/b.ts', score: 1 },
+    ]);
+    assert.equal(byId.get('a.withTimeout')?.similarToTotal, 1);
+    assert.deepEqual(byId.get('b.withTimeout')?.similarTo?.map((entry) => entry.id), ['a.withTimeout']);
+    assert.equal(byId.get('a.twin')?.similarTo, undefined);
+
+    const plain = await fetchProductionCodeMap('p', root, 'test', { fetch });
+    assert.equal(askedSimilar, undefined);
+    assert.deepEqual(plain.similarPairs, []);
+    assert.ok(plain.nodes.every((n) => n.similarTo === undefined));
+  });
+
   it('warns once per distinct out-of-project path, not once per Node per fetch', async (t) => {
     const warn = mock.method(console, 'warn', () => {});
     t.after(() => warn.mock.restore());

@@ -7,13 +7,16 @@
  * so neither sees a Module Node or a Module's edge either.
  * P4-2 phase 3b: then fold Type/Interface Nodes into a side index by id
  * (`fold-types.ts`), so neither sees a type Node or a type edge.
+ * P4-2 phase 4: then, when asked, attach "Similar implementations"
+ * (`similar.ts`) from the backend's `SIMILAR_TO` edges.
  */
 import type { FoldedModule, FoldedType } from '@driller/graph-contracts';
 
 import { attachFoldedModuleLinks, foldModules } from './fold-modules';
 import { attachTypeUses, foldTypes, splitModuleTypeUses } from './fold-types';
-import { fetchCodeMap, type CodeMapFetchResult, type FetchCodeMapOptions } from './mcp-client';
+import { fetchCodeMap, type CodeMapFetchResult, type FetchCodeMapOptions, type SimilarPair } from './mcp-client';
 import { toProjectRelativePosixPath } from './project-path';
+import { attachSimilar } from './similar';
 import { attachTestedBy } from './tested-by';
 import { excludeTestCode, isTestPath } from './test-code';
 
@@ -70,6 +73,12 @@ export interface ProductionCodeMapOptions {
    * row. Only the Code Map handler asks for it; Path Trace doesn't need it.
    */
   includeImplements?: boolean;
+  /**
+   * P4-2 phase 4: fetch `SIMILAR_TO` pairs and attach `similarTo` to the
+   * production Functions. Only the Code Map handler asks for it (Node detail
+   * and `lookup_node`); Path Trace doesn't need it.
+   */
+  includeSimilar?: boolean;
 }
 
 /** `fetchProductionCodeMap`'s result: the production map plus its folded Modules. */
@@ -78,6 +87,12 @@ export interface ProductionCodeMapResult extends CodeMapFetchResult {
   foldedModules: FoldedModule[];
   /** P4-2 phase 3b: the production Type/Interface Nodes folded off the map, sorted by id (see `FoldedType`). */
   foldedTypes: FoldedType[];
+  /**
+   * P4-2 phase 4: the raw `SIMILAR_TO` pairs (`[]` unless `includeSimilar`),
+   * so the Code Map handler can re-attach `similarTo` after its scope filter
+   * (`attachSimilar` on the scoped Nodes names only scoped Nodes).
+   */
+  similarPairs: SimilarPair[];
 }
 
 /**
@@ -95,6 +110,9 @@ export interface ProductionCodeMapResult extends CodeMapFetchResult {
  * folded Module's top-level use of a type moves from `uses` (which then
  * names only map Nodes) to `usesTypes`, and Nodes in that file carry it as
  * `fileTopLevelTypes`.
+ * P4-2 phase 4: with `includeSimilar`, production Functions carry
+ * `similarTo` from the backend's `SIMILAR_TO` pairs (unscoped, like above;
+ * `similarPairs` is returned for the re-scope).
  * Throws whatever `fetchCodeMap` throws.
  */
 export async function fetchProductionCodeMap(
@@ -106,10 +124,12 @@ export async function fetchProductionCodeMap(
   const fetch = options.fetch ?? fetchCodeMap;
   const includeTestEvidence = options.includeTestedBy === true;
   const includeImplements = options.includeImplements === true;
-  const { nodes, edges, testEvidence, implementsLinks } = await fetch(project, undefined, {
+  const includeSimilar = options.includeSimilar === true;
+  const { nodes, edges, testEvidence, implementsLinks, similarPairs } = await fetch(project, undefined, {
     excludeFile: (file) => isTestPath(normalizeFile(projectRoot, file, `${context} hotspot file`)),
     ...(includeTestEvidence ? { includeTestEvidence } : {}),
     ...(includeImplements ? { includeImplements } : {}),
+    ...(includeSimilar ? { includeSimilar } : {}),
   });
   const normalizedNodes = nodes.map((node) => ({
     ...node,
@@ -136,10 +156,13 @@ export async function fetchProductionCodeMap(
     [...folded.modulesByFile.values()].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0)),
     foldedTypes,
   );
+  const pairs = includeSimilar ? (similarPairs ?? []) : [];
+  const withTypeUses = attachTypeUses(attachFoldedModuleLinks(types.nodes, foldedModules), foldedTypes);
   return {
-    nodes: attachTypeUses(attachFoldedModuleLinks(types.nodes, foldedModules), foldedTypes),
+    nodes: includeSimilar ? attachSimilar(withTypeUses, pairs) : withTypeUses,
     edges: types.edges,
     foldedModules,
     foldedTypes,
+    similarPairs: pairs,
   };
 }

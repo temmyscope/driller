@@ -7,7 +7,13 @@ import { describe, it } from 'node:test';
 
 import type { GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
 
-import { joinNaturally, toOkCodeMapResult, toValidatedDiffScopeResult } from './code-map-reply';
+import {
+  isSimilarImplementation,
+  joinNaturally,
+  sanitizeNodeSimilarTo,
+  toOkCodeMapResult,
+  toValidatedDiffScopeResult,
+} from './code-map-reply';
 
 type Reply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMap' }>;
 
@@ -29,6 +35,7 @@ describe('toOkCodeMapResult', () => {
       replaced: [],
       droppedFoldedTypes: 0,
       droppedFoldedModules: 0,
+      droppedSimilarTo: 0,
     });
   });
 
@@ -172,6 +179,70 @@ describe('toOkCodeMapResult', () => {
     assert.equal(joinNaturally(['a']), 'a');
     assert.equal(joinNaturally(['a', 'b']), 'a and b');
     assert.equal(joinNaturally(['hiddenByScope', 'appliedScope', 'foldedTypes']), 'hiddenByScope, appliedScope and foldedTypes');
+  });
+});
+
+describe('similarTo per element (P4-2 phase 4)', () => {
+  const node = (fields: Record<string, unknown> = {}) => ({
+    id: 'a.f',
+    name: 'f',
+    file: 'src/a.ts',
+    startLine: 1,
+    endLine: 2,
+    kind: 'Function',
+    summaryStatus: 'pending',
+    riskSignals: [],
+    ...fields,
+  });
+  const GOOD = { id: 'b.f', name: 'f', file: 'src/b.ts', score: 1 };
+
+  it('isSimilarImplementation needs non-empty id/name/file and a score in [0, 1]', () => {
+    assert.equal(isSimilarImplementation(GOOD), true);
+    assert.equal(isSimilarImplementation({ ...GOOD, score: 0.953 }), true);
+    for (const bad of [
+      null,
+      'b.f',
+      { ...GOOD, id: '' },
+      { ...GOOD, name: 7 },
+      { ...GOOD, file: undefined },
+      { ...GOOD, score: '1.00' },
+      { ...GOOD, score: Number.NaN },
+      { ...GOOD, score: 1.5 },
+      { ...GOOD, score: -0.1 },
+    ]) {
+      assert.equal(isSimilarImplementation(bad), false, JSON.stringify(bad));
+    }
+  });
+
+  it('a well-formed Node passes through as the same object', () => {
+    const ok = node({ similarTo: [GOOD], similarToTotal: 3 });
+    const plain = node();
+    const { result, droppedSimilarTo } = toOkCodeMapResult(reply({ nodes: [ok, plain], foldedTypes: [] }));
+    assert.equal(result.nodes[0], ok);
+    assert.equal(result.nodes[1], plain);
+    assert.equal(droppedSimilarTo, 0);
+  });
+
+  it('drops malformed elements (counted), keeping the rest and a consistent total', () => {
+    const { result, droppedSimilarTo } = toOkCodeMapResult(
+      reply({ nodes: [node({ similarTo: [GOOD, { ...GOOD, score: 'x' }, null], similarToTotal: 3 })], foldedTypes: [] }),
+    );
+    assert.deepEqual(result.nodes[0]?.similarTo, [GOOD]);
+    assert.equal(result.nodes[0]?.similarToTotal, 3);
+    assert.equal(droppedSimilarTo, 2);
+  });
+
+  it('a total below the list, or missing, becomes the list length; a lone total or an emptied list removes both', () => {
+    assert.equal(sanitizeNodeSimilarTo(node({ similarTo: [GOOD], similarToTotal: 0 }) as never).node.similarToTotal, 1);
+    assert.equal(sanitizeNodeSimilarTo(node({ similarTo: [GOOD] }) as never).node.similarToTotal, 1);
+    const deduped = sanitizeNodeSimilarTo(node({ similarTo: [GOOD, { ...GOOD, score: 0.95 }], similarToTotal: 2 }) as never);
+    assert.deepEqual(deduped.node.similarTo, [GOOD]);
+    assert.equal(deduped.dropped, 1);
+    for (const fields of [{ similarToTotal: 4 }, { similarTo: [], similarToTotal: 0 }, { similarTo: 'b.f', similarToTotal: 1 }]) {
+      const { node: cleaned, dropped } = sanitizeNodeSimilarTo(node(fields) as never);
+      assert.ok(!('similarTo' in cleaned) && !('similarToTotal' in cleaned), JSON.stringify(fields));
+      assert.equal(dropped, typeof fields.similarTo === 'string' ? 1 : 0);
+    }
   });
 });
 

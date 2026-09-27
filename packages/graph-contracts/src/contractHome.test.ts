@@ -68,10 +68,15 @@ const MOVED_GRAPH_SHAPES = [
   'FileTopLevelUse',
   'FoldedModule',
   'TopLevelChangedFile',
+  'SimilarImplementation',
 ] as const;
 
-/** Constants that belong with those shapes: `TESTED_BY_MAX_TESTS` bounds `TestedBy.tests`. */
-const CONTRACT_CONSTANTS = ['TESTED_BY_MAX_TESTS'] as const;
+/**
+ * Constants that belong with those shapes: `TESTED_BY_MAX_TESTS` bounds
+ * `TestedBy.tests`; `SIMILAR_TO_MIN_JACCARD`/`SIMILAR_TO_MAX_ENTRIES` bound
+ * `CodeMapNode.similarTo` (P4-2 phase 4).
+ */
+const CONTRACT_CONSTANTS = ['TESTED_BY_MAX_TESTS', 'SIMILAR_TO_MIN_JACCARD', 'SIMILAR_TO_MAX_ENTRIES'] as const;
 
 const CONTRACT_HOME_NAMES: readonly string[] = [...OPERATION_RESULT_TYPES, ...MOVED_GRAPH_SHAPES, ...CONTRACT_CONSTANTS];
 const HOME_SPECIFIER = '@driller/graph-contracts';

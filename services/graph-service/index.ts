@@ -191,6 +191,7 @@ import { attachProjectRiskSignals } from './risk-signals';
 import { attachFoldedModuleLinks, scopeFoldedModules } from './fold-modules';
 import { attachTypeUses, capFoldedTypeUsedBy, scopeFoldedTypes, splitModuleTypeUses } from './fold-types';
 import { fetchProductionCodeMap } from './production-code-map';
+import { attachSimilar } from './similar';
 import { toProjectRelativePosixPath } from './project-path';
 import { isTestPath } from './test-code';
 import { startMcpServer } from './mcp-server';
@@ -1405,16 +1406,19 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // P4-2 phase 3b: and folds Type/Interface Nodes off the map
     // (`fold-types.ts`): no type Node or type edge reaches anything below;
     // each Node carries the types it uses as `usesTypes`.
+    // P4-2 phase 4: and attaches `similarTo` (Node detail's "Similar
+    // implementations", and `lookup_node`) from the backend's `SIMILAR_TO`.
     const {
       nodes: normalizedNodesUnfiltered,
       edges: productionEdges,
       foldedModules: foldedModulesUnfiltered,
       foldedTypes: foldedTypesUnfiltered,
+      similarPairs,
     } = await fetchProductionCodeMap(
       activeProject,
       projectRoot,
       'Code Map',
-      { includeTestedBy: true, includeImplements: true },
+      { includeTestedBy: true, includeImplements: true, includeSimilar: true },
     );
     // Bug fix (2026-09-23): filtered post-normalization (cheaper — avoids
     // `filterCodeMapToScope`'s own internal normalize-for-match-test running
@@ -1444,7 +1448,12 @@ async function handleGetCodeMapRequest(): Promise<void> {
       scopeFoldedModules(foldedModulesUnfiltered, scopedNodeIds, appliedScope),
       foldedTypes,
     );
-    const normalizedNodes = attachTypeUses(attachFoldedModuleLinks(scopedNodes, foldedModules), foldedTypes);
+    // P4-2 phase 4: `similarTo` is re-derived from the scoped set too, so a
+    // similar implementation is named only when it is on this (scoped) map.
+    const normalizedNodes = attachSimilar(
+      attachTypeUses(attachFoldedModuleLinks(scopedNodes, foldedModules), foldedTypes),
+      similarPairs,
+    );
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
     // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
     // live on every fetch — never persisted to `node-record-store.ts`

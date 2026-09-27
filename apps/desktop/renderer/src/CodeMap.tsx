@@ -97,6 +97,7 @@ import type {
   LlmJudgmentRiskSignal,
   PathTraceResult,
   RiskSignal,
+  SimilarImplementation,
   SummaryStatus,
   TestedBy,
   TestedByFile,
@@ -4586,6 +4587,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   testedBy: 'code-map-node-detail-tested-by-heading',
   fileTopLevel: 'code-map-node-detail-file-top-level-heading',
   uses: 'code-map-node-detail-uses-heading',
+  similar: 'code-map-node-detail-similar-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -5592,10 +5594,134 @@ export function NodeTestedBy({
   );
 }
 
+/** P4-2 phase 4: how many "Similar implementations" rows Node detail shows before "+N more". */
+export const NODE_DETAIL_SIMILAR_ROWS = 5;
+
+/** P4-2 phase 4: the honest-copy line under "Similar implementations". */
+export const SIMILARITY_DISCLAIMER = 'Similarity is structural (token overlap), not a claim they behave the same.';
+
+/** P4-2 phase 4: a `SIMILAR_TO` jaccard as shown — "similarity 1.00". */
+export function formatSimilarity(score: number): string {
+  // Floored, so a 0.996 near-duplicate never reads as an identical "1.00".
+  return `similarity ${(Math.floor(score * 100 + 1e-9) / 100).toFixed(2)}`;
+}
+
+/** P4-2 phase 4: the section heading — "Similar implementations (N)", N the full count. */
+export function similarHeading(node: Pick<CodeMapNode, 'similarTo' | 'similarToTotal'>): string {
+  return `Similar implementations (${similarTotal(node)})`;
+}
+
+/** The full count: `similarToTotal`, never below what is carried. */
+function similarTotal(node: Pick<CodeMapNode, 'similarTo' | 'similarToTotal'>): number {
+  return Math.max(node.similarToTotal ?? 0, node.similarTo?.length ?? 0);
+}
+
+function SimilarRow({
+  similar,
+  resolveMapNode,
+  onNavigateToNode,
+}: {
+  similar: SimilarImplementation;
+  resolveMapNode: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  onNavigateToNode: (id: string) => void;
+}) {
+  const score = formatSimilarity(similar.score);
+  const details = (
+    <>
+      {' '}
+      <span className="code-map__node-detail-similar-file">
+        <code>{similar.file}</code>
+      </span>{' '}
+      <span className="code-map__node-detail-similar-score">{score}</span>
+    </>
+  );
+  // A Node the rendered map can't navigate to is named, and says why it
+  // isn't a link.
+  if (resolveMapNode(similar.id) === undefined) {
+    return (
+      <li>
+        <code className="code-map__node-detail-file-top-level-id" title={NOT_ON_CURRENT_MAP}>
+          {similar.name}
+          <span className="visually-hidden"> ({NOT_ON_CURRENT_MAP})</span>
+        </code>
+        {details}
+      </li>
+    );
+  }
+  return (
+    <li>
+      <button
+        type="button"
+        className="code-map__link-button"
+        onClick={() => onNavigateToNode(similar.id)}
+        aria-label={`Go to ${similar.name} in ${similar.file} (${score})`}
+      >
+        <code>{similar.name}</code>
+      </button>
+      {details}
+    </li>
+  );
+}
+
+/**
+ * P4-2 phase 4: the "Similar implementations" section's content — other
+ * production Functions, in other files, that the backend's `SIMILAR_TO`
+ * edge marks as near-duplicates (`CodeMapNode.similarTo`). Each row names
+ * the Node, its file and "similarity 1.00", and navigates the map to it when
+ * the map has it. The first `NODE_DETAIL_SIMILAR_ROWS`, then a native
+ * `<details>` "+N more" (N counted against `similarToTotal`) with the rest
+ * carried and, when the Graph Service carried fewer than exist, "Showing the
+ * first X of Y". Always ends with the honest-copy line. Facts only: no
+ * recommendation. Hookless, like `NodeDetailBody`.
+ */
+export function NodeSimilarImplementations({
+  node,
+  resolveMapNode = RESOLVE_NO_MAP_NODE,
+  onNavigateToNode = NAVIGATE_NOWHERE,
+}: {
+  node: Pick<CodeMapNode, 'similarTo' | 'similarToTotal'>;
+  resolveMapNode?: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  onNavigateToNode?: (id: string) => void;
+}) {
+  const similar = node.similarTo ?? [];
+  const total = similarTotal(node);
+  const shown = similar.slice(0, NODE_DETAIL_SIMILAR_ROWS);
+  const rest = similar.slice(NODE_DETAIL_SIMILAR_ROWS);
+  const more = total - shown.length;
+  const rows = (entries: readonly SimilarImplementation[]) =>
+    entries.map((entry) => (
+      <SimilarRow key={entry.id} similar={entry} resolveMapNode={resolveMapNode} onNavigateToNode={onNavigateToNode} />
+    ));
+  return (
+    <>
+      <ul className="code-map__node-detail-similar" aria-label="Similar implementations">
+        {rows(shown)}
+      </ul>
+      {more > 0 && (
+        <details className="code-map__more">
+          <summary>+{more} more</summary>
+          {rest.length > 0 && (
+            <ul className="code-map__node-detail-similar code-map__more-list" aria-label="Similar implementations, continued">
+              {rows(rest)}
+            </ul>
+          )}
+          {similar.length < total && (
+            <p className="code-map__more-list">
+              Showing the first {similar.length} of {total}.
+            </p>
+          )}
+        </details>
+      )}
+      <p className="code-map__node-detail-similar-note">{SIMILARITY_DISCLAIMER}</p>
+    </>
+  );
+}
+
 /**
  * P2-12: Node Detail's scrolling body — the mockup's labelled, divided
- * sections in the order Summary → Risk Overlay → Tested by → Staleness →
- * Location.
+ * sections in the order Summary → Risk Overlay → Tested by → (Uses) →
+ * (File top-level) → (Similar implementations, P4-2 phase 4) → Staleness →
+ * Location; the parenthesized ones only when they have content.
  * Presentation only: every state, action and handler is the one the panel
  * already had, passed in. Hookless so `CodeMap.nodeDetail.test.ts` can render
  * it as a plain function.
@@ -5739,6 +5865,21 @@ export function NodeDetailBody({
             types={node.fileTopLevelTypes}
             resolveFoldedType={resolveFoldedType}
             onOpenType={onOpenType}
+          />
+        </section>
+      )}
+      {/* P4-2 phase 4: near-duplicate implementations in other files, from
+          the backend's SIMILAR_TO edge only. Only when there are any (a
+          backend without SIMILAR_TO shows no section). Facts, no advice. */}
+      {(node.similarTo?.length ?? 0) > 0 && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.similar}>
+          <h3 id={ids.similar} className="code-map__node-detail-label">
+            {similarHeading(node)}
+          </h3>
+          <NodeSimilarImplementations
+            node={node}
+            resolveMapNode={resolveMapNode}
+            onNavigateToNode={onNavigateToNode}
           />
         </section>
       )}

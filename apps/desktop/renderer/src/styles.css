@@ -3430,6 +3430,33 @@ code,
   cursor: help;
 }
 
+/* P4-2 phase 4: Node detail's "Similar implementations" — the same fine
+   print and link-button entries as "Uses", each row naming the file and
+   score, then the muted honest-copy line. */
+.code-map__node-detail-similar,
+.code-map__node-detail-similar-note {
+  margin: 0;
+  font-size: var(--detail-fine-size);
+  line-height: var(--detail-fine-leading);
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.code-map__node-detail-similar {
+  margin-top: 4px;
+  padding-left: 16px;
+}
+
+.code-map__node-detail-similar-file,
+.code-map__node-detail-similar-score,
+.code-map__node-detail-similar-note {
+  color: var(--text-mute);
+}
+
+.code-map__node-detail-similar-note {
+  margin-top: 4px;
+}
+
 /* P4-2 phase 3a: the card's "↑at load" cue — shaped like a caller pill but
    dashed and not interactive: the caller is folded top-level code. */
 .code-map__node-load-caller {

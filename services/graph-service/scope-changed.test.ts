@@ -84,6 +84,16 @@ export async function fetchCodeMap() {
       { source: 'T2', target: 'U', kind: 'USAGE' },
     ],
     implementsLinks: [{ source: 'T2', target: 'T' }],
+    // P4-2 phase 4: w (web/) is a near-duplicate of a (app/, 1.0) and d
+    // (docs/, 0.953). a/d is flagged same-file, w/x is below 0.9 and w/t has
+    // a test end: none of those three may ever be listed.
+    similarPairs: [
+      { source: 'w', target: 'a', score: 1 },
+      { source: 'd', target: 'w', score: 0.953 },
+      { source: 'a', target: 'd', score: 1, sameFile: true },
+      { source: 'w', target: 'x', score: 0.85 },
+      { source: 'w', target: 't', score: 1 },
+    ],
     // P4-2 phase 2: \`t\` calls \`w\` through an import; \`f\` reaches \`a\` only
     // by a name-only match, which must never count.
     testEvidence: {
@@ -136,6 +146,8 @@ interface Posted {
     calledAtLoadBy?: unknown;
     fileTopLevelTypes?: unknown;
     usesTypes?: unknown;
+    similarTo?: { id: string; score: number }[];
+    similarToTotal?: number;
     riskSignals?: { type?: string; value?: number }[];
   }[];
   edges?: { source: string; target: string }[];
@@ -609,6 +621,58 @@ describe('graphService:scopeChanged through index.ts', () => {
       'a pathTraceResult',
     );
     assert.deepEqual(reply.result, { status: 'no-path-found' });
+  });
+
+  it('P4-2 phase 4: similarTo in the map reply and lookup_node, re-derived after the scope filter', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    const map = await fetchMap();
+    const similar = (reply: Posted, id: string) => {
+      const found = reply.nodes?.find((node) => node.id === id);
+      return found?.similarTo === undefined ? undefined : [found.similarTo.map((entry) => [entry.id, entry.score]), found.similarToTotal];
+    };
+    assert.deepEqual(similar(map, 'w'), [[['a', 1], ['d', 0.953]], 2]);
+    assert.deepEqual(similar(map, 'a'), [[['w', 1]], 1]);
+    assert.deepEqual(similar(map, 'd'), [[['w', 0.953]], 1]);
+    assert.equal(similar(map, 'x'), undefined);
+    // No risk signal is added for it.
+    assert.ok(
+      (map.nodes ?? []).every((node) => (node.riskSignals ?? []).every((signal) => !/similar/i.test(signal.type ?? ''))),
+    );
+
+    // lookup_node, through the registered handler, carries the same fields.
+    const { getNodes, getFolded, getFoldedTypes } = capturedGetters();
+    const { registerLookupNodeTool } = await import('./mcp-server');
+    let handler: ((args: { nodeId: string }) => Promise<{ content: { text: string }[] }>) | undefined;
+    let description = '';
+    registerLookupNodeTool(
+      {
+        registerTool: (_name: string, config: { description?: string }, cb: typeof handler) => {
+          description = config.description ?? '';
+          handler = cb;
+        },
+      } as unknown as Parameters<typeof registerLookupNodeTool>[0],
+      getNodes as Parameters<typeof registerLookupNodeTool>[1],
+      (node) => node,
+      getFolded as Parameters<typeof registerLookupNodeTool>[3],
+      getFoldedTypes as Parameters<typeof registerLookupNodeTool>[4],
+    );
+    assert.ok(handler);
+    const viaTool = JSON.parse((await handler({ nodeId: 'w' })).content[0]!.text);
+    assert.equal(viaTool.status, 'ok');
+    assert.deepEqual(viaTool.node.similarTo, map.nodes?.find((node) => node.id === 'w')?.similarTo);
+    assert.equal(viaTool.node.similarToTotal, 2);
+    assert.match(description, /'similarTo'/);
+    assert.match(description, /capped at 20 with 'similarToTotal'/);
+    assert.match(description, /not a claim they behave the same/);
+
+    // Scoped to web/ + app/: d (docs/) is gone, so w names only a.
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web', 'app'] });
+    assert.deepEqual(similar(await fetchMap(), 'w'), [[['a', 1]], 1]);
+    // Scoped to web/ alone: nothing similar is on this map.
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web'] });
+    assert.equal(similar(await fetchMap(), 'w'), undefined);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    await fetchMap();
   });
 
   it('P4-2 phase 3b: folded types follow the indexing scope, and name only in-scope users', { timeout: 20_000 }, async () => {

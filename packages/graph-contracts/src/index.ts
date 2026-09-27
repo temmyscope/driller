@@ -1261,7 +1261,41 @@ export interface CodeMapNode {
    * Node detail's "File top-level" row. Absent when there is none.
    */
   fileTopLevelTypes?: TypeUse[];
+  /**
+   * P4-2 phase 4: other production Functions, in other files, that the
+   * backend's own `SIMILAR_TO` edge marks as near-duplicates of this one
+   * (jaccard at least `SIMILAR_TO_MIN_JACCARD`) — see
+   * `SimilarImplementation`. Structural (token overlap), never a claim they
+   * behave the same, and never inferred beyond that edge. Sorted by score
+   * (highest first), then name, file and id; capped at
+   * `SIMILAR_TO_MAX_ENTRIES`. Absent when there is none, including on a
+   * backend without `SIMILAR_TO`.
+   */
+  similarTo?: SimilarImplementation[];
+  /** P4-2 phase 4: how many similar implementations exist before the cap. Present exactly when `similarTo` is; never below `similarTo.length`. */
+  similarToTotal?: number;
 }
+
+/**
+ * P4-2 phase 4: one near-duplicate of a Node — the other end of a backend
+ * `SIMILAR_TO` edge. Both ends are production Functions on the Code Map, in
+ * different files. `id` is a Code Map Node id (navigable, resolvable via
+ * `lookup_node`).
+ */
+export interface SimilarImplementation {
+  id: string;
+  name: string;
+  /** POSIX-relative path of its file — never the Node's own file. */
+  file: string;
+  /** The backend's `SIMILAR_TO.jaccard` token-overlap score, 0–1; at least `SIMILAR_TO_MIN_JACCARD`. */
+  score: number;
+}
+
+/** P4-2 phase 4: the lowest `SIMILAR_TO.jaccard` shown as a similar implementation. */
+export const SIMILAR_TO_MIN_JACCARD = 0.9;
+
+/** P4-2 phase 4: the most `CodeMapNode.similarTo` entries carried per Node (and returned by `lookup_node`); `similarToTotal` is the full count. */
+export const SIMILAR_TO_MAX_ENTRIES = 20;
 
 /** P4-2 phase 3b: the Code Map Node kinds folded off the map as contracts (`FoldedType`). */
 export type FoldedTypeKind = Extract<CodeMapNodeKind, 'Type' | 'Interface'>;

@@ -66,6 +66,8 @@ import {
   BLAST_RADIUS_DEFAULT_HOPS,
   CHANGED_CONTRACT_MAX_DEPENDENT_IDS,
   FOLDED_TYPE_LOOKUP_MAX_USED_BY,
+  SIMILAR_TO_MAX_ENTRIES,
+  SIMILAR_TO_MIN_JACCARD,
   TESTED_BY_MAX_TESTS,
   type FoldedModule,
   type FoldedType,
@@ -298,7 +300,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.4.0';
+export const MCP_SERVER_VERSION = '1.5.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -328,7 +330,8 @@ export function registerLookupNodeTool(
         "Module Nodes (a file's top-level code) are folded into their file and are not Code Map Nodes: looking up a Module's id returns {status: 'folded', folded: true, kind: 'Module', nodeId, file, uses, usesTypes} (no 'node'), where 'uses' is the Code Map Nodes that top-level code calls or uses and 'usesTypes' the folded types it uses: check status === 'folded'; folded: true is also set. A folded Module's edges do not count toward any Node's blast radius, and a changed Module is not a changed Node. " +
         "'usesTypes', when present, lists the Type and Interface ids (with name and kind) this Node uses through a real USAGE edge — never inferred from its signature. " +
         `Type and Interface Nodes are folded off the Code Map as contracts: looking up a type's id returns {status: 'folded', folded: true, kind: 'Type' | 'Interface', nodeId, name, file, startLine, endLine, usedBy, usedByTotal, usedByKinds, implements, implementedBy, refersTo, referencedByTypes} (no 'node'), where 'usedBy' is up to ${FOLDED_TYPE_LOOKUP_MAX_USED_BY} ids of Code Map Nodes that use it through a USAGE edge (usedByTotal is the full count, usedByKinds its breakdown by Node kind); 'implements'/'implementedBy' are folded type ids it extends or implements, and that extend or implement it (Interface/Type IMPLEMENTS edges only: Classes are not Code Map Nodes, so a class implementing it is not listed); 'refersTo'/'referencedByTypes' are folded type ids it refers to, and that refer to it, through USAGE edges. A type's edges do not count toward any Node's blast radius, and a changed type is not a changed Node. ` +
-        "'fileTopLevelTypes', when present on a Node, lists the folded types its file's top-level code uses.",
+        "'fileTopLevelTypes', when present on a Node, lists the folded types its file's top-level code uses. " +
+        `'similarTo', when present, lists other production Functions in other files that the index's own SIMILAR_TO edge marks as near-duplicates of this one ({id, name, file, score}, score being the backend's jaccard token overlap, at least ${SIMILAR_TO_MIN_JACCARD}), highest score first, capped at ${SIMILAR_TO_MAX_ENTRIES} with 'similarToTotal' giving the full count; each id is a Code Map Node id. Similarity is structural (token overlap), not a claim they behave the same; same-file pairs and test code are never listed, and nothing is inferred beyond SIMILAR_TO. An absent 'similarTo' means no such pair was found (or the index has no SIMILAR_TO edges).`,
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),
@@ -425,6 +428,8 @@ export function startMcpServer(
   // when not applicable. One behaviour change: `topLevelFiles` now leaves
   // out a file whose every change lies inside a type (a contract-only
   // change, named in `changedContracts` instead).
+  // P4-2 phase 4 (1.5.0): `lookup_node`'s Node gains `similarTo` and
+  // `similarToTotal` — additive, absent when not applicable.
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
   registerLookupNodeTool(server, getActiveCodeMapNodes, deriveLiveNode, getActiveFoldedModules, getActiveFoldedTypes);

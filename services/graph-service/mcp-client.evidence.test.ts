@@ -11,7 +11,9 @@ import { describe, it, mock } from 'node:test';
 import {
   IMPLEMENTS_QUERY,
   parseImplementsRow,
+  parseSimilarPairRow,
   runCodeMapQueries,
+  SIMILAR_TO_QUERY,
   TEST_EVIDENCE_CALLS_QUERY,
   TEST_EVIDENCE_FILES_QUERY,
   type QueryGraphClient,
@@ -224,5 +226,124 @@ describe('runCodeMapQueries: P4-2 phase 3b IMPLEMENTS links', () => {
     assert.deepEqual(result.implementsLinks, []);
     assertMapIntact(result);
     assert.ok(warn.mock.calls.some((call) => String(call.arguments[0]).includes('Implements (implements) evidence unavailable')));
+  });
+});
+
+describe('runCodeMapQueries: P4-2 phase 4 SIMILAR_TO pairs', () => {
+  const SIMILAR = text(
+    'rows: 2  (cols: source target jaccard sameFile)\n' +
+      '  p.a.withTimeout p.b.withTimeout "1.000" "false"\n' +
+      '  p.a.f p.a.g "0.984" "true"\n' +
+      'total: 2\n',
+  );
+
+  function similarClient(reply: () => Promise<unknown>, implementsReply?: () => Promise<unknown>) {
+    const sent: string[] = [];
+    const client = {
+      callTool: async ({ arguments: args }: { arguments?: Record<string, unknown> }) => {
+        const query = String(args?.query);
+        sent.push(query);
+        if (query === SIMILAR_TO_QUERY) {
+          return reply();
+        }
+        if (query === IMPLEMENTS_QUERY) {
+          return implementsReply ? implementsReply() : text('rows: 0  (cols: source target)\ntotal: 0\n');
+        }
+        if (query.includes('[r:CALLS|USAGE]')) {
+          return EDGES;
+        }
+        return query.startsWith('MATCH (f:File)') ? FILES : NODES;
+      },
+    } as unknown as QueryGraphClient;
+    return { client, sent };
+  }
+
+  it('reads the backend properties confirmed with get_graph_schema, filtering on the 0.9 threshold', () => {
+    assert.match(SIMILAR_TO_QUERY, /\(a:Function\)-\[r:SIMILAR_TO\]->\(b:Function\)/);
+    assert.match(SIMILAR_TO_QUERY, /r\.jaccard >= 0\.9 /);
+    assert.match(SIMILAR_TO_QUERY, /r\.jaccard AS jaccard/);
+    assert.match(SIMILAR_TO_QUERY, /r\.same_file AS sameFile/);
+    // Never filtered on same_file in Cypher: an older backend without it would drop every row.
+    assert.doesNotMatch(SIMILAR_TO_QUERY, /same_file\s*=/);
+  });
+
+  it('sends SIMILAR_TO_QUERY only with includeSimilar, and its rows reach similarPairs', async () => {
+    const withFlag = similarClient(async () => SIMILAR);
+    const result = await runCodeMapQueries(withFlag.client, 'p', { includeSimilar: true });
+    assert.deepEqual(result.similarPairs, [
+      { source: 'p.a.withTimeout', target: 'p.b.withTimeout', score: 1 },
+      { source: 'p.a.f', target: 'p.a.g', score: 0.984, sameFile: true },
+    ]);
+    assertMapIntact(result);
+
+    const without = similarClient(async () => SIMILAR);
+    const plain = await runCodeMapQueries(without.client, 'p', { includeTestEvidence: true, includeImplements: true });
+    assert.ok(!without.sent.includes(SIMILAR_TO_QUERY));
+    assert.equal(plain.similarPairs, undefined);
+  });
+
+  it('goes out alongside the other evidence queries, not after them', { timeout: 5000 }, async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { client, sent } = similarClient(
+      async () => SIMILAR,
+      async () => {
+        await gate;
+        return text('rows: 0  (cols: source target)\ntotal: 0\n');
+      },
+    );
+    const running = runCodeMapQueries(client, 'p', { includeImplements: true, includeSimilar: true });
+    for (let i = 0; i < 20 && !sent.includes(SIMILAR_TO_QUERY); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(sent.includes(SIMILAR_TO_QUERY), 'SIMILAR_TO went out while IMPLEMENTS was still pending');
+    release();
+    await running;
+  });
+
+  const failures: [string, () => Promise<unknown>][] = [
+    ['reports isError', async () => ({ isError: true, content: [{ type: 'text', text: 'boom' }] })],
+    ['rejects', () => Promise.reject(new Error('transport closed'))],
+    ['hangs past its timeout', () => new Promise(() => {})],
+  ];
+  for (const [how, reply] of failures) {
+    it(`keeps the map when the SIMILAR_TO query ${how}, with no pairs`, { timeout: 5000 }, async (t) => {
+      const warn = mock.method(console, 'warn', () => {});
+      t.after(() => warn.mock.restore());
+      const { client } = similarClient(reply);
+      const result = await runCodeMapQueries(client, 'p', { includeSimilar: true }, 20);
+      assert.deepEqual(result.similarPairs, []);
+      assertMapIntact(result);
+      const warnings = warn.mock.calls.map((c) => String(c.arguments[0]));
+      assert.ok(
+        warnings.some((m) => m.includes('Similar implementations (SIMILAR_TO) evidence unavailable')),
+        warnings.join(' | '),
+      );
+    });
+  }
+
+  it('parseSimilarPairRow drops a row without both ids or a finite score; same_file is kept only when true', () => {
+    assert.deepEqual(parseSimilarPairRow({ source: 'a', target: 'b', jaccard: '0.953', sameFile: 'false' }), {
+      source: 'a',
+      target: 'b',
+      score: 0.953,
+    });
+    assert.deepEqual(parseSimilarPairRow({ source: 'a', target: 'b', jaccard: '1.000', sameFile: '-' }), {
+      source: 'a',
+      target: 'b',
+      score: 1,
+    });
+    for (const row of [
+      { source: '', target: 'b', jaccard: '1' },
+      { source: 'a', target: '', jaccard: '1' },
+      { source: 'a', target: 'b' },
+      { source: 'a', target: 'b', jaccard: '-' },
+      { source: 'a', target: 'b', jaccard: 'NaN' },
+      { source: 'a', target: 'b', jaccard: '-0.5' },
+    ]) {
+      assert.equal(parseSimilarPairRow(row as Record<string, string>), undefined, JSON.stringify(row));
+    }
   });
 });
