@@ -126,6 +126,33 @@ export function isTestPath(file: string): boolean {
 }
 
 /**
+ * P4-2 phase 2: whether a test-code path is test *support* rather than a
+ * test: the JS/TS support stems above (`testRender`, `test-utils`, ...),
+ * Python's `conftest.py`, a `scripts/*test-loader*` file, or anything under
+ * `__mocks__`. Such files are excluded from the map like any test code, but
+ * a call they make is never "Tested by" evidence. Uses the same in-project
+ * segment rule as `isTestPath`.
+ */
+export function isTestSupportPath(file: string): boolean {
+  const { segments, inside } = projectSegments(file);
+  const basename = segments[segments.length - 1];
+  if (basename === undefined) {
+    return false;
+  }
+  if (JS_TS_EXTENSION.test(basename) && TEST_SUPPORT_STEMS.has(basename.replace(JS_TS_EXTENSION, '').toLowerCase())) {
+    return true;
+  }
+  if (/^conftest\.py$/i.test(basename)) {
+    return true;
+  }
+  if (!inside) {
+    return false;
+  }
+  const directories = segments.slice(0, -1).map((segment) => segment.toLowerCase());
+  return directories.includes('__mocks__') || (directories.includes('scripts') && /test-?loader/i.test(basename));
+}
+
+/**
  * Whether a Node is test code: its path matches `isTestPath`, or the backend
  * flagged it `is_test`. Both count because the backend flag is false on
  * Interfaces and Types declared inside test files.

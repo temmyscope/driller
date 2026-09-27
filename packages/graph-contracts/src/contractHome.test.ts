@@ -62,9 +62,15 @@ const MOVED_GRAPH_SHAPES = [
   'DeterministicRiskSeverity',
   'LlmJudgmentRiskSignal',
   'IngestedRiskSignal',
+  'TestedBy',
+  'TestedByTest',
+  'TestedByFile',
 ] as const;
 
-const CONTRACT_HOME_NAMES: readonly string[] = [...OPERATION_RESULT_TYPES, ...MOVED_GRAPH_SHAPES];
+/** Constants that belong with those shapes: `TESTED_BY_MAX_TESTS` bounds `TestedBy.tests`. */
+const CONTRACT_CONSTANTS = ['TESTED_BY_MAX_TESTS'] as const;
+
+const CONTRACT_HOME_NAMES: readonly string[] = [...OPERATION_RESULT_TYPES, ...MOVED_GRAPH_SHAPES, ...CONTRACT_CONSTANTS];
 const HOME_SPECIFIER = '@driller/graph-contracts';
 
 const srcDir = path.dirname(fileURLToPath(import.meta.url));
@@ -117,9 +123,22 @@ function isGuarded(name: string): boolean {
   return CONTRACT_HOME_NAMES.includes(name);
 }
 
-/** Every type alias, interface, class and enum declared anywhere in `source` (nested ones included). */
+/**
+ * Every type alias, interface, class and enum declared anywhere in `source`
+ * (nested ones included), plus every top-level `const`/`let`/`var` binding —
+ * the guarded constants (`CONTRACT_CONSTANTS`) are module-level.
+ */
 function declarations(source: ts.SourceFile): string[] {
   const found: string[] = [];
+  for (const statement of source.statements) {
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) {
+          found.push(declaration.name.text);
+        }
+      }
+    }
+  }
   const visit = (node: ts.Node): void => {
     if (
       (ts.isTypeAliasDeclaration(node) ||

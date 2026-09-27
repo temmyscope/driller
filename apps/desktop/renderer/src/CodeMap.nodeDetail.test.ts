@@ -14,16 +14,21 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { CodeMapNode, CodeMapNodeKind, RiskSignal } from '@driller/ipc-contracts';
+import type { CodeMapNode, CodeMapNodeKind, RiskSignal, TestedBy, TestedByTest } from '@driller/ipc-contracts';
 
 import { ActionableNotice } from './ActionableNotice';
 import {
   countToggleHiddenSignals,
   formatNodeLocation,
+  NO_TEST_LINK_FOUND,
   NODE_DETAIL_SECTION_HEADING_IDS,
+  NODE_DETAIL_TESTED_BY_ROWS,
   NodeDetailBody,
   NodeDetailHead,
   nodeModuleLine,
+  openTestFromDetail,
+  testSourceTarget,
+  type SourceTarget,
   nodeNameSuffix,
   type NodeDetailBodyProps,
   type RiskSignalFamilyToggles,
@@ -94,6 +99,7 @@ function renderBody(overrides: Partial<NodeDetailBodyProps> = {}): RenderedEleme
     regenerateState: { kind: 'idle' },
     graphServiceAvailable: true,
     onRegenerate: noop,
+    onOpenTest: noop,
     ...overrides,
   };
   return renderTree(NodeDetailBody(props));
@@ -289,17 +295,23 @@ describe('NodeDetailHead', () => {
 // ---------------------------------------------------------------------------
 
 describe('NodeDetailBody: sections', () => {
-  it('renders Summary, Risk Overlay, Staleness, Location in that order, each named by its heading', () => {
-    assert.deepEqual(sectionHeadings(renderBody()), ['Summary', 'Risk Overlay', 'Staleness', 'Location']);
+  it('renders Summary, Risk Overlay, Tested by, Staleness, Location in that order, each named by its heading', () => {
+    assert.deepEqual(sectionHeadings(renderBody()), ['Summary', 'Risk Overlay', 'Tested by', 'Staleness', 'Location']);
   });
 
-  it('keeps the same four sections for a pending, coverage-gap or stale Node', () => {
+  it('keeps the same five sections for a pending, coverage-gap or stale Node', () => {
     for (const node of [
       makeNode({ summaryStatus: 'pending', summary: undefined }),
       makeNode({ summaryStatus: 'coverage-gap', summary: undefined }),
       makeNode({ stale: true }),
     ]) {
-      assert.deepEqual(sectionHeadings(renderBody({ node })), ['Summary', 'Risk Overlay', 'Staleness', 'Location']);
+      assert.deepEqual(sectionHeadings(renderBody({ node })), [
+        'Summary',
+        'Risk Overlay',
+        'Tested by',
+        'Staleness',
+        'Location',
+      ]);
     }
   });
 
@@ -453,5 +465,179 @@ describe('NodeDetailBody: summary action', () => {
     assert.ok(notice);
     assert.equal(notice.props.role, 'alert');
     assert.equal(notice.props.children, 'Backend failed.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NodeDetailBody: Tested by (P4-2 phase 2)
+// ---------------------------------------------------------------------------
+
+function testEntry(i: number, file = 'billing/pay.test.ts'): TestedByTest {
+  return { id: `t${i}`, name: `charges card ${i}`, file, startLine: 10 * i, endLine: 10 * i + 5 };
+}
+
+function testedBySection(testedBy: TestedBy | undefined, onOpenTest: (target: SourceTarget) => void = noop): RenderedElement[] {
+  return section(renderBody({ node: makeNode({ testedBy }), onOpenTest }), NODE_DETAIL_SECTION_HEADING_IDS.testedBy);
+}
+
+/** Row buttons outside any "+N more" expander. */
+function visibleButtons(elements: RenderedElement[]): RenderedElement[] {
+  // Function components re-render into fresh element objects, so buttons are
+  // matched by their (unique per row) accessible name, not by identity.
+  const hidden = new Set(
+    elements
+      .filter((element) => element.type === 'details')
+      .flatMap((details) => renderTree(details.props.children))
+      .filter((element) => element.type === 'button')
+      .map((button) => button.props['aria-label']),
+  );
+  return elements.filter((element) => element.type === 'button' && !hidden.has(element.props['aria-label']));
+}
+
+function expanders(elements: RenderedElement[]): RenderedElement[] {
+  return elements.filter((element) => element.type === 'details');
+}
+
+function click(button: RenderedElement | undefined): void {
+  assert.ok(button);
+  (button.props.onClick as () => void)();
+}
+
+describe('NodeDetailBody: Tested by', () => {
+  it('lists each direct test with its file and line, and an accessible name', () => {
+    const elements = testedBySection({ tests: [testEntry(1), testEntry(2), testEntry(3)], totalTests: 3, files: [] });
+    const rows = visibleButtons(elements);
+    assert.deepEqual(rows.map(textOf), [
+      'charges card 1 billing/pay.test.ts:10',
+      'charges card 2 billing/pay.test.ts:20',
+      'charges card 3 billing/pay.test.ts:30',
+    ]);
+    assert.equal(rows[0]?.props['aria-label'], 'Open test charges card 1 at billing/pay.test.ts:10');
+    assert.deepEqual(expanders(elements), []);
+    assert.equal(byClass(elements, 'code-map__node-detail-tested-by-none'), undefined);
+  });
+
+  it('a top-level row reads "<file>:<line> (top-level)", not the file name twice', () => {
+    const top: TestedByTest = { ...testEntry(4), name: 'pay.test.ts', topLevel: true };
+    const [row] = visibleButtons(testedBySection({ tests: [top], totalTests: 1, files: [] }));
+    assert.equal(textOf(row), 'billing/pay.test.ts:40 (top-level)');
+    assert.equal(row?.props['aria-label'], 'Open top-level test code at billing/pay.test.ts:40');
+  });
+
+  it('clicking a row opens that test in the source viewer, labelled, never a map Node', () => {
+    const opened: SourceTarget[] = [];
+    const tests = [testEntry(1), { ...testEntry(2), topLevel: true as const }];
+    click(visibleButtons(testedBySection({ tests, totalTests: 2, files: [] }, (target) => opened.push(target)))[1]);
+    assert.deepEqual(opened, [
+      { file: 'billing/pay.test.ts', startLine: 20, endLine: 25, label: 'billing/pay.test.ts (top-level)' },
+    ]);
+    assert.deepEqual(testSourceTarget(testEntry(1)), {
+      file: 'billing/pay.test.ts',
+      startLine: 10,
+      endLine: 15,
+      label: 'charges card 1',
+    });
+  });
+
+  it(`shows ${NODE_DETAIL_TESTED_BY_ROWS} rows, then a "+25 more" expander with every carried test and the capped-list line`, () => {
+    // 30 direct tests: the Graph Service carries 20 and the full count.
+    const tests = Array.from({ length: 20 }, (_, i) => testEntry(i + 1));
+    const elements = testedBySection({ tests, totalTests: 30, files: [] });
+    assert.equal(visibleButtons(elements).length, 5);
+    const [expander] = expanders(elements);
+    assert.ok(expander);
+    const inside = renderTree(expander.props.children);
+    assert.equal(textOf(inside.find((element) => element.type === 'summary')), '+25 more');
+    assert.equal(inside.filter((element) => element.type === 'button').length, 15, 'the other 15 carried tests');
+    assert.equal(textOf(byClass(inside, 'code-map__node-detail-tests-truncated')), 'Showing the first 20 of 30.');
+  });
+
+  it('an expander holding every test omits the capped-list line', () => {
+    const tests = Array.from({ length: 8 }, (_, i) => testEntry(i + 1));
+    const [expander] = expanders(testedBySection({ tests, totalTests: 8, files: [] }));
+    assert.ok(expander);
+    const inside = renderTree(expander.props.children);
+    assert.equal(textOf(inside.find((element) => element.type === 'summary')), '+3 more');
+    assert.equal(byClass(inside, 'code-map__node-detail-tests-truncated'), undefined);
+  });
+
+  it('shows TESTS_FILE files as buttons opening the file at its start', () => {
+    const opened: SourceTarget[] = [];
+    const elements = testedBySection(
+      { tests: [], totalTests: 0, files: [{ file: 'billing/pay.test.ts', startLine: 1, endLine: 88 }, { file: 'billing/norange.test.ts' }] },
+      (target) => opened.push(target),
+    );
+    assert.equal(textOf(byClass(elements, 'code-map__node-detail-test-files-label')), 'Tests for this file:');
+    const [button] = visibleButtons(elements);
+    assert.equal(button?.props['aria-label'], 'Open test file billing/pay.test.ts');
+    click(button);
+    assert.deepEqual(opened, [{ file: 'billing/pay.test.ts', startLine: 1, endLine: 88, label: 'billing/pay.test.ts' }]);
+    // A file the index gave no range for is listed, but not a button.
+    assert.equal(visibleButtons(elements).length, 1);
+    assert.match(textOf(elements), /billing\/norange\.test\.ts/);
+    assert.equal(byClass(elements, 'code-map__node-detail-tested-by-none'), undefined);
+  });
+
+  it('shows rows and files together, merging a file already listed as a direct test', () => {
+    const elements = testedBySection({
+      tests: [testEntry(1)],
+      totalTests: 1,
+      files: [
+        { file: 'billing/pay.test.ts', startLine: 1, endLine: 80 },
+        { file: 'billing/refund.test.ts', startLine: 1, endLine: 40 },
+      ],
+    });
+    assert.deepEqual(visibleButtons(elements).map(textOf), ['charges card 1 billing/pay.test.ts:10', 'billing/refund.test.ts']);
+  });
+
+  it(`caps test files at ${NODE_DETAIL_TESTED_BY_ROWS} with a "+N more" expander`, () => {
+    const files = Array.from({ length: 7 }, (_, i) => ({ file: `billing/f${i}.test.ts`, startLine: 1, endLine: 9 }));
+    const elements = testedBySection({ tests: [], totalTests: 0, files });
+    assert.equal(visibleButtons(elements).length, 5);
+    const [expander] = expanders(elements);
+    assert.ok(expander);
+    const inside = renderTree(expander.props.children);
+    assert.equal(textOf(inside.find((element) => element.type === 'summary')), '+2 more');
+    assert.equal(inside.filter((element) => element.type === 'button').length, 2);
+  });
+
+  it('says "No test link found", muted, with no evidence, and never "untested"', () => {
+    for (const testedBy of [undefined, { tests: [], totalTests: 0, files: [] }]) {
+      const elements = testedBySection(testedBy);
+      assert.equal(textOf(byClass(elements, 'code-map__node-detail-tested-by-none')), NO_TEST_LINK_FOUND);
+      assert.equal(NO_TEST_LINK_FOUND, 'No test link found');
+      assert.doesNotMatch(textOf(elements), /untested|not tested/i);
+    }
+  });
+
+  it('never says "No test link found" while totalTests > 0', () => {
+    const elements = testedBySection({ tests: [], totalTests: 4, files: [] });
+    assert.equal(byClass(elements, 'code-map__node-detail-tested-by-none'), undefined);
+    assert.equal(textOf(elements.find((element) => element.type === 'summary')), '+4 more');
+  });
+
+  it('survives a broken totalTests < tests.length (an invariant violation) by counting what is carried', () => {
+    const tests = Array.from({ length: 7 }, (_, i) => testEntry(i + 1));
+    const elements = testedBySection({ tests, totalTests: 2, files: [] });
+    const summary = elements.find((element) => element.type === 'summary');
+    assert.equal(textOf(summary), '+2 more', 'never a negative or missing count');
+    assert.doesNotMatch(textOf(elements), /-\d+ more/);
+  });
+});
+
+describe('openTestFromDetail', () => {
+  it('opens the source viewer over Node detail, leaving Node detail open', () => {
+    const calls: string[] = [];
+    const target: SourceTarget = { file: 'billing/pay.test.ts', startLine: 10, endLine: 15, label: 'charges card 1' };
+    let opened: SourceTarget | undefined;
+    openTestFromDetail(target, {
+      closeNodeDetail: () => calls.push('closeNodeDetail'),
+      openSourceForNode: (t) => {
+        calls.push('openSourceForNode');
+        opened = t;
+      },
+    });
+    assert.deepEqual(calls, ['openSourceForNode']);
+    assert.equal(opened, target);
   });
 });

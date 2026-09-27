@@ -6,6 +6,7 @@
  */
 import { fetchCodeMap, type CodeMapFetchResult, type FetchCodeMapOptions } from './mcp-client';
 import { toProjectRelativePosixPath } from './project-path';
+import { attachTestedBy } from './tested-by';
 import { excludeTestCode, isTestPath } from './test-code';
 
 type FetchCodeMap = (project: string, timeoutMs?: number, options?: FetchCodeMapOptions) => Promise<CodeMapFetchResult>;
@@ -46,22 +47,53 @@ function normalizeFile(projectRoot: string, rawPath: string, context: string): s
   }
 }
 
+/** Options for `fetchProductionCodeMap`. */
+export interface ProductionCodeMapOptions {
+  /** The raw fetch; `fetchCodeMap` unless a test injects one. */
+  fetch?: FetchCodeMap;
+  /**
+   * P4-2 phase 2: fetch test-link evidence and attach `testedBy` to the
+   * production Nodes. Only the Code Map handler asks for it (its Nodes feed
+   * Node detail and `lookup_node`); Path Trace doesn't need it.
+   */
+  includeTestedBy?: boolean;
+}
+
 /**
  * Fetches the Code Map for `project` with every Node's `file` project-
  * relative and all test code removed: test Nodes, edges touching them, and
- * test files' hotspot rows. Throws whatever `fetchCodeMap` throws.
+ * test files' hotspot rows. With `includeTestedBy`, production Nodes carry
+ * `testedBy`, resolved against the test Nodes before they are removed.
+ * Throws whatever `fetchCodeMap` throws.
  */
 export async function fetchProductionCodeMap(
   project: string,
   projectRoot: string,
   context: string,
-  fetch: FetchCodeMap = fetchCodeMap,
+  options: ProductionCodeMapOptions = {},
 ): Promise<CodeMapFetchResult> {
-  const { nodes, edges } = await fetch(project, undefined, {
+  const fetch = options.fetch ?? fetchCodeMap;
+  const includeTestEvidence = options.includeTestedBy === true;
+  const { nodes, edges, testEvidence } = await fetch(project, undefined, {
     excludeFile: (file) => isTestPath(normalizeFile(projectRoot, file, `${context} hotspot file`)),
+    ...(includeTestEvidence ? { includeTestEvidence } : {}),
   });
-  return excludeTestCode(
-    nodes.map((node) => ({ ...node, file: normalizeFile(projectRoot, node.file, `${context} node file`) })),
-    edges,
-  );
+  const normalizedNodes = nodes.map((node) => ({
+    ...node,
+    file: normalizeFile(projectRoot, node.file, `${context} node file`),
+  }));
+  const withTestedBy =
+    includeTestEvidence && testEvidence !== undefined
+      ? attachTestedBy(normalizedNodes, {
+          calls: testEvidence.calls.map((call) => ({
+            ...call,
+            sourceFile: normalizeFile(projectRoot, call.sourceFile, `${context} test caller file`),
+          })),
+          testFiles: testEvidence.testFiles.map(({ testFile, file }) => ({
+            testFile: normalizeFile(projectRoot, testFile, `${context} test file`),
+            file: normalizeFile(projectRoot, file, `${context} tested file`),
+          })),
+        })
+      : normalizedNodes;
+  return excludeTestCode(withTestedBy, edges);
 }

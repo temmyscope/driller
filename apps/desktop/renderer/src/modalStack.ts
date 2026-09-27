@@ -6,11 +6,14 @@
  *
  * Push order is open order, and for every combination that can actually
  * occur it is also visual z-order: Settings (`position: fixed`, z-index 20,
- * rendered by App) over either CodeMap overlay (z-index 10). The two CodeMap
- * overlays never stack on each other — Node Detail's "View source" closes
- * Node Detail before opening the source viewer, since both sit at z-index 10
- * and Node Detail renders later in the DOM. So the top of this stack is
- * always the dialog the user can see on top.
+ * rendered by App) over either CodeMap overlay. The source viewer (z-index
+ * 11) sits over Node Detail (z-index 10): P4-2 phase 2's "Tested by" rows
+ * open it on top of a still-open Node Detail, so Escape returns to that
+ * Node. It can only ever open after Node Detail, never under it — while it
+ * is open its scrim covers every surface that opens Node Detail. Node
+ * Detail's own "View source" still closes Node Detail first (its P0-1
+ * behaviour). So the top of this stack is always the dialog the user can
+ * see on top.
  *
  * Every decision the hook makes — which key does what, whether a scrim press
  * closes, whether closing restores focus, whether an overlay is open — is a

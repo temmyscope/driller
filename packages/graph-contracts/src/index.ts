@@ -945,7 +945,64 @@ export interface CodeMapNode {
    * a Node with zero risk signals is `riskSignals: []`, not a missing field.
    */
   riskSignals: RiskSignal[];
+  /**
+   * P4-2 phase 2: the tests that provably exercise this Node, from real
+   * backend links only (see `TestedBy`). Absent when no link was found —
+   * which never means "untested": the backend's test links are incomplete.
+   */
+  testedBy?: TestedBy;
 }
+
+/**
+ * P4-2 phase 2: one test that directly calls a Node through an
+ * import-resolved `CALLS` edge. Tests are not map Nodes (`lookup_node`
+ * returns not-found for their ids), so this carries the source range the
+ * in-app source viewer opens at, not a map id to navigate to.
+ */
+export interface TestedByTest {
+  /** The test's backend `qualified_name`. */
+  id: string;
+  /** The test function's name; for a `topLevel` entry, the test file's base name. */
+  name: string;
+  /** POSIX-relative path of the test file. */
+  file: string;
+  /** Range to open in the source viewer: the test function's range, or the call's own line for a `topLevel` entry. */
+  startLine: number;
+  endLine: number;
+  /** The call is made at the test file's top level (e.g. inside `test(...)`), not from a named test function. */
+  topLevel?: true;
+}
+
+/**
+ * P4-2 phase 2: a test file linked to a Node's own file by `TESTS_FILE`.
+ * The range is the whole test file, taken from its Module Node; absent when
+ * the index has no Module for it, in which case the file can't be opened.
+ */
+export interface TestedByFile {
+  /** POSIX-relative path of the test file. */
+  file: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+/**
+ * P4-2 phase 2: "Tested by" evidence for a production Node. Only two sources
+ * count, never a bare name match: test→production `CALLS` edges the backend
+ * resolved through an import (`tests`), and `TESTS_FILE` File→File edges
+ * into the Node's own file (`files`). The absence of evidence means "no
+ * link found", never "untested".
+ */
+export interface TestedBy {
+  /** Direct callers, sorted by file then line, capped at `TESTED_BY_MAX_TESTS`. */
+  tests: TestedByTest[];
+  /** How many distinct tests directly call this Node, before the cap. Never below `tests.length`. */
+  totalTests: number;
+  /** Test files linked to this Node's file by `TESTS_FILE`, sorted by path. */
+  files: TestedByFile[];
+}
+
+/** P4-2 phase 2: the most `TestedBy.tests` entries carried per Node. */
+export const TESTED_BY_MAX_TESTS = 20;
 
 /** The call/dependency edge kinds rendered on the Code Map (FR4) — never a containment edge. */
 export type CodeMapEdgeKind = 'CALLS' | 'IMPORTS' | 'USAGE';

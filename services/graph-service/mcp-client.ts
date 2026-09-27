@@ -28,6 +28,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { IMPORT_RESOLVED_CALL_STRATEGIES, TEST_CALLER_PATH_FRAGMENTS } from './test-evidence-strategies';
 import type {
   CodeMapEdge,
   CodeMapEdgeKind,
@@ -61,6 +62,54 @@ export interface IndexRepositoryResult {
 export interface CodeMapFetchResult {
   nodes: CodeMapNodeWithSignalSources[];
   edges: CodeMapEdge[];
+  /**
+   * P4-2 phase 2: raw test-link evidence, present only when
+   * `FetchCodeMapOptions.includeTestEvidence` asked for it.
+   * `production-code-map.ts` turns it into `CodeMapNode.testedBy`.
+   */
+  testEvidence?: TestEvidence;
+}
+
+/**
+ * P4-2 phase 2: one `CALLS` edge from a test-side caller whose strategy is
+ * in `IMPORT_RESOLVED_CALL_STRATEGIES`, straight off
+ * `TEST_EVIDENCE_CALLS_QUERY`. It carries its caller's own details because a
+ * caller need not be a map Node (a `Method`, e.g. a JUnit test method, never
+ * is). `tested-by.ts` makes the final test/production call.
+ */
+export interface TestCallEvidence {
+  /** Caller's `qualified_name`. */
+  source: string;
+  /** Caller's `name` (a Module's is its file path). */
+  sourceName: string;
+  /** Caller's `file_path`, as the backend reports it. */
+  sourceFile: string;
+  sourceStartLine: number;
+  sourceEndLine: number;
+  /** Caller's label. A `Module` caller is a test file's top level. */
+  sourceKind: 'Function' | 'Method' | 'Module';
+  /** Caller's backend `is_test`, set only when true. */
+  sourceIsTest?: boolean;
+  /** Callee's `qualified_name`. */
+  target: string;
+  /** The backend's `r.strategy`. */
+  strategy: string;
+  /** The backend's `r.confidence`, when reported. */
+  confidence?: number;
+  /** The call's own line (`r.line`), when reported. */
+  line?: number;
+}
+
+/** P4-2 phase 2: one `TESTS_FILE` File→File edge, paths as the backend reports them. */
+export interface TestFileEvidence {
+  testFile: string;
+  file: string;
+}
+
+/** P4-2 phase 2: everything `attachTestedBy` reads. */
+export interface TestEvidence {
+  calls: TestCallEvidence[];
+  testFiles: TestFileEvidence[];
 }
 
 /**
@@ -418,6 +467,57 @@ const CODE_MAP_FILES_QUERY = `MATCH (f:File) RETURN f.file_path AS file, f.chang
 // edges are CALLS and USAGE only.
 const CODE_MAP_EDGES_QUERY = `MATCH (a:Function|Interface|Type|Module)-[r:CALLS|USAGE]->(b:Function|Interface|Type|Module) WHERE a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL RETURN a.qualified_name AS source, b.qualified_name AS target, type(r) AS kind`;
 
+// P4-2 phase 2: "Tested by" evidence. Property names confirmed with
+// `get_graph_schema` on the indexed driller/app project (2026-09-27): `CALLS`
+// carries `strategy`, `confidence`, `line` (plus `args`, `callee`,
+// `candidates`); `TESTS_FILE` is File→File with no properties of its own;
+// `is_test` exists on Function, Method and Module. Which strategies count is
+// `test-evidence-strategies.ts`'s `IMPORT_RESOLVED_CALL_STRATEGIES`.
+//
+// Live-verified on driller/app (2026-09-27): a parenthesized
+// `(... OR ...) AND (... OR ...)` WHERE mixing a node flag, `CONTAINS` on a
+// node path and the relationship's `strategy` evaluates as written on this
+// engine (an impossible path clause returns 0 rows; the full query returns
+// 275 rows, 225 of them into production code). The caller side is limited
+// to test code in Cypher — the backend's `is_test`, or a path fragment from
+// `TEST_CALLER_PATH_FRAGMENTS` — so production→production edges are never
+// fetched; `tested-by.ts` still re-checks every row.
+//
+// Callers are Function|Method|Module. Most test calls are made at a test
+// file's top level (inside `test(...)`), which the backend attributes to the
+// file's Module: `formatSyncAge` is called by the `appFrame.test` Module
+// (import_map, 0.95, line 381). `Method` covers class-based test frameworks
+// (JUnit, xUnit, unittest). Targets stay the map's own labels: `Method` is
+// not a map Node (`CODE_MAP_NODES_QUERY`), so there is nothing to attach a
+// "Tested by" row to — a Method target could never be shown. Exported for
+// tests.
+export const TEST_EVIDENCE_CALLS_QUERY = `MATCH (a:Function|Method|Module)-[r:CALLS]->(b:Function|Interface|Type|Module) WHERE (${[
+  'a.is_test = true',
+  ...TEST_CALLER_PATH_FRAGMENTS.map((fragment) => `a.file_path CONTAINS '${fragment}'`),
+].join(' OR ')}) AND (${IMPORT_RESOLVED_CALL_STRATEGIES.map((strategy) => `r.strategy = '${strategy}'`).join(
+  ' OR ',
+)}) RETURN a.qualified_name AS source, a.name AS sourceName, a.file_path AS sourceFile, a.start_line AS sourceStartLine, a.end_line AS sourceEndLine, a.is_test AS sourceIsTest, CASE WHEN a:Module THEN 'Module' WHEN a:Method THEN 'Method' ELSE 'Function' END AS sourceKind, b.qualified_name AS target, r.strategy AS strategy, r.confidence AS confidence, r.line AS line`;
+
+// Live-verified: 18 rows on driller/app (2026-09-27), all same-stem
+// (`x.test.ts`→`x.ts`). An unknown relationship type returns `rows: 0` on
+// this engine rather than an error, so an older backend without TESTS_FILE
+// simply yields none. (File nodes report `start_line`/`end_line` 0, so a
+// test file's range comes from its Module Node instead; see `tested-by.ts`.)
+export const TEST_EVIDENCE_FILES_QUERY = `MATCH (t:File)-[r:TESTS_FILE]->(f:File) RETURN t.file_path AS testFile, f.file_path AS file`;
+
+/**
+ * P4-2 phase 2: each evidence query's own bound, independent of the whole
+ * fetch's `DEFAULT_TIMEOUT_MS`: evidence is a detail row, so a hung query
+ * must give up long before it could threaten the map itself.
+ */
+export const EVIDENCE_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * `query_graph`'s documented hard row ceiling ("a hard 100k row ceiling" in
+ * its own tool description). A result that reaches it may be cut short.
+ */
+const QUERY_GRAPH_ROW_CEILING = 100_000;
+
 /**
  * Connects to `codebase-memory-mcp` over stdio and runs the Code Map's two
  * `query_graph` Cypher calls against `project` (the backend's own project
@@ -462,6 +562,12 @@ export interface FetchCodeMapOptions {
    * files never feed the per-file hotspot population.
    */
   excludeFile?: (file: string) => boolean;
+  /**
+   * P4-2 phase 2: also fetch test-link evidence (`TEST_EVIDENCE_*_QUERY`)
+   * over the same connection. Best-effort: a failed evidence query is logged
+   * and leaves that part empty, never failing the map.
+   */
+  includeTestEvidence?: boolean;
 }
 
 async function runFetchCodeMap(
@@ -471,7 +577,24 @@ async function runFetchCodeMap(
   options: FetchCodeMapOptions,
 ): Promise<CodeMapFetchResult> {
   await client.connect(transport);
+  return runCodeMapQueries(client, project, options);
+}
 
+/** The one method of the MCP `Client` the Code Map queries use — a seam, so tests can drive them with a stub. */
+export type QueryGraphClient = Pick<Client, 'callTool'>;
+
+/**
+ * Runs the Code Map's `query_graph` calls over an already-connected client:
+ * nodes, edges and files (any failure throws), then — only with
+ * `includeTestEvidence` — the two best-effort evidence queries. Exported
+ * for tests; `evidenceTimeoutMs` is a test seam too.
+ */
+export async function runCodeMapQueries(
+  client: QueryGraphClient,
+  project: string,
+  options: FetchCodeMapOptions,
+  evidenceTimeoutMs: number = EVIDENCE_TIMEOUT_MS,
+): Promise<CodeMapFetchResult> {
   const nodesResult = await client.callTool({
     name: 'query_graph',
     arguments: { project, query: CODE_MAP_NODES_QUERY },
@@ -505,7 +628,134 @@ async function runFetchCodeMap(
     throw new Error(`query_graph (Code Map files) reported an error: ${extractErrorText(filesResult)}`);
   }
   const fileRows = parseCodeMapRows(filesResult, parseCodeMapFileRow, 'Code Map files');
-  return { nodes: joinHotspotChangeCounts(nodes, fileRows, options.excludeFile), edges };
+  const joinedNodes = joinHotspotChangeCounts(nodes, fileRows, options.excludeFile);
+  if (options.includeTestEvidence !== true) {
+    return { nodes: joinedNodes, edges };
+  }
+  const [calls, testFiles] = await Promise.all([
+    queryTestEvidence(client, project, TEST_EVIDENCE_CALLS_QUERY, parseTestCallEvidenceRow, 'test calls', evidenceTimeoutMs),
+    queryTestEvidence(client, project, TEST_EVIDENCE_FILES_QUERY, parseTestFileEvidenceRow, 'test files', evidenceTimeoutMs),
+  ]);
+  return { nodes: joinedNodes, edges, testEvidence: { calls, testFiles } };
+}
+
+/**
+ * P4-2 phase 2: runs one evidence query under its own `timeoutMs`. Never
+ * throws: evidence is a detail row, so an error or a timeout logs one
+ * warning and yields no rows for this part, and the map still returns. The
+ * UI's wording ("No test link found") stays true either way. A result that
+ * may be cut short (see `queryGraphTruncation`) is used as-is, with a
+ * warning.
+ */
+async function queryTestEvidence<T>(
+  client: QueryGraphClient,
+  project: string,
+  query: string,
+  parseRow: (row: Record<string, string>) => T | undefined,
+  label: string,
+  timeoutMs: number,
+): Promise<T[]> {
+  try {
+    // `withTimeout` clears its timer as soon as the call settles, and a timed-out
+    // call leaves no timer behind, so nothing here keeps the process alive.
+    const result = await withTimeout(
+      client.callTool({ name: 'query_graph', arguments: { project, query } }),
+      timeoutMs,
+      `query_graph (Tested by ${label})`,
+    );
+    if (result.isError) {
+      throw new Error(extractErrorText(result));
+    }
+    const rows = parseCodeMapRows(result, parseRow, `Tested by (${label})`);
+    const text = extractQueryGraphText(result);
+    const truncation = text !== undefined ? queryGraphTruncation(text) : undefined;
+    if (truncation !== undefined) {
+      console.warn(`[graph-service] Tested by (${label}) evidence may be incomplete: ${truncation}`);
+    }
+    return rows;
+  } catch (error) {
+    console.warn(
+      `[graph-service] Tested by (${label}) evidence unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * P4-2 phase 2: why a `query_graph` text result may be cut short, or
+ * `undefined` when nothing says so. `query_graph` has no offset or cursor
+ * (its tool description: "No offset support"), so the signals are: a
+ * `total:` above the header's `rows:`, a row count at the documented
+ * 100k ceiling, or an explicit `has_more`/`truncated`/cursor marker should
+ * a future backend build add one. Pure; exported for tests.
+ */
+export function queryGraphTruncation(text: string): string | undefined {
+  const rows = /^rows:\s*(\d+)/m.exec(text);
+  const total = /^total:\s*(\d+)/m.exec(text);
+  const rowCount = rows?.[1] !== undefined ? Number(rows[1]) : undefined;
+  const totalCount = total?.[1] !== undefined ? Number(total[1]) : undefined;
+  if (rowCount !== undefined && totalCount !== undefined && totalCount > rowCount) {
+    return `${rowCount} of ${totalCount} rows returned`;
+  }
+  if (rowCount !== undefined && rowCount >= QUERY_GRAPH_ROW_CEILING) {
+    return `${rowCount} rows, at query_graph's ${QUERY_GRAPH_ROW_CEILING}-row ceiling`;
+  }
+  if (/\b(has_more|truncated)\b["']?\s*[:=]\s*["']?true\b|\bnext_?cursor\b/i.test(text)) {
+    return 'the backend reported more rows than it returned';
+  }
+  return undefined;
+}
+
+/**
+ * P4-2 phase 2: parses a `TEST_EVIDENCE_CALLS_QUERY` row. The strategy and
+ * confidence are kept, not trusted: `attachTestedBy` re-checks both, so a
+ * backend that ignored the WHERE could still never admit a name-only edge.
+ * Exported for tests.
+ */
+export function parseTestCallEvidenceRow(row: Record<string, string>): TestCallEvidence | undefined {
+  const { source, sourceName, sourceFile, sourceKind, target, strategy } = row;
+  const sourceStartLine = toLineNumber(row.sourceStartLine);
+  const sourceEndLine = toLineNumber(row.sourceEndLine);
+  if (
+    typeof source !== 'string' ||
+    source.length === 0 ||
+    typeof sourceName !== 'string' ||
+    typeof sourceFile !== 'string' ||
+    sourceFile.length === 0 ||
+    sourceStartLine === undefined ||
+    sourceEndLine === undefined ||
+    (sourceKind !== 'Function' && sourceKind !== 'Method' && sourceKind !== 'Module') ||
+    typeof target !== 'string' ||
+    target.length === 0 ||
+    typeof strategy !== 'string' ||
+    strategy.length === 0
+  ) {
+    return undefined;
+  }
+  const confidence = toOptionalSignalValue(row.confidence);
+  const line = toLineNumber(row.line);
+  return {
+    source,
+    sourceName,
+    sourceFile,
+    sourceStartLine,
+    sourceEndLine,
+    sourceKind,
+    ...(parseTestFlag(row.sourceIsTest) ? { sourceIsTest: true } : {}),
+    target,
+    strategy,
+    ...(confidence !== undefined ? { confidence } : {}),
+    ...(line !== undefined ? { line } : {}),
+  };
+}
+
+/** P4-2 phase 2: parses a `TEST_EVIDENCE_FILES_QUERY` row. Exported for tests. */
+export function parseTestFileEvidenceRow(row: Record<string, string>): TestFileEvidence | undefined {
+  const { testFile, file } = row;
+  if (typeof testFile !== 'string' || testFile.length === 0 || typeof file !== 'string' || file.length === 0) {
+    return undefined;
+  }
+  return { testFile, file };
 }
 
 /**

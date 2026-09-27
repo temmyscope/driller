@@ -93,6 +93,9 @@ import type {
   PathTraceResult,
   RiskSignal,
   SummaryStatus,
+  TestedBy,
+  TestedByFile,
+  TestedByTest,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import {
@@ -121,11 +124,19 @@ export type FetchState =
     }
   | { status: 'error'; message: string };
 
+/**
+ * What the in-app source viewer opens: a file and line range. A Node is one;
+ * P4-2 phase 2's "Tested by" rows open a test, which is not a map Node, and
+ * name it with `label` (the test's name, or the test file for a file row)
+ * so the viewer's header says what it is showing.
+ */
+export type SourceTarget = Pick<CodeMapNode, 'file' | 'startLine' | 'endLine'> & { label?: string };
+
 export type SourceViewState =
   | { status: 'closed' }
-  | { status: 'loading'; node: CodeMapNode }
-  | { status: 'open'; node: CodeMapNode; content: string }
-  | { status: 'error'; node: CodeMapNode; message: string };
+  | { status: 'loading'; node: SourceTarget }
+  | { status: 'open'; node: SourceTarget; content: string }
+  | { status: 'error'; node: SourceTarget; message: string };
 
 /**
  * The Node Detail panel's own state (Story 1.8, Phase 4) — mirrors
@@ -3812,6 +3823,7 @@ export function PathTraceSearchRow({
 export const NODE_DETAIL_SECTION_HEADING_IDS = {
   summary: 'code-map-node-detail-summary-heading',
   riskOverlay: 'code-map-node-detail-risk-overlay-heading',
+  testedBy: 'code-map-node-detail-tested-by-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -3826,11 +3838,186 @@ export interface NodeDetailBodyProps {
   regenerateState: RegenerateState;
   graphServiceAvailable: boolean;
   onRegenerate: () => void;
+  /** P4-2 phase 2: opens a "Tested by" row's test or test file in the source viewer (tests aren't map Nodes, so this never navigates the map). */
+  onOpenTest: (target: SourceTarget) => void;
+}
+
+/** P4-2 phase 2: how many "Tested by" test rows (and, separately, test files) Node detail shows before "+N more". */
+export const NODE_DETAIL_TESTED_BY_ROWS = 5;
+
+/** P4-2 phase 2: the copy for a Node with no test link. Never "untested": the backend's test links are incomplete. */
+export const NO_TEST_LINK_FOUND = 'No test link found';
+
+/** P4-2 phase 2: where a "Tested by" test row opens the source viewer, named for its header. */
+export function testSourceTarget(test: TestedByTest): SourceTarget {
+  return {
+    file: test.file,
+    startLine: test.startLine,
+    endLine: test.endLine,
+    label: test.topLevel === true ? `${test.file} (top-level)` : test.name,
+  };
+}
+
+/** P4-2 phase 2: where a "Tests for this file" entry opens — the file's start — or `undefined` when the index gave it no range. */
+export function testFileSourceTarget(file: TestedByFile): SourceTarget | undefined {
+  if (file.startLine === undefined || file.endLine === undefined) {
+    return undefined;
+  }
+  return { file: file.file, startLine: file.startLine, endLine: file.endLine, label: file.file };
+}
+
+/**
+ * P4-2 phase 2: opens a "Tested by" row's source from Node detail. The
+ * source viewer stacks over Node detail as the top modal layer (P2-7/8), so
+ * Escape (or its close button) returns to the same Node detail. Node detail
+ * is therefore deliberately left open: `closeNodeDetail` is taken only so
+ * that choice is explicit, and is never called. Hookless, so it's testable.
+ */
+export function openTestFromDetail(
+  target: SourceTarget,
+  { openSourceForNode }: { closeNodeDetail: () => void; openSourceForNode: (target: SourceTarget) => void },
+): void {
+  openSourceForNode(target);
+}
+
+function TestedByTestRow({ test, onOpenTest }: { test: TestedByTest; onOpenTest: (target: SourceTarget) => void }) {
+  const location = `${test.file}:${test.startLine}`;
+  const topLevel = test.topLevel === true;
+  return (
+    <li>
+      <button
+        type="button"
+        className="code-map__node-detail-test"
+        onClick={() => onOpenTest(testSourceTarget(test))}
+        aria-label={topLevel ? `Open top-level test code at ${location}` : `Open test ${test.name} at ${location}`}
+      >
+        {topLevel ? (
+          <>
+            <code className="code-map__node-detail-test-file">{location}</code>{' '}
+            <span className="code-map__node-detail-test-top-level">(top-level)</span>
+          </>
+        ) : (
+          <>
+            <code className="code-map__node-detail-test-name">{test.name}</code>{' '}
+            <code className="code-map__node-detail-test-file">{location}</code>
+          </>
+        )}
+      </button>
+    </li>
+  );
+}
+
+function TestedByFileRow({ file, onOpenTest }: { file: TestedByFile; onOpenTest: (target: SourceTarget) => void }) {
+  const target = testFileSourceTarget(file);
+  return (
+    <li>
+      {target === undefined ? (
+        <code className="code-map__node-detail-test-file">{file.file}</code>
+      ) : (
+        <button
+          type="button"
+          className="code-map__node-detail-test"
+          onClick={() => onOpenTest(target)}
+          aria-label={`Open test file ${file.file}`}
+        >
+          <code className="code-map__node-detail-test-file">{file.file}</code>
+        </button>
+      )}
+    </li>
+  );
+}
+
+/**
+ * P4-2 phase 2: the "Tested by" section's content.
+ *
+ * - Direct tests: the first `NODE_DETAIL_TESTED_BY_ROWS` rows, then a
+ *   native `<details>` expander ("+N more", N counted against the full
+ *   `totalTests`) holding the rest of the carried tests (up to
+ *   `TESTED_BY_MAX_TESTS`) and, as P2-4's capped lists do, a "Showing the
+ *   first X of Y" line when the Graph Service carried fewer than exist.
+ * - "Tests for this file": `TESTS_FILE` files not already listed as a direct
+ *   test's file, each opening the file's start; capped the same way.
+ * - No evidence at all: "No test link found", muted — never "untested", and
+ *   never while `totalTests > 0`.
+ *
+ * Every row opens the source viewer via `onOpenTest`; tests are not map
+ * Nodes, so nothing here navigates the map. Hookless, like `NodeDetailBody`.
+ */
+export function NodeTestedBy({
+  testedBy,
+  onOpenTest,
+}: {
+  testedBy: TestedBy | undefined;
+  onOpenTest: (target: SourceTarget) => void;
+}) {
+  const tests = testedBy?.tests ?? [];
+  // `totalTests < tests.length` must never happen; if it does, count what is carried.
+  const total = Math.max(testedBy?.totalTests ?? 0, tests.length);
+  const testFilesListed = new Set(tests.map((test) => test.file));
+  const files = (testedBy?.files ?? []).filter((file) => !testFilesListed.has(file.file));
+  if (total === 0 && files.length === 0) {
+    return <p className="code-map__node-detail-tested-by-none">{NO_TEST_LINK_FOUND}</p>;
+  }
+
+  const shown = tests.slice(0, NODE_DETAIL_TESTED_BY_ROWS);
+  const rest = tests.slice(NODE_DETAIL_TESTED_BY_ROWS);
+  const more = total - shown.length;
+  const shownFiles = files.slice(0, NODE_DETAIL_TESTED_BY_ROWS);
+  const restFiles = files.slice(NODE_DETAIL_TESTED_BY_ROWS);
+  return (
+    <>
+      {shown.length > 0 && (
+        <ul className="code-map__node-detail-tests">
+          {shown.map((test) => (
+            <TestedByTestRow key={`${test.id}:${test.file}:${test.startLine}`} test={test} onOpenTest={onOpenTest} />
+          ))}
+        </ul>
+      )}
+      {more > 0 && (
+        <details className="code-map__node-detail-tests-more">
+          <summary>+{more} more</summary>
+          {rest.length > 0 && (
+            <ul className="code-map__node-detail-tests">
+              {rest.map((test) => (
+                <TestedByTestRow key={`${test.id}:${test.file}:${test.startLine}`} test={test} onOpenTest={onOpenTest} />
+              ))}
+            </ul>
+          )}
+          {tests.length < total && (
+            <p className="code-map__node-detail-tests-truncated">
+              Showing the first {tests.length} of {total}.
+            </p>
+          )}
+        </details>
+      )}
+      {files.length > 0 && (
+        <div className="code-map__node-detail-test-files">
+          <p className="code-map__node-detail-test-files-label">Tests for this file:</p>
+          <ul className="code-map__node-detail-tests">
+            {shownFiles.map((file) => (
+              <TestedByFileRow key={file.file} file={file} onOpenTest={onOpenTest} />
+            ))}
+          </ul>
+          {restFiles.length > 0 && (
+            <details className="code-map__node-detail-tests-more">
+              <summary>+{restFiles.length} more</summary>
+              <ul className="code-map__node-detail-tests">
+                {restFiles.map((file) => (
+                  <TestedByFileRow key={file.file} file={file} onOpenTest={onOpenTest} />
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+    </>
+  );
 }
 
 /**
  * P2-12: Node Detail's scrolling body — the mockup's labelled, divided
- * sections in the order Summary → Risk Overlay → Staleness → Location.
+ * sections in the order Summary → Risk Overlay → Tested by → Staleness →
+ * Location.
  * Presentation only: every state, action and handler is the one the panel
  * already had, passed in. Hookless so `CodeMap.nodeDetail.test.ts` can render
  * it as a plain function.
@@ -3844,6 +4031,7 @@ export function NodeDetailBody({
   regenerateState,
   graphServiceAvailable,
   onRegenerate,
+  onOpenTest,
 }: NodeDetailBodyProps) {
   const ids = NODE_DETAIL_SECTION_HEADING_IDS;
   const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
@@ -3928,6 +4116,15 @@ export function NodeDetailBody({
               : 'No risk signals shown.'}
           </p>
         )}
+      </section>
+      {/* P4-2 phase 2: tests that provably exercise this Node — from real
+          backend links only, never a name match. Always present; with no
+          link it says so, and never claims the Node is untested. */}
+      <section className="code-map__node-detail-section" aria-labelledby={ids.testedBy}>
+        <h3 id={ids.testedBy} className="code-map__node-detail-label">
+          Tested by
+        </h3>
+        <NodeTestedBy testedBy={node.testedBy} onOpenTest={onOpenTest} />
       </section>
       <section className="code-map__node-detail-section" aria-labelledby={ids.staleness}>
         <h3 id={ids.staleness} className="code-map__node-detail-label">
@@ -4998,7 +5195,7 @@ export function CodeMap({
       });
   }, [mode, projectPath, diffScopeState, blastRadiusState.status, graphServiceAvailable]);
 
-  const openSourceForNode = useCallback((node: CodeMapNode) => {
+  const openSourceForNode = useCallback((node: SourceTarget) => {
     const requestId = ++sourceRequestIdRef.current;
     // A fresh source-view open (possibly for a different Node) invalidates
     // any still-in-flight `openInEditor` request from whatever was
@@ -6148,7 +6345,7 @@ export function CodeMap({
    * just above), rather than misattributing the cause and suggesting an
    * install/Settings fix that wouldn't address it.
    */
-  const handleOpenInEditor = useCallback((node: CodeMapNode) => {
+  const handleOpenInEditor = useCallback((node: SourceTarget) => {
     const requestId = ++openInEditorRequestIdRef.current;
     setOpenInEditorState({ status: 'opening' });
     window.driller
@@ -6869,6 +7066,9 @@ export function CodeMap({
           <div className="code-map__source-panel">
             <div className="code-map__source-header">
               <code>
+                {sourceView.node.label !== undefined && (
+                  <span className="code-map__source-label">{sourceView.node.label} — </span>
+                )}
                 {sourceView.node.file}:{sourceView.node.startLine}-{sourceView.node.endLine}
               </code>
               <div className="code-map__source-header-actions">
@@ -6965,13 +7165,14 @@ export function CodeMap({
               regenerateState={regenerateState}
               graphServiceAvailable={graphServiceAvailable}
               onRegenerate={handleRegenerate}
+              onOpenTest={(target) => openTestFromDetail(target, { closeNodeDetail, openSourceForNode })}
             />
             {/* P0-1: the one-click source action this panel's IA row
                 promises — reuses `openSourceForNode` unchanged, at this
-                Node's exact range. Closes the panel on the way: both
-                overlays are `z-index: 10` and this one renders after the
-                source overlay in the DOM, so leaving it open would hide the
-                very source view the action just opened. P2-12: pinned as the
+                Node's exact range. Closes the panel on the way (P0-1's
+                behaviour, kept: the Node's own source replaces its detail).
+                P4-2 phase 2's "Tested by" rows instead stack the source
+                viewer (z-index 11) over this panel. P2-12: pinned as the
                 panel's full-width footer, outside the scrolling body, so it
                 stays one click away however long the summary. Still "View
                 source" — it opens the in-app viewer, not the external

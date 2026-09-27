@@ -1370,10 +1370,13 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // counted in `hiddenByScope` nor seen by adjacency, blast radius, the
     // severity cuts, or anything cached from this map (diff scope,
     // `lookup_node`, Health Audit, staleness). See `test-code.ts`.
+    // P4-2 phase 2: this fetch also attaches `testedBy` (Node detail's
+    // "Tested by" row, and `lookup_node` via the cached Nodes).
     const { nodes: normalizedNodesUnfiltered, edges: productionEdges } = await fetchProductionCodeMap(
       activeProject,
       projectRoot,
       'Code Map',
+      { includeTestedBy: true },
     );
     // Bug fix (2026-09-23): filtered post-normalization (cheaper — avoids
     // `filterCodeMapToScope`'s own internal normalize-for-match-test running

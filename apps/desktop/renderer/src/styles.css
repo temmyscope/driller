@@ -2854,13 +2854,15 @@ code,
   pointer-events: none;
 }
 
+/* z-index 11: above Node detail (10), which P4-2 phase 2's "Tested by" rows
+   leave open underneath (modalStack.ts); still below Settings (20). */
 .code-map__source-overlay {
   position: absolute;
   inset: 0;
   background: color-mix(in srgb, black 50%, transparent);
   display: flex;
   justify-content: flex-end;
-  z-index: 10;
+  z-index: 11;
 }
 
 .code-map__source-panel {
@@ -3084,8 +3086,8 @@ code,
   overflow-y: auto;
 }
 
-/* One labelled, divided section — Summary, Risk Overlay, Staleness,
-   Location, in that order (CodeMap.tsx). */
+/* One labelled, divided section — Summary, Risk Overlay, Tested by,
+   Staleness, Location, in that order (CodeMap.tsx). */
 .code-map__node-detail-section {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
@@ -3184,6 +3186,83 @@ code,
 
 .code-map__node-detail-section .actionable-notice {
   margin-top: 8px;
+}
+
+/* P4-2 phase 2: "Tested by". Each test row is a quiet full-width button
+   (it opens the test in the source viewer); names and paths are code, so
+   monospace. "+N more" is a native <details> expander. "No test link found"
+   is muted like "No summary yet.": an absence of evidence, not a verdict. */
+.code-map__node-detail-tests {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.code-map__node-detail-test {
+  display: block;
+  width: 100%;
+  padding: 3px 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 1.45;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.code-map__node-detail-test:hover .code-map__node-detail-test-name,
+.code-map__node-detail-test:hover .code-map__node-detail-test-file {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.code-map__node-detail-test:focus-visible,
+.code-map__node-detail-tests-more > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.code-map__node-detail-test-file,
+.code-map__node-detail-test-top-level {
+  color: var(--text-mute);
+}
+
+.code-map__node-detail-tests-more,
+.code-map__node-detail-test-files {
+  margin: 4px 0 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.code-map__node-detail-tests-more > summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.code-map__node-detail-test-files-label,
+.code-map__node-detail-tests-truncated {
+  margin: 0;
+}
+
+.code-map__node-detail-tested-by-none {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-mute);
+}
+
+/* The source viewer's header names a "Tested by" target (test or file). */
+.code-map__source-label {
+  color: var(--text);
 }
 
 /* 10.5px `--text-dim` per the mockup's Location line. */

@@ -62,7 +62,7 @@ import {
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts';
-import { BLAST_RADIUS_DEFAULT_HOPS, type NodeLookupResult } from '@driller/graph-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS, TESTED_BY_MAX_TESTS, type NodeLookupResult } from '@driller/graph-contracts';
 import {
   computeBlastRadiusExpansionResult,
   computeDiffScopeResult,
@@ -310,7 +310,8 @@ export function startMcpServer(
       description:
         "Look up a single Node from driller's Code Map by its stable id (qualified name). Returns the exact same shape the human-facing UI shows for that Node, including its full Risk Overlay signals and summary staleness (summaryStatus) — nothing is computed differently for this surface than for the renderer. " +
         `The 'blast-radius' signal's value is a bounded count, not total impact: the distinct Nodes within ${BLAST_RADIUS_DEFAULT_HOPS} hops that this Node reaches (following edges forward) or that reach it (following edges backward), each direction searched separately — Nodes that merely share a caller or callee with it are not counted. ` +
-        "Every deterministic signal carries a 'severity': 'severe' means the value crossed driller's severe threshold; 'moderate' means only \"not severe\" — it covers every value below that threshold, including trivial ones, and is not a claim that the value is risky.",
+        "Every deterministic signal carries a 'severity': 'severe' means the value crossed driller's severe threshold; 'moderate' means only \"not severe\" — it covers every value below that threshold, including trivial ones, and is not a claim that the value is risky. " +
+        `'testedBy', when present, lists tests that provably exercise this Node: 'tests' are test functions or methods (or, with 'topLevel', a test file's top-level test code) that call it through an import-resolved call edge, capped at ${TESTED_BY_MAX_TESTS} with 'totalTests' giving the full count; 'files' are test files the index links to this Node's file. Name-only matches never count. Tests are not Code Map Nodes: looking up a test's id returns not-found; open its file and line range instead. An absent 'testedBy' means no test link was found, NOT that the Node is untested: the index's test links are incomplete, so never report a Node as untested or infer coverage from their absence.`,
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),

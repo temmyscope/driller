@@ -1,0 +1,172 @@
+/**
+ * P4-2 phase 2 (review round 1): the Code Map's `query_graph` sequence,
+ * driven through `runCodeMapQueries` with a stub `callTool`. Test evidence is
+ * fetched only when asked for, both evidence queries go out together, rows
+ * reach `testEvidence`, and an evidence query that errors, throws or hangs
+ * leaves the map's nodes and edges intact.
+ */
+import assert from 'node:assert/strict';
+import { describe, it, mock } from 'node:test';
+
+import {
+  runCodeMapQueries,
+  TEST_EVIDENCE_CALLS_QUERY,
+  TEST_EVIDENCE_FILES_QUERY,
+  type QueryGraphClient,
+} from './mcp-client';
+
+const text = (body: string) => ({ content: [{ type: 'text', text: body }] });
+
+const NODES = text(
+  'rows: 1  (cols: id name file startLine endLine kind complexity cognitive isTest)\n' +
+    '  p.a.f f src/a.ts "1" "5" Function "1" "0" "false"\n' +
+    'total: 1\n',
+);
+const EDGES = text('rows: 1  (cols: source target kind)\n  p.a.f p.a.f CALLS\ntotal: 1\n');
+const FILES = text('rows: 1  (cols: file changeCount)\n  src/a.ts "3"\ntotal: 1\n');
+const CALLS = text(
+  'rows: 1  (cols: source sourceName sourceFile sourceStartLine sourceEndLine sourceIsTest sourceKind target strategy confidence line)\n' +
+    '  p.a.test src/a.test.ts src/a.test.ts "1" "40" "true" Module p.a.f import_map "0.95" "12"\n' +
+    'total: 1\n',
+);
+const TESTS_FILE = text('rows: 1  (cols: testFile file)\n  src/a.test.ts src/a.ts\ntotal: 1\n');
+
+type Reply = unknown | (() => Promise<unknown>);
+
+/** A `callTool` stub answering by query; records every query it was sent. */
+function stubClient(overrides: Partial<Record<'calls' | 'files', Reply>> = {}) {
+  const sent: string[] = [];
+  const replies = new Map<string, Reply>([
+    [TEST_EVIDENCE_CALLS_QUERY, overrides.calls ?? CALLS],
+    [TEST_EVIDENCE_FILES_QUERY, overrides.files ?? TESTS_FILE],
+  ]);
+  const client = {
+    callTool: async ({ arguments: args }: { arguments?: Record<string, unknown> }) => {
+      const query = String(args?.query);
+      sent.push(query);
+      const reply = replies.get(query);
+      if (reply !== undefined) {
+        return typeof reply === 'function' ? (reply as () => Promise<unknown>)() : reply;
+      }
+      if (query.includes('[r:CALLS|USAGE]')) {
+        return EDGES;
+      }
+      if (query.startsWith('MATCH (f:File)')) {
+        return FILES;
+      }
+      return NODES;
+    },
+  } as unknown as QueryGraphClient;
+  return { client, sent };
+}
+
+const evidenceQueries = (sent: string[]) =>
+  sent.filter((query) => query === TEST_EVIDENCE_CALLS_QUERY || query === TEST_EVIDENCE_FILES_QUERY);
+
+function assertMapIntact(result: Awaited<ReturnType<typeof runCodeMapQueries>>): void {
+  assert.deepEqual(result.nodes.map((node) => [node.id, node.hotspotChangeCount]), [['p.a.f', 3]]);
+  assert.deepEqual(result.edges, [{ source: 'p.a.f', target: 'p.a.f', kind: 'CALLS' }]);
+}
+
+describe('runCodeMapQueries: Tested by evidence', () => {
+  it('sends both evidence queries only with includeTestEvidence, and their rows reach testEvidence', async () => {
+    const withFlag = stubClient();
+    const result = await runCodeMapQueries(withFlag.client, 'p', { includeTestEvidence: true });
+    assert.deepEqual(evidenceQueries(withFlag.sent).sort(), [TEST_EVIDENCE_CALLS_QUERY, TEST_EVIDENCE_FILES_QUERY].sort());
+    assertMapIntact(result);
+    assert.deepEqual(result.testEvidence, {
+      calls: [
+        {
+          source: 'p.a.test',
+          sourceName: 'src/a.test.ts',
+          sourceFile: 'src/a.test.ts',
+          sourceStartLine: 1,
+          sourceEndLine: 40,
+          sourceKind: 'Module',
+          sourceIsTest: true,
+          target: 'p.a.f',
+          strategy: 'import_map',
+          confidence: 0.95,
+          line: 12,
+        },
+      ],
+      testFiles: [{ testFile: 'src/a.test.ts', file: 'src/a.ts' }],
+    });
+
+    for (const options of [{}, { includeTestEvidence: false }]) {
+      const without = stubClient();
+      const plain = await runCodeMapQueries(without.client, 'p', options);
+      assert.deepEqual(evidenceQueries(without.sent), [], JSON.stringify(options));
+      assert.equal(plain.testEvidence, undefined);
+      assertMapIntact(plain);
+    }
+  });
+
+  it('sends the two evidence queries together, not one after the other', async () => {
+    let releaseCalls!: () => void;
+    const callsGate = new Promise<void>((resolve) => {
+      releaseCalls = resolve;
+    });
+    const { client, sent } = stubClient({
+      calls: async () => {
+        await callsGate;
+        return CALLS;
+      },
+    });
+    const running = runCodeMapQueries(client, 'p', { includeTestEvidence: true });
+    // Let the map queries and the first evidence query go out.
+    for (let i = 0; i < 20 && evidenceQueries(sent).length < 2; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(evidenceQueries(sent).length, 2, 'the files query went out while the calls query was still pending');
+    releaseCalls();
+    await running;
+  });
+
+  const failures: [string, Reply][] = [
+    ['reports isError', { isError: true, content: [{ type: 'text', text: 'boom' }] }],
+    ['rejects', () => Promise.reject(new Error('transport closed'))],
+    ['hangs past its timeout', () => new Promise(() => {})],
+    ['returns an unparseable result', text('not a table')],
+  ];
+  for (const part of ['calls', 'files'] as const) {
+    for (const [how, reply] of failures) {
+      // The per-test `timeout` turns a missing evidence timeout into a failure, not a hung run.
+      it(`keeps the map when the ${part} evidence query ${how}, with no rows for that part`, { timeout: 5000 }, async (t) => {
+        const warn = mock.method(console, 'warn', () => {});
+        t.after(() => warn.mock.restore());
+        const { client } = stubClient({ [part]: reply });
+        const result = await runCodeMapQueries(client, 'p', { includeTestEvidence: true }, 20);
+        assertMapIntact(result);
+        assert.ok(result.testEvidence);
+        if (part === 'calls') {
+          assert.deepEqual(result.testEvidence.calls, []);
+          assert.equal(result.testEvidence.testFiles.length, 1, 'the other part still arrives');
+        } else {
+          assert.deepEqual(result.testEvidence.testFiles, []);
+          assert.equal(result.testEvidence.calls.length, 1, 'the other part still arrives');
+        }
+        const warnings = warn.mock.calls.map((c) => String(c.arguments[0])).filter((m) => m.includes('Tested by'));
+        assert.equal(warnings.length, 1, `one warning: ${warnings.join(' | ')}`);
+      });
+    }
+  }
+
+  it('logs, but keeps, an evidence result that may be truncated', async (t) => {
+    const warn = mock.method(console, 'warn', () => {});
+    t.after(() => warn.mock.restore());
+    const cut = text('rows: 1  (cols: testFile file)\n  src/a.test.ts src/a.ts\ntotal: 7\n');
+    const { client } = stubClient({ files: cut });
+    const result = await runCodeMapQueries(client, 'p', { includeTestEvidence: true });
+    assert.equal(result.testEvidence?.testFiles.length, 1);
+    const warnings = warn.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(warnings.some((m) => /Tested by \(test files\).*incomplete.*1 of 7/.test(m)), warnings.join(' | '));
+  });
+
+  it('a failing map query still fails the fetch (only evidence is best-effort)', async () => {
+    const client = {
+      callTool: async () => ({ isError: true, content: [{ type: 'text', text: 'nodes down' }] }),
+    } as unknown as QueryGraphClient;
+    await assert.rejects(runCodeMapQueries(client, 'p', { includeTestEvidence: true }), /nodes down/);
+  });
+});

@@ -56,6 +56,15 @@ export async function fetchCodeMap() {
       { source: 'a', target: 'd', kind: 'CALLS' },
       { source: 'w', target: 'd', kind: 'CALLS' },
     ],
+    // P4-2 phase 2: \`t\` calls \`w\` through an import; \`f\` reaches \`a\` only
+    // by a name-only match, which must never count.
+    testEvidence: {
+      calls: [
+        { source: 't', sourceName: 't', sourceFile: 'web/a.test.ts', sourceStartLine: 1, sourceEndLine: 2, sourceKind: 'Function', target: 'w', strategy: 'import_map', confidence: 0.95 },
+        { source: 'f', sourceName: 'f', sourceFile: 'app/fixtures.ts', sourceStartLine: 1, sourceEndLine: 2, sourceKind: 'Function', sourceIsTest: true, target: 'a', strategy: 'unique_name', confidence: 0.75 },
+      ],
+      testFiles: [],
+    },
   };
 }
 `);
@@ -91,7 +100,7 @@ interface Posted {
   requestId?: number;
   result?: unknown;
   state?: string;
-  nodes?: { id: string; file: string }[];
+  nodes?: { id: string; file: string; testedBy?: unknown }[];
   edges?: { source: string; target: string }[];
   message?: string;
   hiddenByScope?: number;
@@ -272,7 +281,17 @@ describe('graphService:scopeChanged through index.ts', () => {
     const cached = getNodes() as Parameters<typeof lookupNode>[1];
     assert.deepEqual(lookupNode('t', cached, (node) => node), { status: 'not-found' });
     assert.deepEqual(lookupNode('f', cached, (node) => node), { status: 'not-found' });
-    assert.equal(lookupNode('w', cached, (node) => node).status, 'ok');
+    // P4-2 phase 2: the map reply and lookup_node carry the same testedBy.
+    const expectedTestedBy = {
+      tests: [{ id: 't', name: 't', file: 'web/a.test.ts', startLine: 1, endLine: 2 }],
+      totalTests: 1,
+      files: [],
+    };
+    assert.deepEqual(map.nodes?.find((node) => node.id === 'w')?.testedBy, expectedTestedBy);
+    assert.equal(map.nodes?.find((node) => node.id === 'a')?.testedBy, undefined);
+    const lookedUp = lookupNode('w', cached, (node) => node);
+    assert.equal(lookedUp.status, 'ok');
+    assert.deepEqual(lookedUp.status === 'ok' ? lookedUp.node.testedBy : undefined, expectedTestedBy);
     // Nothing else reads the captured getter; don't leak it past this test.
     delete (globalThis as { __scopeTestGetNodes?: unknown }).__scopeTestGetNodes;
   });
