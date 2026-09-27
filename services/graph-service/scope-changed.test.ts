@@ -48,6 +48,8 @@ export async function fetchCodeMap() {
       // the map — one in a file with map Nodes, one in a file with none.
       { ...node('mod:web/a', 'web/a.ts'), kind: 'Module' },
       { ...node('mod:lib/boot', 'lib/boot.ts'), kind: 'Module' },
+      // P4-2 phase 3c: web/types.ts's top-level code, beside its types.
+      { ...node('mod:web/types', 'web/types.ts'), kind: 'Module', startLine: 1, endLine: 12 },
       // P4-2 phase 3b: Type/Interface Nodes, folded off the map.
       { ...node('T', 'web/types.ts'), kind: 'Interface', startLine: 3, endLine: 9 },
       { ...node('T2', 'web/types.ts'), kind: 'Interface' },
@@ -140,6 +142,7 @@ interface Posted {
   message?: string;
   hiddenByScope?: number;
   appliedScope?: string[];
+  foldedModules?: { file: string; moduleIds: string[] }[];
   foldedTypes?: {
     id: string;
     usedBy: string[];
@@ -744,6 +747,130 @@ describe('graphService:scopeChanged through index.ts', () => {
         nodeIds: ['w'],
         topLevelFiles: [{ file: 'lib/boot.ts', startLine: 1, endLine: 2 }],
       });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // Also indexes its own temp repo. The stub's T (web/types.ts, lines 3–9)
+  // is used by w (web/) and a (app/) through real USAGE edges; its Module and
+  // test users never count. web/types.ts also has top-level code: the folded
+  // Module mod:web/types (lines 1–12).
+  it('P4-2 phase 3c: a diff touching only a type names it as a changed contract with its real dependents', { timeout: 30_000 }, async (t) => {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is not installed; the diff-scope check needs a real repository.');
+      return;
+    }
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'driller-contract-git-'));
+    try {
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], {
+          cwd: repo,
+          stdio: 'pipe',
+        });
+      const lines = Array.from({ length: 12 }, (_, i) => `// line ${i + 1}`);
+      const writeTypes = (edit: (copy: string[]) => void) => {
+        const copy = [...lines];
+        edit(copy);
+        mkdirSync(path.join(repo, 'web'), { recursive: true });
+        writeFileSync(path.join(repo, 'web/types.ts'), `${copy.join('\n')}\n`);
+      };
+      /** A branch off main with one edit to web/types.ts, committed. */
+      const branch = (name: string, edit: (copy: string[]) => void) => {
+        git('checkout', '-q', 'main');
+        git('checkout', '-q', '-b', name);
+        writeTypes(edit);
+        git('commit', '-q', '-am', name);
+      };
+      const TYPES_MODULE = { file: 'web/types.ts', startLine: 1, endLine: 12 };
+      const T_CONTRACT = { id: 'T', name: 'T', kind: 'Interface', file: 'web/types.ts', dependentCount: 2, dependentIds: ['a', 'w'] };
+      git('init', '-q', '-b', 'main');
+      writeTypes(() => {});
+      git('add', '.');
+      git('commit', '-q', '-m', 'base');
+
+      await index(repo);
+      // The map reply carries the folded Modules too, for the "Show types &
+      // modules" canvas toggle.
+      const map = await fetchMap();
+      assert.deepEqual(
+        (map.foldedModules ?? []).map((module) => [module.file, module.moduleIds]),
+        [
+          ['lib/boot.ts', ['mod:lib/boot']],
+          ['web/a.ts', ['mod:web/a']],
+          ['web/types.ts', ['mod:web/types']],
+        ],
+      );
+      const { computeDiffScopeResult } = await import('./index');
+      const diff = async () => {
+        const result = await computeDiffScopeResult(repo, 'main');
+        assert.equal(result.status, 'resolved');
+        const { resolvedBaseRef: _base, ...rest } = result as Extract<typeof result, { status: 'resolved' }>;
+        return rest;
+      };
+
+      // Outside every type's lines (T2 is 1–2, T is 3–9): top-level code
+      // changed, no contract.
+      branch('outside', (copy) => {
+        copy[10] = '// edited line 11';
+      });
+      assert.deepEqual(await diff(), { status: 'resolved', nodeIds: [], topLevelFiles: [TYPES_MODULE] });
+
+      // Wholly inside T: T is a changed contract with dependents w and a only,
+      // and the file is not "top-level code changed" although it has a Module.
+      branch('inside', (copy) => {
+        copy[4] = '  field: number;';
+      });
+      assert.deepEqual(await diff(), { status: 'resolved', nodeIds: [], changedContracts: [T_CONTRACT] });
+
+      // Spanning T's last line and the top-level line after it: both reported.
+      branch('spanning', (copy) => {
+        copy[8] = '} // T ends, edited';
+        copy[9] = 'boot(); // top-level, edited';
+      });
+      assert.deepEqual(await diff(), {
+        status: 'resolved',
+        nodeIds: [],
+        topLevelFiles: [TYPES_MODULE],
+        changedContracts: [T_CONTRACT],
+      });
+
+      // main moves on after the fork with an edit inside T; the feature
+      // branch only touched line 11. main's edit is not the PR's: no contract.
+      branch('late-base', (copy) => {
+        copy[10] = '// feature edit on line 11';
+      });
+      git('checkout', '-q', 'main');
+      writeTypes((copy) => {
+        copy[4] = '  mainOnly: string;';
+      });
+      git('commit', '-q', '-am', 'main edits T after the fork');
+      git('checkout', '-q', 'late-base');
+      assert.deepEqual(await diff(), { status: 'resolved', nodeIds: [], topLevelFiles: [TYPES_MODULE] });
+
+      // Dependents follow the indexing scope: with only web/ in scope, a (in
+      // app/) is gone, and the count says so.
+      git('checkout', '-q', 'inside');
+      send({ type: 'graphService:scopeChanged', path: repo, includedPaths: ['web'] });
+      await fetchMap();
+      assert.deepEqual(await diff(), {
+        status: 'resolved',
+        nodeIds: [],
+        changedContracts: [{ ...T_CONTRACT, dependentCount: 1, dependentIds: ['w'] }],
+      });
+      send({ type: 'graphService:scopeChanged', path: repo, includedPaths: [] });
+      await fetchMap();
+
+      // With a function's file changed too: that Node counts as changed, as
+      // today, and the contract line stays.
+      writeFileSync(path.join(repo, 'web/a.ts'), 'w();\n');
+      git('add', '.');
+      git('commit', '-q', '-m', 'function change');
+      const mixed = await diff();
+      assert.deepEqual(
+        mixed.status === 'resolved' ? [mixed.nodeIds, mixed.changedContracts?.map((c) => c.id)] : undefined,
+        [['w'], ['T']],
+      );
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

@@ -1575,6 +1575,10 @@ code,
    styles its contents, matching the history toolbar's own floated-chrome
    look (bordered surface, no new visual language). */
 .code-map__signal-toggle-panel {
+  /* P4-2 phase 3c: the checkbox's box and its gap to the label text, shared
+     by `.code-map__signal-toggle` and the hint's indent. */
+  --signal-toggle-box: 13px;
+  --signal-toggle-gap: 0.4rem;
   display: flex;
   /* Story 2.2 (Phase 3): a second checkbox (`showLlmJudgment`) joined this
      Panel — stacked vertically with a small gap rather than the default
@@ -1591,15 +1595,72 @@ code,
 .code-map__signal-toggle {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: var(--signal-toggle-gap);
   font-size: 11px;
   color: var(--text);
   cursor: pointer;
 }
 
+.code-map__signal-toggle input {
+  width: var(--signal-toggle-box);
+  height: var(--signal-toggle-box);
+  margin: 0;
+}
+
 .code-map__signal-toggle:focus-within {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* P4-2 phase 3c: the "Show types & modules" toggle's hint — says the toggle
+   only draws, so no risk number moves. Indented to line up with the label
+   text: the checkbox's width plus the label's own gap (both tokens, set on
+   the panel, so the two can't drift). */
+.code-map__signal-toggle-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  padding-left: calc(var(--signal-toggle-box) + var(--signal-toggle-gap));
+}
+
+/* P4-2 phase 3c: a folded Type/Interface/Module card drawn back by "Show
+   types & modules" (`CodeMapFoldedCard`): a dashed, dimmed card so it never
+   reads as a map Node; its kind label says "folded" in text too. */
+.code-map__node--folded {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.code-map__node-folded-file,
+.code-map__node-folded-note {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.code-map__node-folded-note {
+  font-style: italic;
+}
+
+/* P4-2 phase 3c: a changed contract's dependent (PR Review) — its own
+   treatment, not the blast radius's: a dotted neutral outline plus the
+   ⧉ marker line below, whose text names the contract (never colour-only). */
+.code-map__contract-dependent .code-map__node {
+  outline: 1px dotted var(--text);
+  outline-offset: 2px;
+}
+
+.code-map__node-contract-dependent {
+  margin: 0.1rem 0 0;
+  font-size: 10px;
+  color: var(--text);
+}
+
+/* P4-2 phase 3c: the interactive changed-contract lines, beside (not inside)
+   the PR Review live region. */
+.code-map__changed-contracts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
 }
 
 /* LOD cluster card (Story 1.3 Phase 2, AD-2): a lightweight aggregate
@@ -1677,6 +1738,18 @@ code,
   border: 1px solid var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
   color: var(--accent);
+}
+
+/* P4-2 phase 3c: a cluster holding changed-contract dependents — dotted
+   outline plus the visible "⧉ N affected" text and its accessible name. */
+.code-map__cluster--contract-dependent {
+  outline: 1px dotted var(--text);
+  outline-offset: 2px;
+}
+
+.code-map__cluster-affected {
+  font-size: 9.5px;
+  color: var(--text);
 }
 
 .code-map__cluster-changed {

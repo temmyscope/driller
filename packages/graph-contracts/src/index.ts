@@ -660,6 +660,258 @@ export function findTopLevelOnlyChangedFiles(
   return result;
 }
 
+/**
+ * P4-2 phase 3c: one changed line range in a diff's post-change ("new")
+ * file, 1-based and inclusive. A hunk that only deletes lines has no new
+ * lines: it sits between new lines `n` and `n + 1`, and is recorded as the
+ * empty range `{start: n + 1, end: n}`. `changedRangeTouches`' one overlap
+ * test (`start <= rangeEnd && rangeStart <= end`) then reads it correctly:
+ * the deletion touches a range only when that range spans both `n` and
+ * `n + 1`, i.e. the lines were deleted from inside it.
+ */
+export interface ChangedLineRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * P4-2 phase 3c: changed line ranges per changed file (POSIX,
+ * project-relative), as `git diff -U0` reports them. A file listed with
+ * `[]` was read and has no changed lines (a pure rename, a mode change, a
+ * binary file); a changed file with no entry at all could not be read.
+ */
+export type ChangedLinesByFile = Readonly<Record<string, readonly ChangedLineRange[]>>;
+
+/** P4-2 phase 3c: whether any of `ranges` touches lines `startLine`–`endLine` (see `ChangedLineRange`). */
+export function changedRangeTouches(ranges: readonly ChangedLineRange[], startLine: number, endLine: number): boolean {
+  return ranges.some((range) => range.start <= endLine && startLine <= range.end);
+}
+
+/**
+ * P4-2 phase 3c: whether `range` lies wholly inside lines
+ * `startLine`–`endLine`. A pure deletion (`{start: n + 1, end: n}`) lies
+ * inside when the range spans both `n` and `n + 1`, the same as touching.
+ */
+export function changedRangeInside(range: ChangedLineRange, startLine: number, endLine: number): boolean {
+  const low = Math.min(range.start, range.end);
+  const high = Math.max(range.start, range.end);
+  return startLine <= low && high <= endLine;
+}
+
+/**
+ * P4-2 phase 3c: a folded Type/Interface (`FoldedType`) whose own lines a
+ * diff changed — a changed contract. Types are not map Nodes, so a PR that
+ * edits only a type would otherwise show no change; this names it with the
+ * map Nodes that depend on it.
+ */
+export interface ChangedContract {
+  /** The folded type's id; resolves via `lookup_node` and the Code Map's `foldedTypes`. */
+  id: string;
+  name: string;
+  kind: FoldedTypeKind;
+  /** POSIX-relative path of its file. */
+  file: string;
+  /** How many map Nodes use it — the full count, whatever `dependentIds` carries. */
+  dependentCount: number;
+  /**
+   * The map Nodes with a real `USAGE` edge into it (`FoldedType.usedBy`),
+   * sorted by id, unique, capped at `CHANGED_CONTRACT_MAX_DEPENDENT_IDS`.
+   * Never inferred from a name or a signature.
+   */
+  dependentIds: string[];
+}
+
+/**
+ * P4-2 phase 3c: the most `ChangedContract.dependentIds` carried per
+ * contract (IPC and MCP); `dependentCount` is always exact.
+ */
+export const CHANGED_CONTRACT_MAX_DEPENDENT_IDS = 200;
+
+/** P4-2 phase 3c: `findChangedContracts`' result. */
+export interface ChangedContractsResult {
+  contracts: ChangedContract[];
+  /**
+   * True when some changed file that holds folded types had no line ranges
+   * (`changedLines` undefined, or no entry for the file), so every type in
+   * it was counted: the list may over-report, never hide, a contract.
+   */
+  approximate: boolean;
+}
+
+/** Sorted ranges plus each prefix's greatest `end`, for `touchesSorted`. */
+interface SortedRanges {
+  ranges: ChangedLineRange[];
+  maxEnd: number[];
+}
+
+function sortRanges(ranges: readonly ChangedLineRange[]): SortedRanges {
+  const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
+  const maxEnd: number[] = [];
+  let max = Number.NEGATIVE_INFINITY;
+  for (const range of sorted) {
+    max = Math.max(max, range.end);
+    maxEnd.push(max);
+  }
+  return { ranges: sorted, maxEnd };
+}
+
+/**
+ * `changedRangeTouches` over pre-sorted ranges: binary-searches the first
+ * range whose prefix could reach `startLine`, then scans only ranges that
+ * start at or before `endLine`.
+ */
+function touchesSorted({ ranges, maxEnd }: SortedRanges, startLine: number, endLine: number): boolean {
+  let low = 0;
+  let high = ranges.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if ((maxEnd[mid] ?? Number.NEGATIVE_INFINITY) < startLine) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  for (let index = low; index < ranges.length; index += 1) {
+    const range = ranges[index]!;
+    if (range.start > endLine) {
+      return false;
+    }
+    if (startLine <= range.end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Options for `findChangedContracts`. */
+export interface FindChangedContractsOptions {
+  /** When given, dependents are kept only if in this set (the map Nodes in scope), and counted after that. */
+  mapNodeIds?: ReadonlySet<string>;
+  /** Cap on each contract's `dependentIds` (default `CHANGED_CONTRACT_MAX_DEPENDENT_IDS`). */
+  maxDependentIds?: number;
+}
+
+/**
+ * P4-2 phase 3c: the folded types a diff changed — each type whose own line
+ * range (`startLine`–`endLine`) a changed range in its file touches.
+ * `changedLines` must come from the same merge-base diff as `changedFiles`.
+ * A changed file listed in `changedLines` with `[]` changed no lines and
+ * contributes nothing. A changed file with no entry (or `changedLines`
+ * undefined: the ranges could not be read) counts every type in it and
+ * sets `approximate` — over-reporting a contract, never hiding one. The
+ * dependents are real `USAGE` users either way.
+ *
+ * `foldedTypes`' `usedBy` must be uncapped. Sorted by most dependents, then
+ * name, then id. Pure.
+ */
+export function findChangedContracts(
+  foldedTypes: readonly FoldedType[],
+  changedFiles: readonly string[],
+  changedLines: ChangedLinesByFile | undefined,
+  { mapNodeIds, maxDependentIds = CHANGED_CONTRACT_MAX_DEPENDENT_IDS }: FindChangedContractsOptions = {},
+): ChangedContractsResult {
+  const changedFileSet = new Set(changedFiles);
+  const sortedByFile = new Map<string, SortedRanges | null>();
+  const rangesFor = (file: string): SortedRanges | null => {
+    let sorted = sortedByFile.get(file);
+    if (sorted === undefined) {
+      const ranges = changedLines !== undefined && Object.hasOwn(changedLines, file) ? changedLines[file] : undefined;
+      sorted = ranges === undefined ? null : sortRanges(ranges);
+      sortedByFile.set(file, sorted);
+    }
+    return sorted;
+  };
+  const contracts: ChangedContract[] = [];
+  const seen = new Set<string>();
+  let approximate = false;
+  for (const type of foldedTypes) {
+    if (seen.has(type.id) || !changedFileSet.has(type.file)) {
+      continue;
+    }
+    const sorted = rangesFor(type.file);
+    if (sorted === null) {
+      approximate = true;
+    } else if (!touchesSorted(sorted, type.startLine, type.endLine)) {
+      continue;
+    }
+    seen.add(type.id);
+    const users = [...new Set(type.usedBy)].filter((id) => mapNodeIds === undefined || mapNodeIds.has(id));
+    users.sort(compareStrings);
+    contracts.push({
+      id: type.id,
+      name: type.name,
+      kind: type.kind,
+      file: type.file,
+      dependentCount: users.length,
+      dependentIds: users.slice(0, Math.max(0, maxDependentIds)),
+    });
+  }
+  contracts.sort(
+    (a, b) => b.dependentCount - a.dependentCount || compareStrings(a.name, b.name) || compareStrings(a.id, b.id),
+  );
+  return { contracts, approximate };
+}
+
+/**
+ * P4-2 phase 3c: the changed files whose every changed range lies wholly
+ * inside a folded type of that file (`changedRangeInside`) — a
+ * contract-only change. Such a file's change is already named by
+ * `findChangedContracts`, so it must not also read as "top-level code
+ * changed" (`findTopLevelOnlyChangedFiles`). A range that spans a type and
+ * the code next to it keeps the file out of this set. A file with no
+ * ranges is not listed. Pure; each range is checked by binary search over
+ * the file's types sorted by start line.
+ */
+export function findContractOnlyChangedFiles(
+  foldedTypes: readonly FoldedType[],
+  changedLines: ChangedLinesByFile,
+): Set<string> {
+  const typesByFile = new Map<string, FoldedType[]>();
+  for (const type of foldedTypes) {
+    const list = typesByFile.get(type.file) ?? [];
+    list.push(type);
+    typesByFile.set(type.file, list);
+  }
+  const result = new Set<string>();
+  for (const [file, ranges] of Object.entries(changedLines)) {
+    const types = typesByFile.get(file);
+    if (types === undefined || ranges.length === 0) {
+      continue;
+    }
+    types.sort((a, b) => a.startLine - b.startLine);
+    // maxEnd[i]: the greatest end line among types[0..i].
+    const maxEnd: number[] = [];
+    let max = Number.NEGATIVE_INFINITY;
+    for (const type of types) {
+      max = Math.max(max, type.endLine);
+      maxEnd.push(max);
+    }
+    const inside = (range: ChangedLineRange): boolean => {
+      const low = Math.min(range.start, range.end);
+      const high = Math.max(range.start, range.end);
+      // The last type starting at or before `low`; some type up to it
+      // contains the range exactly when their greatest end reaches `high`.
+      let lo = 0;
+      let hi = types.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (types[mid]!.startLine <= low) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      return lo > 0 && (maxEnd[lo - 1] ?? Number.NEGATIVE_INFINITY) >= high;
+    };
+    if (ranges.every(inside)) {
+      result.add(file);
+    }
+  }
+  return result;
+}
+
+const compareStrings = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
 // ---------------------------------------------------------------------------
 // P4-6: Graph Service operation result shapes (AD-13).
 //
@@ -1293,6 +1545,19 @@ export type DiffScopeResult =
        * top-level-only diff say what changed instead of "0 changed Nodes".
        */
       topLevelFiles?: TopLevelChangedFile[];
+      /**
+       * P4-2 phase 3c: the folded Types/Interfaces whose own lines the diff
+       * changed, with the map Nodes that use them (`findChangedContracts`).
+       * Absent when there are none. A changed contract is not a changed
+       * Node: its dependents are affected, not changed.
+       */
+      changedContracts?: ChangedContract[];
+      /**
+       * P4-2 phase 3c: `true` when the diff's line ranges couldn't be read
+       * for some changed file holding types, so every type in it counted
+       * (`ChangedContractsResult.approximate`). Absent otherwise.
+       */
+      changedContractsApproximate?: true;
     }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }

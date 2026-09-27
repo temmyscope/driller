@@ -178,6 +178,13 @@ const drillerApi: DrillerApi = {
   setProjectScope: (projectPath: string, includedPaths: string[]): Promise<ProjectScopeSaveResult> =>
     ipcRenderer.invoke(IpcChannels.settingsSetProjectScope, projectPath, includedPaths),
 
+  // P4-2 phase 3c: the per-project "Show types & modules" canvas toggle.
+  getShowFoldedKinds: (projectPath: string): Promise<boolean> =>
+    ipcRenderer.invoke(IpcChannels.settingsGetShowFoldedKinds, projectPath),
+
+  setShowFoldedKinds: (projectPath: string, show: boolean): Promise<boolean> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetShowFoldedKinds, projectPath, show),
+
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),
 

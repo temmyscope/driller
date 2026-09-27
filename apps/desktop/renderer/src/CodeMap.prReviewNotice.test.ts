@@ -69,7 +69,7 @@ const NOTICE_STATUSES: DiffScopeNoticeStatus[] = ['no-changes', 'not-a-git-repo'
 const NON_NOTICE_STATES: DiffScopeState[] = [
   { status: 'idle' },
   { status: 'loading' },
-  { status: 'resolved', resolvedBaseRef: 'main', nodeIds: new Set(['src/a.ts#a']), topLevelFiles: [] },
+  { status: 'resolved', resolvedBaseRef: 'main', nodeIds: new Set(['src/a.ts#a']), topLevelFiles: [], changedContracts: [] },
   { status: 'error', message: 'git failed' },
 ];
 
@@ -229,6 +229,7 @@ describe('PR Review: top-level-only changes', () => {
     resolvedBaseRef: 'abc123',
     nodeIds: new Set(),
     topLevelFiles,
+    changedContracts: [],
   });
 
   it("resolvePrReviewView passes a resolved diff scope's top-level files through, in PR Review with a map only", () => {

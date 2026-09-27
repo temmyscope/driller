@@ -27,6 +27,7 @@ import type {
   CodeMapEdge,
   CodeMapNode,
   DiffScopeResult,
+  FoldedModule,
   FoldedType,
   IndexCoverageSummary,
   PathTraceResult,
@@ -61,6 +62,8 @@ export type {
   FileTopLevelUse,
   FoldedModule,
   TopLevelChangedFile,
+  ChangedContract,
+  ChangedLineRange,
   FoldedType,
   FoldedTypeKind,
   FoldedTypeUserKindCount,
@@ -370,6 +373,13 @@ export type CodeMapResult =
        * against it.
        */
       foldedTypes: FoldedType[];
+      /**
+       * P4-2 phase 3c: the Module Nodes folded off this map (see
+       * `FoldedModule`), scope-filtered like `nodes`. Only the "Show types &
+       * modules" canvas toggle reads it, to draw them back as render-only
+       * Nodes; nothing that computes a number does.
+       */
+      foldedModules: FoldedModule[];
     }
   | { status: 'error'; message: string };
 
@@ -429,6 +439,8 @@ export type GraphServiceCodeMapMessage =
       appliedScope: string[];
       /** P4-2 phase 3b: see `CodeMapResult.foldedTypes`. */
       foldedTypes: FoldedType[];
+      /** P4-2 phase 3c: see `CodeMapResult.foldedModules`. */
+      foldedModules: FoldedModule[];
     }
   | { type: 'graphService:codeMapError'; message: string };
 
@@ -1203,6 +1215,8 @@ export const IpcChannels = {
   settingsSetPrBotEnabled: 'settings:setPrBotEnabled',
   settingsGetProjectScope: 'settings:getProjectScope',
   settingsSetProjectScope: 'settings:setProjectScope',
+  settingsGetShowFoldedKinds: 'settings:getShowFoldedKinds',
+  settingsSetShowFoldedKinds: 'settings:setShowFoldedKinds',
   prBotRunIngestion: 'prBot:runIngestion',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
@@ -1405,6 +1419,18 @@ export interface DrillerApi {
    * state without a separate refetch.
    */
   setProjectScope: (projectPath: string, includedPaths: string[]) => Promise<ProjectScopeSaveResult>;
+  /**
+   * P4-2 phase 3c: whether one project's Code Map canvas shows the folded
+   * Types/Interfaces/Modules again ("Show types & modules"). `false` (the
+   * default) when the project has no persisted value.
+   */
+  getShowFoldedKinds: (projectPath: string) => Promise<boolean>;
+  /**
+   * P4-2 phase 3c: remembers one project's "Show types & modules" toggle in
+   * the UI settings store and resolves with the value now in effect. A
+   * render-only preference: nothing is re-indexed or recomputed.
+   */
+  setShowFoldedKinds: (projectPath: string, show: boolean) => Promise<boolean>;
   /**
    * Runs one PR-bot's ingestion pass against `projectPath` (Story 2.3, Phase
    * 2) — this phase's only entry point (Never: "Any UI trigger, entry

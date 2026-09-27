@@ -64,6 +64,7 @@ import { z } from 'zod';
 import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts';
 import {
   BLAST_RADIUS_DEFAULT_HOPS,
+  CHANGED_CONTRACT_MAX_DEPENDENT_IDS,
   FOLDED_TYPE_LOOKUP_MAX_USED_BY,
   TESTED_BY_MAX_TESTS,
   type FoldedModule,
@@ -297,7 +298,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.3.0';
+export const MCP_SERVER_VERSION = '1.4.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -419,6 +420,11 @@ export function startMcpServer(
   // `usesTypes`. Additive for a client that reads fields, but a client
   // comparing the folded-Module result's exact shape (deep equality against
   // `{status, folded, nodeId, file, uses}`) will see the two new fields.
+  // P4-2 phase 3c (1.4.0): `compute_diff_scope`'s resolved result gains
+  // `changedContracts` and `changedContractsApproximate` — additive, absent
+  // when not applicable. One behaviour change: `topLevelFiles` now leaves
+  // out a file whose every change lies inside a type (a contract-only
+  // change, named in `changedContracts` instead).
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
   registerLookupNodeTool(server, getActiveCodeMapNodes, deriveLiveNode, getActiveFoldedModules, getActiveFoldedTypes);
@@ -462,7 +468,16 @@ export function startMcpServer(
       title: 'Compute the diff-scoped Node set',
       description:
         "Compute the diff-scoped Node set for a project against a base ref (or an auto-resolved default branch). Returns the exact same DiffScopeResult the human-facing UI would get for the identical request — an explicit result state (resolved/no-changes/not-a-git-repo/no-base-ref-resolvable/error), never collapsed into a generic success/failure. " +
-        "A resolved result's optional 'topLevelFiles' lists changed files whose only content on the map is folded top-level code (no Code Map Node), so a top-level-only change is named rather than reported as zero changed Nodes.",
+        "A resolved result's optional 'topLevelFiles' lists changed files whose only content on the map is folded top-level code (no Code Map Node), so a top-level-only change is named rather than reported as zero changed Nodes. " +
+        "A resolved result's optional 'changedContracts' lists the folded Types/Interfaces whose own lines the diff " +
+        "changed (types are not Code Map Nodes, so a type-only change would otherwise read as zero changed Nodes), " +
+        "most dependents first: each is {id, name, kind: 'Type' | 'Interface', file, dependentCount, dependentIds}. " +
+        "'dependentIds' are the in-scope Code Map Nodes with a real USAGE edge into the type (sorted, unique, at most " +
+        `${CHANGED_CONTRACT_MAX_DEPENDENT_IDS}); 'dependentCount' is always their full number. ` +
+        "Dependents are affected, not changed: they are not in 'nodeIds'. " +
+        "'changedContractsApproximate: true' means approximate: couldn't read line ranges for some changed file, so " +
+        "every type in it was counted (may over-report, never hides a contract). " +
+        "'topLevelFiles' leaves out a file whose every change lies inside a type.",
       inputSchema: z.object({
         projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
         baseRef: z

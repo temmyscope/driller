@@ -83,12 +83,14 @@ import {
 import '@xyflow/react/dist/style.css';
 import type {
   BlastRadiusExpansionResult,
+  ChangedContract,
   CodeMapEdge,
   CodeMapNode,
   DeterministicRiskSignal,
   DeterministicRiskSignalType,
   DiffScopeResult,
   FileTopLevelUse,
+  FoldedModule,
   FoldedType,
   FoldedTypeUserKindCount,
   IngestedRiskSignal,
@@ -128,6 +130,12 @@ export type FetchState =
       appliedScope: string[];
       /** P4-2 phase 3b: the Type/Interface Nodes folded off this map (`CodeMapResult.foldedTypes`). */
       foldedTypes: readonly FoldedType[];
+      /**
+       * P4-2 phase 3c: the Module Nodes folded off this map
+       * (`CodeMapResult.foldedModules`) — read only by the "Show types &
+       * modules" canvas toggle. Absent means none (e.g. the dev fixture).
+       */
+      foldedModules?: readonly FoldedModule[];
     }
   | { status: 'error'; message: string };
 
@@ -239,6 +247,10 @@ export type DiffScopeState =
       nodeIds: Set<string>;
       /** P4-2 phase 3a: `DiffScopeResult`'s `topLevelFiles`, `[]` when absent. */
       topLevelFiles: readonly TopLevelChangedFile[];
+      /** P4-2 phase 3c: `DiffScopeResult`'s `changedContracts`, `[]` when absent. */
+      changedContracts: readonly ChangedContract[];
+      /** P4-2 phase 3c: `DiffScopeResult`'s `changedContractsApproximate`, `false` when absent. */
+      changedContractsApproximate?: boolean;
     }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }
@@ -997,9 +1009,37 @@ type CodeMapFlowNode = FlowNode<
     // & Constraints: "switching back to Code Map Mode ... no changed-Node
     // treatment ... anywhere".
     isChanged: boolean;
+    /**
+     * P4-2 phase 3c: the names of the changed contracts this Node depends on
+     * (PR Review) — set only when there is one. The card shows a ⧉ marker
+     * and its accessible name says "affected by changed contract X".
+     */
+    affectedByContracts?: readonly string[];
   },
   'codeMapNode'
 >;
+
+/**
+ * P4-2 phase 3c: a folded Type/Interface/Module card drawn by "Show types &
+ * modules" — its own node type and card (`CodeMapFoldedCard`): no summary,
+ * no neighbour pills, no caller counts, no risk signals.
+ */
+type CodeMapFoldedFlowNode = FlowNode<
+  {
+    folded: FoldedCanvasNode;
+    onActivate: (folded: FoldedCanvasNode) => void;
+    /** A changed contract's own card, in PR Review. */
+    isChanged: boolean;
+  },
+  'codeMapFolded'
+>;
+
+/** A card on the canvas: a map Node's, or a folded kind's. */
+type CodeMapCardFlowNode = CodeMapFlowNode | CodeMapFoldedFlowNode;
+
+/** P4-2 phase 3c: a canvas card's map Node — `undefined` for a folded card (not a map Node) or none. */
+const mapNodeOf = (flowNode: CodeMapCardFlowNode | undefined): CodeMapNode | undefined =>
+  flowNode?.type === 'codeMapNode' ? flowNode.data.node : undefined;
 
 /** Per-Node adjacency (Code Map: `Map<nodeId, {callers, callees}>`), built once from the fetched `CodeMapEdge[]`. */
 export type NodeAdjacency = Map<string, { callers: string[]; callees: string[] }>;
@@ -1576,7 +1616,7 @@ export function layoutPosition(index: number, nodeCount: number): { x: number; y
 }
 
 function layoutNodes(
-  nodes: CodeMapNode[],
+  nodes: readonly CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
   onShowNeighbors: (originId: string, direction: NeighborDirection) => void,
   onOpenSource: (node: CodeMapNode) => void,
@@ -1591,13 +1631,22 @@ function layoutNodes(
   // a `'resolved'` diff scope, so every Node's `isChanged` below is simply
   // `false` in every other state (Boundaries & Constraints).
   changedNodeIds: ReadonlySet<string>,
-): CodeMapFlowNode[] {
-  return nodes.map((node, index) => {
+  // P4-2 phase 3c: the "Show types & modules" toggle's render-only folded
+  // cards (`canvasPopulation`), laid out after `nodes` — see
+  // `canvasGridSize` — and activated through `onActivateFolded`.
+  foldedNodes: readonly FoldedCanvasNode[] = [],
+  onActivateFolded: (folded: FoldedCanvasNode) => void = () => {},
+  // P4-2 phase 3c: map Node id → the changed contracts it depends on.
+  contractDependents: ReadonlyMap<string, readonly string[]> = NO_CONTRACT_DEPENDENTS,
+): CodeMapCardFlowNode[] {
+  const gridSize = canvasGridSize(nodes.length, foldedNodes.length);
+  const cards: CodeMapCardFlowNode[] = nodes.map((node, index) => {
     const entry = adjacency.get(node.id);
+    const affectedByContracts = contractDependents.get(node.id);
     return {
       id: node.id,
       type: 'codeMapNode',
-      position: layoutPosition(index, nodes.length),
+      position: layoutPosition(index, gridSize),
       data: {
         node,
         onActivate,
@@ -1611,12 +1660,303 @@ function layoutNodes(
         showLlmJudgment,
         showIngestedFindings,
         isChanged: changedNodeIds.has(node.id),
+        ...(affectedByContracts !== undefined ? { affectedByContracts } : {}),
       },
     };
   });
+  foldedNodes.forEach((folded, index) => {
+    cards.push({
+      id: folded.id,
+      type: 'codeMapFolded',
+      position: layoutPosition(nodes.length + index, gridSize),
+      data: { folded, onActivate: onActivateFolded, isChanged: changedNodeIds.has(folded.id) },
+    });
+  });
+  return cards;
 }
 
-function toFlowEdges(edges: CodeMapEdge[]): FlowEdge[] {
+/**
+ * P4-2 phase 3c: the grid size the canvas is laid out with. Sized by the
+ * map Nodes alone, so they keep their positions when "Show types &
+ * modules" flips and the folded cards fill the rows below; a map with no
+ * Nodes lays the folded cards out in the normal grid of their own count.
+ */
+export function canvasGridSize(mapNodeCount: number, foldedCount: number): number {
+  return mapNodeCount > 0 ? mapNodeCount : foldedCount;
+}
+
+const NO_CONTRACT_DEPENDENTS: ReadonlyMap<string, readonly string[]> = new Map();
+
+/**
+ * P4-2 phase 3c: a folded Type/Interface/Module as a render-only canvas
+ * card ("Show types & modules"). Deliberately not a `CodeMapNode`: it has
+ * no summary, no risk signals, no callers or callees — nothing that could
+ * be mistaken for, or counted as, a map Node. `usedByTotal` is a type's
+ * full user count (absent for a Module).
+ */
+export interface FoldedCanvasNode {
+  folded: true;
+  id: string;
+  name: string;
+  kind: 'Type' | 'Interface' | 'Module';
+  file: string;
+  startLine: number;
+  endLine: number;
+  usedByTotal?: number;
+}
+
+/**
+ * P4-2 phase 3c: the folded kinds as render-only canvas elements. `edges`
+ * are rebuilt from the folded indexes' real links only — a type's `usedBy`
+ * and `refersTo` as `USAGE` edges, a Module's `uses` (with their own kind)
+ * and `usesTypes` (`USAGE`) — and only where both ends are drawn. A type's
+ * `usedBy` may be capped (`FOLDED_TYPE_IPC_MAX_USED_BY`), so a heavily used
+ * type draws at most that many use edges.
+ *
+ * Nothing here feeds a number: see `canvasPopulation`.
+ */
+export interface FoldedCanvasElements {
+  nodes: FoldedCanvasNode[];
+  edges: CodeMapEdge[];
+}
+
+const NO_FOLDED_CANVAS: FoldedCanvasElements = { nodes: [], edges: [] };
+
+/** P4-2 phase 3c: a folded Module's card name — its file's base name. */
+const moduleName = (file: string): string => file.slice(file.lastIndexOf('/') + 1) || file;
+
+/**
+ * P4-2 phase 3c: builds `FoldedCanvasElements`. An id already on the map
+ * (or drawn earlier) is never drawn twice; a Module is drawn under its
+ * first `moduleIds` entry. Pure.
+ */
+export function foldedCanvasElements(
+  mapNodes: readonly Pick<CodeMapNode, 'id'>[],
+  foldedTypes: readonly FoldedType[],
+  foldedModules: readonly FoldedModule[],
+): FoldedCanvasElements {
+  if (foldedTypes.length === 0 && foldedModules.length === 0) {
+    return NO_FOLDED_CANVAS;
+  }
+  const mapIds = new Set(mapNodes.map((node) => node.id));
+  const drawn = new Set(mapIds);
+  const nodes: FoldedCanvasNode[] = [];
+  const typeIds = new Set<string>();
+  for (const type of foldedTypes) {
+    if (drawn.has(type.id)) {
+      continue;
+    }
+    drawn.add(type.id);
+    typeIds.add(type.id);
+    nodes.push({
+      folded: true,
+      id: type.id,
+      name: type.name,
+      kind: type.kind,
+      file: type.file,
+      startLine: type.startLine,
+      endLine: type.endLine,
+      usedByTotal: type.usedByTotal,
+    });
+  }
+  const modules: { id: string; module: FoldedModule }[] = [];
+  for (const module of foldedModules) {
+    const id = module.moduleIds[0];
+    if (id === undefined || drawn.has(id)) {
+      continue;
+    }
+    drawn.add(id);
+    modules.push({ id, module });
+    nodes.push({
+      folded: true,
+      id,
+      name: moduleName(module.file),
+      kind: 'Module',
+      file: module.file,
+      startLine: module.startLine,
+      endLine: module.endLine,
+    });
+  }
+
+  const edges: CodeMapEdge[] = [];
+  const seen = new Set<string>();
+  const addEdge = (source: string, target: string, kind: CodeMapEdge['kind']): void => {
+    const key = `${source}\u0000${target}\u0000${kind}`;
+    if (source !== target && drawn.has(source) && drawn.has(target) && !seen.has(key)) {
+      seen.add(key);
+      edges.push({ source, target, kind });
+    }
+  };
+  for (const type of foldedTypes) {
+    if (!typeIds.has(type.id)) {
+      continue;
+    }
+    for (const user of type.usedBy) {
+      if (mapIds.has(user)) {
+        addEdge(user, type.id, 'USAGE');
+      }
+    }
+    for (const target of type.refersTo) {
+      if (typeIds.has(target)) {
+        addEdge(type.id, target, 'USAGE');
+      }
+    }
+  }
+  for (const { id, module } of modules) {
+    for (const use of module.uses) {
+      if (mapIds.has(use.id)) {
+        addEdge(id, use.id, use.kind);
+      }
+    }
+    for (const use of module.usesTypes ?? []) {
+      if (typeIds.has(use.id)) {
+        addEdge(id, use.id, 'USAGE');
+      }
+    }
+  }
+  return { nodes, edges };
+}
+
+/**
+ * P4-2 phase 3c: what the canvas draws versus what every number is
+ * computed from. `riskNodes`/`riskEdges` are the fetched map as-is — the
+ * only input to adjacency, Path Trace, Health Audit and anything else that
+ * counts — whatever the toggle says. `canvasNodes`/`canvasEdges` add the
+ * folded cards and their edges when `showFolded` is on; they feed only the
+ * card layout, LOD (so folded cards cluster and un-cluster like any card)
+ * and the rendered edges. Pure.
+ */
+export interface CanvasPopulation {
+  riskNodes: readonly CodeMapNode[];
+  riskEdges: readonly CodeMapEdge[];
+  canvasNodes: readonly (CodeMapNode | FoldedCanvasNode)[];
+  canvasEdges: readonly CodeMapEdge[];
+  /** The folded cards drawn (`canvasNodes` minus `riskNodes`); `[]` with the toggle off. */
+  foldedNodes: readonly FoldedCanvasNode[];
+}
+
+const EMPTY_CANVAS_POPULATION: CanvasPopulation = {
+  riskNodes: [],
+  riskEdges: [],
+  canvasNodes: [],
+  canvasEdges: [],
+  foldedNodes: [],
+};
+
+export function canvasPopulation(
+  fetchState: FetchState,
+  foldedCanvas: FoldedCanvasElements,
+  showFolded: boolean,
+): CanvasPopulation {
+  if (fetchState.status !== 'ready') {
+    return EMPTY_CANVAS_POPULATION;
+  }
+  const riskNodes = fetchState.nodes;
+  const riskEdges = fetchState.edges;
+  if (!showFolded || (foldedCanvas.nodes.length === 0 && foldedCanvas.edges.length === 0)) {
+    return { riskNodes, riskEdges, canvasNodes: riskNodes, canvasEdges: riskEdges, foldedNodes: [] };
+  }
+  return {
+    riskNodes,
+    riskEdges,
+    canvasNodes: [...riskNodes, ...foldedCanvas.nodes],
+    canvasEdges: [...riskEdges, ...foldedCanvas.edges],
+    foldedNodes: foldedCanvas.nodes,
+  };
+}
+
+/**
+ * P4-2 phase 3c: what activating a canvas card does — a cluster expands; a
+ * map Node's card calls its `onActivate` (Node detail); a folded card calls
+ * its own (type detail, or a Module's top-level source). Hookless.
+ */
+export function activateCanvasCard(flowNode: CodeMapAnyFlowNode, expandCluster: (cluster: Cluster) => void): void {
+  if (flowNode.type === 'codeMapCluster') {
+    expandCluster(flowNode.data.cluster);
+  } else if (flowNode.type === 'codeMapFolded') {
+    flowNode.data.onActivate(flowNode.data.folded);
+  } else {
+    flowNode.data.onActivate(flowNode.data.node);
+  }
+}
+
+/** P4-2 phase 3c: "changed contract CodeMapNode" / "changed contracts A and B" (names only). */
+export function formatContractNames(names: readonly string[]): string {
+  const shown = names.slice(0, 2);
+  const rest = names.length - shown.length;
+  const list = rest > 0 ? `${shown.join(', ')} and ${rest} more` : shown.join(' and ');
+  return `contract${names.length === 1 ? '' : 's'} ${list}`;
+}
+
+/** P4-2 phase 3c: a dependent card's accessible-name suffix — ", affected by changed contract X" — or `''`. */
+export function contractDependentAriaSuffix(names: readonly string[] | undefined): string {
+  return names === undefined || names.length === 0 ? '' : `, affected by changed ${formatContractNames(names)}`;
+}
+
+/** P4-2 phase 3c: the id of the toggle's hint, which the checkbox names in `aria-describedby`. */
+export const SHOW_FOLDED_KINDS_HINT_ID = 'code-map-show-folded-kinds-hint';
+
+/** P4-2 phase 3c: the "Show types & modules" toggle's hint — the toggle only draws; no number moves. */
+export const SHOW_FOLDED_KINDS_HINT =
+  'Draws folded Types, Interfaces and Modules on the canvas only. Blast radius, severity and Health Audit always use the folded map, so no risk number changes.';
+
+/**
+ * P4-2 phase 3c: a "latest request wins" guard: `begin()` supersedes every
+ * earlier request; `isLatest(id)` says whether a reply may still apply.
+ * Pure (no React), so it's testable.
+ */
+export function createLatestRequestGuard(): { begin(): number; isLatest(id: number): boolean } {
+  let latest = 0;
+  return {
+    begin: () => {
+      latest += 1;
+      return latest;
+    },
+    isLatest: (id) => id === latest,
+  };
+}
+
+/**
+ * P4-2 phase 3c: reads one project's "Show types & modules" value. `false`
+ * with no project; `null` — keep what's shown — when the read fails or
+ * resolves with a non-boolean. Never rejects. Hookless.
+ */
+export async function loadShowFoldedKinds(
+  projectPath: string | null,
+  get: (projectPath: string) => Promise<boolean>,
+): Promise<boolean | null> {
+  if (projectPath === null) {
+    return false;
+  }
+  try {
+    const show: unknown = await get(projectPath);
+    return typeof show === 'boolean' ? show : null;
+  } catch (error) {
+    console.warn('CodeMap: could not read the "Show types & modules" setting.', error);
+    return null;
+  }
+}
+
+/**
+ * P4-2 phase 3c: stores one project's "Show types & modules" value and
+ * resolves with the value main says is now in effect (`null` when the call
+ * fails or replies with a non-boolean). Never rejects. Hookless.
+ */
+export async function saveShowFoldedKinds(
+  projectPath: string,
+  show: boolean,
+  set: (projectPath: string, show: boolean) => Promise<boolean>,
+): Promise<boolean | null> {
+  try {
+    const stored: unknown = await set(projectPath, show);
+    return typeof stored === 'boolean' ? stored : null;
+  } catch (error) {
+    console.warn('CodeMap: could not remember the "Show types & modules" setting.', error);
+    return null;
+  }
+}
+
+function toFlowEdges(edges: readonly CodeMapEdge[]): FlowEdge[] {
   return edges.map((edge, index) => ({
     // Cypher output has no inherent edge identity; (source, target, kind)
     // can repeat if the graph has parallel edges, so the row index keeps
@@ -1682,7 +2022,10 @@ export function isChangedSource(
 }
 
 /** P3-11: how many of a cluster's members are changed Nodes. `0` outside PR Review (empty set). */
-export function changedMemberCount(memberIds: readonly string[], changedNodeIds: ReadonlySet<string>): number {
+export function changedMemberCount(
+  memberIds: readonly string[],
+  changedNodeIds: { readonly size: number; has(id: string): boolean },
+): number {
   if (changedNodeIds.size === 0) {
     return 0;
   }
@@ -2323,7 +2666,7 @@ export function NodeRiskSignalSections({
  * positions) — only its visibility/interactivity is suppressed, not its
  * presence.
  */
-function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
+export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data'>) {
   const {
     node,
     onActivate,
@@ -2337,14 +2680,18 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
     showLlmJudgment,
     showIngestedFindings,
     isChanged,
+    affectedByContracts,
   } = data;
+  const summaryStatus = node.summaryStatus;
   return (
     <div
       className={`code-map__node${isChanged ? ' code-map__node--changed' : ''}`}
       title={`${node.file}:${node.startLine}-${node.endLine}`}
       tabIndex={0}
       role="button"
-      aria-label={`${node.kind} ${node.name}${isChanged ? ', changed' : ''}, open Node detail`}
+      aria-label={`${node.kind} ${node.name}${isChanged ? ', changed' : ''}${contractDependentAriaSuffix(
+        affectedByContracts,
+      )}, open Node detail`}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
@@ -2368,6 +2715,13 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           Changed
         </p>
       )}
+      {/* P4-2 phase 3c: a changed contract's dependent — its own marker, not
+          colour alone: the ⧉ glyph plus visible text naming the contract. */}
+      {affectedByContracts !== undefined && affectedByContracts.length > 0 && (
+        <p className="code-map__node-contract-dependent">
+          <span aria-hidden="true">⧉</span> Uses changed {formatContractNames(affectedByContracts)}
+        </p>
+      )}
       {/* Story 1.5 Phase 2: one-line summary / pending / coverage-gap — a
           Node's file being in the current index's coverage gap set (FR5)
           is a real, distinct signal from an ordinary "not generated yet"
@@ -2376,7 +2730,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           Constraints: "never a confident-looking placeholder", and the
           product's Accessibility Floor: "signal/trust states never
           color-only"). */}
-      {node.summaryStatus === 'ready' && node.summary !== undefined && (
+      {summaryStatus === 'ready' && node.summary !== undefined && (
         <p className="code-map__node-summary">{node.summary}</p>
       )}
       {/* Story 1.8 (Phase 3): a `'ready'` Node's summary can still drift out
@@ -2397,7 +2751,7 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           site change could produce `stale: true` with no summary text
           rendered above it, leaving the staleness note floating with
           nothing for it to describe. */}
-      {node.summaryStatus === 'ready' && node.summary !== undefined && node.stale === true && (
+      {summaryStatus === 'ready' && node.summary !== undefined && node.stale === true && (
         <p className="code-map__node-staleness" role="status">
           <span aria-hidden="true">⏳</span> Summary may be stale — source changed since generation
         </p>
@@ -2410,23 +2764,23 @@ function CodeMapNodeCard({ data }: NodeProps<CodeMapFlowNode>) {
           message and takes priority when both technically apply — already
           resolved in App.tsx, so at most one of these two is ever true
           here). */}
-      {node.summaryStatus === 'pending' && cloudSelectedNoKey && (
+      {summaryStatus === 'pending' && cloudSelectedNoKey && (
         <p className="code-map__node-summary code-map__node-summary--notice" role="status">
           <span aria-hidden="true">☁</span> Cloud is selected but no API key is set — add one in
           Settings.
         </p>
       )}
-      {node.summaryStatus === 'pending' && !cloudSelectedNoKey && noSummaryBackendAvailable && (
+      {summaryStatus === 'pending' && !cloudSelectedNoKey && noSummaryBackendAvailable && (
         <p className="code-map__node-summary code-map__node-summary--notice" role="status">
           <span aria-hidden="true">⚠</span> No summary backend is available — check Settings.
         </p>
       )}
-      {node.summaryStatus === 'pending' && !cloudSelectedNoKey && !noSummaryBackendAvailable && (
+      {summaryStatus === 'pending' && !cloudSelectedNoKey && !noSummaryBackendAvailable && (
         <p className="code-map__node-summary code-map__node-summary--pending" role="status">
           Summary pending…
         </p>
       )}
-      {node.summaryStatus === 'coverage-gap' && (
+      {summaryStatus === 'coverage-gap' && (
         <p className="code-map__node-summary code-map__node-summary--coverage-gap">
           <span aria-hidden="true">⚠</span> Coverage gap — no summary
         </p>
@@ -2526,6 +2880,8 @@ type CodeMapClusterFlowNode = FlowNode<
     onExpand: (cluster: Cluster) => void;
     /** P3-11: members that are changed Nodes (PR Review). `0` renders no changed marker. */
     changedCount: number;
+    /** P4-2 phase 3c: members that depend on a changed contract (PR Review). Absent or `0`: no marker. */
+    affectedCount?: number;
   },
   'codeMapCluster'
 >;
@@ -2884,11 +3240,23 @@ export interface PrReviewView {
    * Review Mode, with a showable map, for a resolved diff scope that has any.
    */
   topLevelFiles: readonly TopLevelChangedFile[];
+  /**
+   * P4-2 phase 3c: the changed contracts (folded types the diff changed),
+   * for the "Contract changed: … → N dependents" lines. Same gating as
+   * `topLevelFiles`.
+   */
+  changedContracts: readonly ChangedContract[];
+  /**
+   * P4-2 phase 3c: the changed contracts were found without line ranges
+   * (`CHANGED_CONTRACTS_APPROXIMATE_NOTE`).
+   */
+  changedContractsApproximate: boolean;
   /** Which surfaces are on — see `CodeMapSurfaces`. */
   surfaces: CodeMapSurfaces;
 }
 
 const NO_TOP_LEVEL_FILES: readonly TopLevelChangedFile[] = [];
+const NO_CHANGED_CONTRACTS: readonly ChangedContract[] = [];
 
 /**
  * P1-5 + P1-6: the one derivation `CodeMap` reads for "is there a PR Review
@@ -2920,11 +3288,14 @@ export function resolvePrReviewView(
       diffScopeState.status === 'no-base-ref-resolvable')
       ? diffScopeState.status
       : null;
-  const topLevelFiles =
-    mode === 'prReview' && showable && diffScopeState.status === 'resolved'
-      ? diffScopeState.topLevelFiles
-      : NO_TOP_LEVEL_FILES;
-  return { noticeStatus, topLevelFiles, surfaces: resolveCodeMapSurfaces(mode, showable) };
+  const resolved = mode === 'prReview' && showable && diffScopeState.status === 'resolved' ? diffScopeState : null;
+  return {
+    noticeStatus,
+    topLevelFiles: resolved?.topLevelFiles ?? NO_TOP_LEVEL_FILES,
+    changedContracts: resolved?.changedContracts ?? NO_CHANGED_CONTRACTS,
+    changedContractsApproximate: resolved?.changedContractsApproximate === true,
+    surfaces: resolveCodeMapSurfaces(mode, showable),
+  };
 }
 
 /** P4-2 phase 3a: how many files the top-level-change notice names before "+N more". */
@@ -2954,11 +3325,88 @@ export function formatTopLevelChangeNotice<T>(
  * level code changed in 1 file", so a top-level-only diff never reads as a
  * bare "0 changed Nodes".
  */
-export function formatDiffScopeChangeCount(nodeCount: number, topLevelFileCount: number): string {
-  const nodes = `${nodeCount} changed Node${nodeCount === 1 ? '' : 's'}`;
-  return topLevelFileCount > 0
-    ? `${nodes} · top-level code changed in ${topLevelFileCount} file${topLevelFileCount === 1 ? '' : 's'}`
-    : nodes;
+export function formatDiffScopeChangeCount(nodeCount: number, topLevelFileCount: number, contractCount = 0): string {
+  const parts: string[] = [];
+  // P4-2 phase 3c: changed contracts lead, and with any, a zero Node count is
+  // left out — a type-only diff reads "1 contract changed", never as a bare
+  // "0 changed Nodes".
+  if (contractCount > 0) {
+    parts.push(`${contractCount} contract${contractCount === 1 ? '' : 's'} changed`);
+  }
+  if (nodeCount > 0 || contractCount === 0) {
+    parts.push(`${nodeCount} changed Node${nodeCount === 1 ? '' : 's'}`);
+  }
+  if (topLevelFileCount > 0) {
+    parts.push(`top-level code changed in ${topLevelFileCount} file${topLevelFileCount === 1 ? '' : 's'}`);
+  }
+  return parts.join(' · ');
+}
+
+/** P4-2 phase 3c: what PR Review says when changed contracts were found without line ranges. */
+export const CHANGED_CONTRACTS_APPROXIMATE_NOTE = "approximate: couldn't read line ranges";
+
+/**
+ * A rendered card's highlight classes: the Path Trace highlight (Story 1.9),
+ * the blast radius's affected treatment (Story 3.2), and — P4-2 phase 3c —
+ * `code-map__contract-dependent` for a changed contract's dependent (its
+ * own class; the card also carries a ⧉ marker and an accessible-name
+ * suffix, so it is never colour alone). Any can apply at once. `null` for
+ * none. Pure.
+ */
+export function nodeHighlightClassName(
+  id: string,
+  pathHighlightNodeIds: ReadonlySet<string>,
+  blastRadiusNodeIds: ReadonlySet<string>,
+  contractDependentIds: { has(id: string): boolean },
+): string | null {
+  const classNames: string[] = [];
+  if (pathHighlightNodeIds.has(id)) {
+    classNames.push('code-map__path-highlight');
+  }
+  if (blastRadiusNodeIds.has(id)) {
+    classNames.push('code-map__blast-radius-highlight');
+  }
+  if (contractDependentIds.has(id)) {
+    classNames.push('code-map__contract-dependent');
+  }
+  return classNames.length > 0 ? classNames.join(' ') : null;
+}
+
+/** P4-2 phase 3c: how many changed-contract lines PR Review shows before "+N more". */
+export const CHANGED_CONTRACTS_SHOWN = 5;
+
+/** P4-2 phase 3c: "59 dependents" / "1 dependent" — a changed contract's dependent count. */
+export function formatContractDependents(contract: Pick<ChangedContract, 'dependentCount'>): string {
+  return formatCount(contract.dependentCount, 'dependent', 'dependents');
+}
+
+/**
+ * P4-2 phase 3c: the map Nodes PR Review marks as affected by the changed
+ * contracts — every contract's real dependents (`dependentIds`, from
+ * `USAGE` edges only), each with the names of the contracts it uses, less
+ * the changed Nodes themselves, which keep the changed treatment. Pure.
+ */
+export function contractDependents(
+  contracts: readonly ChangedContract[],
+  changedNodeIds: ReadonlySet<string>,
+): ReadonlyMap<string, readonly string[]> {
+  if (contracts.length === 0) {
+    return NO_CONTRACT_DEPENDENTS;
+  }
+  const byNode = new Map<string, string[]>();
+  for (const contract of contracts) {
+    for (const id of contract.dependentIds) {
+      if (changedNodeIds.has(id)) {
+        continue;
+      }
+      const names = byNode.get(id) ?? [];
+      if (!names.includes(contract.name)) {
+        names.push(contract.name);
+      }
+      byNode.set(id, names);
+    }
+  }
+  return byNode;
 }
 
 /**
@@ -2974,6 +3422,8 @@ export function diffScopeStateFromResult(result: DiffScopeResult): DiffScopeStat
         resolvedBaseRef: result.resolvedBaseRef,
         nodeIds: new Set(result.nodeIds),
         topLevelFiles: result.topLevelFiles ?? NO_TOP_LEVEL_FILES,
+        changedContracts: result.changedContracts ?? NO_CHANGED_CONTRACTS,
+        changedContractsApproximate: result.changedContractsApproximate === true,
       };
     case 'error':
       return { status: 'error', message: result.message };
@@ -3015,6 +3465,21 @@ function topLevelFileButtons(files: readonly TopLevelChangedFile[], onOpenFile: 
   ));
 }
 
+/** P4-2 phase 3c: a changed contract's name, as the button that opens its type detail. */
+function ChangedContractButton({ contract, onOpenType }: { contract: ChangedContract; onOpenType: (id: string) => void }) {
+  return (
+    <button
+      type="button"
+      className="code-map__link-button"
+      onClick={() => onOpenType(contract.id)}
+      aria-label={`Open the type detail of ${contract.name}`}
+      title={contract.file}
+    >
+      <code>{contract.name}</code>
+    </button>
+  );
+}
+
 /**
  * P1-5 + P1-6: the id of the PR Review notice's live region, which the
  * base-ref input names in `aria-describedby`. A module-scope constant rather
@@ -3046,17 +3511,31 @@ export function PrReviewDiffScopeNoticeRegion({
   status,
   topLevelFiles = NO_TOP_LEVEL_FILES,
   onOpenFile = () => {},
+  changedContracts = NO_CHANGED_CONTRACTS,
+  changedContractsApproximate = false,
+  onOpenType = () => {},
 }: {
   status: DiffScopeNoticeStatus | null;
   /** P4-2 phase 3a: see `PrReviewView.topLevelFiles`. */
   topLevelFiles?: readonly TopLevelChangedFile[];
   /** P4-2 phase 3a: opens a top-level-only changed file in the source viewer. */
   onOpenFile?: (target: SourceTarget) => void;
+  /** P4-2 phase 3c: see `PrReviewView.changedContracts`. */
+  changedContracts?: readonly ChangedContract[];
+  /** P4-2 phase 3c: see `PrReviewView.changedContractsApproximate`. */
+  changedContractsApproximate?: boolean;
+  /** P4-2 phase 3c: opens a changed contract's type detail, by its id. */
+  onOpenType?: (id: string) => void;
 }) {
   const topLevel = formatTopLevelChangeNotice(topLevelFiles);
-  return (
-    <div id={PR_REVIEW_NOTICE_ID} className="code-map__pr-review-notice-region" role="status">
+  const summary = formatChangedContractsSummary(changedContracts.length, changedContractsApproximate);
+  // P4-2 phase 3c: the live region announces only a one-line contract
+  // summary; the interactive contract lines sit beside it, outside it, so a
+  // screen reader isn't read every button whenever the scope resolves.
+  return [
+    <div key="live" id={PR_REVIEW_NOTICE_ID} className="code-map__pr-review-notice-region" role="status">
       {status !== null && <PrReviewDiffScopeNotice status={status} />}
+      {summary !== null && <span className="visually-hidden">{summary}</span>}
       {topLevel !== null && (
         <ActionableNotice tone="info">
           {topLevel.lead}
@@ -3068,6 +3547,72 @@ export function PrReviewDiffScopeNoticeRegion({
         <details className="code-map__more">
           <summary>+{topLevel.rest.length} more</summary>
           <p className="code-map__more-list">{topLevelFileButtons(topLevel.rest, onOpenFile)}</p>
+        </details>
+      )}
+    </div>,
+    changedContracts.length > 0 && (
+      <ChangedContractList
+        key="contracts"
+        contracts={changedContracts}
+        approximate={changedContractsApproximate}
+        onOpenType={onOpenType}
+      />
+    ),
+  ];
+}
+
+/**
+ * P4-2 phase 3c: the live region's one-line contract summary — "2 contracts
+ * changed." (with the approximate note when it applies) — or `null` for none.
+ */
+export function formatChangedContractsSummary(count: number, approximate: boolean): string | null {
+  if (count === 0) {
+    return null;
+  }
+  const lead = `${count} contract${count === 1 ? '' : 's'} changed`;
+  return approximate ? `${lead} (${CHANGED_CONTRACTS_APPROXIMATE_NOTE}).` : `${lead}.`;
+}
+
+/**
+ * P4-2 phase 3c: one line per changed contract, "Contract changed:
+ * CodeMapNode → 59 dependents", up to `CHANGED_CONTRACTS_SHOWN`, then "+N
+ * more"; each name opens the type detail. Outside the live region. MUST
+ * STAY HOOKLESS.
+ */
+export function ChangedContractList({
+  contracts,
+  approximate,
+  onOpenType,
+}: {
+  contracts: readonly ChangedContract[];
+  approximate: boolean;
+  onOpenType: (id: string) => void;
+}) {
+  const shown = contracts.slice(0, CHANGED_CONTRACTS_SHOWN);
+  const more = contracts.slice(CHANGED_CONTRACTS_SHOWN);
+  return (
+    <div className="code-map__changed-contracts" role="group" aria-label="Changed contracts">
+      {approximate && (
+        <ActionableNotice tone="warning">Changed contracts are {CHANGED_CONTRACTS_APPROXIMATE_NOTE}.</ActionableNotice>
+      )}
+      {shown.map((contract) => (
+        <ActionableNotice key={contract.id} tone="info">
+          Contract changed: <ChangedContractButton contract={contract} onOpenType={onOpenType} /> →{' '}
+          {formatContractDependents(contract)}
+        </ActionableNotice>
+      ))}
+      {more.length > 0 && (
+        <details className="code-map__more">
+          <summary>+{more.length} more</summary>
+          <p className="code-map__more-list">
+            {more.map((contract, index) => (
+              <Fragment key={contract.id}>
+                {index > 0 && ', '}
+                <ChangedContractButton contract={contract} onOpenType={onOpenType} /> (
+                {formatContractDependents(contract)})
+              </Fragment>
+            ))}
+          </p>
         </details>
       )}
     </div>
@@ -3671,15 +4216,22 @@ export function HealthAuditClusterGrid({
  * P3-11: a cluster card's accessible name. A cluster holding changed Nodes
  * (PR Review) appends ", N changed" so the marker is never colour-only.
  */
-export function clusterAriaLabel(nodeCount: number, willZoomInsteadOfExpand: boolean, changedCount: number): string {
+export function clusterAriaLabel(
+  nodeCount: number,
+  willZoomInsteadOfExpand: boolean,
+  changedCount: number,
+  affectedCount = 0,
+): string {
   const base = willZoomInsteadOfExpand
     ? `Cluster of ${formatCount(nodeCount, 'Node', 'Nodes')}, too many to expand — zoom in`
     : `Cluster of ${formatCount(nodeCount, 'Node', 'Nodes')}, expand`;
-  return changedCount > 0 ? `${base}, ${formatCountNumber(changedCount)} changed` : base;
+  const changed = changedCount > 0 ? `${base}, ${formatCountNumber(changedCount)} changed` : base;
+  // P4-2 phase 3c: members that depend on a changed contract.
+  return affectedCount > 0 ? `${changed}, ${formatCountNumber(affectedCount)} affected by changed contracts` : changed;
 }
 
 export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) {
-  const { cluster, onExpand, changedCount } = data;
+  const { cluster, onExpand, changedCount, affectedCount = 0 } = data;
   const willZoomInsteadOfExpand = cluster.nodeIds.length > CLUSTER_EXPAND_MAX;
   const classNames = ['code-map__cluster'];
   if (willZoomInsteadOfExpand) {
@@ -3688,12 +4240,15 @@ export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) 
   if (changedCount > 0) {
     classNames.push('code-map__cluster--changed');
   }
+  if (affectedCount > 0) {
+    classNames.push('code-map__cluster--contract-dependent');
+  }
   return (
     <div
       className={classNames.join(' ')}
       tabIndex={0}
       role="button"
-      aria-label={clusterAriaLabel(cluster.nodeIds.length, willZoomInsteadOfExpand, changedCount)}
+      aria-label={clusterAriaLabel(cluster.nodeIds.length, willZoomInsteadOfExpand, changedCount, affectedCount)}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
@@ -3709,14 +4264,60 @@ export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) 
           {formatCountNumber(changedCount)} changed
         </span>
       )}
+      {affectedCount > 0 && (
+        <span className="code-map__cluster-affected" aria-hidden="true">
+          ⧉ {formatCountNumber(affectedCount)} affected
+        </span>
+      )}
       <Handle type="source" position={Position.Right} />
     </div>
   );
 }
 
-type CodeMapAnyFlowNode = CodeMapFlowNode | CodeMapClusterFlowNode;
+type CodeMapAnyFlowNode = CodeMapCardFlowNode | CodeMapClusterFlowNode;
 
-const nodeTypes = { codeMapNode: CodeMapNodeCard, codeMapCluster: CodeMapClusterCard };
+/**
+ * P4-2 phase 3c: a folded kind's card ("Show types & modules"): kind, name,
+ * file, and for a type "used by N". Activating it opens the type detail or
+ * the Module's top-level source. MUST STAY HOOKLESS (rendered in tests).
+ */
+export function CodeMapFoldedCard({ data }: Pick<NodeProps<CodeMapFoldedFlowNode>, 'data'>) {
+  const { folded, onActivate, isChanged } = data;
+  const action = folded.kind === 'Module' ? 'open its top-level code' : 'open type detail';
+  return (
+    <div
+      className={`code-map__node code-map__node--folded${isChanged ? ' code-map__node--changed' : ''}`}
+      title={`${folded.file}:${folded.startLine}-${folded.endLine}`}
+      tabIndex={0}
+      role="button"
+      aria-label={`Folded ${folded.kind} ${folded.name}${isChanged ? ', changed' : ''}, ${action}`}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onActivate(folded);
+        }
+      }}
+    >
+      <Handle type="target" position={Position.Left} />
+      <span className="code-map__node-kind">{folded.kind} · folded</span>
+      <code className="code-map__node-id">{folded.name}</code>
+      {isChanged && (
+        <p className="code-map__node-changed-badge" role="status">
+          Changed
+        </p>
+      )}
+      <p className="code-map__node-folded-file">
+        <code>{folded.file}</code>
+      </p>
+      <p className="code-map__node-folded-note">
+        {folded.usedByTotal !== undefined ? `Used by ${formatCountNumber(folded.usedByTotal)}` : 'File top-level code'}
+      </p>
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+}
+
+const nodeTypes = { codeMapNode: CodeMapNodeCard, codeMapCluster: CodeMapClusterCard, codeMapFolded: CodeMapFoldedCard };
 
 /**
  * Dev-only frame-timing/selection-latency instrumentation (Code Map's
@@ -5475,6 +6076,38 @@ export function CodeMap({
   // showLlmJudgment"), same no-persistence/no-IPC treatment and same
   // default-on reasoning as the two toggles above.
   const [showIngestedFindings, setShowIngestedFindings] = useState(true);
+  // P4-2 phase 3c: "Show types & modules" — draws the folded kinds back on
+  // the canvas, render only. Off by default; remembered per project in the
+  // UI settings store (main). On a project change the previous value stays
+  // until the new project's read lands (no off/on flicker); a user choice
+  // supersedes a read in flight, and the value main stored wins.
+  const [showFoldedKinds, setShowFoldedKinds] = useState(false);
+  const showFoldedKindsRequests = useRef(createLatestRequestGuard()).current;
+  useEffect(() => {
+    const requestId = showFoldedKindsRequests.begin();
+    void loadShowFoldedKinds(projectPath, (path) => window.driller.getShowFoldedKinds(path)).then((show) => {
+      if (show !== null && showFoldedKindsRequests.isLatest(requestId)) {
+        setShowFoldedKinds(show);
+      }
+    });
+  }, [projectPath, showFoldedKindsRequests]);
+  const changeShowFoldedKinds = useCallback(
+    (show: boolean) => {
+      const requestId = showFoldedKindsRequests.begin();
+      setShowFoldedKinds(show);
+      if (projectPath === null) {
+        return;
+      }
+      void saveShowFoldedKinds(projectPath, show, (path, value) => window.driller.setShowFoldedKinds(path, value)).then(
+        (stored) => {
+          if (stored !== null && showFoldedKindsRequests.isLatest(requestId)) {
+            setShowFoldedKinds(stored);
+          }
+        },
+      );
+    },
+    [projectPath, showFoldedKindsRequests],
+  );
   // P0-1 (2026-09-24): the three family toggles above, bundled once for the
   // two surfaces that render risk signals (the Node card, via `layoutNodes`'
   // own separate scalar props, and the Node Detail panel below). Passing one
@@ -5807,6 +6440,7 @@ export function CodeMap({
             hiddenByScope: result.hiddenByScope,
             appliedScope: result.appliedScope,
             foldedTypes: result.foldedTypes,
+            foldedModules: result.foldedModules,
           });
         } else {
           setFetchState({ status: 'error', message: result.message });
@@ -5893,6 +6527,7 @@ export function CodeMap({
             hiddenByScope: outcome.hiddenByScope,
             appliedScope: outcome.appliedScope,
             foldedTypes: outcome.foldedTypes,
+            ...(outcome.foldedModules !== undefined ? { foldedModules: outcome.foldedModules } : {}),
           });
           // P4-2 phase 3b: an open type detail and an "is a type" notice
           // follow their types to the fresh map, or close/clear when gone.
@@ -5920,6 +6555,7 @@ export function CodeMap({
                 hiddenByScope: result.hiddenByScope,
                 appliedScope: result.appliedScope,
                 foldedTypes: result.foldedTypes,
+                foldedModules: result.foldedModules,
               }
             : { kind: 'failed', message: result.message },
         );
@@ -6610,12 +7246,68 @@ export function CodeMap({
   // comment, while only its *rendering* is mode-gated).
   const changedNodeIds: ReadonlySet<string> =
     mode === 'prReview' && diffScopeState.status === 'resolved' ? diffScopeState.nodeIds : EMPTY_ID_SET;
+  // P4-2 phase 3c: the changed contracts' dependents — marked with their own
+  // contract-dependent treatment (never the changed one). Same mode gate as
+  // `changedNodeIds`.
+  const changedContracts =
+    mode === 'prReview' && diffScopeState.status === 'resolved' ? diffScopeState.changedContracts : NO_CHANGED_CONTRACTS;
+  const contractDependentsById = useMemo(
+    () => contractDependents(changedContracts, changedNodeIds),
+    [changedContracts, changedNodeIds],
+  );
+
+  // P4-2 phase 3c: "Show types & modules" — the folded kinds as render-only
+  // canvas cards. `canvasPopulation` keeps them out of everything that
+  // counts: only the card layout, LOD and the rendered edges read
+  // `canvasNodes`/`canvasEdges`; adjacency, Path Trace, the blast radius and
+  // Health Audit read the fetched map.
+  const foldedCanvas = useMemo(
+    () =>
+      showFoldedKinds && fetchState.status === 'ready'
+        ? foldedCanvasElements(fetchState.nodes, fetchState.foldedTypes, fetchState.foldedModules ?? [])
+        : NO_FOLDED_CANVAS,
+    [showFoldedKinds, fetchState],
+  );
+  const population = useMemo(
+    () => canvasPopulation(fetchState, foldedCanvas, showFoldedKinds),
+    [fetchState, foldedCanvas, showFoldedKinds],
+  );
+  // With the folded kinds drawn, a changed contract's own card is marked
+  // changed too (render only — `changedNodeIds` itself is untouched).
+  const renderChangedIds = useMemo<ReadonlySet<string>>(() => {
+    if (population.foldedNodes.length === 0 || changedContracts.length === 0) {
+      return changedNodeIds;
+    }
+    const ids = new Set(changedNodeIds);
+    for (const contract of changedContracts) {
+      ids.add(contract.id);
+    }
+    return ids;
+  }, [population, changedContracts, changedNodeIds]);
+  // A folded card opens what it stands for: a type's detail, or a Module's
+  // top-level code in the source viewer.
+  const activateFoldedNodeRef = useRef<(folded: FoldedCanvasNode) => void>(() => {});
+  activateFoldedNodeRef.current = (folded: FoldedCanvasNode) => {
+    if (folded.kind === 'Module') {
+      openSourceForNode({
+        file: folded.file,
+        startLine: folded.startLine,
+        endLine: folded.endLine,
+        label: `${folded.file} (top-level)`,
+      });
+      return;
+    }
+    openType(folded.id);
+  };
+  const activateFoldedNode = useCallback((folded: FoldedCanvasNode) => {
+    activateFoldedNodeRef.current(folded);
+  }, []);
 
   const flowNodes = useMemo(
     () =>
       fetchState.status === 'ready'
         ? layoutNodes(
-            fetchState.nodes,
+            population.riskNodes,
             activateNode,
             showNeighbors,
             openSourceForNode,
@@ -6625,11 +7317,15 @@ export function CodeMap({
             showDeterministicSignals,
             showLlmJudgment,
             showIngestedFindings,
-            changedNodeIds,
+            renderChangedIds,
+            population.foldedNodes,
+            activateFoldedNode,
+            contractDependentsById,
           )
         : [],
     [
-      fetchState,
+      fetchState.status,
+      population,
       activateNode,
       showNeighbors,
       openSourceForNode,
@@ -6639,21 +7335,17 @@ export function CodeMap({
       showDeterministicSignals,
       showLlmJudgment,
       showIngestedFindings,
-      changedNodeIds,
+      renderChangedIds,
+      activateFoldedNode,
+      contractDependentsById,
     ],
   );
-  const flowEdges = useMemo(
-    () => (fetchState.status === 'ready' ? toFlowEdges(fetchState.edges) : []),
-    [fetchState],
-  );
+  const flowEdges = useMemo(() => toFlowEdges(population.canvasEdges), [population]);
   // FIX-2: the map's real `CALLS` edges, for the `'found'` trace highlight.
-  const callEdges = useMemo(
-    () => (fetchState.status === 'ready' ? callEdgesOf(fetchState.edges) : []),
-    [fetchState],
-  );
+  const callEdges = useMemo(() => callEdgesOf(population.riskEdges), [population]);
 
   const flowNodesById = useMemo(() => {
-    const byId = new Map<string, CodeMapFlowNode>();
+    const byId = new Map<string, CodeMapCardFlowNode>();
     for (const flowNode of flowNodes) {
       byId.set(flowNode.id, flowNode);
     }
@@ -6666,6 +7358,9 @@ export function CodeMap({
   // Constraints: never by array index/position — this is the position
   // `layoutNodes` already computed for each content-stable Node id, not a
   // fresh derivation from list order).
+  // P4-2 phase 3c: `flowNodes` includes the "Show types & modules" folded
+  // cards (canvas only), so they go through LOD — clustered and revealed —
+  // and reach `visibleNodeIds` like any card; nothing that counts reads this.
   const lodInputNodes = useMemo<LODInputNode[]>(
     () => flowNodes.map((flowNode) => ({ id: flowNode.id, position: flowNode.position })),
     [flowNodes],
@@ -6819,15 +7514,9 @@ export function CodeMap({
     // of a ternary could ever win). `styles.css`'s own
     // `.code-map__path-highlight.code-map__blast-radius-highlight` selector
     // is what resolves that combination once both classes are present here.
-    const withHighlight = (flowNode: CodeMapFlowNode): CodeMapFlowNode => {
-      const classNames: string[] = [];
-      if (pathHighlightNodeIds.has(flowNode.id)) {
-        classNames.push('code-map__path-highlight');
-      }
-      if (blastRadiusNodeIds.has(flowNode.id)) {
-        classNames.push('code-map__blast-radius-highlight');
-      }
-      return classNames.length > 0 ? { ...flowNode, className: classNames.join(' ') } : flowNode;
+    const withHighlight = (flowNode: CodeMapCardFlowNode): CodeMapCardFlowNode => {
+      const className = nodeHighlightClassName(flowNode.id, pathHighlightNodeIds, blastRadiusNodeIds, contractDependentsById);
+      return className !== null ? { ...flowNode, className } : flowNode;
     };
 
     for (const id of lodResult.fullNodeIds) {
@@ -6852,12 +7541,14 @@ export function CodeMap({
         continue;
       }
       // P3-11: PR Review's changed marker (`0` everywhere else).
-      const changedCount = changedMemberCount(cluster.nodeIds, changedNodeIds);
+      const changedCount = changedMemberCount(cluster.nodeIds, renderChangedIds);
+      // P4-2 phase 3c: and its changed-contract dependents marker.
+      const affectedCount = changedMemberCount(cluster.nodeIds, contractDependentsById);
       const clusterNode: CodeMapClusterFlowNode = {
         id: cluster.id,
         type: 'codeMapCluster',
         position: cluster.position,
-        data: { cluster, onExpand: expandCluster, changedCount },
+        data: { cluster, onExpand: expandCluster, changedCount, ...(affectedCount > 0 ? { affectedCount } : {}) },
       };
       nodes.push(clusterNode);
     }
@@ -6869,7 +7560,7 @@ export function CodeMap({
       clusters: lodResult.clusters,
       expandedClusterIds,
       visibleNodeIds,
-      changedNodeIds,
+      changedNodeIds: renderChangedIds,
       pathHighlight,
     });
 
@@ -6884,18 +7575,17 @@ export function CodeMap({
     pathHighlightNodeIds,
     pathHighlight,
     blastRadiusNodeIds,
-    changedNodeIds,
+    contractDependentsById,
+    renderChangedIds,
   ]);
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(
     (_event, flowNode) => {
-      if (flowNode.type === 'codeMapCluster') {
-        expandCluster(flowNode.data.cluster);
-        return;
-      }
-      activateNode(flowNode.data.node);
+      // P4-2 phase 3c: see `activateCanvasCard` — a map card's `onActivate`
+      // is `activateNode`; a folded card's is `activateFoldedNode`.
+      activateCanvasCard(flowNode, expandCluster);
     },
-    [activateNode, expandCluster],
+    [expandCluster],
   );
 
   // The shared traversal primitive (Story 1.4 Code Map: `navigateToNode`)
@@ -7506,6 +8196,8 @@ export function CodeMap({
   const {
     noticeStatus: prReviewNoticeStatus,
     topLevelFiles: prReviewTopLevelFiles,
+    changedContracts: prReviewChangedContracts,
+    changedContractsApproximate: prReviewChangedContractsApproximate,
     surfaces,
   } = resolvePrReviewView(mode, fetchState, diffScopeState);
 
@@ -7607,6 +8299,9 @@ export function CodeMap({
             status={prReviewNoticeStatus}
             topLevelFiles={prReviewTopLevelFiles}
             onOpenFile={openSourceForNode}
+            changedContracts={prReviewChangedContracts}
+            changedContractsApproximate={prReviewChangedContractsApproximate}
+            onOpenType={openType}
           />
 
           {/* Review finding (Blind Hunter): the `'idle'` state (before the
@@ -7633,7 +8328,12 @@ export function CodeMap({
           {diffScopeState.status === 'resolved' && (
             <p className="code-map__pr-review-resolved" role="status">
               Diffed against <code>{diffScopeState.resolvedBaseRef}</code> —{' '}
-              {formatDiffScopeChangeCount(diffScopeState.nodeIds.size, diffScopeState.topLevelFiles.length)}.
+              {formatDiffScopeChangeCount(
+                diffScopeState.nodeIds.size,
+                diffScopeState.topLevelFiles.length,
+                diffScopeState.changedContracts.length,
+              )}
+              .
             </p>
           )}
 
@@ -7939,6 +8639,23 @@ export function CodeMap({
               />
               PR-bot findings
             </label>
+            {/* P4-2 phase 3c: "Show types & modules" — draws the folded
+                Types/Interfaces/Modules back on the canvas, render only; off
+                by default and remembered per project. The hint says what it
+                doesn't do: no risk number moves. */}
+            <label className="code-map__signal-toggle" title={SHOW_FOLDED_KINDS_HINT}>
+              <input
+                type="checkbox"
+                checked={showFoldedKinds}
+                onChange={(event) => changeShowFoldedKinds(event.target.checked)}
+                aria-describedby={SHOW_FOLDED_KINDS_HINT_ID}
+              />
+              Show types &amp; modules
+            </label>
+            <span id={SHOW_FOLDED_KINDS_HINT_ID} className="code-map__signal-toggle-hint">
+              Risk numbers unchanged
+              <span className="visually-hidden">: {SHOW_FOLDED_KINDS_HINT}</span>
+            </span>
           </Panel>
         </ReactFlow>
       )}
@@ -8101,7 +8818,7 @@ export function CodeMap({
                 parents={pathTrace.parents}
                 depths={pathTrace.depths}
                 resolveNode={(id) => {
-                  const node = flowNodesById.get(id)?.data.node;
+                  const node = mapNodeOf(flowNodesById.get(id));
                   return { name: node?.name ?? id, file: node?.file };
                 }}
                 onNavigate={navigateToNode}
@@ -8113,11 +8830,11 @@ export function CodeMap({
             {pathTrace.status === 'neighbors' && (
               <NeighborTraceSteps
                 originId={pathTrace.originId}
-                originName={flowNodesById.get(pathTrace.originId)?.data.node.name ?? pathTrace.originId}
+                originName={mapNodeOf(flowNodesById.get(pathTrace.originId))?.name ?? pathTrace.originId}
                 direction={pathTrace.direction}
                 neighborIds={pathTrace.neighborIds}
                 resolveNode={(id) => {
-                  const node = flowNodesById.get(id)?.data.node;
+                  const node = mapNodeOf(flowNodesById.get(id));
                   return { name: node?.name ?? id, file: node?.file };
                 }}
                 onNavigate={navigateToNode}
@@ -8273,7 +8990,7 @@ export function CodeMap({
               onOpenTest={(target) => openTestFromDetail(target, { closeNodeDetail, openSourceForNode })}
               // P4-2 phase 3a: the rendered population `navigateToNode`
               // centres on, so only a navigable Node becomes a button.
-              resolveMapNode={(id) => flowNodesById.get(id)?.data.node}
+              resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id))}
               onNavigateToNode={(id) => navigateFromDetail(id, { closeNodeDetail, navigateToNode })}
               // P4-2 phase 3b: a "Uses" entry opens its type's detail in
               // place of this panel.
@@ -8329,7 +9046,7 @@ export function CodeMap({
             <TypeDetailHead type={typeDetail.type} onClose={closeTypeDetail} />
             <TypeDetailBody
               type={typeDetail.type}
-              resolveMapNode={(id) => flowNodesById.get(id)?.data.node}
+              resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id))}
               onNavigateToNode={(id) =>
                 navigateFromTypeDetail(id, { closeTypeDetail, closeNodeDetail, navigateToNode })
               }

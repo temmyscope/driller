@@ -10,7 +10,7 @@
  * structural data as if it were current — anything other than `indexed` means
  * the map shows the last completed index.
  */
-import type { CodeMapEdge, CodeMapNode, FoldedType, GraphServiceStatusMessage } from '@driller/ipc-contracts';
+import type { CodeMapEdge, CodeMapNode, FoldedModule, FoldedType, GraphServiceStatusMessage } from '@driller/ipc-contracts';
 
 // ---------------------------------------------------------------------------
 // View derivation
@@ -223,6 +223,8 @@ export type CodeMapFetchReply =
       appliedScope: string[];
       /** P4-2 phase 3b: `CodeMapResult.foldedTypes`. */
       foldedTypes: FoldedType[];
+      /** P4-2 phase 3c: `CodeMapResult.foldedModules`; absent means none. */
+      foldedModules?: FoldedModule[];
     }
   | { kind: 'failed'; message: string };
 
@@ -244,6 +246,8 @@ export type RefreshOutcome =
       appliedScope: string[];
       /** P4-2 phase 3b: carried through from the reply. */
       foldedTypes: FoldedType[];
+      /** P4-2 phase 3c: carried through from the reply, when it has one. */
+      foldedModules?: FoldedModule[];
       nodeDetail: NodeDetailRefresh;
     }
   /** The refresh failed but a completed map is on screen: keep it, and say the refresh failed. */
@@ -288,6 +292,7 @@ export function resolveRefreshOutcome({
     hiddenByScope: reply.hiddenByScope,
     appliedScope: reply.appliedScope,
     foldedTypes: reply.foldedTypes,
+    ...(reply.foldedModules !== undefined ? { foldedModules: reply.foldedModules } : {}),
     nodeDetail,
   };
 }

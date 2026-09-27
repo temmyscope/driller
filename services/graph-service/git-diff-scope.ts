@@ -46,6 +46,8 @@
  * establishes for `PrBotIngestionResult`).
  */
 
+import type { ChangedLineRange, ChangedLinesByFile } from '@driller/graph-contracts';
+
 import { resolveDefaultBranch } from './git-base-ref';
 import { runSafeSubprocess, type SubprocessResult } from './subprocess-runner';
 
@@ -65,7 +67,18 @@ const GIT_SUBPROCESS_TIMEOUT_MS = 20 * 1000;
  * `DiffScopeResult`.
  */
 export type GitDiffScopeResult =
-  | { status: 'resolved'; resolvedBaseRef: string; changedFiles: string[] }
+  | {
+      status: 'resolved';
+      resolvedBaseRef: string;
+      changedFiles: string[];
+      /**
+       * P4-2 phase 3c: each changed file's changed line ranges in its HEAD
+       * version (`parseChangedLines`), from the same merge-base..HEAD diff.
+       * Absent when that listing failed (e.g. a diff too large to buffer):
+       * the changed-file list above still stands.
+       */
+      changedLines?: ChangedLinesByFile;
+    }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }
   | { status: 'no-base-ref-resolvable' }
@@ -180,5 +193,140 @@ export async function computeDiffScope(
     return { status: 'no-changes' };
   }
 
-  return { status: 'resolved', resolvedBaseRef, changedFiles };
+  // P4-2 phase 3c: the changed line ranges, for changed-contract detection.
+  // The same basis as the changed-file list above: `resolvedBaseRef` is the
+  // merge-base commit, so this is `merge-base..HEAD` (what `base...HEAD`
+  // means) and commits the base branch gained after the fork never count.
+  // `-U0` so each hunk header is exactly the changed lines. Explicit
+  // prefixes and no external diff/color, so a user's `diff.noprefix`/
+  // `diff.external`/`color.ui` config can't change the shape parsed.
+  // Best-effort: a failure leaves `changedLines` out.
+  const hunksResult = await runSafeSubprocess(
+    'git',
+    [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--no-color',
+      '--no-ext-diff',
+      '--unified=0',
+      '--src-prefix=a/',
+      '--dst-prefix=b/',
+      resolvedBaseRef,
+      'HEAD',
+    ],
+    { cwd: projectRoot, timeoutMs: GIT_SUBPROCESS_TIMEOUT_MS },
+  );
+  if (!('stdout' in hunksResult)) {
+    console.warn(
+      `Could not read the diff's changed line ranges (${describeSubprocessFailure(hunksResult)}); ` +
+        'every type in a changed file will count as changed (approximate).',
+    );
+    return { status: 'resolved', resolvedBaseRef, changedFiles };
+  }
+
+  return { status: 'resolved', resolvedBaseRef, changedFiles, changedLines: parseChangedLines(hunksResult.stdout) };
+}
+
+/**
+ * The path of a `diff --git a/P b/P` header whose two sides are the same
+ * path — unambiguous even with spaces in `P`, since both halves must match.
+ * `null` for a rename/copy header (two paths) or a quoted one.
+ */
+function samePathFromGitHeader(rest: string): string | null {
+  if (rest.length % 2 === 0) {
+    return null;
+  }
+  const half = (rest.length - 1) / 2;
+  const left = rest.slice(0, half);
+  const right = rest.slice(half + 1);
+  if (rest[half] !== ' ' || !left.startsWith('a/') || !right.startsWith('b/') || left.slice(2) !== right.slice(2)) {
+    return null;
+  }
+  return right.slice(2);
+}
+
+const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/**
+ * P4-2 phase 3c: parses `git diff --unified=0 --src-prefix=a/
+ * --dst-prefix=b/` output into each post-change file's changed line ranges
+ * (`ChangedLineRange`: a pure deletion is the empty range between its
+ * neighbours). Hunk bodies are skipped by their header's line counts, so a
+ * changed line that itself reads `+++ b/…` is never taken for a file
+ * header.
+ *
+ * Every file the diff names is listed, so an absent file means "couldn't
+ * read" (`findChangedContracts` then counts all its types): a file whose
+ * header names it with no hunks (a mode change, a binary file, a pure
+ * rename's `rename to`) is listed with `[]`. A deleted file (`+++
+ * /dev/null`) is not listed. A path git still C-quotes (control
+ * characters, a double quote) is not parsed, so it stays absent. Pure.
+ */
+export function parseChangedLines(diff: string): Record<string, ChangedLineRange[]> {
+  const result: Record<string, ChangedLineRange[]> = Object.create(null) as Record<string, ChangedLineRange[]>;
+  const lines = diff.split('\n');
+  let file: string | null = null;
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index] ?? '';
+    index += 1;
+    if (line.startsWith('diff --git ')) {
+      file = samePathFromGitHeader(line.slice('diff --git '.length));
+      if (file !== null) {
+        result[file] ??= [];
+      }
+      continue;
+    }
+    if (line.startsWith('rename to ') || line.startsWith('copy to ')) {
+      file = line.slice(line.indexOf(' to ') + 4);
+      result[file] ??= [];
+      continue;
+    }
+    if (line.startsWith('+++ ')) {
+      // git appends a tab to a header path containing a space.
+      const name = line.slice(4).replace(/\t$/, '');
+      if (name === '/dev/null') {
+        // A deleted file: nothing of it is left to change.
+        if (file !== null && result[file]?.length === 0) {
+          delete result[file];
+        }
+        file = null;
+        continue;
+      }
+      file = name.startsWith('b/') ? name.slice(2) : null;
+      if (file !== null) {
+        result[file] ??= [];
+      }
+      continue;
+    }
+    const hunk = HUNK_HEADER.exec(line);
+    if (hunk === null) {
+      continue;
+    }
+    let oldCount = hunk[1] === undefined ? 1 : Number(hunk[1]);
+    const newStart = Number(hunk[2]);
+    let newCount = hunk[3] === undefined ? 1 : Number(hunk[3]);
+    if (file !== null) {
+      const ranges = result[file] ?? [];
+      ranges.push(newCount === 0 ? { start: newStart + 1, end: newStart } : { start: newStart, end: newStart + newCount - 1 });
+      result[file] = ranges;
+    }
+    // Skip the hunk body: `oldCount` '-' lines, `newCount` '+' lines, and any
+    // "\ No newline at end of file" markers among them.
+    while (index < lines.length && (oldCount > 0 || newCount > 0 || (lines[index] ?? '').startsWith('\\'))) {
+      const body = lines[index] ?? '';
+      index += 1;
+      if (body.startsWith('-')) {
+        oldCount -= 1;
+      } else if (body.startsWith('+')) {
+        newCount -= 1;
+      } else if (!body.startsWith('\\')) {
+        // Not a -U0 body line: stop skipping rather than eat a header.
+        index -= 1;
+        break;
+      }
+    }
+  }
+  return { ...result };
 }

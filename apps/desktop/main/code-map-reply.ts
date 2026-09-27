@@ -11,17 +11,34 @@
  * non-array becomes `[]` (and is named in `replaced`), and each malformed
  * element is dropped and counted in `droppedFoldedTypes`, so one bad row
  * never reaches the renderer and never blanks the rest.
+ *
+ * P4-2 phase 3c: `foldedModules` the same way (`isFoldedModule`,
+ * `droppedFoldedModules`); every source range (types, Modules) must be
+ * whole lines, start ≤ end. And a diff-scope reply
+ * (`toValidatedDiffScopeResult`): `nodeIds`, `topLevelFiles` and
+ * `changedContracts` are checked; malformed elements are dropped.
  */
-import type { CodeMapResult, FoldedType, GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
+import type {
+  ChangedContract,
+  CodeMapResult,
+  DiffScopeResult,
+  FoldedModule,
+  FoldedType,
+  GraphServiceCodeMapMessage,
+  TopLevelChangedFile,
+} from '@driller/ipc-contracts';
 
 type CodeMapReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMap' }>;
 type OkCodeMapResult = Extract<CodeMapResult, { status: 'ok' }>;
 
-export type ReplacedCodeMapField = 'hiddenByScope' | 'appliedScope' | 'foldedTypes';
+export type ReplacedCodeMapField = 'hiddenByScope' | 'appliedScope' | 'foldedTypes' | 'foldedModules';
 
 const isString = (value: unknown): value is string => typeof value === 'string';
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const isStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(isString);
+/** P4-2 phase 3c: a source range's lines — positive integers, start ≤ end. */
+const isLineRange = (start: unknown, end: unknown): boolean =>
+  Number.isInteger(start) && Number.isInteger(end) && (start as number) >= 1 && (start as number) <= (end as number);
 
 /**
  * P4-2 phase 3b: whether `value` has every field the renderer reads off a
@@ -40,8 +57,7 @@ export function isFoldedType(value: unknown): value is FoldedType {
     isString(type.name) &&
     isString(type.file) &&
     (type.kind === 'Type' || type.kind === 'Interface') &&
-    isFiniteNumber(type.startLine) &&
-    isFiniteNumber(type.endLine) &&
+    isLineRange(type.startLine, type.endLine) &&
     isFiniteNumber(type.usedByTotal) &&
     isStringArray(type.usedBy) &&
     isStringArray(type.implements) &&
@@ -59,6 +75,128 @@ export function isFoldedType(value: unknown): value is FoldedType {
   );
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
+
+/**
+ * P4-2 phase 3c: whether `value` has every field the renderer reads off a
+ * `FoldedModule`: string `file`, a non-empty string-array `moduleIds`,
+ * finite `startLine`/`endLine`, a `uses` array of `{id: string, kind:
+ * 'CALLS' | 'USAGE' | 'IMPORTS'}`, and (optional) a `usesTypes` array of
+ * `{id, name: string, kind: 'Type' | 'Interface'}`.
+ */
+export function isFoldedModule(value: unknown): value is FoldedModule {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    isString(value.file) &&
+    isStringArray(value.moduleIds) &&
+    value.moduleIds.length > 0 &&
+    value.moduleIds.every((id) => id.length > 0) &&
+    isLineRange(value.startLine, value.endLine) &&
+    Array.isArray(value.uses) &&
+    value.uses.every(
+      (use: unknown) =>
+        isRecord(use) && isString(use.id) && (use.kind === 'CALLS' || use.kind === 'USAGE' || use.kind === 'IMPORTS'),
+    ) &&
+    (value.usesTypes === undefined ||
+      (Array.isArray(value.usesTypes) &&
+        value.usesTypes.every(
+          (use: unknown) =>
+            isRecord(use) &&
+            isString(use.id) &&
+            isString(use.name) &&
+            (use.kind === 'Type' || use.kind === 'Interface'),
+        )))
+  );
+}
+
+/**
+ * P4-2 phase 3c: whether `value` is a well-formed `ChangedContract`: string
+ * `id`/`name`/`file`, a `kind` of `'Type'` or `'Interface'`, a unique
+ * string-array `dependentIds` (possibly capped), and a non-negative integer
+ * `dependentCount` of at least `dependentIds.length`.
+ */
+export function isChangedContract(value: unknown): value is ChangedContract {
+  return (
+    isRecord(value) &&
+    isString(value.id) &&
+    isString(value.name) &&
+    isString(value.file) &&
+    (value.kind === 'Type' || value.kind === 'Interface') &&
+    isStringArray(value.dependentIds) &&
+    new Set(value.dependentIds).size === value.dependentIds.length &&
+    Number.isInteger(value.dependentCount) &&
+    (value.dependentCount as number) >= value.dependentIds.length
+  );
+}
+
+/** P4-2 phase 3c: a well-formed `TopLevelChangedFile`: string `file`, a valid line range. */
+export function isTopLevelChangedFile(value: unknown): value is TopLevelChangedFile {
+  return isRecord(value) && isString(value.file) && isLineRange(value.startLine, value.endLine);
+}
+
+const MALFORMED_DIFF_SCOPE: DiffScopeResult = {
+  status: 'error',
+  message: 'The diff-scope reply from the Graph Service was malformed.',
+};
+
+/** Keeps an optional array field's well-formed elements; `dropped` counts the rest (a non-array counts 1). */
+function keepValid<T>(raw: unknown, isValid: (value: unknown) => value is T): { kept: T[]; dropped: number } {
+  if (raw === undefined) {
+    return { kept: [], dropped: 0 };
+  }
+  if (!Array.isArray(raw)) {
+    return { kept: [], dropped: 1 };
+  }
+  const kept = raw.filter(isValid);
+  return { kept, dropped: raw.length - kept.length };
+}
+
+/**
+ * P4-2 phase 3c: a diff-scope reply as the renderer may read it. A
+ * resolved result needs a string `resolvedBaseRef` and an array `nodeIds`
+ * (else the whole reply becomes an explicit error); non-string `nodeIds`
+ * entries are dropped. `topLevelFiles` and `changedContracts` keep only
+ * well-formed elements and are left out when none survive;
+ * `changedContractsApproximate` survives only as `true` beside contracts.
+ * An error result needs a string `message`. Other states pass through.
+ * `dropped` counts what was removed, for one warning per reply.
+ */
+export function toValidatedDiffScopeResult(result: DiffScopeResult): { result: DiffScopeResult; dropped: number } {
+  if (!isRecord(result)) {
+    return { result: MALFORMED_DIFF_SCOPE, dropped: 1 };
+  }
+  if (result.status === 'error') {
+    return isString(result.message) ? { result, dropped: 0 } : { result: MALFORMED_DIFF_SCOPE, dropped: 1 };
+  }
+  if (result.status !== 'resolved') {
+    const known = ['no-changes', 'not-a-git-repo', 'no-base-ref-resolvable'] as const;
+    return (known as readonly unknown[]).includes(result.status)
+      ? { result: { status: result.status }, dropped: 0 }
+      : { result: MALFORMED_DIFF_SCOPE, dropped: 1 };
+  }
+  const raw = result as Record<string, unknown>;
+  if (!isString(raw.resolvedBaseRef) || !Array.isArray(raw.nodeIds)) {
+    return { result: MALFORMED_DIFF_SCOPE, dropped: 1 };
+  }
+  const nodeIds = raw.nodeIds.filter(isString);
+  const topLevel = keepValid(raw.topLevelFiles, isTopLevelChangedFile);
+  const contracts = keepValid(raw.changedContracts, isChangedContract);
+  const approximate = raw.changedContractsApproximate === true && contracts.kept.length > 0;
+  return {
+    result: {
+      status: 'resolved',
+      resolvedBaseRef: raw.resolvedBaseRef,
+      nodeIds,
+      ...(topLevel.kept.length > 0 ? { topLevelFiles: topLevel.kept } : {}),
+      ...(contracts.kept.length > 0 ? { changedContracts: contracts.kept } : {}),
+      ...(approximate ? { changedContractsApproximate: true as const } : {}),
+    },
+    dropped: raw.nodeIds.length - nodeIds.length + topLevel.dropped + contracts.dropped,
+  };
+}
+
 /** "a", "a and b", "a, b and c" — for a one-line log of the replaced fields. */
 export function joinNaturally(items: readonly string[]): string {
   if (items.length <= 1) {
@@ -72,6 +210,8 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   replaced: ReplacedCodeMapField[];
   /** P4-2 phase 3b: how many `foldedTypes` elements were malformed and dropped. */
   droppedFoldedTypes: number;
+  /** P4-2 phase 3c: how many `foldedModules` elements were malformed and dropped. */
+  droppedFoldedModules: number;
 } {
   const replaced: ReplacedCodeMapField[] = [];
   const rawHidden: unknown = message.hiddenByScope;
@@ -97,9 +237,27 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   } else {
     replaced.push('foldedTypes');
   }
+  const rawModules: unknown = message.foldedModules;
+  let foldedModules: FoldedModule[] = [];
+  let droppedFoldedModules = 0;
+  if (Array.isArray(rawModules)) {
+    foldedModules = rawModules.filter(isFoldedModule);
+    droppedFoldedModules = rawModules.length - foldedModules.length;
+  } else {
+    replaced.push('foldedModules');
+  }
   return {
-    result: { status: 'ok', nodes: message.nodes, edges: message.edges, hiddenByScope, appliedScope, foldedTypes },
+    result: {
+      status: 'ok',
+      nodes: message.nodes,
+      edges: message.edges,
+      hiddenByScope,
+      appliedScope,
+      foldedTypes,
+      foldedModules,
+    },
     replaced,
     droppedFoldedTypes,
+    droppedFoldedModules,
   };
 }

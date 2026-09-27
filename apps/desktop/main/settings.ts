@@ -10,6 +10,8 @@
 import Store from 'electron-store';
 import type { RecentProject } from '@driller/ipc-contracts';
 
+import { normalizePathForComparison } from './project-path';
+
 interface SettingsSchema {
   recentProjects: RecentProject[];
 }
@@ -87,13 +89,4 @@ function pathBasename(projectPath: string): string {
   return segments[segments.length - 1] || trimmed;
 }
 
-/**
- * Normalizes a path for de-duplication purposes: strips a trailing
- * separator and case-folds it. Case-insensitive filesystems (macOS and
- * Windows defaults) would otherwise treat differently-cased or
- * trailing-slash variants of the same folder as distinct Recent Projects
- * entries.
- */
-function normalizePathForComparison(projectPath: string): string {
-  return projectPath.replace(/[\\/]+$/, '').toLowerCase();
-}
+

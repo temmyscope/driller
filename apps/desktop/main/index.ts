@@ -75,7 +75,7 @@ import {
   setCloudApiKey,
 } from './backend-settings';
 import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection } from './app-menu';
-import { joinNaturally, toOkCodeMapResult } from './code-map-reply';
+import { joinNaturally, toOkCodeMapResult, toValidatedDiffScopeResult } from './code-map-reply';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
@@ -85,7 +85,8 @@ import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
 import { getProjectScope, setProjectScope } from './project-scope-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
-import { uiSettings } from './ui-settings-store';
+import { handleGetShowFoldedKinds, handleSetShowFoldedKinds } from './ui-settings';
+import { showFoldedKindsSetting, uiSettings } from './ui-settings-store';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -792,13 +793,19 @@ function spawnGraphService(): void {
           // P2-5: the scope fields are validated here, at the process boundary.
           // P4-2 phase 3b: and each folded type; malformed ones are dropped,
           // with one warning per reply.
-          const { result, replaced, droppedFoldedTypes } = toOkCodeMapResult(message);
+          // P4-2 phase 3c: and each folded Module.
+          const { result, replaced, droppedFoldedTypes, droppedFoldedModules } = toOkCodeMapResult(message);
           if (replaced.length > 0) {
             console.warn(`Code Map reply had malformed ${joinNaturally(replaced)}; replaced with the empty default.`);
           }
           if (droppedFoldedTypes > 0) {
             console.warn(
               `Code Map reply had ${droppedFoldedTypes} malformed folded type${droppedFoldedTypes === 1 ? '' : 's'}; dropped.`,
+            );
+          }
+          if (droppedFoldedModules > 0) {
+            console.warn(
+              `Code Map reply had ${droppedFoldedModules} malformed folded Module${droppedFoldedModules === 1 ? '' : 's'}; dropped.`,
             );
           }
           settlePendingCodeMapRequest(result);
@@ -820,7 +827,14 @@ function spawnGraphService(): void {
         return;
       }
       if (isComputeDiffScopeResultMessage(message)) {
-        settlePendingDiffScopeRequest(message.projectPath, message.result, message.requestId);
+        // P4-2 phase 3c: the reply is validated here, at the process
+        // boundary (`nodeIds`, `topLevelFiles`, `changedContracts`);
+        // malformed elements are dropped, with one warning.
+        const { result, dropped } = toValidatedDiffScopeResult(message.result);
+        if (dropped > 0) {
+          console.warn(`Diff-scope reply had ${dropped} malformed field${dropped === 1 ? '' : 's'} or element${dropped === 1 ? '' : 's'}; dropped.`);
+        }
+        settlePendingDiffScopeRequest(message.projectPath, result, message.requestId);
         return;
       }
       if (isExpandBlastRadiusResultMessage(message)) {
@@ -1984,6 +1998,19 @@ function registerIpcHandlers(): void {
   // delegation shell and untyped-arg validation discipline as the PR-bot
   // handlers immediately above.
   // -------------------------------------------------------------------------
+
+  // P4-2 phase 3c: the per-project "Show types & modules" canvas toggle —
+  // same thin delegation and untyped-arg discipline. A malformed project path
+  // reads as off; a malformed value is a no-op returning what's stored.
+  ipcMain.handle(IpcChannels.settingsGetShowFoldedKinds, (_event, projectPath: unknown): boolean =>
+    handleGetShowFoldedKinds(showFoldedKindsSetting, projectPath),
+  );
+
+  ipcMain.handle(
+    IpcChannels.settingsSetShowFoldedKinds,
+    (_event, projectPath: unknown, show: unknown): boolean =>
+      handleSetShowFoldedKinds(showFoldedKindsSetting, projectPath, show),
+  );
 
   ipcMain.handle(
     IpcChannels.settingsGetProjectScope,

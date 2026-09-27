@@ -291,6 +291,23 @@ describe('resolveRefreshOutcome', () => {
     );
   });
 
+  it('P4-2 phase 3c: carries the reply\'s folded Modules to the applied map, and none when it has none', () => {
+    // P4-2 phase 3c: a reply's folded Modules ride along to the applied map;
+    // a reply without them applies none.
+    const modules = [{ file: 'lib/boot.ts', moduleIds: ['mod:boot'], startLine: 1, endLine: 4, uses: [] }];
+    const withModules = resolveRefreshOutcome({
+      requestId: 5,
+      latestRequestId: 5,
+      reply: { ...ok, foldedModules: modules },
+      hasReadyData: true,
+      openDetailNodeId: null,
+    });
+    assert.deepEqual(withModules.kind === 'apply' ? withModules.foldedModules : 'not applied', modules);
+    const noModules = resolveRefreshOutcome({ requestId: 6, latestRequestId: 6, reply: ok, hasReadyData: true, openDetailNodeId: null });
+    assert.equal(noModules.kind === 'apply' && 'foldedModules' in noModules, false);
+
+  });
+
   it('P2-5: an empty map emptied by the scope keeps hiddenByScope and appliedScope through a refresh', () => {
     const emptied = { kind: 'ok' as const, nodes: [], edges: [], hiddenByScope: 229, appliedScope: ['wbe'], foldedTypes: [] };
     assert.deepEqual(

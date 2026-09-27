@@ -123,6 +123,8 @@ import {
   buildBidirectionalAdjacency,
   computeBlastRadiusHopDistances,
   findChangedNodeIds,
+  findChangedContracts,
+  findContractOnlyChangedFiles,
   findTopLevelOnlyChangedFiles,
   FOLDED_TYPE_IPC_MAX_USED_BY,
   traceCallPath,
@@ -1492,6 +1494,8 @@ async function handleGetCodeMapRequest(): Promise<void> {
       // Capped per type for the reply only (`usedByTotal` stays the full
       // count); the cache below keeps every user for `lookup_node`.
       foldedTypes: capFoldedTypeUsedBy(foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
+      // P4-2 phase 3c: for the "Show types & modules" canvas toggle only.
+      foldedModules,
     });
     // Review round (patch): passes `nodesWithRiskSignals`, not
     // `normalizedNodes` — `startSummaryGenerationForProject` caches its
@@ -1983,6 +1987,8 @@ export async function computeDiffScopeResult(
     const nodes = activeCodeMapNodes;
     // P4-2 phase 3a: captured with `nodes` (same fetch, same tick).
     const foldedModules = activeFoldedModules ?? [];
+    // P4-2 phase 3c: captured with them too; `usedBy` here is uncapped.
+    const foldedTypes = activeFoldedTypes ?? [];
     const projectRoot = activeProjectPath;
     if (!nodes || !projectRoot) {
       return { status: 'error', message: 'No project has finished indexing yet.' };
@@ -2024,12 +2030,34 @@ export async function computeDiffScopeResult(
     // P4-2 phase 3a: a changed Module is not a changed Node (it isn't in
     // `nodes`), so a file whose only change-able content is top-level code
     // is reported by name instead — never a silent "0 changed Nodes".
-    const topLevelFiles = findTopLevelOnlyChangedFiles(nodes, foldedModules, diffScope.changedFiles);
+    // P4-2 phase 3c: a changed type is not a changed Node either (types are
+    // folded off the map), so it is named as a changed contract, with the map
+    // Nodes that use it — and a file whose every change touches a type is a
+    // contract change, not a "top-level code" change.
+    // Dependents are kept only among `nodes` (the map in scope), so the count
+    // is what PR Review can highlight; `dependentIds` is capped for the wire.
+    const { contracts: changedContracts, approximate } = findChangedContracts(
+      foldedTypes,
+      diffScope.changedFiles,
+      diffScope.changedLines,
+      { mapNodeIds: new Set(nodes.map((node) => node.id)) },
+    );
+    const contractOnlyFiles =
+      diffScope.changedLines === undefined
+        ? new Set<string>()
+        : findContractOnlyChangedFiles(foldedTypes, diffScope.changedLines);
+    const topLevelFiles = findTopLevelOnlyChangedFiles(
+      nodes,
+      foldedModules,
+      diffScope.changedFiles.filter((file) => !contractOnlyFiles.has(file)),
+    );
     return {
       status: 'resolved',
       resolvedBaseRef: diffScope.resolvedBaseRef,
       nodeIds,
       ...(topLevelFiles.length > 0 ? { topLevelFiles } : {}),
+      ...(changedContracts.length > 0 ? { changedContracts } : {}),
+      ...(changedContracts.length > 0 && approximate ? { changedContractsApproximate: true as const } : {}),
     };
   } catch (error) {
     return { status: 'error', message: error instanceof Error ? error.message : String(error) };
