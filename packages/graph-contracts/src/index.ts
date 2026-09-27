@@ -994,7 +994,86 @@ export interface CodeMapNode {
    * there is none.
    */
   calledAtLoadBy?: string[];
+  /**
+   * P4-2 phase 3b: the Type and Interface Nodes this Node uses — each from a
+   * real `USAGE` edge out of this Node, never inferred from its signature
+   * (`param_types`/`return_type`). Types are folded off the map (see
+   * `FoldedType`), so this is where the link survives. Sorted by name, then
+   * id. Absent when there is none.
+   */
+  usesTypes?: TypeUse[];
+  /**
+   * P4-2 phase 3b (review round 1): the Type and Interface Nodes this Node's
+   * file's top-level code uses — the folded Module's `usesTypes` (see
+   * `FoldedModule.usesTypes`), shared by every Node in the file, shown in
+   * Node detail's "File top-level" row. Absent when there is none.
+   */
+  fileTopLevelTypes?: TypeUse[];
 }
+
+/** P4-2 phase 3b: the Code Map Node kinds folded off the map as contracts (`FoldedType`). */
+export type FoldedTypeKind = Extract<CodeMapNodeKind, 'Type' | 'Interface'>;
+
+/** P4-2 phase 3b: one folded Type/Interface a Node uses (`CodeMapNode.usesTypes`); `id` resolves via `lookup_node`. */
+export interface TypeUse {
+  id: string;
+  name: string;
+  kind: FoldedTypeKind;
+}
+
+/**
+ * P4-2 phase 3b: a Type or Interface Node, folded off the Code Map. Its
+ * complexity is always 0 and it is a pure sink (only `USAGE` edges into it),
+ * so it is not a map Node: its edges don't count toward adjacency, blast
+ * radius, severity, Health Audit or Path Trace. Who depends on it is kept
+ * here, keyed by id, for Node detail's "Uses" / type detail's "Used by" and
+ * `lookup_node`. Every link comes from a real backend edge; nothing is
+ * inferred from a name or a signature.
+ */
+export interface FoldedType {
+  /** `qualified_name`, the same stable id it had as a map Node. */
+  id: string;
+  name: string;
+  kind: FoldedTypeKind;
+  /** POSIX-relative path of its file. */
+  file: string;
+  startLine: number;
+  endLine: number;
+  /**
+   * Map Node ids with a `USAGE` edge into it, sorted by id. May be capped
+   * (the Code Map reply carries at most `FOLDED_TYPE_IPC_MAX_USED_BY`);
+   * `usedByTotal` is always the full count.
+   */
+  usedBy: string[];
+  /** How many map Nodes use it — the full count, whatever `usedBy` carries. */
+  usedByTotal: number;
+  /** `usedByTotal` broken down by the users' Node kind, most first, then by kind. */
+  usedByKinds: FoldedTypeUserKindCount[];
+  /**
+   * Folded type ids it extends or implements (backend `IMPLEMENTS` edges),
+   * sorted by id. Only Interface/Type ends are fetched: a Class implementing
+   * an Interface is not, because Classes are not Code Map Nodes.
+   */
+  implements: string[];
+  /** The reverse of `implements`: folded type ids that extend or implement it, sorted by id. */
+  implementedBy: string[];
+  /** Folded type ids it refers to (`USAGE` edges out of it into another folded type), sorted by id. */
+  refersTo: string[];
+  /** The reverse of `refersTo`: folded type ids that refer to it, sorted by id. */
+  referencedByTypes: string[];
+}
+
+/** P4-2 phase 3b: how many of a folded type's users are of one Node kind. */
+export interface FoldedTypeUserKindCount {
+  kind: CodeMapNodeKind;
+  count: number;
+}
+
+/** P4-2 phase 3b: `lookup_node`'s cap on a folded type's `usedBy` ids; `usedByTotal` gives the full count. */
+export const FOLDED_TYPE_LOOKUP_MAX_USED_BY = 50;
+
+/** P4-2 phase 3b (review round 1): the Code Map reply's cap on each folded type's `usedBy` ids. */
+export const FOLDED_TYPE_IPC_MAX_USED_BY = 200;
 
 /**
  * P4-2 phase 3a: one thing a file's top-level code calls or uses — the
@@ -1027,6 +1106,13 @@ export interface FoldedModule {
   endLine: number;
   /** Distinct targets, `CALLS` before `USAGE`/`IMPORTS`, then by id. A target reached both ways is listed once, as `CALLS`. */
   uses: FileTopLevelUse[];
+  /**
+   * P4-2 phase 3b (review round 1): the folded Type/Interface Nodes this
+   * file's top-level code uses, moved out of `uses` when types were folded
+   * (so `uses` names only map Nodes). Sorted by name, then id. Absent when
+   * there is none.
+   */
+  usesTypes?: TypeUse[];
 }
 
 /** P4-2 phase 3a: a changed file whose only map content is folded top-level code (see `findTopLevelOnlyChangedFiles`). */
@@ -1118,7 +1204,39 @@ export type NodeLookupResult =
    * falls into its default branch instead. `folded: true` is deliberately
    * redundant (the spec's marker); narrow on `status === 'folded'`.
    */
-  | { status: 'folded'; folded: true; nodeId: string; file: string; uses: FileTopLevelUse[] }
+  | {
+      status: 'folded';
+      folded: true;
+      kind: 'Module';
+      nodeId: string;
+      file: string;
+      uses: FileTopLevelUse[];
+      /** P4-2 phase 3b: the types its top-level code uses (`FoldedModule.usesTypes`); `[]` when none. */
+      usesTypes: TypeUse[];
+    }
+  /**
+   * P4-2 phase 3b: `nodeId` is a Type or Interface folded off the map (see
+   * `FoldedType`) — same `status: 'folded'`, told apart from a folded Module
+   * by `kind`. `usedBy` is at most `FOLDED_TYPE_LOOKUP_MAX_USED_BY` Node ids
+   * (sorted by id); `usedByTotal` is the full count.
+   */
+  | {
+      status: 'folded';
+      folded: true;
+      kind: FoldedTypeKind;
+      nodeId: string;
+      name: string;
+      file: string;
+      startLine: number;
+      endLine: number;
+      usedBy: string[];
+      usedByTotal: number;
+      usedByKinds: FoldedTypeUserKindCount[];
+      implements: string[];
+      implementedBy: string[];
+      refersTo: string[];
+      referencedByTypes: string[];
+    }
   | { status: 'not-found' }
   | { status: 'error'; message: string };
 

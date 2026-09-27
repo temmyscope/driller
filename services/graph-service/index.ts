@@ -124,11 +124,13 @@ import {
   computeBlastRadiusHopDistances,
   findChangedNodeIds,
   findTopLevelOnlyChangedFiles,
+  FOLDED_TYPE_IPC_MAX_USED_BY,
   traceCallPath,
   type BlastRadiusExpansionResult,
   type CoverageSummaryResult,
   type DiffScopeResult,
   type FoldedModule,
+  type FoldedType,
   type IndexCoverageSummary,
   type PathTraceResult,
 } from '@driller/graph-contracts';
@@ -185,6 +187,7 @@ import {
 } from './project-scope';
 import { attachProjectRiskSignals } from './risk-signals';
 import { attachFoldedModuleLinks, scopeFoldedModules } from './fold-modules';
+import { attachTypeUses, capFoldedTypeUsedBy, scopeFoldedTypes, splitModuleTypeUses } from './fold-types';
 import { fetchProductionCodeMap } from './production-code-map';
 import { toProjectRelativePosixPath } from './project-path';
 import { isTestPath } from './test-code';
@@ -473,6 +476,11 @@ let activeCodeMapEdges: CodeMapEdge[] | undefined;
 // id resolves as folded) and by diff scope (a top-level-only change).
 let activeFoldedModules: FoldedModule[] | undefined;
 
+// P4-2 phase 3b: the most recently fetched Code Map's folded Type/Interface
+// Nodes (`fold-types.ts`), scope-filtered like its Nodes. Same lifecycle as
+// `activeFoldedModules`. Read by `lookup_node` (a type id resolves as folded).
+let activeFoldedTypes: FoldedType[] | undefined;
+
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
 // Node's own `child_process.fork` argv convention, which `utilityProcess.
@@ -519,6 +527,7 @@ try {
     postMcpServerStatus,
     (node) => deriveLiveNode(node, { getRecord: getNodeRecord, coverageGapFiles: coverageGapFileSet }),
     () => activeFoldedModules,
+    () => activeFoldedTypes,
   );
 } catch (error) {
   console.error('[graph-service] failed to start the Agent-Facing Query Surface (mcp-server.ts):', error);
@@ -922,7 +931,7 @@ function handleRetryModelRequest(): void {
         // (`activeGenerationRunId`/`activeJudgmentGenerationRunId`) clears
         // itself in its `finally`, so neither blocks this restart — while
         // still stopping a duplicate if one is somehow already running.
-        startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? []).catch(
+        startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? []).catch(
           logFailure('summary generation'),
         );
         startJudgmentGenerationForProject(nodes).catch(logFailure('judgment generation'));
@@ -1153,6 +1162,7 @@ async function handleIndexRequest(
   activeCodeMapEdges = undefined;
   // P4-2 phase 3a: same lifecycle as the two above.
   activeFoldedModules = undefined;
+  activeFoldedTypes = undefined;
   // Story 5.1 (Phase 2): reset alongside `activeCodeMapEdges` — same
   // never-serve-a-since-superseded-project's-coverage-summary reasoning.
   activeCoverageSummary = undefined;
@@ -1390,15 +1400,19 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // P4-2 phase 3a: and folds Module Nodes off the map (`fold-modules.ts`):
     // no Module Node or Module edge reaches anything below; each Node carries
     // its file's top-level uses as `fileTopLevel`.
+    // P4-2 phase 3b: and folds Type/Interface Nodes off the map
+    // (`fold-types.ts`): no type Node or type edge reaches anything below;
+    // each Node carries the types it uses as `usesTypes`.
     const {
       nodes: normalizedNodesUnfiltered,
       edges: productionEdges,
       foldedModules: foldedModulesUnfiltered,
+      foldedTypes: foldedTypesUnfiltered,
     } = await fetchProductionCodeMap(
       activeProject,
       projectRoot,
       'Code Map',
-      { includeTestedBy: true },
+      { includeTestedBy: true, includeImplements: true },
     );
     // Bug fix (2026-09-23): filtered post-normalization (cheaper — avoids
     // `filterCodeMapToScope`'s own internal normalize-for-match-test running
@@ -1415,12 +1429,20 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // P4-2 phase 3a: a folded Module is in scope exactly when its file is,
     // and names only Nodes that survived the scope filter; the Nodes' own
     // `fileTopLevel`/`calledAtLoadBy` are re-derived from that scoped set.
-    const foldedModules = scopeFoldedModules(
-      foldedModulesUnfiltered,
-      new Set(scopedNodes.map((node) => node.id)),
+    const scopedNodeIds = new Set(scopedNodes.map((node) => node.id));
+    // P4-2 phase 3b: the same for folded types — in scope when their file
+    // is, naming only scoped Nodes; `usesTypes` is re-derived from that set.
+    // A folded Module's top-level type uses keep only in-scope types.
+    const foldedTypes = scopeFoldedTypes(
+      foldedTypesUnfiltered,
+      new Map(scopedNodes.map((node) => [node.id, node.kind])),
       appliedScope,
     );
-    const normalizedNodes = attachFoldedModuleLinks(scopedNodes, foldedModules);
+    const foldedModules = splitModuleTypeUses(
+      scopeFoldedModules(foldedModulesUnfiltered, scopedNodeIds, appliedScope),
+      foldedTypes,
+    );
+    const normalizedNodes = attachTypeUses(attachFoldedModuleLinks(scopedNodes, foldedModules), foldedTypes);
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
     // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
     // live on every fetch — never persisted to `node-record-store.ts`
@@ -1467,6 +1489,9 @@ async function handleGetCodeMapRequest(): Promise<void> {
       edges,
       hiddenByScope,
       appliedScope,
+      // Capped per type for the reply only (`usedByTotal` stays the full
+      // count); the cache below keeps every user for `lookup_node`.
+      foldedTypes: capFoldedTypeUsedBy(foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
     });
     // Review round (patch): passes `nodesWithRiskSignals`, not
     // `normalizedNodes` — `startSummaryGenerationForProject` caches its
@@ -1493,7 +1518,7 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // (new edges, stale nodes) with no error, since neither the
     // `activeProjectPath` nor the `activeSummaryGenerationId` guard changes
     // on a plain Code Map refetch of the same project.
-    void startSummaryGenerationForProject(nodesWithRiskSignals, edges, foldedModules);
+    void startSummaryGenerationForProject(nodesWithRiskSignals, edges, foldedModules, foldedTypes);
     // Story 2.2 Phase 2: judgment generation kicked off the same
     // fire-and-forget way, alongside the summary/staleness kick-offs — never
     // delays this response (AD-8). Same `nodesWithRiskSignals` set (not
@@ -2223,6 +2248,8 @@ async function startSummaryGenerationForProject(
   // passes its own; a re-kick of generation over the cached map passes the
   // cached `activeFoldedModules`.
   foldedModules: FoldedModule[],
+  // P4-2 phase 3b: cached with them, the same way.
+  foldedTypes: FoldedType[],
 ): Promise<void> {
   const generationId = activeSummaryGenerationId;
   const projectRoot = activeProjectPath;
@@ -2234,6 +2261,7 @@ async function startSummaryGenerationForProject(
   activeCodeMapNodes = nodes;
   activeCodeMapEdges = edges;
   activeFoldedModules = foldedModules;
+  activeFoldedTypes = foldedTypes;
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
@@ -2556,7 +2584,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
     // genuinely-blocked/pending Nodes (e.g. blocked on a missing key that
     // now exists) are retried.
     activeSummaryGenerationId += 1;
-    void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? []);
+    void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? []);
     return;
   }
 
@@ -2596,7 +2624,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
   }
 
   activeSummaryGenerationId += 1;
-  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? []);
+  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? []);
 }
 
 process.parentPort?.on('message', (event) => {

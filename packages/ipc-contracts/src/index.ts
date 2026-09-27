@@ -27,6 +27,7 @@ import type {
   CodeMapEdge,
   CodeMapNode,
   DiffScopeResult,
+  FoldedType,
   IndexCoverageSummary,
   PathTraceResult,
 } from '@driller/graph-contracts';
@@ -60,6 +61,10 @@ export type {
   FileTopLevelUse,
   FoldedModule,
   TopLevelChangedFile,
+  FoldedType,
+  FoldedTypeKind,
+  FoldedTypeUserKindCount,
+  TypeUse,
   CodeMapEdgeKind,
   CodeMapEdge,
   DiffScopeResult,
@@ -74,7 +79,11 @@ export type {
  * uses — for PR Review's initial stepper depth and the Blast Radius chip's
  * tooltip/accessible name ("within N hops"), never a second literal.
  */
-export { BLAST_RADIUS_DEFAULT_HOPS, TESTED_BY_MAX_TESTS } from '@driller/graph-contracts';
+export {
+  BLAST_RADIUS_DEFAULT_HOPS,
+  FOLDED_TYPE_IPC_MAX_USED_BY,
+  TESTED_BY_MAX_TESTS,
+} from '@driller/graph-contracts';
 
 // ---------------------------------------------------------------------------
 // Recent Projects (AD-5: persisted via electron-store under userData)
@@ -352,6 +361,15 @@ export type CodeMapResult =
        * produced it, never a persisted value that may not have applied yet.
        */
       appliedScope: string[];
+      /**
+       * P4-2 phase 3b: the Type/Interface Nodes folded off this map (see
+       * `FoldedType`), scope-filtered like `nodes`, sorted by id, each
+       * `usedBy` capped at `FOLDED_TYPE_IPC_MAX_USED_BY` (`usedByTotal` is
+       * the full count). Node
+       * detail's "Uses" links and Path Trace's "is a type" notice resolve
+       * against it.
+       */
+      foldedTypes: FoldedType[];
     }
   | { status: 'error'; message: string };
 
@@ -409,6 +427,8 @@ export type GraphServiceCodeMapMessage =
       edges: CodeMapEdge[];
       hiddenByScope: number;
       appliedScope: string[];
+      /** P4-2 phase 3b: see `CodeMapResult.foldedTypes`. */
+      foldedTypes: FoldedType[];
     }
   | { type: 'graphService:codeMapError'; message: string };
 

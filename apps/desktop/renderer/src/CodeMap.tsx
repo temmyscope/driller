@@ -89,6 +89,8 @@ import type {
   DeterministicRiskSignalType,
   DiffScopeResult,
   FileTopLevelUse,
+  FoldedType,
+  FoldedTypeUserKindCount,
   IngestedRiskSignal,
   LlmJudgmentRiskSignal,
   PathTraceResult,
@@ -98,6 +100,7 @@ import type {
   TestedByFile,
   TestedByTest,
   TopLevelChangedFile,
+  TypeUse,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import {
@@ -107,7 +110,7 @@ import {
   type ActionableNoticeTone,
 } from './ActionableNotice';
 import { computeLOD, type Cluster, type ComputeLODResult, type LODInputNode } from '../map/lod';
-import { resolveRefreshOutcome, type CodeMapFetchReply } from './sessionView';
+import { resolveRefreshOutcome, type CodeMapFetchReply, type RefreshOutcome } from './sessionView';
 import { diffScopeSyncTimeFor, mapFooterState, type MapFooterState } from './appFrame';
 import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
@@ -123,6 +126,8 @@ export type FetchState =
       hiddenByScope: number;
       /** P2-5: the scope that filter used (`CodeMapResult.appliedScope`); `[]` means none. */
       appliedScope: string[];
+      /** P4-2 phase 3b: the Type/Interface Nodes folded off this map (`CodeMapResult.foldedTypes`). */
+      foldedTypes: readonly FoldedType[];
     }
   | { status: 'error'; message: string };
 
@@ -197,6 +202,12 @@ export type PathTraceState =
   | ({ status: 'neighbors'; originId: string; direction: NeighborDirection } & NeighborTrace)
   | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
+  // P4-2 phase 3b: the query names a Type/Interface — folded off the map, so
+  // it has no call path. Renderer-local (`resolvePathTraceQuery`), shown as
+  // the "is a type — open its detail" notice instead of "No path found";
+  // `types` (never empty, sorted by id) holds more than one when several
+  // types match, for a chooser.
+  | { status: 'folded-type'; query: string; types: FoldedType[] }
   | { status: 'error'; message: string };
 
 /** FIX-2: a `'found'` Path Trace — `traceCallPath`'s result as-is, BFS tree included. */
@@ -3973,6 +3984,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   riskOverlay: 'code-map-node-detail-risk-overlay-heading',
   testedBy: 'code-map-node-detail-tested-by-heading',
   fileTopLevel: 'code-map-node-detail-file-top-level-heading',
+  uses: 'code-map-node-detail-uses-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -3997,6 +4009,13 @@ export interface NodeDetailBodyProps {
   resolveMapNode?: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
   /** P4-2 phase 3a: navigates the map to a "File top-level" entry. Defaults to a no-op. */
   onNavigateToNode?: (id: string) => void;
+  /**
+   * P4-2 phase 3b: the folded type with this id, if the current map has it —
+   * a "Uses" entry opens its type detail only then. Defaults to none.
+   */
+  resolveFoldedType?: (id: string) => FoldedType | undefined;
+  /** P4-2 phase 3b: opens a "Uses" entry's type detail. Defaults to a no-op. */
+  onOpenType?: (id: string) => void;
 }
 
 const RESOLVE_NO_MAP_NODE = (): undefined => undefined;
@@ -4139,6 +4158,664 @@ export function NodeFileTopLevel({
         </details>
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// P4-2 phase 3b: folded Type/Interface Nodes — Node detail's "Uses" section
+// and the type detail panel (the Node detail surface's type variant).
+// ---------------------------------------------------------------------------
+
+const RESOLVE_NO_TYPE = (): undefined => undefined;
+
+/** P4-2 phase 3b: how many types Node detail's "Uses" list names before "+N more". */
+export const NODE_DETAIL_USES_ROWS = 8;
+
+/** P4-2 phase 3b: how many users type detail's "Used by" list shows before "+N more". */
+export const TYPE_DETAIL_USED_BY_ROWS = 20;
+
+/** P4-2 phase 3b: the title and screen-reader text of a type the current map doesn't have. */
+export const TYPE_NOT_ON_CURRENT_MAP = 'Not on the current map';
+
+/** P4-2 phase 3b: the notice shown when an "open this type" action finds the type gone. */
+export const TYPE_GONE_NOTICE = 'That type is no longer on the map.';
+
+/** P4-2 phase 3b: "interface" / "type", for accessible names and the type detail head. */
+export function foldedTypeNoun(kind: FoldedType['kind']): string {
+  return kind === 'Interface' ? 'interface' : 'type';
+}
+
+/** P4-2 phase 3b: a Node kind as a counted noun — "function"/"functions", "method"/"methods", … */
+function kindNoun(kind: string, count: number): string {
+  const singular = kind === 'Module' ? 'file top level' : kind.toLowerCase();
+  return count === 1 ? singular : `${singular}s`;
+}
+
+/**
+ * P4-2 phase 3b: type detail's user count, naming the counted kinds —
+ * "Used by 59 functions", "Used by 59 (57 functions, 2 methods)" — or
+ * neutral ("Used by 59") when the kinds aren't known. Users whose kind is
+ * missing from `kinds` are counted as "other". "Used by nothing on the map"
+ * for none.
+ */
+export function formatUsedByCount(total: number, kinds: readonly FoldedTypeUserKindCount[] = []): string {
+  if (total === 0) {
+    return 'Used by nothing on the map';
+  }
+  const counted = kinds.reduce((sum, entry) => sum + entry.count, 0);
+  if (kinds.length === 0 || counted > total) {
+    return `Used by ${total}`;
+  }
+  if (kinds.length === 1 && counted === total) {
+    return `Used by ${total} ${kindNoun(kinds[0]!.kind, total)}`;
+  }
+  const parts = kinds.map((entry) => `${entry.count} ${kindNoun(entry.kind, entry.count)}`);
+  if (counted < total) {
+    parts.push(`${total - counted} other`);
+  }
+  return `Used by ${total} (${parts.join(', ')})`;
+}
+
+function TypeLink({
+  use,
+  resolveFoldedType,
+  onOpenType,
+}: {
+  use: Pick<TypeUse, 'id' | 'name' | 'kind'>;
+  resolveFoldedType: (id: string) => FoldedType | undefined;
+  onOpenType: (id: string) => void;
+}) {
+  if (resolveFoldedType(use.id) === undefined) {
+    return (
+      <code className="code-map__node-detail-type-id" title={TYPE_NOT_ON_CURRENT_MAP}>
+        {use.name}
+        <span className="visually-hidden"> ({TYPE_NOT_ON_CURRENT_MAP})</span>
+      </code>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="code-map__link-button"
+      onClick={() => onOpenType(use.id)}
+      aria-label={`Open ${foldedTypeNoun(use.kind)} ${use.name}`}
+    >
+      <code>{use.name}</code>
+    </button>
+  );
+}
+
+/** Types as inline, comma-separated links, keyed by id. */
+function typeLinks(
+  uses: readonly Pick<TypeUse, 'id' | 'name' | 'kind'>[],
+  resolveFoldedType: (id: string) => FoldedType | undefined,
+  onOpenType: (id: string) => void,
+) {
+  return uses.map((use, index) => (
+    <Fragment key={use.id}>
+      {index > 0 && ', '}
+      <TypeLink use={use} resolveFoldedType={resolveFoldedType} onOpenType={onOpenType} />
+    </Fragment>
+  ));
+}
+
+/** Types as `<li>` links, keyed by id. */
+function typeListItems(
+  uses: readonly Pick<TypeUse, 'id' | 'name' | 'kind'>[],
+  resolveFoldedType: (id: string) => FoldedType | undefined,
+  onOpenType: (id: string) => void,
+) {
+  return uses.map((use) => (
+    <li key={use.id}>
+      <TypeLink use={use} resolveFoldedType={resolveFoldedType} onOpenType={onOpenType} />
+    </li>
+  ));
+}
+
+/**
+ * P4-2 phase 3b: a list of types (`<ul>`), the first `rows`, then a native
+ * `<details>` "+N more" holding the rest in a second `<ul>`. `label` names
+ * the list for assistive tech. Hookless.
+ */
+function TypeList({
+  uses,
+  rows,
+  label,
+  className,
+  resolveFoldedType,
+  onOpenType,
+}: {
+  uses: readonly Pick<TypeUse, 'id' | 'name' | 'kind'>[];
+  rows: number;
+  label: string;
+  className: string;
+  resolveFoldedType: (id: string) => FoldedType | undefined;
+  onOpenType: (id: string) => void;
+}) {
+  const rest = uses.slice(rows);
+  return (
+    <>
+      <ul className={className} aria-label={label}>
+        {typeListItems(uses.slice(0, rows), resolveFoldedType, onOpenType)}
+      </ul>
+      {rest.length > 0 && (
+        <details className="code-map__more">
+          <summary>+{rest.length} more</summary>
+          <ul className={`${className} code-map__more-list`} aria-label={`${label}, continued`}>
+            {typeListItems(rest, resolveFoldedType, onOpenType)}
+          </ul>
+        </details>
+      )}
+    </>
+  );
+}
+
+/**
+ * P4-2 phase 3b: Node detail's "Uses" list — the types this Node uses
+ * through a real `USAGE` edge (`CodeMapNode.usesTypes`), never inferred
+ * from its signature. The first `NODE_DETAIL_USES_ROWS`, then "+N more".
+ * Each type the current map has opens its type detail. Hookless.
+ */
+export function NodeUsesTypes({
+  uses = [],
+  resolveFoldedType = RESOLVE_NO_TYPE,
+  onOpenType = NAVIGATE_NOWHERE,
+}: {
+  uses?: readonly TypeUse[];
+  resolveFoldedType?: (id: string) => FoldedType | undefined;
+  onOpenType?: (id: string) => void;
+}) {
+  return (
+    <TypeList
+      uses={uses}
+      rows={NODE_DETAIL_USES_ROWS}
+      label="Types this Node uses"
+      className="code-map__node-detail-uses"
+      resolveFoldedType={resolveFoldedType}
+      onOpenType={onOpenType}
+    />
+  );
+}
+
+/**
+ * P4-2 phase 3a + 3b: the "File top-level" row's type line — "Top-level
+ * code in this file uses types: A, B" (`CodeMapNode.fileTopLevelTypes`).
+ * Hookless.
+ */
+export function NodeFileTopLevelTypes({
+  types = [],
+  resolveFoldedType = RESOLVE_NO_TYPE,
+  onOpenType = NAVIGATE_NOWHERE,
+}: {
+  types?: readonly TypeUse[];
+  resolveFoldedType?: (id: string) => FoldedType | undefined;
+  onOpenType?: (id: string) => void;
+}) {
+  const rows = NODE_DETAIL_FILE_TOP_LEVEL_ROWS;
+  const rest = types.slice(rows);
+  if (types.length === 0) {
+    return null;
+  }
+  return (
+    <>
+      <p className="code-map__node-detail-file-top-level code-map__node-detail-file-top-level-types">
+        Top-level code in this file uses types: {typeLinks(types.slice(0, rows), resolveFoldedType, onOpenType)}
+      </p>
+      {rest.length > 0 && (
+        <details className="code-map__more">
+          <summary>+{rest.length} more</summary>
+          <p className="code-map__more-list">{typeLinks(rest, resolveFoldedType, onOpenType)}</p>
+        </details>
+      )}
+    </>
+  );
+}
+
+/**
+ * P4-2 phase 3b: opens a type's detail from Node detail, type detail or
+ * Path Trace. Checks the type is still on the map BEFORE changing anything:
+ * a gone type calls `onMissing` (the "no longer on the map" notice) and
+ * leaves every open panel as it is. The type detail stacks over Node detail
+ * (Escape returns to the Node) and, from another type, replaces the top
+ * layer. Returns whether it opened. Hookless, so it's testable.
+ */
+export function openTypeFromDetail(
+  id: string,
+  {
+    resolveFoldedType,
+    openTypeDetail,
+    onMissing,
+  }: {
+    resolveFoldedType: (id: string) => FoldedType | undefined;
+    openTypeDetail: (type: FoldedType) => void;
+    onMissing: () => void;
+  },
+): boolean {
+  const type = resolveFoldedType(id);
+  if (type === undefined) {
+    onMissing();
+    return false;
+  }
+  openTypeDetail(type);
+  return true;
+}
+
+/**
+ * P4-2 phase 3b: navigates from a type detail's "Used by" entry: closes the
+ * type detail and any Node detail under it (both would cover the map), then
+ * moves the map to that Node, with history. Hookless.
+ */
+export function navigateFromTypeDetail(
+  id: string,
+  {
+    closeTypeDetail,
+    closeNodeDetail,
+    navigateToNode,
+  }: { closeTypeDetail: () => void; closeNodeDetail: () => void; navigateToNode: (id: string) => void },
+): void {
+  closeTypeDetail();
+  closeNodeDetail();
+  navigateToNode(id);
+}
+
+const NO_FOLDED_TYPES: readonly FoldedType[] = [];
+const IDLE_TRACE: PathTraceState = { status: 'idle' };
+const NO_MAP_NODES: readonly CodeMapNode[] = [];
+const CLOSED_TYPE: TypeDetailState = { status: 'closed' };
+
+/** P4-2 phase 3b: the type detail panel's state — the Node detail surface's type variant. */
+export type TypeDetailState = { status: 'closed' } | { status: 'open'; type: FoldedType };
+
+/**
+ * P4-2 phase 3b: an open type detail follows its type to fresh
+ * `foldedTypes` (by id), or closes when the type is gone. Pure.
+ */
+export function refreshTypeDetail(state: TypeDetailState, foldedTypes: readonly FoldedType[]): TypeDetailState {
+  if (state.status === 'closed') {
+    return state;
+  }
+  const fresh = foldedTypes.find((type) => type.id === state.type.id);
+  return fresh === undefined ? { status: 'closed' } : { status: 'open', type: fresh };
+}
+
+/**
+ * P4-2 phase 3b: what a map refresh's outcome does to the type detail and
+ * to a Path Trace "is a type" notice: new data re-points both at the fresh
+ * types (a gone type closes the detail and drops out of the notice, which
+ * clears when none is left); an error that replaces the map closes the
+ * detail and clears the notice; anything else leaves both alone. Pure.
+ */
+export function foldedTypeStateAfterRefresh(
+  outcome: Pick<RefreshOutcome, 'kind'> & { foldedTypes?: readonly FoldedType[] },
+  typeDetail: TypeDetailState,
+  pathTrace: PathTraceState,
+): { typeDetail: TypeDetailState; pathTrace: PathTraceState } {
+  if (outcome.kind === 'replace-with-error') {
+    return {
+      typeDetail: { status: 'closed' },
+      pathTrace: pathTrace.status === 'folded-type' ? { status: 'idle' } : pathTrace,
+    };
+  }
+  if (outcome.kind !== 'apply') {
+    return { typeDetail, pathTrace };
+  }
+  const fresh = outcome.foldedTypes ?? NO_FOLDED_TYPES;
+  let nextTrace = pathTrace;
+  if (pathTrace.status === 'folded-type') {
+    const byId = new Map(fresh.map((type) => [type.id, type]));
+    const still = pathTrace.types.flatMap((type) => {
+      const current = byId.get(type.id);
+      return current === undefined ? [] : [current];
+    });
+    nextTrace = still.length === 0 ? { status: 'idle' } : { ...pathTrace, types: still };
+  }
+  return { typeDetail: refreshTypeDetail(typeDetail, fresh), pathTrace: nextTrace };
+}
+
+/** P4-2 phase 3b: the type detail panel's section heading ids (`aria-labelledby`). */
+export const TYPE_DETAIL_SECTION_HEADING_IDS = {
+  usedBy: 'code-map-type-detail-used-by-heading',
+  implements: 'code-map-type-detail-implements-heading',
+  implementedBy: 'code-map-type-detail-implemented-by-heading',
+  refersTo: 'code-map-type-detail-refers-to-heading',
+  referencedByTypes: 'code-map-type-detail-referenced-by-types-heading',
+  location: 'code-map-type-detail-location-heading',
+} as const;
+
+/**
+ * P4-2 phase 3b: the type detail head — module line, name and kind, and the
+ * same "[esc] close" button as `NodeDetailHead`. Hookless.
+ */
+export function TypeDetailHead({ type, onClose }: { type: FoldedType; onClose: () => void }) {
+  const moduleLine = nodeModuleLine(type.file);
+  return (
+    <div className="code-map__node-detail-head">
+      <div className="code-map__node-detail-title">
+        {moduleLine !== null && (
+          <div className="code-map__node-detail-module" title={moduleLine}>
+            {moduleLine}
+          </div>
+        )}
+        <code className="code-map__node-detail-name">
+          <span className="code-map__node-detail-name-text" title={type.name}>
+            {type.name}
+          </span>
+          <span className="code-map__node-detail-paren"> {foldedTypeNoun(type.kind)}</span>
+        </code>
+      </div>
+      <button type="button" className="code-map__node-detail-close" onClick={onClose}>
+        [esc] close<span className="visually-hidden"> type detail</span>
+      </button>
+    </div>
+  );
+}
+
+function UsedByEntry({
+  id,
+  typeName,
+  resolveMapNode,
+  onNavigateToNode,
+}: {
+  id: string;
+  typeName: string;
+  resolveMapNode: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  onNavigateToNode: (id: string) => void;
+}) {
+  const mapNode = resolveMapNode(id);
+  if (mapNode === undefined) {
+    return (
+      <code className="code-map__node-detail-file-top-level-id" title={NOT_ON_CURRENT_MAP}>
+        {id}
+        <span className="visually-hidden"> ({NOT_ON_CURRENT_MAP})</span>
+      </code>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="code-map__link-button"
+      onClick={() => onNavigateToNode(id)}
+      aria-label={`Go to ${mapNode.name} (uses ${typeName})`}
+    >
+      <code>{mapNode.name}</code>
+    </button>
+  );
+}
+
+function usedByItems(
+  ids: readonly string[],
+  typeName: string,
+  resolveMapNode: (id: string) => Pick<CodeMapNode, 'name'> | undefined,
+  onNavigateToNode: (id: string) => void,
+) {
+  return ids.map((id) => (
+    <li key={id}>
+      <UsedByEntry id={id} typeName={typeName} resolveMapNode={resolveMapNode} onNavigateToNode={onNavigateToNode} />
+    </li>
+  ));
+}
+
+export interface TypeDetailBodyProps {
+  type: FoldedType;
+  /** The rendered map Node with this id, if the map can navigate to it — names a "Used by" entry. */
+  resolveMapNode?: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  /** Navigates the map to a "Used by" entry. */
+  onNavigateToNode?: (id: string) => void;
+  /** Resolves a linked type (Implements, Refers to, …) to its folded type. */
+  resolveFoldedType?: (id: string) => FoldedType | undefined;
+  /** Opens a linked type's detail. */
+  onOpenType?: (id: string) => void;
+}
+
+/**
+ * P4-2 phase 3b: the type detail body, every row from a real backend edge:
+ *  - "Used by" — `formatUsedByCount` (kinds named), then the users (the
+ *    first `TYPE_DETAIL_USED_BY_ROWS`, then "+N more"), each navigating to
+ *    that Node; users beyond what the map reply carries are counted;
+ *  - "Implements" / "Implemented by" — `IMPLEMENTS` edges, both ways;
+ *  - "Refers to" / "Referenced by types" — `USAGE` edges between types;
+ *  - Location.
+ * A link row appears only when it has entries. Hookless.
+ */
+export function TypeDetailBody({
+  type,
+  resolveMapNode = RESOLVE_NO_MAP_NODE,
+  onNavigateToNode = NAVIGATE_NOWHERE,
+  resolveFoldedType = RESOLVE_NO_TYPE,
+  onOpenType = NAVIGATE_NOWHERE,
+}: TypeDetailBodyProps) {
+  const ids = TYPE_DETAIL_SECTION_HEADING_IDS;
+  const shown = type.usedBy.slice(0, TYPE_DETAIL_USED_BY_ROWS);
+  const rest = type.usedBy.slice(TYPE_DETAIL_USED_BY_ROWS);
+  const unlisted = Math.max(0, type.usedByTotal - type.usedBy.length);
+  const countText = formatUsedByCount(type.usedByTotal, type.usedByKinds);
+  const asUses = (typeIds: readonly string[]) =>
+    typeIds.map((id) => {
+      const target = resolveFoldedType(id);
+      return { id, name: target?.name ?? id, kind: target?.kind ?? ('Type' as const) };
+    });
+  const linkRows: { key: keyof typeof ids; heading: string; label: string; typeIds: readonly string[] }[] = [
+    { key: 'implements', heading: 'Implements', label: `Types ${type.name} implements or extends`, typeIds: type.implements },
+    {
+      key: 'implementedBy',
+      heading: 'Implemented by / Extended by',
+      label: `Types that implement or extend ${type.name}`,
+      typeIds: type.implementedBy,
+    },
+    { key: 'refersTo', heading: 'Refers to', label: `Types ${type.name} refers to`, typeIds: type.refersTo },
+    {
+      key: 'referencedByTypes',
+      heading: 'Referenced by types',
+      label: `Types that refer to ${type.name}`,
+      typeIds: type.referencedByTypes,
+    },
+  ];
+  return (
+    <div className="code-map__node-detail-body">
+      <section className="code-map__node-detail-section" aria-labelledby={ids.usedBy}>
+        <h3 id={ids.usedBy} className="code-map__node-detail-label">
+          Used by
+        </h3>
+        <p className="code-map__type-detail-used-by-count">{countText}</p>
+        {shown.length > 0 && (
+          <ul className="code-map__type-detail-used-by" aria-label={countText}>
+            {usedByItems(shown, type.name, resolveMapNode, onNavigateToNode)}
+          </ul>
+        )}
+        {rest.length > 0 && (
+          <details className="code-map__more">
+            <summary>+{rest.length} more</summary>
+            <ul className="code-map__type-detail-used-by code-map__more-list" aria-label={`${countText}, continued`}>
+              {usedByItems(rest, type.name, resolveMapNode, onNavigateToNode)}
+            </ul>
+          </details>
+        )}
+        {unlisted > 0 && (
+          <p className="code-map__type-detail-used-by-unlisted">
+            {unlisted} more not listed here — the full list is on the agent surface (<code>lookup_node</code>).
+          </p>
+        )}
+      </section>
+      {linkRows
+        .filter((row) => row.typeIds.length > 0)
+        .map((row) => (
+          <section key={row.key} className="code-map__node-detail-section" aria-labelledby={ids[row.key]}>
+            <h3 id={ids[row.key]} className="code-map__node-detail-label">
+              {row.heading}
+            </h3>
+            <TypeList
+              uses={asUses(row.typeIds)}
+              rows={NODE_DETAIL_USES_ROWS}
+              label={row.label}
+              className="code-map__node-detail-uses"
+              resolveFoldedType={resolveFoldedType}
+              onOpenType={onOpenType}
+            />
+          </section>
+        ))}
+      <section
+        className="code-map__node-detail-section code-map__node-detail-section--location"
+        aria-labelledby={ids.location}
+      >
+        <h3 id={ids.location} className="code-map__node-detail-label">
+          Location
+        </h3>
+        <p className="code-map__node-detail-location">
+          <code>{formatNodeLocation(type.file, type.startLine, type.endLine)}</code>
+        </p>
+      </section>
+    </div>
+  );
+}
+
+/** P4-2 phase 3b: where a folded type opens in the source viewer. */
+export function foldedTypeSourceTarget(type: FoldedType): SourceTarget {
+  return { file: type.file, startLine: type.startLine, endLine: type.endLine, label: type.name };
+}
+
+const compareTypeIds = (a: FoldedType, b: FoldedType): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+/** P4-2 phase 3b: `resolvePathTraceQuery`'s answer before a trace: show a type notice instead, or trace. */
+export type PathTracePreCheck = { skipTrace: true; state: PathTraceState } | { skipTrace: false };
+
+/**
+ * P4-2 phase 3b: Path Trace's whole decision about folded types, pure.
+ * Path Trace is CALLS-only and types are folded off the map, so a query
+ * naming a type would otherwise read as "No path found".
+ *
+ * Before the trace (no `traceResult`): an exact (case-insensitive) type id,
+ * then an exact type name, that no map Node matches the same way skips the
+ * trace for the "is a type" notice (`status: 'folded-type'`) — every type
+ * with that name, sorted by id, so two same-named types get a chooser, never
+ * a silent first pick. A real function with that name still traces.
+ *
+ * After the trace (`traceResult` given): only a `'no-path-found'` is looked
+ * at — in `traceCallPath` that means no entry resolved at any tier (not "an
+ * entry with no calls", which is a one-Node `'found'`), so no map Node's
+ * name even contains the query. Then the types whose name contains it are
+ * offered the same way. `'found'`, `'ambiguous'` and `'error'` pass through
+ * unchanged.
+ */
+export function resolvePathTraceQuery(
+  query: string,
+  mapNodes: readonly Pick<CodeMapNode, 'id' | 'name'>[],
+  foldedTypes: readonly FoldedType[],
+): PathTracePreCheck;
+export function resolvePathTraceQuery(
+  query: string,
+  mapNodes: readonly Pick<CodeMapNode, 'id' | 'name'>[],
+  foldedTypes: readonly FoldedType[],
+  traceResult: PathTraceResult,
+): PathTraceState;
+export function resolvePathTraceQuery(
+  query: string,
+  mapNodes: readonly Pick<CodeMapNode, 'id' | 'name'>[],
+  foldedTypes: readonly FoldedType[],
+  traceResult?: PathTraceResult,
+): PathTracePreCheck | PathTraceState {
+  const q = query.trim().toLowerCase();
+  const typeNotice = (types: FoldedType[]): PathTraceState => ({
+    status: 'folded-type',
+    query: query.trim(),
+    types: [...types].sort(compareTypeIds),
+  });
+  if (traceResult !== undefined) {
+    if (traceResult.status !== 'no-path-found' || q.length === 0) {
+      return traceResult;
+    }
+    const matches = foldedTypes.filter((type) => type.name.toLowerCase().includes(q));
+    return matches.length > 0 ? typeNotice(matches) : traceResult;
+  }
+  if (q.length === 0 || mapNodes.some((node) => node.id.toLowerCase() === q)) {
+    return { skipTrace: false };
+  }
+  const byId = foldedTypes.filter((type) => type.id.toLowerCase() === q);
+  if (byId.length > 0) {
+    return { skipTrace: true, state: typeNotice(byId.slice(0, 1)) };
+  }
+  if (mapNodes.some((node) => node.name.toLowerCase() === q)) {
+    return { skipTrace: false };
+  }
+  const byName = foldedTypes.filter((type) => type.name.toLowerCase() === q);
+  return byName.length > 0 ? { skipTrace: true, state: typeNotice(byName) } : { skipTrace: false };
+}
+
+/**
+ * P4-2 phase 3b: Path Trace's "is a type" notice. One type: "<name> is a
+ * type — open its detail", with that action. Several (same name, or several
+ * names containing the query): "N types match <query> — pick one", with one
+ * open action per type, named by its file. Hookless.
+ */
+export function PathTraceFoldedTypeNotice({
+  query,
+  types,
+  onOpenType,
+  onDismiss,
+}: {
+  query: string;
+  types: readonly FoldedType[];
+  onOpenType: (id: string) => void;
+  onDismiss: () => void;
+}) {
+  const [only] = types;
+  if (types.length === 1 && only !== undefined) {
+    const noun = foldedTypeNoun(only.kind);
+    return (
+      <div className="code-map__path-trace-dismissable-notice">
+        <ActionableNotice
+          tone="info"
+          role="status"
+          action={
+            <button
+              type="button"
+              className="code-map__link-button"
+              onClick={() => onOpenType(only.id)}
+              aria-label={`Open its detail — ${only.name}`}
+            >
+              Open its detail
+            </button>
+          }
+        >
+          <code>{only.name}</code> is {noun === 'interface' ? 'an interface' : 'a type'} — open its detail.
+        </ActionableNotice>
+        <button type="button" className="code-map__path-trace-dismiss" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="code-map__path-trace-dismissable-notice">
+      <ActionableNotice tone="info" role="status">
+        {types.length} types match <code>{query}</code> — pick one to open its detail.
+      </ActionableNotice>
+      <ul className="code-map__type-choices" aria-label={`Types matching ${query}`}>
+        {types.map((type) => (
+          <li key={type.id}>
+            <button
+              type="button"
+              className="code-map__link-button"
+              onClick={() => onOpenType(type.id)}
+              aria-label={`Open ${foldedTypeNoun(type.kind)} ${type.name} in ${type.file}`}
+            >
+              <code>{type.name}</code> <span className="code-map__type-choice-file">{type.file}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+      <button type="button" className="code-map__path-trace-dismiss" onClick={onDismiss}>
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+/** P4-2 phase 3b: the "no longer on the map" notice an open-type action shows when its type is gone. Hookless. */
+export function TypeGoneNotice() {
+  return (
+    <ActionableNotice tone="warning" role="status">
+      {TYPE_GONE_NOTICE}
+    </ActionableNotice>
   );
 }
 
@@ -4334,6 +5011,8 @@ export function NodeDetailBody({
   onOpenTest,
   resolveMapNode = RESOLVE_NO_MAP_NODE,
   onNavigateToNode = NAVIGATE_NOWHERE,
+  resolveFoldedType = RESOLVE_NO_TYPE,
+  onOpenType = NAVIGATE_NOWHERE,
 }: NodeDetailBodyProps) {
   const ids = NODE_DETAIL_SECTION_HEADING_IDS;
   const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
@@ -4428,10 +5107,22 @@ export function NodeDetailBody({
         </h3>
         <NodeTestedBy testedBy={node.testedBy} onOpenTest={onOpenTest} />
       </section>
+      {/* P4-2 phase 3b: the types and interfaces this Node uses — folded off
+          the map, from real USAGE edges only. Only when there are any. */}
+      {(node.usesTypes?.length ?? 0) > 0 && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.uses}>
+          <h3 id={ids.uses} className="code-map__node-detail-label">
+            Uses
+          </h3>
+          <NodeUsesTypes uses={node.usesTypes} resolveFoldedType={resolveFoldedType} onOpenType={onOpenType} />
+        </section>
+      )}
       {/* P4-2 phase 3a: folded top-level code — Module Nodes are not on the
           map, so what this file's top level uses, and which files' top
           level use this Node, are shown here. Only when there is either. */}
-      {((node.fileTopLevel?.length ?? 0) > 0 || (node.calledAtLoadBy?.length ?? 0) > 0) && (
+      {((node.fileTopLevel?.length ?? 0) > 0 ||
+        (node.calledAtLoadBy?.length ?? 0) > 0 ||
+        (node.fileTopLevelTypes?.length ?? 0) > 0) && (
         <section className="code-map__node-detail-section" aria-labelledby={ids.fileTopLevel}>
           <h3 id={ids.fileTopLevel} className="code-map__node-detail-label">
             File top-level
@@ -4441,6 +5132,12 @@ export function NodeDetailBody({
             calledAtLoadBy={node.calledAtLoadBy}
             resolveMapNode={resolveMapNode}
             onNavigateToNode={onNavigateToNode}
+          />
+          {/* P4-2 phase 3b: the types this file's top-level code uses. */}
+          <NodeFileTopLevelTypes
+            types={node.fileTopLevelTypes}
+            resolveFoldedType={resolveFoldedType}
+            onOpenType={onOpenType}
           />
         </section>
       )}
@@ -4720,6 +5417,13 @@ export function CodeMap({
   // Detail never reads source, and the source overlay's own state shape has
   // no room for a staleness/regenerate concept).
   const [nodeDetail, setNodeDetail] = useState<NodeDetailState>({ status: 'closed' });
+  // P4-2 phase 3b: the type detail panel — the Node detail surface's type
+  // variant, for a Type/Interface folded off the map.
+  const [typeDetail, setTypeDetail] = useState<TypeDetailState>({ status: 'closed' });
+  // P4-2 phase 3b: an "open this type" action found its type gone — shown as
+  // a small notice on whichever surface is on top, until the next open,
+  // close, search or refresh.
+  const [typeGone, setTypeGone] = useState(false);
   const [regenerateState, setRegenerateState] = useState<RegenerateState>({ kind: 'idle' });
   // Story 1.9 (Phase 2): the search toolbar's own query text and its
   // `tracePath` result state — kept separate (rather than folding the query
@@ -5019,6 +5723,9 @@ export function CodeMap({
     // survive into this one.
     updateNodeDetail({ status: 'closed' });
     setRegenerateState({ kind: 'idle' });
+    // P4-2 phase 3b: the same for a type detail.
+    setTypeDetail({ status: 'closed' });
+    setTypeGone(false);
     // Story 1.9 (Phase 2): same reasoning as the Node Detail reset just
     // above — a Retry/reload swaps in an entirely different Node/edge set,
     // so a highlighted route or step list from the previous map must not
@@ -5075,6 +5782,7 @@ export function CodeMap({
             edges: synthetic.edges,
             hiddenByScope: 0,
             appliedScope: [],
+            foldedTypes: [],
           });
         })
         .catch((error: unknown) => {
@@ -5098,6 +5806,7 @@ export function CodeMap({
             edges: result.edges,
             hiddenByScope: result.hiddenByScope,
             appliedScope: result.appliedScope,
+            foldedTypes: result.foldedTypes,
           });
         } else {
           setFetchState({ status: 'error', message: result.message });
@@ -5171,6 +5880,10 @@ export function CodeMap({
           return;
         case 'replace-with-error':
           setFetchState({ status: 'error', message: outcome.message });
+          // P4-2 phase 3b: no map, so no type detail and no "is a type" notice.
+          setTypeDetail((current) => foldedTypeStateAfterRefresh(outcome, current, IDLE_TRACE).typeDetail);
+          setPathTrace((current) => foldedTypeStateAfterRefresh(outcome, CLOSED_TYPE, current).pathTrace);
+          setTypeGone(false);
           return;
         case 'apply':
           setFetchState({
@@ -5179,7 +5892,13 @@ export function CodeMap({
             edges: outcome.edges,
             hiddenByScope: outcome.hiddenByScope,
             appliedScope: outcome.appliedScope,
+            foldedTypes: outcome.foldedTypes,
           });
+          // P4-2 phase 3b: an open type detail and an "is a type" notice
+          // follow their types to the fresh map, or close/clear when gone.
+          setTypeDetail((current) => foldedTypeStateAfterRefresh(outcome, current, IDLE_TRACE).typeDetail);
+          setPathTrace((current) => foldedTypeStateAfterRefresh(outcome, CLOSED_TYPE, current).pathTrace);
+          setTypeGone(false);
           if (outcome.nodeDetail.kind === 'close') {
             updateNodeDetail({ status: 'closed' });
             setRegenerateState({ kind: 'idle' });
@@ -5200,6 +5919,7 @@ export function CodeMap({
                 edges: result.edges,
                 hiddenByScope: result.hiddenByScope,
                 appliedScope: result.appliedScope,
+                foldedTypes: result.foldedTypes,
               }
             : { kind: 'failed', message: result.message },
         );
@@ -5569,6 +6289,37 @@ export function CodeMap({
   const closeNodeDetail = useCallback(() => {
     updateNodeDetail({ status: 'closed' });
     setRegenerateState({ kind: 'idle' });
+    setTypeGone(false);
+  }, []);
+
+  // P4-2 phase 3b: the folded types of the map on screen, and the one lookup
+  // every "open a type" affordance resolves through.
+  const foldedTypes = fetchState.status === 'ready' ? fetchState.foldedTypes : NO_FOLDED_TYPES;
+  const foldedTypesById = useMemo(() => new Map(foldedTypes.map((type) => [type.id, type])), [foldedTypes]);
+  const resolveFoldedType = useCallback((id: string) => foldedTypesById.get(id), [foldedTypesById]);
+  // Read at call time by async paths (an in-flight Path Trace), so they see
+  // the map on screen when they land, not the one they started on.
+  const foldedTypesRef = useRef(foldedTypes);
+  foldedTypesRef.current = foldedTypes;
+  // Opens (or, from another type, replaces) the type detail — it stacks over
+  // an open Node detail rather than closing it, so Escape returns to the
+  // Node. Every way in goes through `openTypeFromDetail`, which checks the
+  // type is still on the map first.
+  const openType = useCallback(
+    (id: string): boolean =>
+      openTypeFromDetail(id, {
+        resolveFoldedType,
+        openTypeDetail: (type) => {
+          setTypeGone(false);
+          setTypeDetail({ status: 'open', type });
+        },
+        onMissing: () => setTypeGone(true),
+      }),
+    [resolveFoldedType],
+  );
+  const closeTypeDetail = useCallback(() => {
+    setTypeDetail({ status: 'closed' });
+    setTypeGone(false);
   }, []);
 
   /**
@@ -6496,6 +7247,8 @@ export function CodeMap({
    * highlight/step-list for a Node id that no longer belongs to the current
    * map.
    */
+  // P4-2 phase 3b: the Nodes `resolvePathTraceQuery` checks a query against.
+  const mapNodesForTrace = fetchState.status === 'ready' ? fetchState.nodes : NO_MAP_NODES;
   const runPathTrace = useCallback(
     (query: string) => {
       if (pathTrace.status === 'searching') {
@@ -6505,6 +7258,15 @@ export function CodeMap({
       // Review fix (Phase 4): captured here, not from `pathQuery` state — see
       // `lastTracedQueryRef`'s own doc comment for why the two can diverge.
       lastTracedQueryRef.current = query;
+      setTypeGone(false);
+      // P4-2 phase 3b: a query naming a folded type (and no map Node) has no
+      // call path — say it is a type, with a way to its detail, instead of
+      // tracing to "No path found". The decision is `resolvePathTraceQuery`'s.
+      const preCheck = resolvePathTraceQuery(query, mapNodesForTrace, foldedTypesRef.current);
+      if (preCheck.skipTrace) {
+        setPathTrace(preCheck.state);
+        return;
+      }
       setPathTrace({ status: 'searching' });
       window.driller
         .tracePath(query)
@@ -6514,7 +7276,10 @@ export function CodeMap({
             // rather than let it clobber the map the user is now looking at.
             return;
           }
-          setPathTrace(result);
+          // P4-2 phase 3b: a "no-path-found" whose query a folded type's
+          // name contains becomes the "is a type" notice (current map's types).
+          const state = resolvePathTraceQuery(query, mapNodesForTrace, foldedTypesRef.current, result);
+          setPathTrace(state);
           if (result.status === 'found') {
             fitViewToPath(result.path);
           }
@@ -6529,7 +7294,7 @@ export function CodeMap({
           });
         });
     },
-    [pathTrace.status, fitViewToPath],
+    [pathTrace.status, fitViewToPath, mapNodesForTrace],
   );
 
   /**
@@ -6696,6 +7461,26 @@ export function CodeMap({
     onClose: closeNodeDetail,
     containerRef: nodeDetailOverlayRef,
   });
+  // P4-2 phase 3b: the type detail is a layer of its own on the same stack.
+  const typeDetailOverlayRef = useRef<HTMLDivElement | null>(null);
+  const typeDetailScrimProps = useModalLayer({
+    open: typeDetail.status === 'open',
+    onClose: closeTypeDetail,
+    containerRef: typeDetailOverlayRef,
+  });
+  // Following a link to another type replaces the open layer, so the hook's
+  // open-time focus move doesn't run again: move focus into the dialog here,
+  // so it never stays on the link that just unmounted. (Closing still
+  // returns focus to whatever opened the layer first.)
+  const shownTypeIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const id = typeDetail.status === 'open' ? typeDetail.type.id : null;
+    const previous = shownTypeIdRef.current;
+    shownTypeIdRef.current = id;
+    if (id !== null && previous !== null && previous !== id) {
+      typeDetailOverlayRef.current?.focus();
+    }
+  }, [typeDetail]);
 
   // Review fix: a plain boolean, computed once here rather than re-reading
   // `pathTrace.status === 'searching'` inline inside the `ambiguous` JSX
@@ -7220,6 +8005,20 @@ export function CodeMap({
                 </button>
               </div>
             )}
+            {pathTrace.status === 'folded-type' && (
+              <PathTraceFoldedTypeNotice
+                query={pathTrace.query}
+                types={pathTrace.types}
+                onOpenType={(id) => {
+                  // The notice has done its job once the detail opens.
+                  if (openType(id)) {
+                    setPathTrace({ status: 'idle' });
+                  }
+                }}
+                onDismiss={() => setPathTrace({ status: 'idle' })}
+              />
+            )}
+            {typeGone && typeDetail.status === 'closed' && nodeDetail.status === 'closed' && <TypeGoneNotice />}
             {pathTrace.status === 'error' && (
               <ActionableNotice tone="error" role="alert">
                 {pathTrace.message}
@@ -7476,7 +8275,12 @@ export function CodeMap({
               // centres on, so only a navigable Node becomes a button.
               resolveMapNode={(id) => flowNodesById.get(id)?.data.node}
               onNavigateToNode={(id) => navigateFromDetail(id, { closeNodeDetail, navigateToNode })}
+              // P4-2 phase 3b: a "Uses" entry opens its type's detail in
+              // place of this panel.
+              resolveFoldedType={resolveFoldedType}
+              onOpenType={openType}
             />
+            {typeGone && typeDetail.status === 'closed' && <TypeGoneNotice />}
             {/* P0-1: the one-click source action this panel's IA row
                 promises — reuses `openSourceForNode` unchanged, at this
                 Node's exact range. Closes the panel on the way (P0-1's
@@ -7493,6 +8297,52 @@ export function CodeMap({
               onClick={() => {
                 const target = nodeDetail.node;
                 closeNodeDetail();
+                openSourceForNode(target);
+              }}
+            >
+              View source
+            </button>
+          </div>
+        </div>
+      )}
+      {/* P4-2 phase 3b: the type detail — the Node detail surface's type
+          variant, for a Type/Interface folded off the map. Opened from Node
+          detail's "Uses" / "File top-level", another type's links or Path
+          Trace's "is a type" notice; a sibling of the Node detail overlay for
+          the same reason that one is a sibling of the surface gates. It is
+          its own modal layer, STACKED over an open Node detail (z-index
+          above it), so Escape returns to the Node and focus to the link that
+          opened it. Following a link to another type REPLACES this top layer
+          (no deeper stack): Escape from there still returns to the Node
+          detail (or the map) beneath. */}
+      {typeDetail.status === 'open' && (
+        <div
+          ref={typeDetailOverlayRef}
+          className="code-map__node-detail-overlay code-map__node-detail-overlay--type"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Type detail: ${typeDetail.type.name}`}
+          tabIndex={-1}
+          {...typeDetailScrimProps}
+        >
+          <div className="code-map__node-detail-panel">
+            <TypeDetailHead type={typeDetail.type} onClose={closeTypeDetail} />
+            <TypeDetailBody
+              type={typeDetail.type}
+              resolveMapNode={(id) => flowNodesById.get(id)?.data.node}
+              onNavigateToNode={(id) =>
+                navigateFromTypeDetail(id, { closeTypeDetail, closeNodeDetail, navigateToNode })
+              }
+              resolveFoldedType={resolveFoldedType}
+              onOpenType={openType}
+            />
+            {typeGone && <TypeGoneNotice />}
+            <button
+              type="button"
+              className="code-map__node-detail-source"
+              onClick={() => {
+                const target = foldedTypeSourceTarget(typeDetail.type);
+                closeTypeDetail();
                 openSourceForNode(target);
               }}
             >

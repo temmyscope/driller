@@ -9,6 +9,8 @@ import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 
 import {
+  IMPLEMENTS_QUERY,
+  parseImplementsRow,
   runCodeMapQueries,
   TEST_EVIDENCE_CALLS_QUERY,
   TEST_EVIDENCE_FILES_QUERY,
@@ -168,5 +170,59 @@ describe('runCodeMapQueries: Tested by evidence', () => {
       callTool: async () => ({ isError: true, content: [{ type: 'text', text: 'nodes down' }] }),
     } as unknown as QueryGraphClient;
     await assert.rejects(runCodeMapQueries(client, 'p', { includeTestEvidence: true }), /nodes down/);
+  });
+});
+
+describe('runCodeMapQueries: P4-2 phase 3b IMPLEMENTS links', () => {
+  const IMPLEMENTS = text('rows: 1  (cols: source target)\n  p.a.Rect p.a.Point\ntotal: 1\n');
+
+  function implementsClient(reply: () => Promise<unknown>) {
+    const sent: string[] = [];
+    const client = {
+      callTool: async ({ arguments: args }: { arguments?: Record<string, unknown> }) => {
+        const query = String(args?.query);
+        sent.push(query);
+        if (query === IMPLEMENTS_QUERY) {
+          return reply();
+        }
+        if (query.includes('[r:CALLS|USAGE]')) {
+          return EDGES;
+        }
+        return query.startsWith('MATCH (f:File)') ? FILES : NODES;
+      },
+    } as unknown as QueryGraphClient;
+    return { client, sent };
+  }
+
+  it('sends IMPLEMENTS_QUERY only with includeImplements, and its rows reach implementsLinks', async () => {
+    const withFlag = implementsClient(async () => IMPLEMENTS);
+    const result = await runCodeMapQueries(withFlag.client, 'p', { includeImplements: true });
+    assert.deepEqual(result.implementsLinks, [{ source: 'p.a.Rect', target: 'p.a.Point' }]);
+    assert.equal(result.testEvidence, undefined);
+    assertMapIntact(result);
+
+    const without = implementsClient(async () => IMPLEMENTS);
+    const plain = await runCodeMapQueries(without.client, 'p', { includeTestEvidence: true });
+    assert.ok(!without.sent.includes(IMPLEMENTS_QUERY));
+    assert.equal(plain.implementsLinks, undefined);
+  });
+
+  it('parseImplementsRow drops a row with an empty or missing column', () => {
+    assert.deepEqual(parseImplementsRow({ source: 'a', target: 'b' }), { source: 'a', target: 'b' });
+    for (const row of [{ source: '', target: 'b' }, { source: 'a', target: '' }, { source: 'a' }, { target: 'b' }, {}]) {
+      assert.equal(parseImplementsRow(row as Record<string, string>), undefined, JSON.stringify(row));
+    }
+  });
+
+  it('keeps the map when the IMPLEMENTS query throws, with no links', async (t) => {
+    const warn = mock.method(console, 'warn', () => {});
+    t.after(() => warn.mock.restore());
+    const { client } = implementsClient(async () => {
+      throw new Error('boom');
+    });
+    const result = await runCodeMapQueries(client, 'p', { includeImplements: true });
+    assert.deepEqual(result.implementsLinks, []);
+    assertMapIntact(result);
+    assert.ok(warn.mock.calls.some((call) => String(call.arguments[0]).includes('Implements (implements) evidence unavailable')));
   });
 });

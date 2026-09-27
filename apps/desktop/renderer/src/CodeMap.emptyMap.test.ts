@@ -145,7 +145,7 @@ describe('reindexButtonState', () => {
 });
 
 describe('isReindexPending', () => {
-  const empty: FetchState = { status: 'ready', nodes: [], edges: [], hiddenByScope: 0, appliedScope: [] };
+  const empty: FetchState = { status: 'ready', nodes: [], edges: [], hiddenByScope: 0, appliedScope: [], foldedTypes: [] };
 
   it('is pending while the screen still shows what it showed at the click', () => {
     const click = { fetchState: empty, refreshError: null };

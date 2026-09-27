@@ -75,7 +75,7 @@ import {
   setCloudApiKey,
 } from './backend-settings';
 import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection } from './app-menu';
-import { toOkCodeMapResult } from './code-map-reply';
+import { joinNaturally, toOkCodeMapResult } from './code-map-reply';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
@@ -790,9 +790,16 @@ function spawnGraphService(): void {
       if (isCodeMapMessage(message)) {
         if (message.type === 'graphService:codeMap') {
           // P2-5: the scope fields are validated here, at the process boundary.
-          const { result, replaced } = toOkCodeMapResult(message);
+          // P4-2 phase 3b: and each folded type; malformed ones are dropped,
+          // with one warning per reply.
+          const { result, replaced, droppedFoldedTypes } = toOkCodeMapResult(message);
           if (replaced.length > 0) {
-            console.warn(`Code Map reply had malformed ${replaced.join(' and ')}; replaced with the no-scope default.`);
+            console.warn(`Code Map reply had malformed ${joinNaturally(replaced)}; replaced with the empty default.`);
+          }
+          if (droppedFoldedTypes > 0) {
+            console.warn(
+              `Code Map reply had ${droppedFoldedTypes} malformed folded type${droppedFoldedTypes === 1 ? '' : 's'}; dropped.`,
+            );
           }
           settlePendingCodeMapRequest(result);
         } else {

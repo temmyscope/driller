@@ -2993,6 +2993,13 @@ code,
   z-index: 10;
 }
 
+/* P4-2 phase 3b: the type detail stacks over an open Node detail (10), as
+   its own modal layer. The source viewer (11) never shows at the same time:
+   the type detail's View source closes it first. */
+.code-map__node-detail-overlay--type {
+  z-index: 11;
+}
+
 /* P2-12: the panel takes `mockups/node-detail.html`'s composition — 400px
    (max 90vw), a `--border-strong` left edge, and a flex column whose body
    scrolls between the fixed head and the pinned View source footer. */
@@ -3311,6 +3318,41 @@ code,
 }
 
 .code-map__node-detail-file-top-level-id {
+  color: var(--text-mute);
+  cursor: help;
+}
+
+/* P4-2 phase 3b: Node detail's "Uses" list, the type detail's "Used by" and
+   type-link lists, and Path Trace's type chooser — the same fine print and
+   link-button entries as "File top-level". */
+.code-map__node-detail-uses,
+.code-map__type-detail-used-by-count,
+.code-map__type-detail-used-by-unlisted,
+.code-map__type-choices,
+.code-map__type-detail-used-by {
+  margin: 0;
+  font-size: var(--detail-fine-size);
+  line-height: var(--detail-fine-leading);
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.code-map__type-detail-used-by,
+.code-map__node-detail-uses,
+.code-map__type-choices {
+  margin-top: 4px;
+  padding-left: 16px;
+}
+
+.code-map__type-detail-used-by-unlisted {
+  margin-top: 4px;
+}
+
+.code-map__type-choice-file {
+  color: var(--text-mute);
+}
+
+.code-map__node-detail-type-id {
   color: var(--text-mute);
   cursor: help;
 }

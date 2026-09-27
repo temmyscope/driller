@@ -29,6 +29,7 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { IMPORT_RESOLVED_CALL_STRATEGIES, TEST_CALLER_PATH_FRAGMENTS } from './test-evidence-strategies';
+import type { ImplementsLink } from './fold-types';
 import type {
   CodeMapEdge,
   CodeMapEdgeKind,
@@ -68,6 +69,12 @@ export interface CodeMapFetchResult {
    * `production-code-map.ts` turns it into `CodeMapNode.testedBy`.
    */
   testEvidence?: TestEvidence;
+  /**
+   * P4-2 phase 3b: backend `IMPLEMENTS` edges between Type/Interface Nodes,
+   * present only when `FetchCodeMapOptions.includeImplements` asked for it.
+   * `fold-types.ts` turns them into `FoldedType.implements`.
+   */
+  implementsLinks?: ImplementsLink[];
 }
 
 /**
@@ -503,6 +510,13 @@ export const TEST_EVIDENCE_CALLS_QUERY = `MATCH (a:Function|Method|Module)-[r:CA
 // this engine rather than an error, so an older backend without TESTS_FILE
 // simply yields none. (File nodes report `start_line`/`end_line` 0, so a
 // test file's range comes from its Module Node instead; see `tested-by.ts`.)
+// P4-2 phase 3b: a folded type's "Implements" row. Live-verified on
+// driller/app (2026-09-27): 4 rows, all Interface→Interface (TS `extends`),
+// e.g. `CodeMapNodeWithSignalSources` → `CodeMapNode`. Pattern-position
+// label alternation on both ends, like `CODE_MAP_EDGES_QUERY`. Exported for
+// tests.
+export const IMPLEMENTS_QUERY = `MATCH (a:Interface|Type)-[r:IMPLEMENTS]->(b:Interface|Type) WHERE a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL RETURN a.qualified_name AS source, b.qualified_name AS target`;
+
 export const TEST_EVIDENCE_FILES_QUERY = `MATCH (t:File)-[r:TESTS_FILE]->(f:File) RETURN t.file_path AS testFile, f.file_path AS file`;
 
 /**
@@ -568,6 +582,11 @@ export interface FetchCodeMapOptions {
    * and leaves that part empty, never failing the map.
    */
   includeTestEvidence?: boolean;
+  /**
+   * P4-2 phase 3b: also fetch `IMPLEMENTS_QUERY` over the same connection.
+   * Best-effort, like test evidence: a failure leaves it empty.
+   */
+  includeImplements?: boolean;
 }
 
 async function runFetchCodeMap(
@@ -629,14 +648,37 @@ export async function runCodeMapQueries(
   }
   const fileRows = parseCodeMapRows(filesResult, parseCodeMapFileRow, 'Code Map files');
   const joinedNodes = joinHotspotChangeCounts(nodes, fileRows, options.excludeFile);
-  if (options.includeTestEvidence !== true) {
+  const includeTestEvidence = options.includeTestEvidence === true;
+  const includeImplements = options.includeImplements === true;
+  if (!includeTestEvidence && !includeImplements) {
     return { nodes: joinedNodes, edges };
   }
-  const [calls, testFiles] = await Promise.all([
-    queryTestEvidence(client, project, TEST_EVIDENCE_CALLS_QUERY, parseTestCallEvidenceRow, 'test calls', evidenceTimeoutMs),
-    queryTestEvidence(client, project, TEST_EVIDENCE_FILES_QUERY, parseTestFileEvidenceRow, 'test files', evidenceTimeoutMs),
+  const [calls, testFiles, implementsLinks] = await Promise.all([
+    includeTestEvidence
+      ? queryTestEvidence(client, project, TEST_EVIDENCE_CALLS_QUERY, parseTestCallEvidenceRow, 'test calls', evidenceTimeoutMs)
+      : undefined,
+    includeTestEvidence
+      ? queryTestEvidence(client, project, TEST_EVIDENCE_FILES_QUERY, parseTestFileEvidenceRow, 'test files', evidenceTimeoutMs)
+      : undefined,
+    includeImplements
+      ? queryTestEvidence(client, project, IMPLEMENTS_QUERY, parseImplementsRow, 'implements', evidenceTimeoutMs, 'Implements')
+      : undefined,
   ]);
-  return { nodes: joinedNodes, edges, testEvidence: { calls, testFiles } };
+  return {
+    nodes: joinedNodes,
+    edges,
+    ...(calls !== undefined && testFiles !== undefined ? { testEvidence: { calls, testFiles } } : {}),
+    ...(implementsLinks !== undefined ? { implementsLinks } : {}),
+  };
+}
+
+/** P4-2 phase 3b: parses an `IMPLEMENTS_QUERY` row. Exported for tests. */
+export function parseImplementsRow(row: Record<string, string>): ImplementsLink | undefined {
+  const { source, target } = row;
+  if (typeof source !== 'string' || source.length === 0 || typeof target !== 'string' || target.length === 0) {
+    return undefined;
+  }
+  return { source, target };
 }
 
 /**
@@ -654,6 +696,8 @@ async function queryTestEvidence<T>(
   parseRow: (row: Record<string, string>) => T | undefined,
   label: string,
   timeoutMs: number,
+  // P4-2 phase 3b: the detail row this evidence feeds, for log lines.
+  section = 'Tested by',
 ): Promise<T[]> {
   try {
     // `withTimeout` clears its timer as soon as the call settles, and a timed-out
@@ -661,21 +705,21 @@ async function queryTestEvidence<T>(
     const result = await withTimeout(
       client.callTool({ name: 'query_graph', arguments: { project, query } }),
       timeoutMs,
-      `query_graph (Tested by ${label})`,
+      `query_graph (${section} ${label})`,
     );
     if (result.isError) {
       throw new Error(extractErrorText(result));
     }
-    const rows = parseCodeMapRows(result, parseRow, `Tested by (${label})`);
+    const rows = parseCodeMapRows(result, parseRow, `${section} (${label})`);
     const text = extractQueryGraphText(result);
     const truncation = text !== undefined ? queryGraphTruncation(text) : undefined;
     if (truncation !== undefined) {
-      console.warn(`[graph-service] Tested by (${label}) evidence may be incomplete: ${truncation}`);
+      console.warn(`[graph-service] ${section} (${label}) evidence may be incomplete: ${truncation}`);
     }
     return rows;
   } catch (error) {
     console.warn(
-      `[graph-service] Tested by (${label}) evidence unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      `[graph-service] ${section} (${label}) evidence unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
     return [];
   }

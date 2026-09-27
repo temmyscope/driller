@@ -16,7 +16,7 @@
  * top level use this Node), so a function called only at load time still
  * names its caller.
  */
-import type { CodeMapEdge, CodeMapEdgeKind, FileTopLevelUse, FoldedModule } from '@driller/graph-contracts';
+import type { CodeMapEdge, CodeMapEdgeKind, FileTopLevelUse, FoldedModule, TypeUse } from '@driller/graph-contracts';
 
 import { isFileInScope } from './project-scope';
 
@@ -138,19 +138,32 @@ export function scopeFoldedModules(
  * Sets each Node's folded-Module links from `foldedModules`:
  *  - `fileTopLevel`: its file's top-level uses — the same array for every
  *    Node in that file;
- *  - `calledAtLoadBy`: the files whose top-level uses include it, sorted.
+ *  - `calledAtLoadBy`: the files whose top-level uses include it, sorted;
+ *  - `fileTopLevelTypes` (P4-2 phase 3b): its file's top-level uses of
+ *    folded types (`FoldedModule.usesTypes`) — the same array for every
+ *    Node in that file.
  * A link with nothing in it is removed rather than left empty or stale, so
  * this can re-run after `scopeFoldedModules`. Pure; returns new Node objects
  * only for Nodes whose links are set or removed.
  */
 export function attachFoldedModuleLinks<
-  TNode extends { id: string; file: string; fileTopLevel?: FileTopLevelUse[]; calledAtLoadBy?: string[] },
+  TNode extends {
+    id: string;
+    file: string;
+    fileTopLevel?: FileTopLevelUse[];
+    calledAtLoadBy?: string[];
+    fileTopLevelTypes?: TypeUse[];
+  },
 >(nodes: TNode[], foldedModules: readonly FoldedModule[]): TNode[] {
   const usesByFile = new Map<string, FileTopLevelUse[]>();
+  const typesByFile = new Map<string, TypeUse[]>();
   const loadCallers = new Map<string, Set<string>>();
   for (const module of foldedModules) {
     if (module.uses.length > 0) {
       usesByFile.set(module.file, module.uses);
+    }
+    if ((module.usesTypes?.length ?? 0) > 0) {
+      typesByFile.set(module.file, module.usesTypes!);
     }
     for (const use of module.uses) {
       const files = loadCallers.get(use.id) ?? new Set<string>();
@@ -161,19 +174,23 @@ export function attachFoldedModuleLinks<
   return nodes.map((node) => {
     const fileTopLevel = usesByFile.get(node.file);
     const callers = loadCallers.get(node.id);
+    const fileTopLevelTypes = typesByFile.get(node.file);
     if (
       fileTopLevel === undefined &&
       callers === undefined &&
+      fileTopLevelTypes === undefined &&
       node.fileTopLevel === undefined &&
-      node.calledAtLoadBy === undefined
+      node.calledAtLoadBy === undefined &&
+      node.fileTopLevelTypes === undefined
     ) {
       return node;
     }
-    const { fileTopLevel: _oldUses, calledAtLoadBy: _oldCallers, ...rest } = node;
+    const { fileTopLevel: _oldUses, calledAtLoadBy: _oldCallers, fileTopLevelTypes: _oldTypes, ...rest } = node;
     return {
       ...rest,
       ...(fileTopLevel !== undefined ? { fileTopLevel } : {}),
       ...(callers !== undefined ? { calledAtLoadBy: [...callers].sort(compareIds) } : {}),
+      ...(fileTopLevelTypes !== undefined ? { fileTopLevelTypes } : {}),
     } as TNode;
   });
 }

@@ -48,6 +48,11 @@ export async function fetchCodeMap() {
       // the map — one in a file with map Nodes, one in a file with none.
       { ...node('mod:web/a', 'web/a.ts'), kind: 'Module' },
       { ...node('mod:lib/boot', 'lib/boot.ts'), kind: 'Module' },
+      // P4-2 phase 3b: Type/Interface Nodes, folded off the map.
+      { ...node('T', 'web/types.ts'), kind: 'Interface', startLine: 3, endLine: 9 },
+      { ...node('T2', 'web/types.ts'), kind: 'Interface' },
+      { ...node('U', 'docs/types.ts'), kind: 'Type' },
+      { ...node('Unused', 'app/types.ts'), kind: 'Type' },
     ],
     // FIX-2: w calls a AND d, and a calls d too — so BFS reaches d first
     // from w (a sibling of a, not a's callee in the tree).
@@ -64,7 +69,19 @@ export async function fetchCodeMap() {
       { source: 'mod:web/a', target: 'a', kind: 'CALLS' },
       { source: 'mod:web/a', target: 'd', kind: 'USAGE' },
       { source: 'mod:lib/boot', target: 'a', kind: 'CALLS' },
+      // P4-2 phase 3b: w and a use T; d and w use U. A CALLS into a type, a
+      // Module's use of one and a test Node's use of one never count as uses.
+      { source: 'w', target: 'T', kind: 'USAGE' },
+      { source: 'a', target: 'T', kind: 'USAGE' },
+      { source: 'd', target: 'U', kind: 'USAGE' },
+      { source: 'w', target: 'U', kind: 'USAGE' },
+      { source: 'x', target: 'T', kind: 'CALLS' },
+      { source: 'mod:web/a', target: 'T', kind: 'USAGE' },
+      { source: 't', target: 'T', kind: 'USAGE' },
+      // Type → type: T2 refers to U.
+      { source: 'T2', target: 'U', kind: 'USAGE' },
     ],
+    implementsLinks: [{ source: 'T2', target: 'T' }],
     // P4-2 phase 2: \`t\` calls \`w\` through an import; \`f\` reaches \`a\` only
     // by a name-only match, which must never count.
     testEvidence: {
@@ -81,7 +98,7 @@ const MODEL_MANAGER_STUB = toDataUrl('export function ensureLocalModel() { retur
 // Keeps the live `activeCodeMapNodes` getter `index.ts` hands the agent
 // surface, so a test can run the real `lookupNode` against it.
 const MCP_SERVER_STUB = toDataUrl(
-  'export function startMcpServer(getNodes, _post, _derive, getFolded) { globalThis.__scopeTestGetNodes = getNodes; globalThis.__scopeTestGetFolded = getFolded; return async () => {}; }',
+  'export function startMcpServer(getNodes, _post, _derive, getFolded, getFoldedTypes) { globalThis.__scopeTestGetNodes = getNodes; globalThis.__scopeTestGetFolded = getFolded; globalThis.__scopeTestGetFoldedTypes = getFoldedTypes; return async () => {}; }',
 );
 
 const HOOKS = toDataUrl(`
@@ -115,12 +132,23 @@ interface Posted {
     testedBy?: unknown;
     fileTopLevel?: unknown;
     calledAtLoadBy?: unknown;
+    fileTopLevelTypes?: unknown;
+    usesTypes?: unknown;
     riskSignals?: { type?: string; value?: number }[];
   }[];
   edges?: { source: string; target: string }[];
   message?: string;
   hiddenByScope?: number;
   appliedScope?: string[];
+  foldedTypes?: {
+    id: string;
+    usedBy: string[];
+    usedByTotal: number;
+    implements: string[];
+    implementedBy: string[];
+    refersTo: string[];
+    referencedByTypes: string[];
+  }[];
 }
 
 const port = new EventEmitter() as EventEmitter & { postMessage: (message: Posted) => void };
@@ -181,10 +209,18 @@ async function index(projectPath: string, includedPaths?: string[]): Promise<voi
 const ALL = ['web/a.ts', 'app/b.ts', 'docs/c.ts', 'webapp/d.ts'];
 
 /** P4-2 phase 3a: the live `activeCodeMapNodes` / `activeFoldedModules` getters the stubbed `startMcpServer` captured. */
-function capturedGetters(): { getNodes: () => unknown; getFolded: () => unknown } {
-  const captured = globalThis as { __scopeTestGetNodes?: () => unknown; __scopeTestGetFolded?: () => unknown };
-  assert.ok(captured.__scopeTestGetNodes && captured.__scopeTestGetFolded);
-  return { getNodes: captured.__scopeTestGetNodes, getFolded: captured.__scopeTestGetFolded };
+function capturedGetters(): { getNodes: () => unknown; getFolded: () => unknown; getFoldedTypes: () => unknown } {
+  const captured = globalThis as {
+    __scopeTestGetNodes?: () => unknown;
+    __scopeTestGetFolded?: () => unknown;
+    __scopeTestGetFoldedTypes?: () => unknown;
+  };
+  assert.ok(captured.__scopeTestGetNodes && captured.__scopeTestGetFolded && captured.__scopeTestGetFoldedTypes);
+  return {
+    getNodes: captured.__scopeTestGetNodes,
+    getFolded: captured.__scopeTestGetFolded,
+    getFoldedTypes: captured.__scopeTestGetFoldedTypes,
+  };
 }
 
 describe('graphService:scopeChanged through index.ts', () => {
@@ -201,6 +237,7 @@ describe('graphService:scopeChanged through index.ts', () => {
   after(() => {
     delete (globalThis as { __scopeTestGetNodes?: unknown }).__scopeTestGetNodes;
     delete (globalThis as { __scopeTestGetFolded?: unknown }).__scopeTestGetFolded;
+    delete (globalThis as { __scopeTestGetFoldedTypes?: unknown }).__scopeTestGetFoldedTypes;
   });
 
   it('filters the next Code Map fetch with the saved scope, posting no status', async () => {
@@ -352,9 +389,11 @@ describe('graphService:scopeChanged through index.ts', () => {
     assert.deepEqual(lookupNode('mod:lib/boot', cached, (node) => node, folded), {
       status: 'folded',
       folded: true,
+      kind: 'Module',
       nodeId: 'mod:lib/boot',
       file: 'lib/boot.ts',
       uses: [{ id: 'a', kind: 'CALLS' }],
+      usesTypes: [],
     });
     assert.deepEqual(lookupNode('mod:nope', cached, (node) => node, folded), { status: 'not-found' });
     const a = lookupNode('a', cached, (node) => node, folded);
@@ -379,18 +418,38 @@ describe('graphService:scopeChanged through index.ts', () => {
       getNodes as Parameters<typeof registerLookupNodeTool>[1],
       (node) => node,
       getFolded as Parameters<typeof registerLookupNodeTool>[3],
+      () => [
+        {
+          id: 'T',
+          name: 'T',
+          kind: 'Interface',
+          file: 'web/types.ts',
+          startLine: 1,
+          endLine: 2,
+          usedBy: [],
+          usedByTotal: 0,
+          usedByKinds: [],
+          implements: [],
+          implementedBy: [],
+          refersTo: [],
+          referencedByTypes: [],
+        },
+      ],
     );
     assert.ok(handler);
     const result = JSON.parse((await handler({ nodeId: 'mod:web/a' })).content[0]!.text);
     assert.deepEqual(result, {
       status: 'folded',
       folded: true,
+      kind: 'Module',
       nodeId: 'mod:web/a',
       file: 'web/a.ts',
       uses: [
         { id: 'a', kind: 'CALLS' },
         { id: 'd', kind: 'USAGE' },
       ],
+      // P4-2 phase 3b: its top-level use of T is kept, as a type.
+      usesTypes: [{ id: 'T', name: 'T', kind: 'Interface' }],
     });
     assert.match(description, /check status === 'folded'; folded: true is also set/);
     assert.match(description, /calledAtLoadBy/);
@@ -406,7 +465,15 @@ describe('graphService:scopeChanged through index.ts', () => {
     const { lookupNode } = await import('./mcp-server');
     type Args = Parameters<typeof lookupNode>;
     const look = (id: string) => lookupNode(id, getNodes() as Args[1], (node) => node, getFolded() as Args[3]);
-    assert.deepEqual(look('mod:web/a'), { status: 'folded', folded: true, nodeId: 'mod:web/a', file: 'web/a.ts', uses: [] });
+    assert.deepEqual(look('mod:web/a'), {
+      status: 'folded',
+      folded: true,
+      kind: 'Module',
+      nodeId: 'mod:web/a',
+      file: 'web/a.ts',
+      uses: [],
+      usesTypes: [{ id: 'T', name: 'T', kind: 'Interface' }],
+    });
     // lib/boot.ts is out of scope: its Module is gone too.
     assert.deepEqual(look('mod:lib/boot'), { status: 'not-found' });
 
@@ -418,6 +485,180 @@ describe('graphService:scopeChanged through index.ts', () => {
     assert.deepEqual(wider.nodes?.find((node) => node.id === 'a')?.calledAtLoadBy, ['web/a.ts']);
     send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
     await fetchMap();
+  });
+
+  it('P4-2 phase 3b: Type/Interface Nodes leave the map, its edges and blast radius; each Node lists the types it uses', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    const map = await fetchMap();
+    assert.deepEqual((map.nodes ?? []).map((node) => node.id), ['w', 'a', 'd', 'x']);
+    const typeIds = new Set(['T', 'T2', 'U', 'Unused']);
+    assert.ok(!(map.edges ?? []).some((edge) => typeIds.has(edge.source) || typeIds.has(edge.target)));
+    const mapNode = (id: string) => map.nodes?.find((node) => node.id === id);
+    const blast = (id: string) => mapNode(id)?.riskSignals?.find((signal) => signal.type === 'blast-radius')?.value;
+    // w reaches a and d (and d via a); T is not counted. x's only edge was a CALLS into T.
+    assert.equal(blast('w'), 2);
+    assert.equal(blast('x'), 0);
+    assert.deepEqual(mapNode('w')?.usesTypes, [
+      { id: 'T', name: 'T', kind: 'Interface' },
+      { id: 'U', name: 'U', kind: 'Type' },
+    ]);
+    assert.deepEqual(mapNode('d')?.usesTypes, [{ id: 'U', name: 'U', kind: 'Type' }]);
+    // A CALLS into a type is not a use.
+    assert.equal(mapNode('x')?.usesTypes, undefined);
+    // A Module's use of a type leaves fileTopLevel (map Nodes only) and is
+    // kept as the file's top-level type use, on every Node in the file.
+    assert.deepEqual(mapNode('w')?.fileTopLevel, [
+      { id: 'a', kind: 'CALLS' },
+      { id: 'd', kind: 'USAGE' },
+    ]);
+    assert.deepEqual(mapNode('w')?.fileTopLevelTypes, [{ id: 'T', name: 'T', kind: 'Interface' }]);
+    assert.equal(mapNode('a')?.fileTopLevelTypes, undefined);
+    assert.deepEqual(
+      (map.foldedTypes ?? []).map((type) => [
+        type.id,
+        type.usedBy,
+        type.usedByTotal,
+        type.implements,
+        type.implementedBy,
+        type.refersTo,
+        type.referencedByTypes,
+      ]),
+      [
+        ['T', ['a', 'w'], 2, [], ['T2'], [], []],
+        ['T2', [], 0, ['T'], [], ['U'], []],
+        ['U', ['d', 'w'], 2, [], [], [], ['T2']],
+        ['Unused', [], 0, [], [], [], []],
+      ],
+    );
+
+    const { getNodes, getFolded, getFoldedTypes } = capturedGetters();
+    const { lookupNode, registerLookupNodeTool } = await import('./mcp-server');
+    type Args = Parameters<typeof lookupNode>;
+    assert.deepEqual(lookupNode('T', getNodes() as Args[1], (node) => node, getFolded() as Args[3], getFoldedTypes() as Args[4]), {
+      status: 'folded',
+      folded: true,
+      kind: 'Interface',
+      nodeId: 'T',
+      name: 'T',
+      file: 'web/types.ts',
+      startLine: 3,
+      endLine: 9,
+      usedBy: ['a', 'w'],
+      usedByTotal: 2,
+      usedByKinds: [{ kind: 'Function', count: 2 }],
+      implements: [],
+      implementedBy: ['T2'],
+      refersTo: [],
+      referencedByTypes: [],
+    });
+    // usedBy is capped at 50, with the full count alongside; a map Node wins over a type with its id.
+    const many = Array.from({ length: 60 }, (_, i) => `u${String(i).padStart(2, '0')}`);
+    const big = {
+      id: 'Big',
+      name: 'Big',
+      kind: 'Type' as const,
+      file: 'b.ts',
+      startLine: 1,
+      endLine: 2,
+      usedBy: many,
+      usedByTotal: 60,
+      usedByKinds: [{ kind: 'Function' as const, count: 60 }],
+      implements: [],
+      implementedBy: [],
+      refersTo: [],
+      referencedByTypes: [],
+    };
+    const bigResult = lookupNode('Big', [], (node) => node, [], [big]);
+    assert.deepEqual(
+      bigResult.status === 'folded' && bigResult.kind !== 'Module' ? [bigResult.usedBy, bigResult.usedByTotal] : undefined,
+      [many.slice(0, 50), 60],
+    );
+    assert.equal(lookupNode('w', getNodes() as Args[1], (node) => node, [], [{ ...big, id: 'w' }]).status, 'ok');
+    // Through the registered handler, with its live getters.
+    let handler: ((args: { nodeId: string }) => Promise<{ content: { type: string; text: string }[] }>) | undefined;
+    let description = '';
+    registerLookupNodeTool(
+      {
+        registerTool: (_name: string, config: { description?: string }, cb: typeof handler) => {
+          description = config.description ?? '';
+          handler = cb;
+        },
+      } as unknown as Parameters<typeof registerLookupNodeTool>[0],
+      getNodes as Parameters<typeof registerLookupNodeTool>[1],
+      (node) => node,
+      getFolded as Parameters<typeof registerLookupNodeTool>[3],
+      getFoldedTypes as Parameters<typeof registerLookupNodeTool>[4],
+    );
+    assert.ok(handler);
+    const viaTool = JSON.parse((await handler({ nodeId: 'T2' })).content[0]!.text);
+    assert.equal(viaTool.status, 'folded');
+    assert.equal(viaTool.kind, 'Interface');
+    assert.deepEqual(viaTool.implements, ['T']);
+    assert.deepEqual(viaTool.refersTo, ['U']);
+    assert.match(description, /usesTypes/);
+    assert.match(description, /never inferred from its signature/);
+
+    // Path Trace is CALLS-only: a type name resolves to no entry.
+    const from = posted.length;
+    send({ type: 'graphService:pathTrace', query: 'Unused', requestId: 5151 });
+    const reply = await waitFor(
+      () => posted.slice(from).find((message) => message.type === 'graphService:pathTraceResult' && message.requestId === 5151),
+      'a pathTraceResult',
+    );
+    assert.deepEqual(reply.result, { status: 'no-path-found' });
+  });
+
+  it('P4-2 phase 3b: folded types follow the indexing scope, and name only in-scope users', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web'] });
+    const map = await fetchMap();
+    // U (docs/) and Unused (app/) are out of scope; T keeps only w, and w no
+    // longer lists U among the types it uses.
+    assert.deepEqual(map.nodes?.find((node) => node.id === 'w')?.usesTypes, [{ id: 'T', name: 'T', kind: 'Interface' }]);
+    // T2's reference to U (docs/) is out of scope too.
+    assert.deepEqual(
+      (map.foldedTypes ?? []).map((type) => [type.id, type.usedBy, type.refersTo]),
+      [
+        ['T', ['w'], []],
+        ['T2', [], []],
+      ],
+    );
+    const { getNodes, getFolded, getFoldedTypes } = capturedGetters();
+    const { lookupNode } = await import('./mcp-server');
+    type Args = Parameters<typeof lookupNode>;
+    const look = (id: string) =>
+      lookupNode(id, getNodes() as Args[1], (node) => node, getFolded() as Args[3], getFoldedTypes() as Args[4]);
+    assert.deepEqual(look('U'), { status: 'not-found' });
+    const t = look('T');
+    assert.deepEqual(t.status === 'folded' && t.kind !== 'Module' ? [t.usedBy, t.usedByTotal] : undefined, [['w'], 1]);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    await fetchMap();
+  });
+
+  it('P4-2 phase 3b: a backend switch (and a same-backend re-affirm) keeps the cached folded types and Modules', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    await fetchMap();
+    const { getNodes, getFolded, getFoldedTypes } = capturedGetters();
+    const { lookupNode } = await import('./mcp-server');
+    type Args = Parameters<typeof lookupNode>;
+    const look = (id: string) =>
+      lookupNode(id, getNodes() as Args[1], (node) => node, getFolded() as Args[3], getFoldedTypes() as Args[4]);
+    const typeIds = () => ((getFoldedTypes() as { id: string }[] | undefined) ?? []).map((type) => type.id);
+    const moduleFiles = () => ((getFolded() as { file: string }[] | undefined) ?? []).map((module) => module.file);
+    const before = { types: typeIds(), modules: moduleFiles() };
+    assert.deepEqual(before.types, ['T', 'T2', 'U', 'Unused']);
+    // A genuine switch (local → cloud), then a re-affirm (cloud → cloud), then back.
+    for (const activeBackend of ['cloud', 'cloud', 'local']) {
+      send({ type: 'graphService:backendSwitched', activeBackend });
+      // The handler re-caches synchronously up to its first await; give it a tick or two anyway.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(typeIds(), before.types, `folded types after ${activeBackend}`);
+      assert.deepEqual(moduleFiles(), before.modules, `folded Modules after ${activeBackend}`);
+      assert.equal(look('T').status, 'folded');
+      const t = look('T');
+      assert.equal(t.status === 'folded' ? t.kind : undefined, 'Interface');
+      const mod = look('mod:web/a');
+      assert.equal(mod.status === 'folded' ? mod.kind : undefined, 'Module');
+    }
   });
 
   it('ignores a malformed scopeChanged', async () => {

@@ -5,10 +5,13 @@
  * it, so neither can see a test Node, a test edge, or a test file's hotspot.
  * P4-2 phase 3a: then fold Module Nodes into their file (`fold-modules.ts`),
  * so neither sees a Module Node or a Module's edge either.
+ * P4-2 phase 3b: then fold Type/Interface Nodes into a side index by id
+ * (`fold-types.ts`), so neither sees a type Node or a type edge.
  */
-import type { FoldedModule } from '@driller/graph-contracts';
+import type { FoldedModule, FoldedType } from '@driller/graph-contracts';
 
 import { attachFoldedModuleLinks, foldModules } from './fold-modules';
+import { attachTypeUses, foldTypes, splitModuleTypeUses } from './fold-types';
 import { fetchCodeMap, type CodeMapFetchResult, type FetchCodeMapOptions } from './mcp-client';
 import { toProjectRelativePosixPath } from './project-path';
 import { attachTestedBy } from './tested-by';
@@ -62,12 +65,19 @@ export interface ProductionCodeMapOptions {
    * Node detail and `lookup_node`); Path Trace doesn't need it.
    */
   includeTestedBy?: boolean;
+  /**
+   * P4-2 phase 3b: fetch `IMPLEMENTS` links for the folded types' "Implements"
+   * row. Only the Code Map handler asks for it; Path Trace doesn't need it.
+   */
+  includeImplements?: boolean;
 }
 
 /** `fetchProductionCodeMap`'s result: the production map plus its folded Modules. */
 export interface ProductionCodeMapResult extends CodeMapFetchResult {
   /** P4-2 phase 3a: the production files' folded Module Nodes, sorted by file (see `FoldedModule`). */
   foldedModules: FoldedModule[];
+  /** P4-2 phase 3b: the production Type/Interface Nodes folded off the map, sorted by id (see `FoldedType`). */
+  foldedTypes: FoldedType[];
 }
 
 /**
@@ -79,6 +89,12 @@ export interface ProductionCodeMapResult extends CodeMapFetchResult {
  * (`foldModules`) into `foldedModules`; Nodes carry the links as
  * `fileTopLevel` / `calledAtLoadBy` (unscoped: the Code Map handler re-scopes
  * them after its scope filter).
+ * P4-2 phase 3b: then Type/Interface Nodes are folded off the map
+ * (`foldTypes`) into `foldedTypes`, built only from real `USAGE` edges;
+ * Nodes carry the types they use as `usesTypes` (unscoped, like above). A
+ * folded Module's top-level use of a type moves from `uses` (which then
+ * names only map Nodes) to `usesTypes`, and Nodes in that file carry it as
+ * `fileTopLevelTypes`.
  * Throws whatever `fetchCodeMap` throws.
  */
 export async function fetchProductionCodeMap(
@@ -89,9 +105,11 @@ export async function fetchProductionCodeMap(
 ): Promise<ProductionCodeMapResult> {
   const fetch = options.fetch ?? fetchCodeMap;
   const includeTestEvidence = options.includeTestedBy === true;
-  const { nodes, edges, testEvidence } = await fetch(project, undefined, {
+  const includeImplements = options.includeImplements === true;
+  const { nodes, edges, testEvidence, implementsLinks } = await fetch(project, undefined, {
     excludeFile: (file) => isTestPath(normalizeFile(projectRoot, file, `${context} hotspot file`)),
     ...(includeTestEvidence ? { includeTestEvidence } : {}),
+    ...(includeImplements ? { includeImplements } : {}),
   });
   const normalizedNodes = nodes.map((node) => ({
     ...node,
@@ -112,12 +130,16 @@ export async function fetchProductionCodeMap(
       : normalizedNodes;
   const production = excludeTestCode(withTestedBy, edges);
   const folded = foldModules(production.nodes, production.edges);
-  const foldedModules = [...folded.modulesByFile.values()].sort((a, b) =>
-    a.file < b.file ? -1 : a.file > b.file ? 1 : 0,
+  const types = foldTypes(folded.nodes, folded.edges, implementsLinks ?? []);
+  const foldedTypes = [...types.typesById.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const foldedModules = splitModuleTypeUses(
+    [...folded.modulesByFile.values()].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0)),
+    foldedTypes,
   );
   return {
-    nodes: attachFoldedModuleLinks(folded.nodes, foldedModules),
-    edges: folded.edges,
+    nodes: attachTypeUses(attachFoldedModuleLinks(types.nodes, foldedModules), foldedTypes),
+    edges: types.edges,
     foldedModules,
+    foldedTypes,
   };
 }

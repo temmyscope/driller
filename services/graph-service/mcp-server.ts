@@ -64,8 +64,10 @@ import { z } from 'zod';
 import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts';
 import {
   BLAST_RADIUS_DEFAULT_HOPS,
+  FOLDED_TYPE_LOOKUP_MAX_USED_BY,
   TESTED_BY_MAX_TESTS,
   type FoldedModule,
+  type FoldedType,
   type NodeLookupResult,
 } from '@driller/graph-contracts';
 import {
@@ -128,14 +130,23 @@ export type { NodeLookupResult };
  *
  * P4-2 phase 3a: an id that is no map Node but is a Module folded into its
  * file (`foldedModules`, the live `activeFoldedModules`) resolves as
- * `{status: 'folded', folded: true, nodeId, file, uses}` — never
- * `'not-found'`. A map Node wins over a folded Module with the same id.
+ * `{status: 'folded', folded: true, kind: 'Module', nodeId, file, uses, usesTypes}` —
+ * never `'not-found'`. A map Node wins over a folded Module with the same id.
+ *
+ * P4-2 phase 3b: likewise an id that is a Type/Interface folded off the map
+ * (`foldedTypes`, the live `activeFoldedTypes`) resolves as `{status:
+ * 'folded', folded: true, kind, nodeId, name, file, startLine, endLine,
+ * usedBy, usedByTotal, usedByKinds, implements, implementedBy, refersTo,
+ * referencedByTypes}`, with `usedBy` capped at
+ * `FOLDED_TYPE_LOOKUP_MAX_USED_BY`. A map Node, then a folded Module, wins
+ * over a folded type with the same id.
  */
 export function lookupNode(
   nodeId: string,
   nodes: CodeMapNode[] | undefined,
   deriveLive: (cached: CodeMapNode) => CodeMapNode,
   foldedModules: readonly FoldedModule[] = [],
+  foldedTypes: readonly FoldedType[] = [],
 ): NodeLookupResult {
   if (!nodes) {
     return { status: 'error', message: 'No project has finished indexing yet.' };
@@ -144,7 +155,35 @@ export function lookupNode(
   if (!node) {
     const folded = foldedModules.find((module) => module.moduleIds.includes(nodeId));
     if (folded) {
-      return { status: 'folded', folded: true, nodeId, file: folded.file, uses: folded.uses };
+      return {
+        status: 'folded',
+        folded: true,
+        kind: 'Module',
+        nodeId,
+        file: folded.file,
+        uses: folded.uses,
+        usesTypes: folded.usesTypes ?? [],
+      };
+    }
+    const type = foldedTypes.find((candidate) => candidate.id === nodeId);
+    if (type) {
+      return {
+        status: 'folded',
+        folded: true,
+        kind: type.kind,
+        nodeId,
+        name: type.name,
+        file: type.file,
+        startLine: type.startLine,
+        endLine: type.endLine,
+        usedBy: type.usedBy.slice(0, FOLDED_TYPE_LOOKUP_MAX_USED_BY),
+        usedByTotal: type.usedByTotal,
+        usedByKinds: type.usedByKinds,
+        implements: type.implements,
+        implementedBy: type.implementedBy,
+        refersTo: type.refersTo,
+        referencedByTypes: type.referencedByTypes,
+      };
     }
     return { status: 'not-found' };
   }
@@ -244,7 +283,8 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
         '`parents` maps each reached Node id to the caller it was first reached from (the entry maps to null); use it for who calls whom. ' +
         '`depths` maps each reached Node id to its hop distance from the entry (entry = 0). ' +
         'Returns the exact same PathTraceResult the human-facing UI renders for the identical query: an explicit result state (found/ambiguous/no-path-found/error), never collapsed into a generic success/failure. ' +
-        "A Module id (a file's top-level code) is folded into its file and has no Code Map Node, so it never resolves as an entry and its calls are not traced; use lookup_node on it to see what that top-level code calls or uses.",
+        "A Module id (a file's top-level code) is folded into its file and has no Code Map Node, so it never resolves as an entry and its calls are not traced; use lookup_node on it to see what that top-level code calls or uses. " +
+        "Type and Interface Nodes are folded off the Code Map too, so a type's id or name never resolves as an entry: a type-only query returns no-path-found here. The human-facing UI shows this same result, adding only an 'is a type — open its detail' hint on top of it; agents should use lookup_node with the type's id to see who uses it.",
       inputSchema: z.object({
         query: z
           .string()
@@ -257,7 +297,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.2.0';
+export const MCP_SERVER_VERSION = '1.3.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -270,6 +310,8 @@ export function registerLookupNodeTool(
   getActiveCodeMapNodes: () => CodeMapNode[] | undefined,
   deriveLiveNode: (cached: CodeMapNode) => CodeMapNode,
   getActiveFoldedModules: () => FoldedModule[] | undefined,
+  // P4-2 phase 3b: the live `activeFoldedTypes`, read at call time too.
+  getActiveFoldedTypes: () => FoldedType[] | undefined,
 ): void {
   server.registerTool(
     'lookup_node',
@@ -282,13 +324,24 @@ export function registerLookupNodeTool(
         `'testedBy', when present, lists tests that provably exercise this Node: 'tests' are test functions or methods (or, with 'topLevel', a test file's top-level test code) that call it through an import-resolved call edge, capped at ${TESTED_BY_MAX_TESTS} with 'totalTests' giving the full count; 'files' are test files the index links to this Node's file. Name-only matches never count. Tests are not Code Map Nodes: looking up a test's id returns not-found; open its file and line range instead. An absent 'testedBy' means no test link was found, NOT that the Node is untested: the index's test links are incomplete, so never report a Node as untested or infer coverage from their absence. ` +
         "'fileTopLevel', when present, lists what this Node's file's top-level code (code outside any function, e.g. module-level calls and registrations) calls or uses: Code Map Node ids with the edge kind. " +
         "'calledAtLoadBy', when present, lists the files whose top-level code calls or uses this Node — a Node called only at load time (main(), route registration, init hooks) has no Code Map caller, so this is where its caller is named. " +
-        "Module Nodes (a file's top-level code) are folded into their file and are not Code Map Nodes: looking up a Module's id returns {status: 'folded', folded: true, nodeId, file, uses} (no 'node'), where 'uses' is what that top-level code calls or uses: check status === 'folded'; folded: true is also set. A folded Module's edges do not count toward any Node's blast radius, and a changed Module is not a changed Node.",
+        "Module Nodes (a file's top-level code) are folded into their file and are not Code Map Nodes: looking up a Module's id returns {status: 'folded', folded: true, kind: 'Module', nodeId, file, uses, usesTypes} (no 'node'), where 'uses' is the Code Map Nodes that top-level code calls or uses and 'usesTypes' the folded types it uses: check status === 'folded'; folded: true is also set. A folded Module's edges do not count toward any Node's blast radius, and a changed Module is not a changed Node. " +
+        "'usesTypes', when present, lists the Type and Interface ids (with name and kind) this Node uses through a real USAGE edge — never inferred from its signature. " +
+        `Type and Interface Nodes are folded off the Code Map as contracts: looking up a type's id returns {status: 'folded', folded: true, kind: 'Type' | 'Interface', nodeId, name, file, startLine, endLine, usedBy, usedByTotal, usedByKinds, implements, implementedBy, refersTo, referencedByTypes} (no 'node'), where 'usedBy' is up to ${FOLDED_TYPE_LOOKUP_MAX_USED_BY} ids of Code Map Nodes that use it through a USAGE edge (usedByTotal is the full count, usedByKinds its breakdown by Node kind); 'implements'/'implementedBy' are folded type ids it extends or implements, and that extend or implement it (Interface/Type IMPLEMENTS edges only: Classes are not Code Map Nodes, so a class implementing it is not listed); 'refersTo'/'referencedByTypes' are folded type ids it refers to, and that refer to it, through USAGE edges. A type's edges do not count toward any Node's blast radius, and a changed type is not a changed Node. ` +
+        "'fileTopLevelTypes', when present on a Node, lists the folded types its file's top-level code uses.",
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
       }),
     },
     async ({ nodeId }) =>
-      jsonToolResult(lookupNode(nodeId, getActiveCodeMapNodes(), deriveLiveNode, getActiveFoldedModules() ?? [])),
+      jsonToolResult(
+        lookupNode(
+          nodeId,
+          getActiveCodeMapNodes(),
+          deriveLiveNode,
+          getActiveFoldedModules() ?? [],
+          getActiveFoldedTypes() ?? [],
+        ),
+      ),
   );
 }
 
@@ -350,6 +403,8 @@ export function startMcpServer(
   // P4-2 phase 3a: the live `activeFoldedModules`, a getter for the same
   // reason `getActiveCodeMapNodes` is one.
   getActiveFoldedModules: () => FoldedModule[] | undefined,
+  // P4-2 phase 3b: the live `activeFoldedTypes`, a getter for the same reason.
+  getActiveFoldedTypes: () => FoldedType[] | undefined,
 ): () => Promise<void> {
   // Phase 1 shipped '1.0.0' as the documented v1 contract covering
   // `lookup_node` alone. Phase 2 bumps the MINOR version (semver:
@@ -358,10 +413,15 @@ export function startMcpServer(
   // replaced (Acceptance Criteria). P4-2 phase 3a bumps it again (1.2.0):
   // `lookup_node` gains the folded-Module result and the `fileTopLevel`/
   // `calledAtLoadBy` Node fields, and `compute_diff_scope` gains
-  // `topLevelFiles` — all additive.
+  // `topLevelFiles` — all additive. P4-2 phase 3b (1.3.0): `lookup_node`
+  // gains the folded-type result and the `usesTypes`/`fileTopLevelTypes`
+  // Node fields, and the folded-Module result gains `kind: 'Module'` and
+  // `usesTypes`. Additive for a client that reads fields, but a client
+  // comparing the folded-Module result's exact shape (deep equality against
+  // `{status, folded, nodeId, file, uses}`) will see the two new fields.
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
-  registerLookupNodeTool(server, getActiveCodeMapNodes, deriveLiveNode, getActiveFoldedModules);
+  registerLookupNodeTool(server, getActiveCodeMapNodes, deriveLiveNode, getActiveFoldedModules, getActiveFoldedTypes);
 
   // Story 5.1 (Phase 2): the remaining four operations. Each handler calls
   // straight into its already-exported, already-reviewed compute function
@@ -383,7 +443,8 @@ export function startMcpServer(
         "Compute hop-distance blast radius expansion from a seed set of Node ids through driller's Code Map. Returns the exact same BlastRadiusExpansionResult the human-facing UI would get for the identical seed set — an explicit result state (resolved/error), never collapsed into a generic success/failure. " +
         "Hop distances are per direction and unbounded: each Node's distance is the smaller of its forward (seed reaches it) and backward (it reaches a seed) distance from the nearest seed, never a path that mixes directions, so Nodes that only share a caller or callee with a seed are not returned. Seeds are excluded. " +
         `Filtering to distances 1..${BLAST_RADIUS_DEFAULT_HOPS} for a single seed gives exactly the Node set that seed's 'blast-radius' signal counts. ` +
-        "A Module id (a file's top-level code) is folded into its file and has no Code Map Node: as a seed it reaches nothing, and Module edges are never walked.",
+        "A Module id (a file's top-level code) is folded into its file and has no Code Map Node: as a seed it reaches nothing, and Module edges are never walked. " +
+        "Type and Interface ids are folded off the Code Map the same way: as seeds they reach nothing, and type (USAGE) edges are never walked.",
       inputSchema: z.object({
         projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
         nodeIds: z

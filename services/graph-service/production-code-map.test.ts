@@ -152,6 +152,63 @@ describe('fetchProductionCodeMap', () => {
     assert.deepEqual(result.nodes.find((n) => n.id === 'g')?.calledAtLoadBy, ['src/x.ts']);
   });
 
+  it('P4-2 phase 3b: folds production Type/Interface Nodes after Modules, from real USAGE edges only', async () => {
+    const root = '/home/u/proj-fold-types';
+    const typed = (id: string, file: string, kind: 'Type' | 'Interface'): CodeMapNodeWithSignalSources => ({ ...node(id, file), kind });
+    const nodes = [
+      node('f', `${root}/src/x.ts`),
+      node('g', `${root}/src/y.ts`),
+      { ...node('mod:x', `${root}/src/x.ts`), kind: 'Module' as const },
+      typed('T', `${root}/src/types.ts`, 'Interface'),
+      typed('Base', `${root}/src/types.ts`, 'Interface'),
+      // Test-file types are test code: removed, never folded.
+      typed('Fixture', `${root}/src/x.test.ts`, 'Type'),
+    ];
+    const edges: CodeMapEdge[] = [
+      { source: 'f', target: 'g', kind: 'CALLS' },
+      { source: 'f', target: 'T', kind: 'USAGE' },
+      { source: 'g', target: 'T', kind: 'USAGE' },
+      { source: 'g', target: 'Fixture', kind: 'USAGE' },
+      // A file's top-level use of a type is kept as a type use.
+      { source: 'mod:x', target: 'T', kind: 'USAGE' },
+      { source: 'mod:x', target: 'g', kind: 'CALLS' },
+    ];
+    let askedImplements: boolean | undefined;
+    const fetch = async (project: string, timeoutMs?: number, options?: FetchCodeMapOptions) => {
+      askedImplements = options?.includeImplements;
+      return { ...(await fakeFetch(nodes, edges)(project, timeoutMs, options)), implementsLinks: [{ source: 'T', target: 'Base' }] };
+    };
+    const result = await fetchProductionCodeMap('p', root, 'test', { fetch, includeImplements: true });
+    assert.equal(askedImplements, true);
+    assert.deepEqual(result.nodes.map((n) => n.id), ['f', 'g']);
+    assert.deepEqual(result.edges, [{ source: 'f', target: 'g', kind: 'CALLS' }]);
+    const common = { kind: 'Interface', file: 'src/types.ts', startLine: 1, endLine: 2, refersTo: [], referencedByTypes: [] };
+    assert.deepEqual(result.foldedTypes, [
+      { ...common, id: 'Base', name: 'Base', usedBy: [], usedByTotal: 0, usedByKinds: [], implements: [], implementedBy: ['T'] },
+      {
+        ...common,
+        id: 'T',
+        name: 'T',
+        usedBy: ['f', 'g'],
+        usedByTotal: 2,
+        usedByKinds: [{ kind: 'Function', count: 2 }],
+        implements: ['Base'],
+        implementedBy: [],
+      },
+    ]);
+    assert.deepEqual(result.nodes.find((n) => n.id === 'f')?.usesTypes, [{ id: 'T', name: 'T', kind: 'Interface' }]);
+    // The file's top-level use of T moves from `uses` to `usesTypes`, and
+    // Nodes in that file carry it.
+    assert.deepEqual(result.foldedModules.map((m) => [m.uses, m.usesTypes]), [
+      [[{ id: 'g', kind: 'CALLS' }], [{ id: 'T', name: 'T', kind: 'Interface' }]],
+    ]);
+    assert.deepEqual(result.nodes.find((n) => n.id === 'f')?.fileTopLevelTypes, [{ id: 'T', name: 'T', kind: 'Interface' }]);
+    assert.equal(result.nodes.find((n) => n.id === 'g')?.fileTopLevelTypes, undefined);
+
+    await fetchProductionCodeMap('p', root, 'test', { fetch });
+    assert.equal(askedImplements, undefined);
+  });
+
   it('warns once per distinct out-of-project path, not once per Node per fetch', async (t) => {
     const warn = mock.method(console, 'warn', () => {});
     t.after(() => warn.mock.restore());

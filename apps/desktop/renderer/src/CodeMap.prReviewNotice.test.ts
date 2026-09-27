@@ -55,12 +55,13 @@ const SHOWABLE: FetchState = {
   edges: [],
   hiddenByScope: 0,
   appliedScope: [],
+  foldedTypes: [],
 };
 
 const NOT_SHOWABLE: Record<string, FetchState> = {
   loading: { status: 'loading' },
   error: { status: 'error', message: 'boom' },
-  empty: { status: 'ready', nodes: [], edges: [], hiddenByScope: 0, appliedScope: [] },
+  empty: { status: 'ready', nodes: [], edges: [], hiddenByScope: 0, appliedScope: [], foldedTypes: [] },
 };
 
 const NOTICE_STATUSES: DiffScopeNoticeStatus[] = ['no-changes', 'not-a-git-repo', 'no-base-ref-resolvable'];

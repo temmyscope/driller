@@ -12,8 +12,11 @@
  * Node. It can only ever open after Node Detail, never under it — while it
  * is open its scrim covers every surface that opens Node Detail. Node
  * Detail's own "View source" still closes Node Detail first (its P0-1
- * behaviour). So the top of this stack is always the dialog the user can
- * see on top.
+ * behaviour). P4-2 phase 3b's type detail (z-index 11) stacks over Node
+ * detail the same way: opened from a Node detail link, so Escape returns to
+ * that Node; it and the source viewer are never open together (the type
+ * detail's View source closes it first). So the top of this stack is always
+ * the dialog the user can see on top.
  *
  * Every decision the hook makes — which key does what, whether a scrim press
  * closes, whether closing restores focus, whether an overlay is open — is a
