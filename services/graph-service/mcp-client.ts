@@ -81,6 +81,12 @@ export interface CodeMapNodeWithSignalSources extends CodeMapNode {
   cognitiveComplexity?: number;
   /** `f.change_count` off the Node's own File (via the query's `OPTIONAL MATCH`), when present. */
   hotspotChangeCount?: number;
+  /**
+   * P4-2 phase 1: the backend's `n.is_test` (see `parseTestFlag`), set only
+   * when true. Never reaches the wire: `excludeTestCode` removes every Node
+   * that carries it, and `attachProjectRiskSignals` strips the field anyway.
+   */
+  isTest?: boolean;
 }
 
 const CLIENT_INFO = { name: 'driller-graph-service', version: '0.1.0' };
@@ -287,8 +293,9 @@ async function runIndex(
 // Node/edge selection here is a judgment call (Design Notes): Function /
 // Interface / Type / Module labels only (EXPERIENCE.md's "function/method/
 // module name" atomic map unit) — never Variable/Section (too granular) or
-// File/Folder/Project/Branch (scaffolding). CALLS/IMPORTS/USAGE edges only —
-// never DEFINES/CONTAINS_* containment edges (FR4 is call/dependency edges).
+// File/Folder/Project/Branch (scaffolding). CALLS/USAGE edges only (IMPORTS
+// never matches; see CODE_MAP_EDGES_QUERY) — never DEFINES/CONTAINS_*
+// containment edges (FR4 is call/dependency edges).
 // ---------------------------------------------------------------------------
 
 const CODE_MAP_NODE_KINDS: readonly CodeMapNodeKind[] = [
@@ -298,6 +305,10 @@ const CODE_MAP_NODE_KINDS: readonly CodeMapNodeKind[] = [
   'Module',
 ];
 
+// P4-2 phase 1: `IMPORTS` stays an accepted kind here and in the
+// `CodeMapEdgeKind` contract, because the backend may emit symbol-level
+// IMPORTS edges later. `CODE_MAP_EDGES_QUERY` currently omits it: today every
+// IMPORTS edge starts at a `File` node, so it could never match.
 const CODE_MAP_EDGE_KINDS: readonly CodeMapEdgeKind[] = ['CALLS', 'IMPORTS', 'USAGE'];
 
 // Live-verified against a real codebase-memory-mcp instance (this story's
@@ -374,7 +385,14 @@ const CODE_MAP_EDGE_KINDS: readonly CodeMapEdgeKind[] = ['CALLS', 'IMPORTS', 'US
 // reason, and this file's own comment on that query already establishes
 // that a dangling edge to a Node this query drops is harmless (React Flow
 // silently discards it).
-const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) WHERE NOT n.file_path STARTS WITH '<' RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind, n.complexity AS complexity, n.cognitive AS cognitive`;
+//
+// P4-2 phase 1: `n.is_test AS isTest` is the backend's own test flag, read so
+// `test-code.ts`'s `excludeTestCode` can drop test Nodes (along with its path
+// rules, since the flag is false on Interfaces/Types inside test files).
+// Live-verified: it comes back as `"true"`/`"false"`, and a Node without the
+// property reports `-`, so the column count never changes.
+// Exported for `mcp-client.test.ts`'s column-count check.
+export const CODE_MAP_NODES_QUERY = `MATCH (n:Function|Interface|Type|Module) WHERE NOT n.file_path STARTS WITH '<' RETURN n.qualified_name AS id, n.name AS name, n.file_path AS file, n.start_line AS startLine, n.end_line AS endLine, CASE WHEN n:Function THEN 'Function' WHEN n:Interface THEN 'Interface' WHEN n:Type THEN 'Type' ELSE 'Module' END AS kind, n.complexity AS complexity, n.cognitive AS cognitive, n.is_test AS isTest`;
 
 // Story 2.1 (Phase 1), review round: hotspot data, fetched standalone (see
 // `CODE_MAP_NODES_QUERY`'s comment for why it can't be joined in one Cypher
@@ -393,7 +411,12 @@ const CODE_MAP_FILES_QUERY = `MATCH (f:File) RETURN f.file_path AS file, f.chang
 // consistent. See the comment above `CODE_MAP_NODES_QUERY` for why both
 // `a` and `b` use pattern-position `(x:A|B|C|D)` label alternation rather
 // than a `WHERE` boolean disjunction.
-const CODE_MAP_EDGES_QUERY = `MATCH (a:Function|Interface|Type|Module)-[r:CALLS|IMPORTS|USAGE]->(b:Function|Interface|Type|Module) WHERE a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL RETURN a.qualified_name AS source, b.qualified_name AS target, type(r) AS kind`;
+//
+// P4-2 phase 1: `IMPORTS` is deliberately not in the relationship list. Every
+// IMPORTS edge in the backend starts at a `File` node, never a
+// Function/Interface/Type/Module, so it could never match here; the map's
+// edges are CALLS and USAGE only.
+const CODE_MAP_EDGES_QUERY = `MATCH (a:Function|Interface|Type|Module)-[r:CALLS|USAGE]->(b:Function|Interface|Type|Module) WHERE a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL RETURN a.qualified_name AS source, b.qualified_name AS target, type(r) AS kind`;
 
 /**
  * Connects to `codebase-memory-mcp` over stdio and runs the Code Map's two
@@ -414,6 +437,7 @@ const CODE_MAP_EDGES_QUERY = `MATCH (a:Function|Interface|Type|Module)-[r:CALLS|
 export async function fetchCodeMap(
   project: string,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  options: FetchCodeMapOptions = {},
 ): Promise<CodeMapFetchResult> {
   const { command, args } = resolveBackendCommand();
   const transport = new StdioClientTransport({ command, args });
@@ -421,7 +445,7 @@ export async function fetchCodeMap(
 
   try {
     return await withTimeout(
-      runFetchCodeMap(client, transport, project),
+      runFetchCodeMap(client, transport, project, options),
       timeoutMs,
       `query_graph (${project})`,
     );
@@ -430,10 +454,21 @@ export async function fetchCodeMap(
   }
 }
 
+/** Options for `fetchCodeMap`. */
+export interface FetchCodeMapOptions {
+  /**
+   * P4-2 phase 1: files (as the backend reports them) whose
+   * `CODE_MAP_FILES_QUERY` row is dropped before the hotspot join, so test
+   * files never feed the per-file hotspot population.
+   */
+  excludeFile?: (file: string) => boolean;
+}
+
 async function runFetchCodeMap(
   client: Client,
   transport: StdioClientTransport,
   project: string,
+  options: FetchCodeMapOptions,
 ): Promise<CodeMapFetchResult> {
   await client.connect(transport);
 
@@ -470,18 +505,30 @@ async function runFetchCodeMap(
     throw new Error(`query_graph (Code Map files) reported an error: ${extractErrorText(filesResult)}`);
   }
   const fileRows = parseCodeMapRows(filesResult, parseCodeMapFileRow, 'Code Map files');
+  return { nodes: joinHotspotChangeCounts(nodes, fileRows, options.excludeFile), edges };
+}
+
+/**
+ * Joins each File row's `changeCount` onto the Nodes in that file, by the
+ * backend's own `file` string. P4-2 phase 1: rows `excludeFile` rejects are
+ * dropped first, so an excluded (test) file never contributes a hotspot
+ * value. Pure; exported for tests.
+ */
+export function joinHotspotChangeCounts<TNode extends { file: string }>(
+  nodes: readonly TNode[],
+  fileRows: readonly { file: string; changeCount?: number }[],
+  excludeFile?: (file: string) => boolean,
+): (TNode & { hotspotChangeCount: number | undefined })[] {
   const hotspotChangeCountByFile = new Map<string, number>();
   for (const row of fileRows) {
-    if (row.changeCount !== undefined) {
+    if (row.changeCount !== undefined && !excludeFile?.(row.file)) {
       hotspotChangeCountByFile.set(row.file, row.changeCount);
     }
   }
-  const nodesWithHotspot = nodes.map((node) => ({
+  return nodes.map((node) => ({
     ...node,
     hotspotChangeCount: hotspotChangeCountByFile.get(node.file),
   }));
-
-  return { nodes: nodesWithHotspot, edges };
 }
 
 /**
@@ -568,7 +615,7 @@ function extractQueryGraphText(result: unknown): string | undefined {
  * the trailing `total:`/`hint:` lines by shape — those lines are simply
  * never reached when `N` data lines have already been consumed.
  */
-function parseQueryGraphRows(text: string, label: string): Record<string, string>[] {
+export function parseQueryGraphRows(text: string, label: string): Record<string, string>[] {
   const lines = text.split(/\r\n|\r|\n/);
   const headerIndex = lines.findIndex((line) => /^rows:\s*\d+\s*\(cols:/.test(line));
   const headerLine = headerIndex >= 0 ? lines[headerIndex] : undefined;
@@ -746,7 +793,7 @@ function toOptionalSignalValue(value: unknown): number | undefined {
   return parsed !== undefined && isFiniteNonNegative(parsed) ? parsed : undefined;
 }
 
-function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNodeWithSignalSources | undefined {
+export function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNodeWithSignalSources | undefined {
   const { id, name, file, kind } = row;
   const startLine = toLineNumber(row.startLine);
   const endLine = toLineNumber(row.endLine);
@@ -786,7 +833,24 @@ function parseCodeMapNodeRow(row: Record<string, string>): CodeMapNodeWithSignal
     riskSignals: [],
     complexity: toOptionalSignalValue(row.complexity),
     cognitiveComplexity: toOptionalSignalValue(row.cognitive),
+    ...(parseTestFlag(row.isTest) ? { isTest: true } : {}),
   };
+}
+
+/**
+ * P4-2 phase 1: reads the `isTest` column (`n.is_test`). `true`, `"true"`
+ * (any case) and `1` are true; anything else — `false`, `-` (the backend's
+ * absent-property marker), empty, missing — is false, i.e. absent.
+ */
+export function parseTestFlag(value: unknown): boolean {
+  if (value === true || value === 1) {
+    return true;
+  }
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'true' || normalized === '1';
 }
 
 function parseCodeMapEdgeRow(row: Record<string, string>): CodeMapEdge | undefined {

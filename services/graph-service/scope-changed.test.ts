@@ -34,10 +34,24 @@ export async function indexRepository() {
 const node = (id, file) => ({ id, name: id, file, startLine: 1, endLine: 2, kind: 'Function', summaryStatus: 'pending', riskSignals: [] });
 export async function fetchCodeMap() {
   return {
-    nodes: [node('w', 'web/a.ts'), node('a', 'app/b.ts'), node('d', 'docs/c.ts'), node('x', 'webapp/d.ts')],
+    nodes: [
+      node('w', 'web/a.ts'),
+      node('a', 'app/b.ts'),
+      node('d', 'docs/c.ts'),
+      node('x', 'webapp/d.ts'),
+      // P4-2 phase 1: test code the fetch path must drop — by path rule
+      // (\`t\`), and by the backend flag alone (\`f\`).
+      node('t', 'web/a.test.ts'),
+      { ...node('f', 'app/fixtures.ts'), isTest: true },
+    ],
     // FIX-2: w calls a AND d, and a calls d too — so BFS reaches d first
     // from w (a sibling of a, not a's callee in the tree).
+    // P4-2 phase 1: w's first edge goes to the test Node \`t\` (and \`t\` on to
+    // \`f\`), so a trace that didn't exclude test code would include them.
     edges: [
+      { source: 'w', target: 't', kind: 'CALLS' },
+      { source: 't', target: 'f', kind: 'CALLS' },
+      { source: 'f', target: 'a', kind: 'CALLS' },
       { source: 'w', target: 'a', kind: 'CALLS' },
       { source: 'a', target: 'd', kind: 'CALLS' },
       { source: 'w', target: 'd', kind: 'CALLS' },
@@ -46,7 +60,11 @@ export async function fetchCodeMap() {
 }
 `);
 const MODEL_MANAGER_STUB = toDataUrl('export function ensureLocalModel() { return new Promise(() => {}); }');
-const MCP_SERVER_STUB = toDataUrl('export function startMcpServer() { return async () => {}; }');
+// Keeps the live `activeCodeMapNodes` getter `index.ts` hands the agent
+// surface, so a test can run the real `lookupNode` against it.
+const MCP_SERVER_STUB = toDataUrl(
+  'export function startMcpServer(getNodes) { globalThis.__scopeTestGetNodes = getNodes; return async () => {}; }',
+);
 
 const HOOKS = toDataUrl(`
 const STUBS = ${JSON.stringify({
@@ -55,7 +73,13 @@ const STUBS = ${JSON.stringify({
   './mcp-server': MCP_SERVER_STUB,
 })};
 export function resolve(specifier, context, nextResolve) {
-  if (context.parentURL && context.parentURL.endsWith('/services/graph-service/index.ts') && STUBS[specifier]) {
+  // P4-2: \`production-code-map.ts\` is where \`index.ts\`'s Code Map fetch
+  // now imports \`./mcp-client\` from, so it gets the same stub.
+  const parent = context.parentURL ?? '';
+  const stubbedParent =
+    parent.endsWith('/services/graph-service/index.ts') ||
+    parent.endsWith('/services/graph-service/production-code-map.ts');
+  if (stubbedParent && STUBS[specifier]) {
     return { url: STUBS[specifier], format: 'module', shortCircuit: true };
   }
   return nextResolve(specifier, context);
@@ -67,7 +91,8 @@ interface Posted {
   requestId?: number;
   result?: unknown;
   state?: string;
-  nodes?: { file: string }[];
+  nodes?: { id: string; file: string }[];
+  edges?: { source: string; target: string }[];
   message?: string;
   hiddenByScope?: number;
   appliedScope?: string[];
@@ -212,6 +237,44 @@ describe('graphService:scopeChanged through index.ts', () => {
     assert.deepEqual(JSON.parse(toolResult.content[0]!.text), expected);
     assert.match(description, /call tree/);
     assert.match(description, /not a single path/);
+  });
+
+  it('P4-2: the map reply, lookup_node and the cached map exclude test Nodes and their edges', async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    const map = await fetchMap();
+    assert.deepEqual(
+      (map.nodes ?? []).map((node) => node.id),
+      ['w', 'a', 'd', 'x'],
+    );
+    assert.deepEqual(
+      (map.edges ?? []).map((edge) => `${edge.source}->${edge.target}`),
+      ['w->a', 'a->d', 'w->d'],
+    );
+    // Test Nodes are not "hidden by scope" — they never reach the scope filter.
+    assert.equal(map.hiddenByScope, 0);
+
+    // `lookup_node` (the real handler logic, over the live cache every
+    // cache-reading consumer — diff scope, Blast Radius, Health Audit — reads).
+    const getNodes = (globalThis as { __scopeTestGetNodes?: () => { id: string }[] | undefined })
+      .__scopeTestGetNodes;
+    assert.ok(getNodes);
+    assert.deepEqual(
+      (getNodes() ?? []).map((node) => node.id),
+      ['w', 'a', 'd', 'x'],
+    );
+    // This test file's own import is not redirected (the hook only stubs
+    // imports made from `index.ts`/`production-code-map.ts`), so this is the
+    // real `lookupNode` — the stub module has no such export at all.
+    const mcpServer = await import('./mcp-server');
+    assert.equal(typeof mcpServer.lookupNode, 'function');
+    assert.equal(typeof mcpServer.registerTracePathTool, 'function');
+    const { lookupNode } = mcpServer;
+    const cached = getNodes() as Parameters<typeof lookupNode>[1];
+    assert.deepEqual(lookupNode('t', cached, (node) => node), { status: 'not-found' });
+    assert.deepEqual(lookupNode('f', cached, (node) => node), { status: 'not-found' });
+    assert.equal(lookupNode('w', cached, (node) => node).status, 'ok');
+    // Nothing else reads the captured getter; don't leak it past this test.
+    delete (globalThis as { __scopeTestGetNodes?: unknown }).__scopeTestGetNodes;
   });
 
   it('ignores a malformed scopeChanged', async () => {

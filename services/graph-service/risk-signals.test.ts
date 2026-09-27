@@ -256,6 +256,8 @@ describe('attachProjectRiskSignals — the fetch path', () => {
       summaryStatus: 'pending',
       riskSignals: [],
       complexity: i + 1,
+      // P4-2 phase 1: fetch-internal, must be stripped like the raw fields.
+      isTest: false,
     }));
     // What `annotateNodesWithSummaryState` hands over: same order, raw
     // fields still present at runtime.
@@ -288,6 +290,7 @@ describe('attachProjectRiskSignals — the fetch path', () => {
       assert.equal('complexity' in node, false);
       assert.equal('cognitiveComplexity' in node, false);
       assert.equal('hotspotChangeCount' in node, false);
+      assert.equal('isTest' in node, false);
     });
   });
 

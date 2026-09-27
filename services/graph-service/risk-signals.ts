@@ -307,6 +307,8 @@ export function attachProjectRiskSignals(
       complexity: _complexity,
       cognitiveComplexity: _cognitiveComplexity,
       hotspotChangeCount: _hotspotChangeCount,
+      // P4-2 phase 1: the backend test flag is fetch-internal, never wire data.
+      isTest: _isTest,
       ...cleanNode
     } = node as CodeMapNodeWithSignalSources;
     return { ...cleanNode, riskSignals: rated[i]! };
