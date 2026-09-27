@@ -17,12 +17,50 @@
  * (Node lookup, Path Trace, Blast Radius, coverage-check, etc. — AD-13)
  * belongs in packages/graph-contracts — Story 1.9 (Phase 1) is its first real
  * content (Path Trace), reused here for the `path:trace` IPC envelope rather
- * than redefined ad hoc (see `PathTraceResult`'s import below).
+ * than redefined ad hoc (see `PathTraceResult`'s import below). P4-6 moved
+ * every other Graph Service operation result shape there as well; this
+ * package re-exports them.
  */
 
-import type { PathTraceResult } from '@driller/graph-contracts';
+import type {
+  BlastRadiusExpansionResult,
+  CodeMapEdge,
+  CodeMapNode,
+  DiffScopeResult,
+  IndexCoverageSummary,
+  PathTraceResult,
+} from '@driller/graph-contracts';
 
-export type { PathTraceResult } from '@driller/graph-contracts';
+/**
+ * P4-6 (AD-13): every Graph Service operation's result shape — and each
+ * graph shape those results carry (`CodeMapNode`/`CodeMapEdge` and their
+ * types, `GapFile`) — is declared once in `@driller/graph-contracts` and re-exported
+ * here unchanged, so every existing `@driller/ipc-contracts` import keeps
+ * compiling. Never redeclare one of these here: `graph-contracts`'s
+ * `contractHome.test.ts` fails if this file does.
+ */
+export type {
+  PathTraceResult,
+  GapFile,
+  IndexCoverageSummary,
+  CodeMapNodeKind,
+  SummaryStatus,
+  RiskSignalFamily,
+  RiskSignalLocation,
+  DeterministicRiskSignalType,
+  DeterministicRiskSignal,
+  DeterministicRiskSeverity,
+  LlmJudgmentRiskSignal,
+  IngestedRiskSignal,
+  RiskSignal,
+  CodeMapNode,
+  CodeMapEdgeKind,
+  CodeMapEdge,
+  DiffScopeResult,
+  BlastRadiusExpansionResult,
+  NodeLookupResult,
+  CoverageSummaryResult,
+} from '@driller/graph-contracts';
 
 /**
  * P0-5: re-exported so the renderer (whose only contracts dependency is this
@@ -108,74 +146,10 @@ export type GraphServiceState =
   | 'error';
 
 // ---------------------------------------------------------------------------
-// Phase 2: coverage/scale transparency (FR2, NFR1, AD-15).
-//
-// Sourced entirely from the real backend's own `index_repository`/
-// `index_status` reporting — driller never re-derives or infers coverage
-// locally. `parse_partial`/`skipped` files are the only genuine coverage
-// gaps; `not_indexed` (gitignore/skip-list exclusions) is by-design and MUST
-// NOT be surfaced here. The follow-up `index_status` call that supplies
-// `gapPaths` is best-effort: if it fails, `coverage` is omitted from the
-// `indexed` message entirely rather than posting a partial summary.
-//
-// `expectedNodes`/`expectedEdges` are optional enrichment, not a gate:
-// live testing found the backend's MCP `index_repository` response
-// intermittently omits them even on an otherwise-healthy call, while
-// `skippedCount`/`parsePartialCount` (the fields that actually determine a
-// genuine gap) are always present. Requiring the expected-count fields
-// before building `coverage` at all made the summary vanish on healthy
-// runs — see mcp-client.ts's `fetchCoverage` and this spec's Design Notes.
+// Phase 2: coverage/scale transparency (FR2, NFR1, AD-15) — `GapFile` and
+// `IndexCoverageSummary` are declared once in `@driller/graph-contracts`
+// (P4-6) and re-exported above.
 // ---------------------------------------------------------------------------
-
-/**
- * One coverage-gap file from the `index_status` follow-up call, tagged with
- * which kind of gap it is. `skipped` (not indexed at all) and `parse_partial`
- * (indexed, but tree-sitter's error recovery may have missed some constructs)
- * are meaningfully different severities — Story 1.3's per-Node rendering is
- * expected to show them differently, so this story preserves the distinction
- * through the wire rather than flattening it into an undifferentiated
- * `string[]`.
- */
-export interface GapFile {
-  /**
-   * The gap file's path exactly as `index_status` reported it. Documented
-   * here as "absolute" when this shape was first introduced, but Story 1.5
-   * Phase 2's live verification against the real backend found it actually
-   * reporting a bare project-relative path (e.g. `"broken.js"`, matching
-   * `CodeMapNode.file`'s own format directly) for at least one real
-   * build/invocation shape — never trust this field's absoluteness without
-   * checking `path.isAbsolute()` first (see `toProjectRelativePosixPath` in
-   * `services/graph-service/index.ts`, this contract's one real consumer).
-   */
-  path: string;
-  /** Which kind of coverage gap this file is. */
-  kind: 'skipped' | 'parse_partial';
-}
-
-export interface IndexCoverageSummary {
-  /**
-   * Node count the backend expected to produce for a fully-covered index.
-   * Optional enrichment — present only when the backend's response happens
-   * to include it; never required to produce a `coverage` object at all.
-   */
-  expectedNodes?: number;
-  /**
-   * Edge count the backend expected to produce for a fully-covered index.
-   * Optional enrichment — same caveat as `expectedNodes`.
-   */
-  expectedEdges?: number;
-  /** Count of files the backend skipped outright (a genuine coverage gap). */
-  skippedCount: number;
-  /** Count of files the backend could only partially parse (a genuine coverage gap). */
-  parsePartialCount: number;
-  /**
-   * The `parse_partial`/`skipped` gap files from the `index_status`
-   * follow-up call, each tagged with its `kind`. Wired through for Story
-   * 1.3's Code Map to render per-Node — this story does not render them
-   * itself.
-   */
-  gapPaths: GapFile[];
-}
 
 export type GraphServiceStatusMessage =
   | { state: 'starting'; pid?: number; at: string }
@@ -341,233 +315,9 @@ export interface GraphServiceBackendSwitchedRequest {
 // re-does that parsing or forgets it.
 // ---------------------------------------------------------------------------
 
-/** The map-eligible Node labels (Design Notes — a judgment call, not fixed by the backend's schema). */
-export type CodeMapNodeKind = 'Function' | 'Interface' | 'Type' | 'Module';
-
-/** The call/dependency edge kinds rendered on the Code Map (FR4) — never a containment edge. */
-export type CodeMapEdgeKind = 'CALLS' | 'IMPORTS' | 'USAGE';
-
-/**
- * A Node's summary-generation state (Story 1.5 Phase 2):
- *  - 'pending': eligible for generation (resolvable source, no coverage
- *    gap) but generation hasn't completed for it yet — renders a
- *    lightweight "summary pending" state, never a confident-looking
- *    placeholder.
- *  - 'ready': `summary` carries the generated one-line plain-language text.
- *  - 'coverage-gap': this Node's file is in the current index's coverage
- *    gap set (FR5) — ineligible for generation entirely; renders a real,
- *    distinct coverage-gap indicator (icon+text, never color-only), never a
- *    summary.
- */
-export type SummaryStatus = 'pending' | 'ready' | 'coverage-gap';
-
-// ---------------------------------------------------------------------------
-// Story 2.1 (Phase 1): deterministic risk signals (FR7, AD-9 corrected).
-// Story 2.2 (Phase 1): `RiskSignal` splits into a discriminated union —
-// `DeterministicRiskSignal` (renamed from the former single `RiskSignal`
-// interface, no field changes) and the new `LlmJudgmentRiskSignal` — so the
-// qualitative `'llm-judgment'` family (FR8) has a shape to persist into and
-// render, distinct from a deterministic signal's mandatory numeric `value`.
-//
-// `RiskSignalFamily` is deliberately its own union rather than a bare string
-// literal inlined on each signal interface — Epic 2's third family
-// (`ingested`, Story 2.3) extends this union as a sibling member later,
-// never redefine/compete with it (Consistency Conventions).
-// `DeterministicRiskSignalType` is likewise extensible: Phase 2 adds
-// `'test-coverage-gap'` as a fifth sibling member.
-//
-// Every `RiskSignal` carries its own `location` — for this phase, always the
-// owning Node's own `{file, startLine, endLine}` range (a duplicate of the
-// Node's own fields, degenerate here but required by the Consistency
-// Conventions table, since later families may report a narrower location
-// than their owning Node's full range).
-//
-// Complexity/cognitive-complexity and hotspot values are sourced only from
-// `codebase-memory-mcp`'s own already-computed per-Node/per-File properties
-// (see mcp-client.ts's extended `CODE_MAP_NODES_QUERY`) — never a new
-// tree-sitter parsing pass or `git log` shell-out. Blast radius is computed
-// live via `@driller/graph-contracts`'s `computeBlastRadius`, a cycle-safe
-// BFS over the Code Map's already-fetched edges. All four are recomputed on
-// every `getCodeMap` fetch — none persisted to `node-record-store.ts`
-// (Boundaries & Constraints), and reproducible: re-fetching against
-// unchanged repo state yields byte-identical `riskSignals` (FR7).
-// ---------------------------------------------------------------------------
-
-/** The Risk Overlay's three signal families (Epic 2) — Story 2.3 (Phase 1) adds `'ingested'`, the last of the three. */
-export type RiskSignalFamily = 'deterministic' | 'llm-judgment' | 'ingested';
-
-/**
- * Review round (patch): factored out of `DeterministicRiskSignal`/
- * `LlmJudgmentRiskSignal` — before this phase there was one `RiskSignal`
- * interface with one `location` field; the union split would otherwise leave
- * two independent inline copies of this same shape to keep in sync by hand.
- */
-export interface RiskSignalLocation {
-  file: string;
-  startLine: number;
-  endLine: number;
-}
-
-/**
- * Deterministic risk signal types (Story 2.1 Phase 1; Phase 2 adds
- * `'test-coverage-gap'` as a fifth sibling member, never a competing type).
- *
- * `'test-coverage-gap'` (Story 2.1 Phase 2, FR7) — a Node whose `[startLine,
- * endLine]` range has zero covered lines per a hand-parsed
- * `coverage/lcov.info` (see `services/graph-service/lcov.ts`). This is
- * distinct from `SummaryStatus`'s unrelated `'coverage-gap'` member, which
- * means indexing/parse coverage (FR-2/FR-5) — the two are unrelated
- * concepts that happen to share the word "coverage"; never conflate them.
- */
-export type DeterministicRiskSignalType =
-  | 'complexity'
-  | 'cognitive-complexity'
-  | 'hotspot'
-  | 'blast-radius'
-  | 'test-coverage-gap';
-
-/**
- * One deterministic risk signal attached to a `CodeMapNode`. A Node with no
- * data for a given signal (e.g. zero complexity data for an unsupported
- * grammar) simply omits that entry from `riskSignals` — never a signal with
- * an undefined/null `value` standing in for "absent" (AD-13's explicit-
- * result-state pattern applied at the array level: absence is expressed by
- * omission from the array, not by a placeholder entry).
- *
- * Story 2.2 (Phase 1): this was formerly the single `RiskSignal` interface,
- * renamed here as part of `RiskSignal`'s split into a discriminated union —
- * every already-shipped Story 2.1 consumer keeps behaving identically
- * against this renamed shape, though two call sites (`buildRiskSignals`'s
- * return type in `services/graph-service/index.ts`, and the import there)
- * needed a mechanical update to the new name (review round: the original
- * comment overstated this as needing zero consumer changes). The only real
- * field change is `family`'s type narrowing from the old `RiskSignalFamily`
- * union to the literal `'deterministic'`, required for discriminant
- * narrowing — not a new/removed field.
- */
-export interface DeterministicRiskSignal {
-  family: 'deterministic';
-  type: DeterministicRiskSignalType;
-  value: number;
-  location: RiskSignalLocation;
-  /**
-   * P1-1: the triage band for `value` — `'severe'` renders red with a `!`
-   * glyph and "(severe)" in its label, `'moderate'` renders amber (DESIGN.md:
-   * "amber for moderate, red for severe"). `'moderate'` means only "not
-   * severe": it is every value below the severe threshold, down to trivial
-   * ones, and makes no claim that the value is risky (there is no neutral
-   * third tier). Assigned once, in the Graph
-   * Service (`risk-signals.ts`'s `assignDeterministicSeverities`), from
-   * named default thresholds, so the renderer and `lookup_node` always carry
-   * the same judgement (FR15). Deterministic like `value` (FR-7). Unrelated
-   * to `IngestedRiskSignal.severity`, which keeps its own mapping.
-   */
-  severity: DeterministicRiskSeverity;
-}
-
-/** P1-1: see `DeterministicRiskSignal.severity`. No neutral third tier. */
-export type DeterministicRiskSeverity = 'moderate' | 'severe';
-
-/**
- * Story 2.2 (Phase 1): the qualitative LLM-judgment risk signal (FR8) — a
- * free-text `judgment` in place of a deterministic signal's mandatory
- * numeric `value`, and no `type` (deterministic-only; see
- * `DeterministicRiskSignalType`). No `model`/`generatedAt` provenance here —
- * consistent with `CodeMapNode.summary`'s own wire shape (a bare `string`,
- * its provenance never reaches the renderer either), not an oversight.
- * `judgment` here corresponds to `NodeRecord.llmJudgment.text` on the
- * persisted side (`services/graph-service/node-record-store.ts`) — the two
- * names differ deliberately (this is the wire/render-facing shape, that one
- * follows `summary`'s own provenance-object naming) but describe the same
- * value; whoever bridges the two (Phase 2) reads `record.llmJudgment.text`
- * into this field's `judgment`. This phase only defines the shape — no code
- * yet produces one (Phase 2's job) or renders one (Phase 3's job); nothing
- * in this codebase can construct an `LlmJudgmentRiskSignal` yet.
- */
-export interface LlmJudgmentRiskSignal {
-  family: 'llm-judgment';
-  judgment: string;
-  location: RiskSignalLocation;
-}
-
-/**
- * Story 2.3 (Phase 1): a finding ingested from an external PR-review bot
- * (CodeRabbit, Qodo) — the Risk Overlay's third and final signal family
- * (FR-per epic-2-context.md). Mirrors `LlmJudgmentRiskSignal`'s shape
- * (`family` discriminant + `location`), with `severity` and `sourceTool`
- * added per the Consistency Conventions ("`ingested` signals additionally
- * carry `severity` and `sourceTool`"): every ingested finding must display
- * its originating tool and a canonical severity mapped from the source
- * tool's native scale — never passed through unmapped.
- *
- * This phase only defines the shape — no code yet produces one (Story 2.3
- * Phase 2/3's job, the actual CodeRabbit/Qodo CLI adapters) or renders one
- * (Phase 4's job). Nothing in this codebase can construct an
- * `IngestedRiskSignal` yet.
- */
-export interface IngestedRiskSignal {
-  family: 'ingested';
-  severity: 'blocker' | 'major' | 'minor' | 'info';
-  sourceTool: string;
-  finding: string;
-  location: RiskSignalLocation;
-}
-
-/**
- * The Risk Overlay's per-signal shape (Epic 2) — a discriminated union on
- * `family`, so each family's own fields (a deterministic signal's `value`
- * vs. an LLM-judgment signal's `judgment` vs. an ingested signal's
- * `severity`/`sourceTool`/`finding`) are only ever accessed after narrowing,
- * never assumed present across the whole union. All three families now
- * exist as of Story 2.3 (Phase 1).
- */
-export type RiskSignal = DeterministicRiskSignal | LlmJudgmentRiskSignal | IngestedRiskSignal;
-
-export interface CodeMapNode {
-  /** `qualified_name` — stable node identity, shown verbatim/monospace (Always: no summary content yet). */
-  id: string;
-  /** `name` — the bare identifier, verbatim from source. */
-  name: string;
-  /** POSIX-relative path to the file this Node is defined in (AD-19). */
-  file: string;
-  startLine: number;
-  endLine: number;
-  kind: CodeMapNodeKind;
-  /**
-   * Populated at `getCodeMap` fetch time from the Node record store's
-   * current state (Story 1.5 Phase 2) — never null/undefined standing in
-   * for "not generated yet" (AD-13's broader explicit-result-state pattern).
-   */
-  summaryStatus: SummaryStatus;
-  /** The generated one-line plain-language summary — present only when `summaryStatus === 'ready'`. */
-  summary?: string;
-  /**
-   * Story 1.8 Phase 3: whether this Node's summary has drifted from its
-   * source since generation (the record store's `NodeRecord.stale`,
-   * populated at `getCodeMap` fetch time by the same `classifyNode` step
-   * that populates `summaryStatus`/`summary` above). Meaningful only when
-   * `summaryStatus === 'ready'` — `true` only when the record's `stale`
-   * flag is actually set; absent otherwise (never a default `false`
-   * standing in for "not evaluated", matching `NodeRecord.stale`'s own
-   * tri-state contract).
-   */
-  stale?: boolean;
-  /**
-   * FR7's deterministic complexity/cognitive-complexity/hotspot/blast-radius
-   * signals (Story 2.1, Phase 1), recomputed live on every `getCodeMap`
-   * fetch. Never omitted/undefined (AD-13's explicit-result-state pattern) —
-   * a Node with zero risk signals is `riskSignals: []`, not a missing field.
-   */
-  riskSignals: RiskSignal[];
-}
-
-export interface CodeMapEdge {
-  /** Source Node's `id` (`qualified_name`). */
-  source: string;
-  /** Target Node's `id` (`qualified_name`). */
-  target: string;
-  kind: CodeMapEdgeKind;
-}
+// `CodeMapNode`, `CodeMapEdge` and their own types (`CodeMapNodeKind`,
+// `CodeMapEdgeKind`, `SummaryStatus`, the Risk Signal family types) are
+// declared once in `@driller/graph-contracts` (P4-6) and re-exported above.
 
 /**
  * Result of fetching the Code Map — an explicit result state (AD-13's
@@ -1283,33 +1033,9 @@ export interface GraphServiceRunIngestionResultMessage {
 // reused here for the IPC envelope rather than redefined ad hoc — same
 // precedent as `PathTraceResult`'s import above.
 //
-// `DiffScopeResult` is an explicit, enumerated result-state union (AD-13's
-// broader pattern), never null/empty standing in for "nothing changed" or
-// "couldn't compute":
-//  - `'resolved'`: `resolvedBaseRef` is always the merge-base COMMIT (never
-//    the branch/ref name that was supplied or resolved) — the exact commit
-//    `git diff --name-only` was actually run against, so what's reported and
-//    what was computed can never silently diverge (Design Notes).
-//    `nodeIds` is the diff-scoped Node set, matched via `findChangedNodeIds`.
-//  - `'no-changes'`: the resolved base ref produced an empty changed-file
-//    list — never an empty-but-unexplained `nodeIds`.
-//  - `'not-a-git-repo'`: `.git` was absent at the project root at call time
-//    (checked fresh, not cached from project-open — Design Notes) — no git
-//    subprocess call was made.
-//  - `'no-base-ref-resolvable'`: `baseRef` was omitted and
-//    `resolveDefaultBranch` found nothing (no upstream, no local
-//    `main`/`master`) — no git diff/merge-base call was made.
-//  - `'error'`: any other failure (a non-`ENOENT` subprocess failure, or an
-//    unexpected `merge-base`/`diff` result) — `message` is safe, user-facing
-//    text.
+// `DiffScopeResult` itself (the explicit result-state union) is declared
+// once in `@driller/graph-contracts` and re-exported above (P4-6).
 // ---------------------------------------------------------------------------
-
-export type DiffScopeResult =
-  | { status: 'resolved'; resolvedBaseRef: string; nodeIds: string[] }
-  | { status: 'no-changes' }
-  | { status: 'not-a-git-repo' }
-  | { status: 'no-base-ref-resolvable' }
-  | { status: 'error'; message: string };
 
 /**
  * Message main sends to ask the Graph Service subprocess to compute a
@@ -1377,27 +1103,9 @@ export interface GraphServiceComputeDiffScopeResultMessage {
 // for the IPC envelope rather than redefined ad hoc — same precedent
 // `findChangedNodeIds`/`DiffScopeResult` already established.
 //
-// `BlastRadiusExpansionResult` is an explicit, enumerated result-state union
-// (AD-13's broader pattern), never null/empty standing in for "nothing
-// reachable" or "couldn't compute":
-//  - `'resolved'`: `hopDistances` maps every reachable Node's id to its
-//    minimum hop distance from the nearest seed in the request's `nodeIds`
-//    (seed Nodes themselves excluded — Always). A plain
-//    `Record<string, number>`, not a `Map`, to keep this result JSON-shaped
-//    like every other IPC result in this file — the Graph Service converts
-//    `computeBlastRadiusHopDistances`'s `Map` return value to this shape
-//    before posting it back. An empty `nodeIds` request (or one whose every
-//    seed id is stale) resolves with an empty `hopDistances` object, not an
-//    error.
-//  - `'error'`: the expansion couldn't even be attempted (no project indexed
-//    yet, the requested project isn't the currently active one, or it
-//    changed mid-computation) — `message` is safe, user-facing text, mirrors
-//    `DiffScopeResult`'s own `'error'` variant.
+// `BlastRadiusExpansionResult` itself (the explicit result-state union) is
+// declared once in `@driller/graph-contracts` and re-exported above (P4-6).
 // ---------------------------------------------------------------------------
-
-export type BlastRadiusExpansionResult =
-  | { status: 'resolved'; hopDistances: Record<string, number> }
-  | { status: 'error'; message: string };
 
 /**
  * Message main sends to ask the Graph Service subprocess to expand blast

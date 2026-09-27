@@ -124,14 +124,16 @@ import {
   computeBlastRadiusHopDistances,
   findChangedNodeIds,
   traceCallPath,
+  type BlastRadiusExpansionResult,
+  type CoverageSummaryResult,
+  type DiffScopeResult,
+  type IndexCoverageSummary,
   type PathTraceResult,
 } from '@driller/graph-contracts';
 import type {
-  BlastRadiusExpansionResult,
   CloudBackend,
   CodeMapEdge,
   CodeMapNode,
-  DiffScopeResult,
   GraphServiceBackendSwitchedRequest,
   GraphServiceCodeMapMessage,
   GraphServiceComputeDiffScopeRequest,
@@ -151,7 +153,6 @@ import type {
   GraphServiceStatusMessage,
   HardwareAdvisoryMessage,
   HardwareAdvisoryReason,
-  IndexCoverageSummary,
   LlmJudgmentProgressMessage,
   McpServerStatusMessage,
   ModelStatusMessage,
@@ -279,8 +280,8 @@ let pendingScopeOverride: PendingScopeOverride | undefined;
 
 // The current index's coverage-gap files (FR5), as POSIX-relative paths
 // matching `CodeMapNode.file`'s own format — the backend's `index_status`
-// reports `GapFile.path` as an absolute path (see ipc-contracts's doc
-// comment on it), so `handleIndexRequest`'s success branch below converts
+// reports `GapFile.path` as an absolute path (see its doc comment in
+// `@driller/graph-contracts`), so `handleIndexRequest`'s success branch below converts
 // each one via `toProjectRelativePosixPath` before storing it here. Set
 // alongside `activeProject`/`activeProjectPath`, same never-cleared-on-
 // failure reasoning.
@@ -2055,24 +2056,11 @@ export function computeBlastRadiusExpansionResult(
 }
 
 /**
- * Coverage-check retrieval's own explicit result-state union (Story 5.1,
- * Phase 2, AD-13's broader pattern: `null`/`undefined` must never stand in
- * for "nothing here"). Not part of `@driller/ipc-contracts` — like
- * `mcp-server.ts`'s `NodeLookupResult`, this is a new MCP-only operation with
- * no existing IPC contract of its own to reuse (Code Map: "no IPC-contracts
- * changes"), so its result shape is defined here instead.
- *
- * `'unavailable'` is deliberately distinct from `'error'` (I/O & Edge-Case
- * Matrix): a successfully indexed project whose best-effort `index_status`
- * follow-up call failed (`IndexCoverageSummary`'s own doc comment,
- * `@driller/ipc-contracts`) is "indexed, but no coverage summary" — a real,
- * different case from "not indexed at all" or "wrong project", never
- * collapsed into the same generic failure.
+ * P4-6: `CoverageSummaryResult` is declared once in `@driller/graph-contracts`
+ * (AD-13) — imported above and re-exported here so this module's public
+ * surface is unchanged.
  */
-export type CoverageSummaryResult =
-  | { status: 'ok'; coverage: IndexCoverageSummary }
-  | { status: 'unavailable' }
-  | { status: 'error'; message: string };
+export type { CoverageSummaryResult };
 
 /**
  * Resolves the currently cached `activeCoverageSummary` for `projectPath`

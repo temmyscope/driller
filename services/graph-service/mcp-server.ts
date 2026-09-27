@@ -62,7 +62,7 @@ import {
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts';
-import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/graph-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS, type NodeLookupResult } from '@driller/graph-contracts';
 import {
   computeBlastRadiusExpansionResult,
   computeDiffScopeResult,
@@ -101,19 +101,11 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const SOCKET_IDLE_TIMEOUT_MS = 30_000;
 
 /**
- * Node lookup's own explicit result-state union (AD-13: `null`/`undefined`
- * must never stand in for "nothing here"). Not part of `@driller/ipc-contracts`
- * — this phase adds a new MCP-only operation, not a new IPC contract (Code
- * Map: "no changes this phase" there). Mirrors `RegenerateNodeResult`'s own
- * `{status: 'ok', node} | {status: 'error', message}` shape, with a third
- * `'not-found'` state for a syntactically valid but unknown `nodeId` — a
- * distinct case from "no project indexed yet" (both would otherwise collapse
- * into the same generic error).
+ * P4-6: `NodeLookupResult` is declared once in `@driller/graph-contracts`
+ * (AD-13) — imported above and re-exported here so this module's public
+ * surface is unchanged.
  */
-export type NodeLookupResult =
-  | { status: 'ok'; node: CodeMapNode }
-  | { status: 'not-found' }
-  | { status: 'error'; message: string };
+export type { NodeLookupResult };
 
 /**
  * Looks `nodeId` up in `nodes` (the caller's live `activeCodeMapNodes`,
