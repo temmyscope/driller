@@ -123,10 +123,12 @@ import {
   buildBidirectionalAdjacency,
   computeBlastRadiusHopDistances,
   findChangedNodeIds,
+  findTopLevelOnlyChangedFiles,
   traceCallPath,
   type BlastRadiusExpansionResult,
   type CoverageSummaryResult,
   type DiffScopeResult,
+  type FoldedModule,
   type IndexCoverageSummary,
   type PathTraceResult,
 } from '@driller/graph-contracts';
@@ -176,11 +178,13 @@ import { indexRepository, stopCbmDaemon } from './mcp-client';
 import { deriveLiveNode } from './live-node';
 import {
   applyScopeChanged,
+  isFileInScope,
   isScopeChangedRequest,
   resolveIncludedPathsOnIndexSuccess,
   type PendingScopeOverride,
 } from './project-scope';
 import { attachProjectRiskSignals } from './risk-signals';
+import { attachFoldedModuleLinks, scopeFoldedModules } from './fold-modules';
 import { fetchProductionCodeMap } from './production-code-map';
 import { toProjectRelativePosixPath } from './project-path';
 import { isTestPath } from './test-code';
@@ -461,6 +465,14 @@ let activeCodeMapNodes: CodeMapNode[] | undefined;
 // they reflected.
 let activeCodeMapEdges: CodeMapEdge[] | undefined;
 
+// P4-2 phase 3a: the most recently fetched Code Map's folded Module Nodes
+// (`fold-modules.ts`), scope-filtered like its Nodes. Same lifecycle as
+// `activeCodeMapNodes`/`activeCodeMapEdges`: reset alongside them in
+// `handleIndexRequest`, and set in the same synchronous statement as them
+// inside `startSummaryGenerationForProject`. Read by `lookup_node` (a Module
+// id resolves as folded) and by diff scope (a top-level-only change).
+let activeFoldedModules: FoldedModule[] | undefined;
+
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
 // Node's own `child_process.fork` argv convention, which `utilityProcess.
@@ -506,6 +518,7 @@ try {
     () => activeCodeMapNodes,
     postMcpServerStatus,
     (node) => deriveLiveNode(node, { getRecord: getNodeRecord, coverageGapFiles: coverageGapFileSet }),
+    () => activeFoldedModules,
   );
 } catch (error) {
   console.error('[graph-service] failed to start the Agent-Facing Query Surface (mcp-server.ts):', error);
@@ -909,7 +922,9 @@ function handleRetryModelRequest(): void {
         // (`activeGenerationRunId`/`activeJudgmentGenerationRunId`) clears
         // itself in its `finally`, so neither blocks this restart — while
         // still stopping a duplicate if one is somehow already running.
-        startSummaryGenerationForProject(nodes, edges).catch(logFailure('summary generation'));
+        startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? []).catch(
+          logFailure('summary generation'),
+        );
         startJudgmentGenerationForProject(nodes).catch(logFailure('judgment generation'));
       }
     })
@@ -1136,6 +1151,8 @@ async function handleIndexRequest(
   // Story 3.2 (Phase 1): reset alongside `activeCodeMapNodes` — same
   // never-reuse-a-since-superseded-project's-Edges reasoning (Design Notes).
   activeCodeMapEdges = undefined;
+  // P4-2 phase 3a: same lifecycle as the two above.
+  activeFoldedModules = undefined;
   // Story 5.1 (Phase 2): reset alongside `activeCodeMapEdges` — same
   // never-serve-a-since-superseded-project's-coverage-summary reasoning.
   activeCoverageSummary = undefined;
@@ -1344,10 +1361,8 @@ function filterCodeMapToScope<TNode extends { id: string; file: string }, TEdge 
   if (includedPaths.length === 0) {
     return { nodes, edges };
   }
-  const isIncludedFile = (file: string): boolean => {
-    const normalized = toProjectRelativePosixPath(projectRoot, file, 'indexing scope filter');
-    return includedPaths.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
-  };
+  const isIncludedFile = (file: string): boolean =>
+    isFileInScope(toProjectRelativePosixPath(projectRoot, file, 'indexing scope filter'), includedPaths);
   const filteredNodes = nodes.filter((node) => isIncludedFile(node.file));
   const includedIds = new Set(filteredNodes.map((node) => node.id));
   const filteredEdges = edges.filter((edge) => includedIds.has(edge.source) && includedIds.has(edge.target));
@@ -1372,7 +1387,14 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // `lookup_node`, Health Audit, staleness). See `test-code.ts`.
     // P4-2 phase 2: this fetch also attaches `testedBy` (Node detail's
     // "Tested by" row, and `lookup_node` via the cached Nodes).
-    const { nodes: normalizedNodesUnfiltered, edges: productionEdges } = await fetchProductionCodeMap(
+    // P4-2 phase 3a: and folds Module Nodes off the map (`fold-modules.ts`):
+    // no Module Node or Module edge reaches anything below; each Node carries
+    // its file's top-level uses as `fileTopLevel`.
+    const {
+      nodes: normalizedNodesUnfiltered,
+      edges: productionEdges,
+      foldedModules: foldedModulesUnfiltered,
+    } = await fetchProductionCodeMap(
       activeProject,
       projectRoot,
       'Code Map',
@@ -1384,12 +1406,21 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // P2-5: captured once, so the scope reported with the map is exactly the
     // one this filter call used.
     const appliedScope = [...activeIncludedPaths];
-    const { nodes: normalizedNodes, edges } = filterCodeMapToScope(
+    const { nodes: scopedNodes, edges } = filterCodeMapToScope(
       projectRoot,
       normalizedNodesUnfiltered,
       productionEdges,
       appliedScope,
     );
+    // P4-2 phase 3a: a folded Module is in scope exactly when its file is,
+    // and names only Nodes that survived the scope filter; the Nodes' own
+    // `fileTopLevel`/`calledAtLoadBy` are re-derived from that scoped set.
+    const foldedModules = scopeFoldedModules(
+      foldedModulesUnfiltered,
+      new Set(scopedNodes.map((node) => node.id)),
+      appliedScope,
+    );
+    const normalizedNodes = attachFoldedModuleLinks(scopedNodes, foldedModules);
     const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
     // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
     // live on every fetch — never persisted to `node-record-store.ts`
@@ -1462,7 +1493,7 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // (new edges, stale nodes) with no error, since neither the
     // `activeProjectPath` nor the `activeSummaryGenerationId` guard changes
     // on a plain Code Map refetch of the same project.
-    void startSummaryGenerationForProject(nodesWithRiskSignals, edges);
+    void startSummaryGenerationForProject(nodesWithRiskSignals, edges, foldedModules);
     // Story 2.2 Phase 2: judgment generation kicked off the same
     // fire-and-forget way, alongside the summary/staleness kick-offs — never
     // delays this response (AD-8). Same `nodesWithRiskSignals` set (not
@@ -1925,6 +1956,8 @@ export async function computeDiffScopeResult(
   activeDiffScopeComputationInFlight = true;
   try {
     const nodes = activeCodeMapNodes;
+    // P4-2 phase 3a: captured with `nodes` (same fetch, same tick).
+    const foldedModules = activeFoldedModules ?? [];
     const projectRoot = activeProjectPath;
     if (!nodes || !projectRoot) {
       return { status: 'error', message: 'No project has finished indexing yet.' };
@@ -1963,7 +1996,16 @@ export async function computeDiffScopeResult(
     }
 
     const nodeIds = findChangedNodeIds(nodes, diffScope.changedFiles);
-    return { status: 'resolved', resolvedBaseRef: diffScope.resolvedBaseRef, nodeIds };
+    // P4-2 phase 3a: a changed Module is not a changed Node (it isn't in
+    // `nodes`), so a file whose only change-able content is top-level code
+    // is reported by name instead — never a silent "0 changed Nodes".
+    const topLevelFiles = findTopLevelOnlyChangedFiles(nodes, foldedModules, diffScope.changedFiles);
+    return {
+      status: 'resolved',
+      resolvedBaseRef: diffScope.resolvedBaseRef,
+      nodeIds,
+      ...(topLevelFiles.length > 0 ? { topLevelFiles } : {}),
+    };
   } catch (error) {
     return { status: 'error', message: error instanceof Error ? error.message : String(error) };
   } finally {
@@ -2174,7 +2216,14 @@ export function getCoverageSummaryResult(projectPath: string): CoverageSummaryRe
  * model sequence concurrently. The second call returns immediately; only
  * the first proceeds.
  */
-async function startSummaryGenerationForProject(nodes: CodeMapNode[], edges: CodeMapEdge[]): Promise<void> {
+async function startSummaryGenerationForProject(
+  nodes: CodeMapNode[],
+  edges: CodeMapEdge[],
+  // P4-2 phase 3a: cached with `nodes`/`edges`. A fresh Code Map fetch
+  // passes its own; a re-kick of generation over the cached map passes the
+  // cached `activeFoldedModules`.
+  foldedModules: FoldedModule[],
+): Promise<void> {
   const generationId = activeSummaryGenerationId;
   const projectRoot = activeProjectPath;
   const gapFiles = coverageGapFileSet;
@@ -2184,6 +2233,7 @@ async function startSummaryGenerationForProject(nodes: CodeMapNode[], edges: Cod
   // function's own doc comment for the race condition this atomicity fixes.
   activeCodeMapNodes = nodes;
   activeCodeMapEdges = edges;
+  activeFoldedModules = foldedModules;
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
@@ -2506,7 +2556,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
     // genuinely-blocked/pending Nodes (e.g. blocked on a missing key that
     // now exists) are retried.
     activeSummaryGenerationId += 1;
-    void startSummaryGenerationForProject(nodes, edges);
+    void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? []);
     return;
   }
 
@@ -2546,7 +2596,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
   }
 
   activeSummaryGenerationId += 1;
-  void startSummaryGenerationForProject(nodes, edges);
+  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? []);
 }
 
 process.parentPort?.on('message', (event) => {

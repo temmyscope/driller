@@ -63,7 +63,7 @@
  * the shared `ActionableNotice` shape (P1-7).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Background,
   Controls,
@@ -88,6 +88,7 @@ import type {
   DeterministicRiskSignal,
   DeterministicRiskSignalType,
   DiffScopeResult,
+  FileTopLevelUse,
   IngestedRiskSignal,
   LlmJudgmentRiskSignal,
   PathTraceResult,
@@ -96,6 +97,7 @@ import type {
   TestedBy,
   TestedByFile,
   TestedByTest,
+  TopLevelChangedFile,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import {
@@ -220,7 +222,13 @@ export type FoundPathTrace = Extract<PathTraceResult, { status: 'found' }>;
 export type DiffScopeState =
   | { status: 'idle' }
   | { status: 'loading' }
-  | { status: 'resolved'; resolvedBaseRef: string; nodeIds: Set<string> }
+  | {
+      status: 'resolved';
+      resolvedBaseRef: string;
+      nodeIds: Set<string>;
+      /** P4-2 phase 3a: `DiffScopeResult`'s `topLevelFiles`, `[]` when absent. */
+      topLevelFiles: readonly TopLevelChangedFile[];
+    }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }
   | { status: 'no-base-ref-resolvable' }
@@ -1095,6 +1103,12 @@ export function neighborPillLabel(direction: NeighborDirection, count: number, o
   return `${neighborPillText(direction, count)} — show the ${noun}${count === 1 ? '' : 's'} of ${originName}`;
 }
 
+/** P4-2 phase 3a: the "↑at load" cue's title: "Called at load by a.ts, b.ts" (up to 3 files, then "+N more"). */
+export function loadCallerPillTitle(files: readonly string[]): string {
+  const more = files.length - 3;
+  return `Called at load by ${files.slice(0, 3).join(', ')}${more > 0 ? ` +${more} more` : ''}`;
+}
+
 /** P2-4: the neighbour-trace step panel's heading text ("Callers of handle (3)"). */
 export function neighborTraceHeading(originName: string, direction: NeighborDirection, count: number): string {
   return `${direction === 'callers' ? 'Callers' : 'Callees'} of ${originName} (${count})`;
@@ -1116,13 +1130,23 @@ export function NodeNeighborPills({
   calleeCount,
   onShowNeighbors,
 }: {
-  node: { id: string; name: string };
+  node: { id: string; name: string; calledAtLoadBy?: string[] };
   callerCount: number;
   calleeCount: number;
   onShowNeighbors: (originId: string, direction: NeighborDirection) => void;
 }) {
+  const loadCallers = node.calledAtLoadBy ?? [];
   return (
     <>
+      {/* P4-2 phase 3a: a Node whose only callers are files' top-level code
+          (folded off the map) has no caller pill — this says it is still
+          called, at load. Not a button: there is no map Node to trace to;
+          Node detail's "File top-level" section names the files. */}
+      {callerCount === 0 && loadCallers.length > 0 && (
+        <span className="code-map__node-load-caller" title={loadCallerPillTitle(loadCallers)}>
+          ↑at load<span className="visually-hidden"> — {loadCallerPillTitle(loadCallers)}</span>
+        </span>
+      )}
       {callerCount > 0 && (
         <button
           type="button"
@@ -2843,9 +2867,17 @@ export interface PrReviewView {
    * the three `DiffScopeNoticeStatus` results.
    */
   noticeStatus: DiffScopeNoticeStatus | null;
+  /**
+   * P4-2 phase 3a: changed files whose only change is folded top-level code,
+   * for the "Changed: top-level code in …" notice. Non-empty only in PR
+   * Review Mode, with a showable map, for a resolved diff scope that has any.
+   */
+  topLevelFiles: readonly TopLevelChangedFile[];
   /** Which surfaces are on — see `CodeMapSurfaces`. */
   surfaces: CodeMapSurfaces;
 }
+
+const NO_TOP_LEVEL_FILES: readonly TopLevelChangedFile[] = [];
 
 /**
  * P1-5 + P1-6: the one derivation `CodeMap` reads for "is there a PR Review
@@ -2877,7 +2909,99 @@ export function resolvePrReviewView(
       diffScopeState.status === 'no-base-ref-resolvable')
       ? diffScopeState.status
       : null;
-  return { noticeStatus, surfaces: resolveCodeMapSurfaces(mode, showable) };
+  const topLevelFiles =
+    mode === 'prReview' && showable && diffScopeState.status === 'resolved'
+      ? diffScopeState.topLevelFiles
+      : NO_TOP_LEVEL_FILES;
+  return { noticeStatus, topLevelFiles, surfaces: resolveCodeMapSurfaces(mode, showable) };
+}
+
+/** P4-2 phase 3a: how many files the top-level-change notice names before "+N more". */
+export const TOP_LEVEL_CHANGE_FILES_SHOWN = 3;
+
+/**
+ * P4-2 phase 3a: the top-level-change notice's parts — "Changed: top-level
+ * code in x.ts, y.ts", naming up to `TOP_LEVEL_CHANGE_FILES_SHOWN` files,
+ * the rest behind "+N more". `null` for no files: there is nothing to say.
+ */
+export function formatTopLevelChangeNotice<T>(
+  files: readonly T[],
+): { lead: string; shown: readonly T[]; rest: readonly T[] } | null {
+  if (files.length === 0) {
+    return null;
+  }
+  return {
+    lead: 'Changed: top-level code in ',
+    shown: files.slice(0, TOP_LEVEL_CHANGE_FILES_SHOWN),
+    rest: files.slice(TOP_LEVEL_CHANGE_FILES_SHOWN),
+  };
+}
+
+/**
+ * P4-2 phase 3a: the PR Review status line's count — "3 changed Nodes", or
+ * for a diff whose top-level-only files changed too, "0 changed Nodes · top-
+ * level code changed in 1 file", so a top-level-only diff never reads as a
+ * bare "0 changed Nodes".
+ */
+export function formatDiffScopeChangeCount(nodeCount: number, topLevelFileCount: number): string {
+  const nodes = `${nodeCount} changed Node${nodeCount === 1 ? '' : 's'}`;
+  return topLevelFileCount > 0
+    ? `${nodes} · top-level code changed in ${topLevelFileCount} file${topLevelFileCount === 1 ? '' : 's'}`
+    : nodes;
+}
+
+/**
+ * P4-2 phase 3a: `DiffScopeResult` → `DiffScopeState`, as `CodeMap`'s
+ * diff-scope request stores it (a resolved `nodeIds` becomes a `Set`, and
+ * `topLevelFiles` is always present). Hookless, so it's testable.
+ */
+export function diffScopeStateFromResult(result: DiffScopeResult): DiffScopeState {
+  switch (result.status) {
+    case 'resolved':
+      return {
+        status: 'resolved',
+        resolvedBaseRef: result.resolvedBaseRef,
+        nodeIds: new Set(result.nodeIds),
+        topLevelFiles: result.topLevelFiles ?? NO_TOP_LEVEL_FILES,
+      };
+    case 'error':
+      return { status: 'error', message: result.message };
+    default:
+      return { status: result.status };
+  }
+}
+
+/** P4-2 phase 3a: where a top-level-only changed file opens in the source viewer — its folded top-level code's range. */
+export function topLevelFileSourceTarget(file: TopLevelChangedFile): SourceTarget {
+  return { file: file.file, startLine: file.startLine, endLine: file.endLine, label: `${file.file} (top-level)` };
+}
+
+function TopLevelFileButton({
+  file,
+  onOpenFile,
+}: {
+  file: TopLevelChangedFile;
+  onOpenFile: (target: SourceTarget) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="code-map__link-button"
+      onClick={() => onOpenFile(topLevelFileSourceTarget(file))}
+      aria-label={`Open the top-level code of ${file.file}`}
+    >
+      <code>{file.file}</code>
+    </button>
+  );
+}
+
+function topLevelFileButtons(files: readonly TopLevelChangedFile[], onOpenFile: (target: SourceTarget) => void) {
+  return files.map((file, index) => (
+    <Fragment key={file.file}>
+      {index > 0 && ', '}
+      <TopLevelFileButton file={file} onOpenFile={onOpenFile} />
+    </Fragment>
+  ));
 }
 
 /**
@@ -2907,10 +3031,34 @@ export function PrReviewDiffScopeNotice({ status }: { status: DiffScopeNoticeSta
  * inside it is gated on `status`. MUST STAY HOOKLESS, same as
  * `PrReviewDiffScopeNotice`.
  */
-export function PrReviewDiffScopeNoticeRegion({ status }: { status: DiffScopeNoticeStatus | null }) {
+export function PrReviewDiffScopeNoticeRegion({
+  status,
+  topLevelFiles = NO_TOP_LEVEL_FILES,
+  onOpenFile = () => {},
+}: {
+  status: DiffScopeNoticeStatus | null;
+  /** P4-2 phase 3a: see `PrReviewView.topLevelFiles`. */
+  topLevelFiles?: readonly TopLevelChangedFile[];
+  /** P4-2 phase 3a: opens a top-level-only changed file in the source viewer. */
+  onOpenFile?: (target: SourceTarget) => void;
+}) {
+  const topLevel = formatTopLevelChangeNotice(topLevelFiles);
   return (
     <div id={PR_REVIEW_NOTICE_ID} className="code-map__pr-review-notice-region" role="status">
       {status !== null && <PrReviewDiffScopeNotice status={status} />}
+      {topLevel !== null && (
+        <ActionableNotice tone="info">
+          {topLevel.lead}
+          {topLevelFileButtons(topLevel.shown, onOpenFile)}
+          {topLevel.rest.length === 0 && '.'}
+        </ActionableNotice>
+      )}
+      {topLevel !== null && topLevel.rest.length > 0 && (
+        <details className="code-map__more">
+          <summary>+{topLevel.rest.length} more</summary>
+          <p className="code-map__more-list">{topLevelFileButtons(topLevel.rest, onOpenFile)}</p>
+        </details>
+      )}
     </div>
   );
 }
@@ -3824,6 +3972,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   summary: 'code-map-node-detail-summary-heading',
   riskOverlay: 'code-map-node-detail-risk-overlay-heading',
   testedBy: 'code-map-node-detail-tested-by-heading',
+  fileTopLevel: 'code-map-node-detail-file-top-level-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -3840,6 +3989,157 @@ export interface NodeDetailBodyProps {
   onRegenerate: () => void;
   /** P4-2 phase 2: opens a "Tested by" row's test or test file in the source viewer (tests aren't map Nodes, so this never navigates the map). */
   onOpenTest: (target: SourceTarget) => void;
+  /**
+   * P4-2 phase 3a: the rendered map Node with this id, if the map can
+   * navigate to it — names a "File top-level" entry. Defaults to none, so
+   * every entry shows as not on the map.
+   */
+  resolveMapNode?: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  /** P4-2 phase 3a: navigates the map to a "File top-level" entry. Defaults to a no-op. */
+  onNavigateToNode?: (id: string) => void;
+}
+
+const RESOLVE_NO_MAP_NODE = (): undefined => undefined;
+const NAVIGATE_NOWHERE = (): void => {};
+
+/** P4-2 phase 3a: how many "File top-level" entries (and, separately, "Called at load by" files) Node detail names before "+N more". */
+export const NODE_DETAIL_FILE_TOP_LEVEL_ROWS = 5;
+
+/** P4-2 phase 3a: the title and screen-reader text of a "File top-level" entry the map can't navigate to. */
+export const NOT_ON_CURRENT_MAP = 'Not on the current map (hidden by scope or filters)';
+
+/**
+ * P4-2 phase 3a: navigates from a "File top-level" entry: closes Node detail
+ * (it would cover the map) and moves the map to that Node, with history.
+ * Hookless, so it's testable.
+ */
+export function navigateFromDetail(
+  id: string,
+  { closeNodeDetail, navigateToNode }: { closeNodeDetail: () => void; navigateToNode: (id: string) => void },
+): void {
+  closeNodeDetail();
+  navigateToNode(id);
+}
+
+/** P4-2 phase 3a: how a file's top-level code reaches a Node, for an entry's accessible name. */
+function topLevelVerb(kind: FileTopLevelUse['kind']): string {
+  switch (kind) {
+    case 'CALLS':
+      return 'called';
+    case 'USAGE':
+      return 'used';
+    case 'IMPORTS':
+      return 'imported';
+  }
+}
+
+function FileTopLevelEntry({
+  use,
+  resolveMapNode,
+  onNavigateToNode,
+}: {
+  use: FileTopLevelUse;
+  resolveMapNode: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  onNavigateToNode: (id: string) => void;
+}) {
+  const mapNode = resolveMapNode(use.id);
+  // A target the rendered map can't navigate to is named by its id, and
+  // says why it isn't a link.
+  if (mapNode === undefined) {
+    return (
+      <code className="code-map__node-detail-file-top-level-id" title={NOT_ON_CURRENT_MAP}>
+        {use.id}
+        <span className="visually-hidden"> ({NOT_ON_CURRENT_MAP})</span>
+      </code>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="code-map__link-button"
+      onClick={() => onNavigateToNode(use.id)}
+      aria-label={`Go to ${mapNode.name} (${topLevelVerb(use.kind)} by this file's top-level code)`}
+    >
+      <code>{mapNode.name}</code>
+    </button>
+  );
+}
+
+/** Entries separated by ", ", keyed by id (each id is listed once). */
+function fileTopLevelEntries(
+  uses: readonly FileTopLevelUse[],
+  resolveMapNode: (id: string) => Pick<CodeMapNode, 'name'> | undefined,
+  onNavigateToNode: (id: string) => void,
+) {
+  return uses.map((use, index) => (
+    <Fragment key={use.id}>
+      {index > 0 && ', '}
+      <FileTopLevelEntry use={use} resolveMapNode={resolveMapNode} onNavigateToNode={onNavigateToNode} />
+    </Fragment>
+  ));
+}
+
+/** "a.ts, b.ts" as monospace file names, keyed by file. */
+function loadCallerFiles(files: readonly string[]) {
+  return files.map((file, index) => (
+    <Fragment key={file}>
+      {index > 0 && ', '}
+      <code>{file}</code>
+    </Fragment>
+  ));
+}
+
+/**
+ * P4-2 phase 3a: the "File top-level" section's content, from the folded
+ * Module Nodes' real edges:
+ *  - "Top-level code in this file uses: A, B…" (`fileTopLevel`) — each
+ *    entry on the rendered map navigates to it;
+ *  - "Called at load by: x.ts" (`calledAtLoadBy`) — the files whose
+ *    top-level code calls or uses this Node, which has no map caller for it.
+ * Each line names its first `NODE_DETAIL_FILE_TOP_LEVEL_ROWS` entries, then
+ * a native `<details>` "+N more" with the rest. Hookless, like
+ * `NodeDetailBody`.
+ */
+export function NodeFileTopLevel({
+  uses = [],
+  calledAtLoadBy = [],
+  resolveMapNode = RESOLVE_NO_MAP_NODE,
+  onNavigateToNode = NAVIGATE_NOWHERE,
+}: {
+  uses?: readonly FileTopLevelUse[];
+  calledAtLoadBy?: readonly string[];
+  resolveMapNode?: (id: string) => Pick<CodeMapNode, 'name'> | undefined;
+  onNavigateToNode?: (id: string) => void;
+}) {
+  const rows = NODE_DETAIL_FILE_TOP_LEVEL_ROWS;
+  const restUses = uses.slice(rows);
+  const restCallers = calledAtLoadBy.slice(rows);
+  return (
+    <>
+      {uses.length > 0 && (
+        <p className="code-map__node-detail-file-top-level">
+          Top-level code in this file uses: {fileTopLevelEntries(uses.slice(0, rows), resolveMapNode, onNavigateToNode)}
+        </p>
+      )}
+      {restUses.length > 0 && (
+        <details className="code-map__more">
+          <summary>+{restUses.length} more</summary>
+          <p className="code-map__more-list">{fileTopLevelEntries(restUses, resolveMapNode, onNavigateToNode)}</p>
+        </details>
+      )}
+      {calledAtLoadBy.length > 0 && (
+        <p className="code-map__node-detail-file-top-level code-map__node-detail-called-at-load">
+          Called at load by: {loadCallerFiles(calledAtLoadBy.slice(0, rows))}
+        </p>
+      )}
+      {restCallers.length > 0 && (
+        <details className="code-map__more">
+          <summary>+{restCallers.length} more</summary>
+          <p className="code-map__more-list">{loadCallerFiles(restCallers)}</p>
+        </details>
+      )}
+    </>
+  );
 }
 
 /** P4-2 phase 2: how many "Tested by" test rows (and, separately, test files) Node detail shows before "+N more". */
@@ -4032,6 +4332,8 @@ export function NodeDetailBody({
   graphServiceAvailable,
   onRegenerate,
   onOpenTest,
+  resolveMapNode = RESOLVE_NO_MAP_NODE,
+  onNavigateToNode = NAVIGATE_NOWHERE,
 }: NodeDetailBodyProps) {
   const ids = NODE_DETAIL_SECTION_HEADING_IDS;
   const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
@@ -4126,6 +4428,22 @@ export function NodeDetailBody({
         </h3>
         <NodeTestedBy testedBy={node.testedBy} onOpenTest={onOpenTest} />
       </section>
+      {/* P4-2 phase 3a: folded top-level code — Module Nodes are not on the
+          map, so what this file's top level uses, and which files' top
+          level use this Node, are shown here. Only when there is either. */}
+      {((node.fileTopLevel?.length ?? 0) > 0 || (node.calledAtLoadBy?.length ?? 0) > 0) && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.fileTopLevel}>
+          <h3 id={ids.fileTopLevel} className="code-map__node-detail-label">
+            File top-level
+          </h3>
+          <NodeFileTopLevel
+            uses={node.fileTopLevel}
+            calledAtLoadBy={node.calledAtLoadBy}
+            resolveMapNode={resolveMapNode}
+            onNavigateToNode={onNavigateToNode}
+          />
+        </section>
+      )}
       <section className="code-map__node-detail-section" aria-labelledby={ids.staleness}>
         <h3 id={ids.staleness} className="code-map__node-detail-label">
           Staleness
@@ -5058,27 +5376,7 @@ export function CodeMap({
           diffScopeSyncHeldForRef.current = projectPath;
           onDiffScopeSyncedRef.current(projectPath, syncedAt);
         }
-        switch (result.status) {
-          case 'resolved':
-            setDiffScopeState({
-              status: 'resolved',
-              resolvedBaseRef: result.resolvedBaseRef,
-              nodeIds: new Set(result.nodeIds),
-            });
-            break;
-          case 'no-changes':
-            setDiffScopeState({ status: 'no-changes' });
-            break;
-          case 'not-a-git-repo':
-            setDiffScopeState({ status: 'not-a-git-repo' });
-            break;
-          case 'no-base-ref-resolvable':
-            setDiffScopeState({ status: 'no-base-ref-resolvable' });
-            break;
-          case 'error':
-            setDiffScopeState({ status: 'error', message: result.message });
-            break;
-        }
+        setDiffScopeState(diffScopeStateFromResult(result));
       })
       .catch((error: unknown) => {
         if (diffScopeRequestIdRef.current !== requestId) {
@@ -6420,7 +6718,11 @@ export function CodeMap({
   // annotates the map; it never gates a surface. A diff-scope `'error'` is
   // not a notice status: it renders inline in the PR Review toolbar, same
   // convention as `pathTrace.status === 'error'`.
-  const { noticeStatus: prReviewNoticeStatus, surfaces } = resolvePrReviewView(mode, fetchState, diffScopeState);
+  const {
+    noticeStatus: prReviewNoticeStatus,
+    topLevelFiles: prReviewTopLevelFiles,
+    surfaces,
+  } = resolvePrReviewView(mode, fetchState, diffScopeState);
 
   // P0-2b: `reactFlowInstanceRef` is written once, in `handleInit`, and was
   // never cleared because before this spec the canvas only ever unmounted with
@@ -6516,7 +6818,11 @@ export function CodeMap({
               uses the toolbar's status-line styling, not the full-canvas
               `.code-map__notice`, which would cover the canvas and swallow
               its clicks. */}
-          <PrReviewDiffScopeNoticeRegion status={prReviewNoticeStatus} />
+          <PrReviewDiffScopeNoticeRegion
+            status={prReviewNoticeStatus}
+            topLevelFiles={prReviewTopLevelFiles}
+            onOpenFile={openSourceForNode}
+          />
 
           {/* Review finding (Blind Hunter): the `'idle'` state (before the
               user's first trigger click) previously rendered nothing at
@@ -6542,7 +6848,7 @@ export function CodeMap({
           {diffScopeState.status === 'resolved' && (
             <p className="code-map__pr-review-resolved" role="status">
               Diffed against <code>{diffScopeState.resolvedBaseRef}</code> —{' '}
-              {diffScopeState.nodeIds.size} changed Node{diffScopeState.nodeIds.size === 1 ? '' : 's'}.
+              {formatDiffScopeChangeCount(diffScopeState.nodeIds.size, diffScopeState.topLevelFiles.length)}.
             </p>
           )}
 
@@ -7166,6 +7472,10 @@ export function CodeMap({
               graphServiceAvailable={graphServiceAvailable}
               onRegenerate={handleRegenerate}
               onOpenTest={(target) => openTestFromDetail(target, { closeNodeDetail, openSourceForNode })}
+              // P4-2 phase 3a: the rendered population `navigateToNode`
+              // centres on, so only a navigable Node becomes a button.
+              resolveMapNode={(id) => flowNodesById.get(id)?.data.node}
+              onNavigateToNode={(id) => navigateFromDetail(id, { closeNodeDetail, navigateToNode })}
             />
             {/* P0-1: the one-click source action this panel's IA row
                 promises — reuses `openSourceForNode` unchanged, at this

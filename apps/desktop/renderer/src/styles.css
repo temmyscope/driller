@@ -61,6 +61,10 @@
   --stale-yellow: #d9c65a;
   --trace-cyan: #4fd8e0;
   --healthy: #2f9e6e;
+  /* P4-2 phase 3a: Node detail's fine print (the "Tested by" rows use the
+     same values literally). */
+  --detail-fine-size: 10.5px;
+  --detail-fine-leading: 1.45;
   font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
@@ -3246,6 +3250,83 @@ code,
 .code-map__node-detail-tests-more > summary {
   cursor: pointer;
   width: fit-content;
+}
+
+/* P4-2 phase 3a: Node detail's "File top-level" lines and PR Review's
+   top-level-change notice — inline, comma-separated entries. A navigable one
+   is a link-styled button (`.code-map__link-button`), underlined on hover
+   and focus so the cue is never colour alone; `.code-map__more` is the
+   generic "+N more" expander both use. */
+.code-map__node-detail-file-top-level,
+.code-map__more,
+.code-map__more-list {
+  margin: 0;
+  font-size: var(--detail-fine-size);
+  line-height: var(--detail-fine-leading);
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.code-map__node-detail-called-at-load,
+.code-map__more {
+  margin-top: 4px;
+}
+
+.code-map__more > summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.code-map__more > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.code-map__link-button {
+  display: inline;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.code-map__link-button:hover,
+.code-map__link-button:focus-visible {
+  color: var(--accent);
+  text-decoration: underline solid;
+}
+
+.code-map__link-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.code-map__link-button:active {
+  color: var(--accent-dim);
+}
+
+.code-map__node-detail-file-top-level-id {
+  color: var(--text-mute);
+  cursor: help;
+}
+
+/* P4-2 phase 3a: the card's "↑at load" cue — shaped like a caller pill but
+   dashed and not interactive: the caller is folded top-level code. */
+.code-map__node-load-caller {
+  padding: 3px 8px;
+  font-size: 9.5px;
+  font-weight: 700;
+  border-radius: 999px;
+  border: 1px dashed var(--border-control);
+  color: var(--text-mute);
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: help;
 }
 
 .code-map__node-detail-test-files-label,

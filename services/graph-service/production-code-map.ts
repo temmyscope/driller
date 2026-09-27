@@ -3,7 +3,12 @@
  * normalize each Node's `file` to project-relative POSIX, then drop test
  * code (`test-code.ts`). `index.ts`'s map handler and Path Trace both call
  * it, so neither can see a test Node, a test edge, or a test file's hotspot.
+ * P4-2 phase 3a: then fold Module Nodes into their file (`fold-modules.ts`),
+ * so neither sees a Module Node or a Module's edge either.
  */
+import type { FoldedModule } from '@driller/graph-contracts';
+
+import { attachFoldedModuleLinks, foldModules } from './fold-modules';
 import { fetchCodeMap, type CodeMapFetchResult, type FetchCodeMapOptions } from './mcp-client';
 import { toProjectRelativePosixPath } from './project-path';
 import { attachTestedBy } from './tested-by';
@@ -59,11 +64,21 @@ export interface ProductionCodeMapOptions {
   includeTestedBy?: boolean;
 }
 
+/** `fetchProductionCodeMap`'s result: the production map plus its folded Modules. */
+export interface ProductionCodeMapResult extends CodeMapFetchResult {
+  /** P4-2 phase 3a: the production files' folded Module Nodes, sorted by file (see `FoldedModule`). */
+  foldedModules: FoldedModule[];
+}
+
 /**
  * Fetches the Code Map for `project` with every Node's `file` project-
  * relative and all test code removed: test Nodes, edges touching them, and
  * test files' hotspot rows. With `includeTestedBy`, production Nodes carry
  * `testedBy`, resolved against the test Nodes before they are removed.
+ * P4-2 phase 3a: production Module Nodes are then folded off the map
+ * (`foldModules`) into `foldedModules`; Nodes carry the links as
+ * `fileTopLevel` / `calledAtLoadBy` (unscoped: the Code Map handler re-scopes
+ * them after its scope filter).
  * Throws whatever `fetchCodeMap` throws.
  */
 export async function fetchProductionCodeMap(
@@ -71,7 +86,7 @@ export async function fetchProductionCodeMap(
   projectRoot: string,
   context: string,
   options: ProductionCodeMapOptions = {},
-): Promise<CodeMapFetchResult> {
+): Promise<ProductionCodeMapResult> {
   const fetch = options.fetch ?? fetchCodeMap;
   const includeTestEvidence = options.includeTestedBy === true;
   const { nodes, edges, testEvidence } = await fetch(project, undefined, {
@@ -95,5 +110,14 @@ export async function fetchProductionCodeMap(
           })),
         })
       : normalizedNodes;
-  return excludeTestCode(withTestedBy, edges);
+  const production = excludeTestCode(withTestedBy, edges);
+  const folded = foldModules(production.nodes, production.edges);
+  const foldedModules = [...folded.modulesByFile.values()].sort((a, b) =>
+    a.file < b.file ? -1 : a.file > b.file ? 1 : 0,
+  );
+  return {
+    nodes: attachFoldedModuleLinks(folded.nodes, foldedModules),
+    edges: folded.edges,
+    foldedModules,
+  };
 }

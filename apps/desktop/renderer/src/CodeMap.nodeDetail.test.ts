@@ -14,7 +14,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { CodeMapNode, CodeMapNodeKind, RiskSignal, TestedBy, TestedByTest } from '@driller/ipc-contracts';
+import type {
+  CodeMapNode,
+  CodeMapNodeKind,
+  FileTopLevelUse,
+  RiskSignal,
+  TestedBy,
+  TestedByTest,
+} from '@driller/ipc-contracts';
 
 import { ActionableNotice } from './ActionableNotice';
 import {
@@ -22,8 +29,11 @@ import {
   formatNodeLocation,
   NO_TEST_LINK_FOUND,
   NODE_DETAIL_SECTION_HEADING_IDS,
+  NODE_DETAIL_FILE_TOP_LEVEL_ROWS,
   NODE_DETAIL_TESTED_BY_ROWS,
+  NOT_ON_CURRENT_MAP,
   NodeDetailBody,
+  navigateFromDetail,
   NodeDetailHead,
   nodeModuleLine,
   openTestFromDetail,
@@ -100,6 +110,8 @@ function renderBody(overrides: Partial<NodeDetailBodyProps> = {}): RenderedEleme
     graphServiceAvailable: true,
     onRegenerate: noop,
     onOpenTest: noop,
+    resolveMapNode: () => undefined,
+    onNavigateToNode: noop,
     ...overrides,
   };
   return renderTree(NodeDetailBody(props));
@@ -639,5 +651,150 @@ describe('openTestFromDetail', () => {
     });
     assert.deepEqual(calls, ['openSourceForNode']);
     assert.equal(opened, target);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NodeDetailBody: File top-level (P4-2 phase 3a)
+// ---------------------------------------------------------------------------
+
+const MAP_NAMES: Record<string, string> = {
+  'billing/gateway.ts::connect': 'connect',
+  'billing/config.ts::load': 'load',
+  'billing/types.ts::Config': 'Config',
+};
+
+function fileTopLevelSection(
+  fileTopLevel: FileTopLevelUse[] | undefined,
+  onNavigateToNode: (id: string) => void = noop,
+): RenderedElement[] {
+  return section(
+    renderBody({
+      node: makeNode({ fileTopLevel }),
+      resolveMapNode: (id) => (MAP_NAMES[id] === undefined ? undefined : { name: MAP_NAMES[id] }),
+      onNavigateToNode,
+    }),
+    NODE_DETAIL_SECTION_HEADING_IDS.fileTopLevel,
+  );
+}
+
+describe('NodeDetailBody: File top-level', () => {
+  it('is present, after Tested by, only when the file has folded top-level uses', () => {
+    assert.deepEqual(sectionHeadings(renderBody({ node: makeNode({ fileTopLevel: [{ id: 'x', kind: 'CALLS' }] }) })), [
+      'Summary',
+      'Risk Overlay',
+      'Tested by',
+      'File top-level',
+      'Staleness',
+      'Location',
+    ]);
+    for (const fileTopLevel of [undefined, []]) {
+      assert.ok(!sectionHeadings(renderBody({ node: makeNode({ fileTopLevel }) })).includes('File top-level'));
+    }
+  });
+
+  it('reads "Top-level code in this file uses: A, B" with each map Node navigable', () => {
+    const navigated: string[] = [];
+    const elements = fileTopLevelSection(
+      [
+        { id: 'billing/gateway.ts::connect', kind: 'CALLS' },
+        { id: 'billing/types.ts::Config', kind: 'USAGE' },
+      ],
+      (id) => navigated.push(id),
+    );
+    assert.equal(textOf(byClass(elements, 'code-map__node-detail-file-top-level')), 'Top-level code in this file uses: connect, Config');
+    const buttons = elements.filter((element) => element.type === 'button');
+    assert.deepEqual(
+      buttons.map((button) => button.props['aria-label']),
+      [
+        "Go to connect (called by this file's top-level code)",
+        "Go to Config (used by this file's top-level code)",
+      ],
+    );
+    click(buttons[1]);
+    assert.deepEqual(navigated, ['billing/types.ts::Config']);
+  });
+
+  it('names a target not on the current map by its id, not as a navigable entry', () => {
+    const elements = fileTopLevelSection([{ id: 'vendor/x.ts::hidden', kind: 'CALLS' }]);
+    assert.equal(elements.filter((element) => element.type === 'button').length, 0);
+    assert.equal(
+      textOf(byClass(elements, 'code-map__node-detail-file-top-level')),
+      `Top-level code in this file uses: vendor/x.ts::hidden (${NOT_ON_CURRENT_MAP})`,
+    );
+    const unmapped = byClass(elements, 'code-map__node-detail-file-top-level-id');
+    assert.equal(unmapped?.props.title, 'Not on the current map (hidden by scope or filters)');
+    assert.equal(byClass(renderTree(unmapped?.props.children), 'visually-hidden') !== undefined, true, 'screen-reader text');
+  });
+
+  it(`shows ${NODE_DETAIL_FILE_TOP_LEVEL_ROWS}, then "+N more" holding the rest`, () => {
+    const uses = Array.from({ length: 8 }, (_, i): FileTopLevelUse => ({ id: `u${i}`, kind: 'CALLS' }));
+    const elements = fileTopLevelSection(uses);
+    const [expander] = expanders(elements);
+    assert.ok(expander);
+    const inside = renderTree(expander.props.children);
+    assert.equal(textOf(inside.find((element) => element.type === 'summary')), '+3 more');
+    assert.equal(expander.props.className, 'code-map__more');
+    assert.match(textOf(byClass(inside, 'code-map__more-list')), /^u5 \(.*\), u6 \(.*\), u7 \(.*\)$/);
+    assert.equal(
+      textOf(byClass(elements, 'code-map__node-detail-file-top-level')).replaceAll(` (${NOT_ON_CURRENT_MAP})`, ''),
+      'Top-level code in this file uses: u0, u1, u2, u3, u4',
+    );
+  });
+});
+
+describe('NodeDetailBody: Called at load by', () => {
+  it('shows the section for a Node called only by top-level code, naming the files', () => {
+    const body = renderBody({ node: makeNode({ calledAtLoadBy: ['app/main.ts', 'app/routes.ts'] }) });
+    assert.ok(sectionHeadings(body).includes('File top-level'));
+    const elements = section(body, NODE_DETAIL_SECTION_HEADING_IDS.fileTopLevel);
+    assert.equal(textOf(byClass(elements, 'code-map__node-detail-file-top-level code-map__node-detail-called-at-load')), 'Called at load by: app/main.ts, app/routes.ts');
+    // No "uses" line: this Node's own file has no top-level uses.
+    assert.equal(byClass(elements, 'code-map__node-detail-file-top-level'), undefined);
+  });
+
+  it(`caps the files at ${NODE_DETAIL_FILE_TOP_LEVEL_ROWS} with a "+N more" expander`, () => {
+    const files = Array.from({ length: 7 }, (_, i) => `f${i}.ts`);
+    const elements = section(renderBody({ node: makeNode({ calledAtLoadBy: files }) }), NODE_DETAIL_SECTION_HEADING_IDS.fileTopLevel);
+    assert.equal(textOf(byClass(elements, 'code-map__node-detail-file-top-level code-map__node-detail-called-at-load')), 'Called at load by: f0.ts, f1.ts, f2.ts, f3.ts, f4.ts');
+    const [expander] = expanders(elements);
+    assert.ok(expander);
+    const inside = renderTree(expander.props.children);
+    assert.equal(textOf(inside.find((element) => element.type === 'summary')), '+2 more');
+    assert.equal(textOf(byClass(inside, 'code-map__more-list')), 'f5.ts, f6.ts');
+  });
+
+  it('NodeDetailBody renders without the optional navigation props', () => {
+    const props: NodeDetailBodyProps = {
+      node: makeNode({ fileTopLevel: [{ id: 'billing/gateway.ts::connect', kind: 'IMPORTS' }] }),
+      toggles: ALL_ON,
+      cloudSelectedNoKey: false,
+      noSummaryBackendAvailable: false,
+      summaryAction: null,
+      regenerateState: { kind: 'idle' },
+      graphServiceAvailable: true,
+      onRegenerate: noop,
+      onOpenTest: noop,
+    };
+    const elements = section(renderTree(NodeDetailBody(props)), NODE_DETAIL_SECTION_HEADING_IDS.fileTopLevel);
+    assert.equal(elements.filter((element) => element.type === 'button').length, 0, 'nothing navigable by default');
+  });
+
+  it('an IMPORTS entry reads "imported"', () => {
+    const [button] = fileTopLevelSection([{ id: 'billing/gateway.ts::connect', kind: 'IMPORTS' }]).filter(
+      (element) => element.type === 'button',
+    );
+    assert.equal(button?.props['aria-label'], "Go to connect (imported by this file's top-level code)");
+  });
+});
+
+describe('navigateFromDetail', () => {
+  it('closes Node detail, then navigates the map to the Node', () => {
+    const calls: string[] = [];
+    navigateFromDetail('billing/gateway.ts::connect', {
+      closeNodeDetail: () => calls.push('close'),
+      navigateToNode: (id) => calls.push(`navigate:${id}`),
+    });
+    assert.deepEqual(calls, ['close', 'navigate:billing/gateway.ts::connect']);
   });
 });

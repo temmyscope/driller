@@ -88,3 +88,15 @@ export function isScopeChangedRequest(data: unknown): data is GraphServiceScopeC
     includedPaths.every((entry) => typeof entry === 'string')
   );
 }
+
+/**
+ * Whether a project-relative POSIX `file` is inside the indexing scope
+ * `includedPaths`: always true for an empty scope; otherwise `file` equals
+ * an included path or lies under it on a path boundary (`"web"` matches
+ * `"web/x.ts"`, never `"webapp/x.ts"`). Pure — the caller normalizes
+ * `file` first. `filterCodeMapToScope` (`index.ts`) and P4-2 phase 3a's
+ * folded-Module scoping (`fold-modules.ts`) share it.
+ */
+export function isFileInScope(file: string, includedPaths: readonly string[]): boolean {
+  return includedPaths.length === 0 || includedPaths.some((prefix) => file === prefix || file.startsWith(`${prefix}/`));
+}

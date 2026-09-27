@@ -15,12 +15,13 @@
  *    stubbed: the filter, the handlers and the state are the real ones.
  */
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { register } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 const toDataUrl = (source: string): string => `data:text/javascript,${encodeURIComponent(source)}`;
 
@@ -43,6 +44,10 @@ export async function fetchCodeMap() {
       // (\`t\`), and by the backend flag alone (\`f\`).
       node('t', 'web/a.test.ts'),
       { ...node('f', 'app/fixtures.ts'), isTest: true },
+      // P4-2 phase 3a: Module Nodes (a file's top-level code), folded off
+      // the map — one in a file with map Nodes, one in a file with none.
+      { ...node('mod:web/a', 'web/a.ts'), kind: 'Module' },
+      { ...node('mod:lib/boot', 'lib/boot.ts'), kind: 'Module' },
     ],
     // FIX-2: w calls a AND d, and a calls d too — so BFS reaches d first
     // from w (a sibling of a, not a's callee in the tree).
@@ -55,6 +60,10 @@ export async function fetchCodeMap() {
       { source: 'w', target: 'a', kind: 'CALLS' },
       { source: 'a', target: 'd', kind: 'CALLS' },
       { source: 'w', target: 'd', kind: 'CALLS' },
+      // P4-2 phase 3a: top-level calls; kept only as the files' top-level uses.
+      { source: 'mod:web/a', target: 'a', kind: 'CALLS' },
+      { source: 'mod:web/a', target: 'd', kind: 'USAGE' },
+      { source: 'mod:lib/boot', target: 'a', kind: 'CALLS' },
     ],
     // P4-2 phase 2: \`t\` calls \`w\` through an import; \`f\` reaches \`a\` only
     // by a name-only match, which must never count.
@@ -72,7 +81,7 @@ const MODEL_MANAGER_STUB = toDataUrl('export function ensureLocalModel() { retur
 // Keeps the live `activeCodeMapNodes` getter `index.ts` hands the agent
 // surface, so a test can run the real `lookupNode` against it.
 const MCP_SERVER_STUB = toDataUrl(
-  'export function startMcpServer(getNodes) { globalThis.__scopeTestGetNodes = getNodes; return async () => {}; }',
+  'export function startMcpServer(getNodes, _post, _derive, getFolded) { globalThis.__scopeTestGetNodes = getNodes; globalThis.__scopeTestGetFolded = getFolded; return async () => {}; }',
 );
 
 const HOOKS = toDataUrl(`
@@ -100,7 +109,14 @@ interface Posted {
   requestId?: number;
   result?: unknown;
   state?: string;
-  nodes?: { id: string; file: string; testedBy?: unknown }[];
+  nodes?: {
+    id: string;
+    file: string;
+    testedBy?: unknown;
+    fileTopLevel?: unknown;
+    calledAtLoadBy?: unknown;
+    riskSignals?: { type?: string; value?: number }[];
+  }[];
   edges?: { source: string; target: string }[];
   message?: string;
   hiddenByScope?: number;
@@ -164,6 +180,13 @@ async function index(projectPath: string, includedPaths?: string[]): Promise<voi
 
 const ALL = ['web/a.ts', 'app/b.ts', 'docs/c.ts', 'webapp/d.ts'];
 
+/** P4-2 phase 3a: the live `activeCodeMapNodes` / `activeFoldedModules` getters the stubbed `startMcpServer` captured. */
+function capturedGetters(): { getNodes: () => unknown; getFolded: () => unknown } {
+  const captured = globalThis as { __scopeTestGetNodes?: () => unknown; __scopeTestGetFolded?: () => unknown };
+  assert.ok(captured.__scopeTestGetNodes && captured.__scopeTestGetFolded);
+  return { getNodes: captured.__scopeTestGetNodes, getFolded: captured.__scopeTestGetFolded };
+}
+
 describe('graphService:scopeChanged through index.ts', () => {
   before(async () => {
     register(HOOKS, import.meta.url);
@@ -171,6 +194,13 @@ describe('graphService:scopeChanged through index.ts', () => {
     process.argv[2] = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-userdata-'));
     await import('./index');
     await index(PROJECT);
+  });
+
+  // The stubbed `startMcpServer` parks `index.ts`'s live getters on
+  // `globalThis`; nothing outside this file reads them, so don't leak them.
+  after(() => {
+    delete (globalThis as { __scopeTestGetNodes?: unknown }).__scopeTestGetNodes;
+    delete (globalThis as { __scopeTestGetFolded?: unknown }).__scopeTestGetFolded;
   });
 
   it('filters the next Code Map fetch with the saved scope, posting no status', async () => {
@@ -292,8 +322,102 @@ describe('graphService:scopeChanged through index.ts', () => {
     const lookedUp = lookupNode('w', cached, (node) => node);
     assert.equal(lookedUp.status, 'ok');
     assert.deepEqual(lookedUp.status === 'ok' ? lookedUp.node.testedBy : undefined, expectedTestedBy);
-    // Nothing else reads the captured getter; don't leak it past this test.
-    delete (globalThis as { __scopeTestGetNodes?: unknown }).__scopeTestGetNodes;
+  });
+
+  it('P4-2 phase 3a: Module Nodes leave the map, its edges and blast radius; lookup_node resolves them as folded', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    const map = await fetchMap();
+    assert.deepEqual((map.nodes ?? []).map((node) => node.id), ['w', 'a', 'd', 'x']);
+    assert.ok(!(map.edges ?? []).some((edge) => edge.source.startsWith('mod:') || edge.target.startsWith('mod:')));
+    // a: called by w, calls d. Both Modules' calls into it no longer count.
+    const mapNode = (id: string) => map.nodes?.find((node) => node.id === id);
+    const blast = (id: string) => mapNode(id)?.riskSignals?.find((signal) => signal.type === 'blast-radius')?.value;
+    assert.equal(blast('a'), 2);
+    // Every Node in web/a.ts carries web/a.ts's top-level uses; others none.
+    assert.deepEqual(mapNode('w')?.fileTopLevel, [
+      { id: 'a', kind: 'CALLS' },
+      { id: 'd', kind: 'USAGE' },
+    ]);
+    assert.equal(mapNode('a')?.fileTopLevel, undefined);
+    // The reverse link: a is called only by top-level code (and w).
+    assert.deepEqual(mapNode('a')?.calledAtLoadBy, ['lib/boot.ts', 'web/a.ts']);
+    assert.deepEqual(mapNode('d')?.calledAtLoadBy, ['web/a.ts']);
+    assert.equal(mapNode('w')?.calledAtLoadBy, undefined);
+
+    const { getNodes, getFolded } = capturedGetters();
+    const { lookupNode } = await import('./mcp-server');
+    type Args = Parameters<typeof lookupNode>;
+    const cached = getNodes() as Args[1];
+    const folded = getFolded() as Args[3];
+    assert.deepEqual(lookupNode('mod:lib/boot', cached, (node) => node, folded), {
+      status: 'folded',
+      folded: true,
+      nodeId: 'mod:lib/boot',
+      file: 'lib/boot.ts',
+      uses: [{ id: 'a', kind: 'CALLS' }],
+    });
+    assert.deepEqual(lookupNode('mod:nope', cached, (node) => node, folded), { status: 'not-found' });
+    const a = lookupNode('a', cached, (node) => node, folded);
+    assert.deepEqual(a.status === 'ok' ? a.node.calledAtLoadBy : undefined, ['lib/boot.ts', 'web/a.ts']);
+  });
+
+  it('P4-2 phase 3a: the registered lookup_node handler resolves a Module id as folded', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    await fetchMap();
+    const { registerLookupNodeTool } = await import('./mcp-server');
+    const { getNodes, getFolded } = capturedGetters();
+    let handler: ((args: { nodeId: string }) => Promise<{ content: { type: string; text: string }[] }>) | undefined;
+    let description = '';
+    registerLookupNodeTool(
+      {
+        registerTool: (name: string, config: { description?: string }, cb: typeof handler) => {
+          assert.equal(name, 'lookup_node');
+          description = config.description ?? '';
+          handler = cb;
+        },
+      } as unknown as Parameters<typeof registerLookupNodeTool>[0],
+      getNodes as Parameters<typeof registerLookupNodeTool>[1],
+      (node) => node,
+      getFolded as Parameters<typeof registerLookupNodeTool>[3],
+    );
+    assert.ok(handler);
+    const result = JSON.parse((await handler({ nodeId: 'mod:web/a' })).content[0]!.text);
+    assert.deepEqual(result, {
+      status: 'folded',
+      folded: true,
+      nodeId: 'mod:web/a',
+      file: 'web/a.ts',
+      uses: [
+        { id: 'a', kind: 'CALLS' },
+        { id: 'd', kind: 'USAGE' },
+      ],
+    });
+    assert.match(description, /check status === 'folded'; folded: true is also set/);
+    assert.match(description, /calledAtLoadBy/);
+  });
+
+  it('P4-2 phase 3a: folded links name only Nodes inside the indexing scope', { timeout: 20_000 }, async () => {
+    // web/a.ts's top level uses a (app/) and d (docs/): both out of scope.
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web'] });
+    const map = await fetchMap();
+    assert.deepEqual((map.nodes ?? []).map((node) => node.id), ['w']);
+    assert.equal(map.nodes?.[0]?.fileTopLevel, undefined, 'no out-of-scope id in fileTopLevel');
+    const { getNodes, getFolded } = capturedGetters();
+    const { lookupNode } = await import('./mcp-server');
+    type Args = Parameters<typeof lookupNode>;
+    const look = (id: string) => lookupNode(id, getNodes() as Args[1], (node) => node, getFolded() as Args[3]);
+    assert.deepEqual(look('mod:web/a'), { status: 'folded', folded: true, nodeId: 'mod:web/a', file: 'web/a.ts', uses: [] });
+    // lib/boot.ts is out of scope: its Module is gone too.
+    assert.deepEqual(look('mod:lib/boot'), { status: 'not-found' });
+
+    // In scope ['web', 'app']: a survives, so it's named; d (docs/) is not.
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: ['web', 'app'] });
+    const wider = await fetchMap();
+    assert.deepEqual(wider.nodes?.find((node) => node.id === 'w')?.fileTopLevel, [{ id: 'a', kind: 'CALLS' }]);
+    // a's load-time caller in lib/boot.ts is out of scope; web/a.ts is not.
+    assert.deepEqual(wider.nodes?.find((node) => node.id === 'a')?.calledAtLoadBy, ['web/a.ts']);
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    await fetchMap();
   });
 
   it('ignores a malformed scopeChanged', async () => {
@@ -331,5 +455,56 @@ describe('graphService:scopeChanged through index.ts', () => {
     // must not win over it.
     await index(PROJECT, ['docs']);
     assert.deepEqual(await fetchMapFiles(), ['docs/c.ts']);
+  });
+
+  // Last: it indexes its own temp repo, which becomes the active project.
+  it('P4-2 phase 3a: a diff touching only top-level code is named, not counted as a changed Node', { timeout: 30_000 }, async (t) => {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is not installed; the diff-scope check needs a real repository.');
+      return;
+    }
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-git-'));
+    try {
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], {
+          cwd: repo,
+          stdio: 'pipe',
+        });
+      git('init', '-q', '-b', 'main');
+      writeFileSync(path.join(repo, 'README.md'), 'x\n');
+      git('add', '.');
+      git('commit', '-q', '-m', 'base');
+      git('checkout', '-q', '-b', 'feature');
+      mkdirSync(path.join(repo, 'lib'), { recursive: true });
+      writeFileSync(path.join(repo, 'lib/boot.ts'), 'a();\n');
+      git('add', '.');
+      git('commit', '-q', '-m', 'top-level only');
+
+      await index(repo);
+      await fetchMap();
+      const { computeDiffScopeResult } = await import('./index');
+      const onlyTopLevel = await computeDiffScopeResult(repo, 'main');
+      assert.equal(onlyTopLevel.status, 'resolved');
+      assert.deepEqual(onlyTopLevel.status === 'resolved' ? onlyTopLevel.nodeIds : undefined, []);
+      assert.deepEqual(onlyTopLevel.status === 'resolved' ? onlyTopLevel.topLevelFiles : undefined, [
+        { file: 'lib/boot.ts', startLine: 1, endLine: 2 },
+      ]);
+
+      // With a map Node's file changed too, that Node counts; its file's
+      // Module does not, and web/a.ts is not "top-level only".
+      mkdirSync(path.join(repo, 'web'), { recursive: true });
+      writeFileSync(path.join(repo, 'web/a.ts'), 'w();\n');
+      git('add', '.');
+      git('commit', '-q', '-m', 'function change');
+      const mixed = await computeDiffScopeResult(repo, 'main');
+      assert.deepEqual(mixed, {
+        status: 'resolved',
+        resolvedBaseRef: mixed.status === 'resolved' ? mixed.resolvedBaseRef : '',
+        nodeIds: ['w'],
+        topLevelFiles: [{ file: 'lib/boot.ts', startLine: 1, endLine: 2 }],
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

@@ -21,6 +21,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
+import type { TopLevelChangedFile } from '@driller/ipc-contracts';
+
 import { ACTIONABLE_NOTICE_GLYPHS, ACTIONABLE_NOTICE_SPOKEN_PREFIX } from './ActionableNotice';
 import {
   type CodeMapMode,
@@ -31,8 +33,13 @@ import {
   PR_REVIEW_NOTICE_ID,
   PrReviewDiffScopeNotice,
   PrReviewDiffScopeNoticeRegion,
+  type SourceTarget,
+  diffScopeStateFromResult,
+  formatDiffScopeChangeCount,
+  formatTopLevelChangeNotice,
   hasShowableMap,
   resolvePrReviewView,
+  topLevelFileSourceTarget,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
@@ -61,7 +68,7 @@ const NOTICE_STATUSES: DiffScopeNoticeStatus[] = ['no-changes', 'not-a-git-repo'
 const NON_NOTICE_STATES: DiffScopeState[] = [
   { status: 'idle' },
   { status: 'loading' },
-  { status: 'resolved', resolvedBaseRef: 'main', nodeIds: new Set(['src/a.ts#a']) },
+  { status: 'resolved', resolvedBaseRef: 'main', nodeIds: new Set(['src/a.ts#a']), topLevelFiles: [] },
   { status: 'error', message: 'git failed' },
 ];
 
@@ -206,5 +213,102 @@ describe('PrReviewDiffScopeNoticeRegion', () => {
       const prefix = ACTIONABLE_NOTICE_SPOKEN_PREFIX[DIFF_SCOPE_NOTICE_TONES[status]];
       assert.ok(text.startsWith(prefix === null ? glyph : `${glyph}${prefix} `), text);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-2 phase 3a: a top-level-only change is named, never silent
+// ---------------------------------------------------------------------------
+
+const file = (name: string, endLine = 20): TopLevelChangedFile => ({ file: name, startLine: 1, endLine });
+
+describe('PR Review: top-level-only changes', () => {
+  const resolved = (topLevelFiles: TopLevelChangedFile[] = []): DiffScopeState => ({
+    status: 'resolved',
+    resolvedBaseRef: 'abc123',
+    nodeIds: new Set(),
+    topLevelFiles,
+  });
+
+  it("resolvePrReviewView passes a resolved diff scope's top-level files through, in PR Review with a map only", () => {
+    assert.deepEqual(resolvePrReviewView('prReview', SHOWABLE, resolved([file('x.ts')])).topLevelFiles, [file('x.ts')]);
+    assert.deepEqual(resolvePrReviewView('prReview', SHOWABLE, resolved()).topLevelFiles, []);
+    assert.deepEqual(resolvePrReviewView('codeMap', SHOWABLE, resolved([file('x.ts')])).topLevelFiles, []);
+    assert.deepEqual(resolvePrReviewView('prReview', NOT_SHOWABLE.loading!, resolved([file('x.ts')])).topLevelFiles, []);
+  });
+
+  it('says "Changed: top-level code in x.ts." in the notice region, as an info notice; the file opens its top-level code', () => {
+    const opened: SourceTarget[] = [];
+    const elements = renderTree(
+      PrReviewDiffScopeNoticeRegion({ status: null, topLevelFiles: [file('x.ts', 12)], onOpenFile: (t) => opened.push(t) }),
+    );
+    const root = elements[0];
+    assert.equal(root?.props.id, PR_REVIEW_NOTICE_ID);
+    assert.match(textOf(root), /Changed: top-level code in x\.ts\.$/);
+    assert.ok(elements.some((element) => element.props.className === 'actionable-notice actionable-notice--info'));
+    assert.doesNotMatch(textOf(root), /No changes to review/);
+    const button = elements.find((element) => element.type === 'button');
+    assert.equal(button?.props['aria-label'], 'Open the top-level code of x.ts');
+    (button?.props.onClick as () => void)();
+    assert.deepEqual(opened, [{ file: 'x.ts', startLine: 1, endLine: 12, label: 'x.ts (top-level)' }]);
+    assert.deepEqual(opened[0], topLevelFileSourceTarget(file('x.ts', 12)));
+  });
+
+  it('names up to three files, then an expandable "+N more" holding the rest, each openable', () => {
+    const files = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'].map((name) => file(name));
+    const elements = renderTree(PrReviewDiffScopeNoticeRegion({ status: null, topLevelFiles: files }));
+    const notice = elements.find((element) => element.props.className === 'actionable-notice actionable-notice--info');
+    assert.match(textOf(notice), /Changed: top-level code in a\.ts, b\.ts, c\.ts$/);
+    const details = elements.find((element) => element.type === 'details');
+    assert.ok(details);
+    assert.equal(details.props.className, 'code-map__more');
+    const inside = renderTree(details.props.children);
+    assert.equal(textOf(inside.find((element) => element.type === 'summary')), '+2 more');
+    assert.deepEqual(
+      inside.filter((element) => element.type === 'button').map((button) => button.props['aria-label']),
+      ['Open the top-level code of d.ts', 'Open the top-level code of e.ts'],
+    );
+  });
+
+  it('formatTopLevelChangeNotice is null for no files, and splits at three', () => {
+    assert.equal(formatTopLevelChangeNotice([]), null);
+    assert.deepEqual(formatTopLevelChangeNotice(['a', 'b', 'c', 'd']), {
+      lead: 'Changed: top-level code in ',
+      shown: ['a', 'b', 'c'],
+      rest: ['d'],
+    });
+  });
+
+  it('shows nothing extra without top-level files', () => {
+    assert.equal(textOf(renderTree(PrReviewDiffScopeNoticeRegion({ status: null, topLevelFiles: [] }))[0]), '');
+  });
+
+  it('the status line never reads as a bare "0 changed Nodes" when top-level code changed', () => {
+    assert.equal(formatDiffScopeChangeCount(0, 1), '0 changed Nodes · top-level code changed in 1 file');
+    assert.equal(formatDiffScopeChangeCount(1, 2), '1 changed Node · top-level code changed in 2 files');
+    assert.equal(formatDiffScopeChangeCount(3, 0), '3 changed Nodes');
+  });
+});
+
+describe('diffScopeStateFromResult', () => {
+  it('keeps topLevelFiles on a resolved result, and defaults it to []', () => {
+    const state = diffScopeStateFromResult({
+      status: 'resolved',
+      resolvedBaseRef: 'abc',
+      nodeIds: ['n1'],
+      topLevelFiles: [file('x.ts')],
+    });
+    assert.equal(state.status, 'resolved');
+    assert.deepEqual(state.status === 'resolved' ? [...state.nodeIds] : undefined, ['n1']);
+    assert.deepEqual(state.status === 'resolved' ? state.topLevelFiles : undefined, [file('x.ts')]);
+    const without = diffScopeStateFromResult({ status: 'resolved', resolvedBaseRef: 'abc', nodeIds: [] });
+    assert.deepEqual(without.status === 'resolved' ? without.topLevelFiles : undefined, []);
+  });
+
+  it('passes every other state through', () => {
+    for (const status of NOTICE_STATUSES) {
+      assert.deepEqual(diffScopeStateFromResult({ status }), { status });
+    }
+    assert.deepEqual(diffScopeStateFromResult({ status: 'error', message: 'boom' }), { status: 'error', message: 'boom' });
   });
 });

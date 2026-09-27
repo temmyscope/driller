@@ -632,6 +632,34 @@ export function findChangedNodeIds(nodes: ChangedFileNodeCandidate[], changedFil
   return nodeIds;
 }
 
+/**
+ * P4-2 phase 3a: the changed files that touch only folded top-level code —
+ * a file with a `FoldedModule` but no Node in `nodes` — in `changedFiles`
+ * order, each once, with the folded Module's range (so the file can be
+ * opened). Same exact-string, already-normalized path contract as
+ * `findChangedNodeIds`. A changed file with map Nodes is not listed: its
+ * Nodes already count as changed — diff scope is file-based, so a
+ * top-level-only edit in such a file still marks its Nodes changed.
+ */
+export function findTopLevelOnlyChangedFiles(
+  nodes: ChangedFileNodeCandidate[],
+  foldedModules: readonly TopLevelChangedFile[],
+  changedFiles: string[],
+): TopLevelChangedFile[] {
+  const filesWithNodes = new Set(nodes.map((node) => node.file));
+  const foldedByFile = new Map(foldedModules.map((module) => [module.file, module]));
+  const result: TopLevelChangedFile[] = [];
+  const seen = new Set<string>();
+  for (const file of changedFiles) {
+    const folded = foldedByFile.get(file);
+    if (!seen.has(file) && folded !== undefined && !filesWithNodes.has(file)) {
+      result.push({ file, startLine: folded.startLine, endLine: folded.endLine });
+    }
+    seen.add(file);
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // P4-6: Graph Service operation result shapes (AD-13).
 //
@@ -951,7 +979,58 @@ export interface CodeMapNode {
    * which never means "untested": the backend's test links are incomplete.
    */
   testedBy?: TestedBy;
+  /**
+   * P4-2 phase 3a: what this Node's file's top-level code calls or uses —
+   * the folded Module Node's own outgoing edges (see `FoldedModule`), shared
+   * by every Node in the file. Absent when the file has no folded top-level
+   * code, or that code uses nothing on the map.
+   */
+  fileTopLevel?: FileTopLevelUse[];
+  /**
+   * P4-2 phase 3a: the files whose top-level code calls or uses this Node —
+   * the reverse of `fileTopLevel`, sorted. A Node called only at load time
+   * (`main()`, route registration, init hooks) has no map caller, since
+   * Module Nodes are folded; this is where that caller is named. Absent when
+   * there is none.
+   */
+  calledAtLoadBy?: string[];
 }
+
+/**
+ * P4-2 phase 3a: one thing a file's top-level code calls or uses — the
+ * target of a real `CALLS`/`USAGE` edge out of the file's Module Node, never
+ * a name match. `id` is a Code Map Node id within the indexing scope.
+ * `IMPORTS` is in `CodeMapEdgeKind` but the Code Map edge query never
+ * returns it today (every backend IMPORTS edge starts at a File node);
+ * consumers still handle it ("imported").
+ */
+export interface FileTopLevelUse {
+  id: string;
+  kind: CodeMapEdgeKind;
+}
+
+/**
+ * P4-2 phase 3a: a file's Module Node(s), folded off the Code Map. A Module
+ * is the file's top-level code (complexity always 0, a pure edge source), so
+ * it is not a map Node: its edges don't count toward adjacency, blast
+ * radius, severity or Path Trace, and a changed Module is not a changed
+ * Node. What it calls or uses is kept here, keyed by file, for Node detail's
+ * "File top-level" section and `lookup_node`.
+ */
+export interface FoldedModule {
+  /** POSIX-relative path of the file. */
+  file: string;
+  /** The folded Module Node ids (backend `qualified_name`s) for this file, sorted; usually one. */
+  moduleIds: string[];
+  /** The Modules' combined range: the file's top-level code, for the source viewer. */
+  startLine: number;
+  endLine: number;
+  /** Distinct targets, `CALLS` before `USAGE`/`IMPORTS`, then by id. A target reached both ways is listed once, as `CALLS`. */
+  uses: FileTopLevelUse[];
+}
+
+/** P4-2 phase 3a: a changed file whose only map content is folded top-level code (see `findTopLevelOnlyChangedFiles`). */
+export type TopLevelChangedFile = Pick<FoldedModule, 'file' | 'startLine' | 'endLine'>;
 
 /**
  * P4-2 phase 2: one test that directly calls a Node through an
@@ -1031,6 +1110,15 @@ export interface CodeMapEdge {
  */
 export type NodeLookupResult =
   | { status: 'ok'; node: CodeMapNode }
+  /**
+   * P4-2 phase 3a: `nodeId` is a Module Node folded into its file (see
+   * `FoldedModule`): it resolves (never `'not-found'`), but there is no map
+   * Node for it. Its own `status: 'folded'` keeps a client written against
+   * `'ok'` (which reads `.node`) from mistaking it for a Node — such a client
+   * falls into its default branch instead. `folded: true` is deliberately
+   * redundant (the spec's marker); narrow on `status === 'folded'`.
+   */
+  | { status: 'folded'; folded: true; nodeId: string; file: string; uses: FileTopLevelUse[] }
   | { status: 'not-found' }
   | { status: 'error'; message: string };
 
@@ -1076,7 +1164,18 @@ export type CoverageSummaryResult =
  *    text.
  */
 export type DiffScopeResult =
-  | { status: 'resolved'; resolvedBaseRef: string; nodeIds: string[] }
+  | {
+      status: 'resolved';
+      resolvedBaseRef: string;
+      nodeIds: string[];
+      /**
+       * P4-2 phase 3a: changed files whose only map content is folded
+       * top-level code (a `FoldedModule`, no Code Map Node) — see
+       * `findTopLevelOnlyChangedFiles`. Absent when there are none. Lets a
+       * top-level-only diff say what changed instead of "0 changed Nodes".
+       */
+      topLevelFiles?: TopLevelChangedFile[];
+    }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }
   | { status: 'no-base-ref-resolvable' }

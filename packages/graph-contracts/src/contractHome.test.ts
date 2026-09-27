@@ -65,6 +65,9 @@ const MOVED_GRAPH_SHAPES = [
   'TestedBy',
   'TestedByTest',
   'TestedByFile',
+  'FileTopLevelUse',
+  'FoldedModule',
+  'TopLevelChangedFile',
 ] as const;
 
 /** Constants that belong with those shapes: `TESTED_BY_MAX_TESTS` bounds `TestedBy.tests`. */

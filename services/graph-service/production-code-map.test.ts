@@ -121,6 +121,37 @@ describe('fetchProductionCodeMap', () => {
     assert.equal(plain.nodes[0]?.testedBy, undefined);
   });
 
+  it('P4-2 phase 3a: folds production Module Nodes after test exclusion, keeping their top-level uses', async () => {
+    const root = '/home/u/proj-fold';
+    const module = (id: string, file: string) => ({ ...node(id, file), kind: 'Module' as const });
+    const nodes = [
+      module('mod:x', `${root}/src/x.ts`),
+      node('f', `${root}/src/x.ts`),
+      node('g', `${root}/src/y.ts`),
+      module('mod:boot', `${root}/src/boot.ts`),
+      // A test file's Module is test code: removed, never folded.
+      module('mod:x.test', `${root}/src/x.test.ts`),
+    ];
+    const edges: CodeMapEdge[] = [
+      { source: 'mod:x', target: 'g', kind: 'CALLS' },
+      { source: 'mod:boot', target: 'f', kind: 'USAGE' },
+      { source: 'mod:x.test', target: 'f', kind: 'CALLS' },
+      { source: 'f', target: 'g', kind: 'CALLS' },
+    ];
+    const result = await fetchProductionCodeMap('p', root, 'test', { fetch: fakeFetch(nodes, edges) });
+    assert.deepEqual(result.nodes.map((n) => n.id), ['f', 'g']);
+    assert.deepEqual(result.edges, [{ source: 'f', target: 'g', kind: 'CALLS' }]);
+    assert.deepEqual(result.foldedModules, [
+      { file: 'src/boot.ts', moduleIds: ['mod:boot'], startLine: 1, endLine: 2, uses: [{ id: 'f', kind: 'USAGE' }] },
+      { file: 'src/x.ts', moduleIds: ['mod:x'], startLine: 1, endLine: 2, uses: [{ id: 'g', kind: 'CALLS' }] },
+    ]);
+    assert.deepEqual(result.nodes.find((n) => n.id === 'f')?.fileTopLevel, [{ id: 'g', kind: 'CALLS' }]);
+    assert.equal(result.nodes.find((n) => n.id === 'g')?.fileTopLevel, undefined);
+    // The reverse link; the test Module's call into f is not a load-time caller.
+    assert.deepEqual(result.nodes.find((n) => n.id === 'f')?.calledAtLoadBy, ['src/boot.ts']);
+    assert.deepEqual(result.nodes.find((n) => n.id === 'g')?.calledAtLoadBy, ['src/x.ts']);
+  });
+
   it('warns once per distinct out-of-project path, not once per Node per fetch', async (t) => {
     const warn = mock.method(console, 'warn', () => {});
     t.after(() => warn.mock.restore());

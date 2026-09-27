@@ -18,6 +18,7 @@ import {
   type NodeAdjacency,
   type PathTraceState,
   isPathHighlightEdge,
+  loadCallerPillTitle,
   neighborPillLabel,
   neighborTrace,
   neighborTraceHeading,
@@ -403,5 +404,36 @@ describe('NeighborTraceSteps', () => {
     const [dismiss] = byClass(renderSteps('callers', undefined, [], dismissed), 'code-map__path-trace-dismiss');
     (dismiss?.props.onClick as () => void)();
     assert.equal(dismissed.length, 1);
+  });
+});
+
+describe('NodeNeighborPills: called only at load (P4-2 phase 3a)', () => {
+  function render(callerCount: number, calledAtLoadBy?: string[]) {
+    return renderTree(
+      NodeNeighborPills({
+        node: { id: 'node-o', name: 'main', ...(calledAtLoadBy ? { calledAtLoadBy } : {}) },
+        callerCount,
+        calleeCount: 0,
+        onShowNeighbors: () => {},
+      }),
+    );
+  }
+
+  it('with no map caller, says the Node is called at load instead of looking uncalled', () => {
+    const [cue] = byClass(render(0, ['app/index.ts']), 'code-map__node-load-caller');
+    assert.ok(cue);
+    assert.equal(cue.type, 'span', 'not a button: there is no map Node to trace to');
+    assert.equal(cue.props.title, 'Called at load by app/index.ts');
+    assert.equal(textOf(cue), '↑at load — Called at load by app/index.ts');
+  });
+
+  it('shows no cue when the Node has map callers, or no load-time caller', () => {
+    assert.equal(byClass(render(2, ['app/index.ts']), 'code-map__node-load-caller').length, 0);
+    assert.equal(byClass(render(0), 'code-map__node-load-caller').length, 0);
+    assert.equal(byClass(render(0, []), 'code-map__node-load-caller').length, 0);
+  });
+
+  it('names up to three files in the title', () => {
+    assert.equal(loadCallerPillTitle(['a.ts', 'b.ts', 'c.ts', 'd.ts']), 'Called at load by a.ts, b.ts, c.ts +1 more');
   });
 });
