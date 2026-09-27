@@ -1011,6 +1011,34 @@ code,
 .code-map {
   position: absolute;
   inset: 0;
+  /* FIX-4: the floated toolbars lay out against the map's own size, not
+     the window's (see the FIX-4 block after the blast-radius stepper).
+     `size`, not `inline-size`: the narrow layout also caps the toolbar
+     columns' height against the map (`cqh`). `inset: 0` gives the map a
+     definite size, so size containment changes nothing else. */
+  container: code-map / size;
+  /* FIX-4: the one search-row/history-row height, derived from the values
+     the toolbars' own rules use: vertical padding, a 1px edge top and
+     bottom, and one line of their 11px text. */
+  --code-map-toolbar-pad-y: 0.4rem;
+  --code-map-toolbar-line: calc(11px * 1.25);
+  --code-map-toolbar-row: calc(2 * var(--code-map-toolbar-pad-y) + 2px + var(--code-map-toolbar-line));
+  /* FIX-4: what a floated column must leave free at the map's bottom edge:
+     React Flow's `<Controls>` (a 15px panel margin plus three 26px buttons;
+     `showInteractive={false}`), which is taller than the bottom-right
+     signal-toggle panel, plus 3rem more so a refresh-error notice wrapped
+     to three lines between the two corners still fits under the columns. */
+  --code-map-bottom-clearance: calc(15px + 3 * 26px + 3rem);
+  /* FIX-4: the bottom corners the refresh-error notice keeps clear of:
+     `<Controls>` (bottom-left: 15px panel margin, one 26px button column, a
+     gap) and the signal-toggle panel (bottom-right: its two checkbox rows'
+     ~127px measured in a headless render, 15px margin, a gap). */
+  --code-map-controls-clearance: calc(15px + 26px + 0.5rem);
+  --code-map-corner-clearance: 10rem;
+  /* FIX-4: a scrolling floated column clips its children's focus rings
+     (2px outline + 2px offset); this much padding, cancelled by an equal
+     negative margin, keeps them inside the scroll box. */
+  --code-map-focus-gutter: 4px;
 }
 
 /* P2-7 + P2-8: `.code-map` is the modal layers' focus fallback
@@ -1481,6 +1509,17 @@ code,
   color: var(--text-mute);
 }
 
+/* FIX-4: a disabled button floated over the canvas keeps its opaque
+   `panel-alt` background — an `opacity` fade let dense Node cards show
+   through the label. It dims only its text (`--text-mute`, still readable)
+   and its edge (dashed, same `--border-control` colour), so disabled never
+   rests on colour alone. The same treatment covers every floated control:
+   history, Path Trace (field and button), PR Review (input and button), the
+   blast-radius stepper and the refresh-error Retry. The borderless
+   ambiguous-candidate rows mute their text only. `contrast.test.ts` fails if
+   any of their disabled rules uses `opacity`, `filter: opacity()` or a
+   see-through background. */
+
 /* Back/Forward traversal history toolbar (Story 1.4): lightweight chrome
    floated over the map, matching the source panel's close button and the
    Retry button's plain bordered style rather than introducing a new visual
@@ -1499,7 +1538,7 @@ code,
 }
 
 .code-map__history-toolbar button {
-  padding: 0.4rem 0.75rem;
+  padding: var(--code-map-toolbar-pad-y) 0.75rem;
   border-radius: 0;
   border: 1px solid var(--border-control);
   background: var(--panel-alt);
@@ -1513,7 +1552,8 @@ code,
 }
 
 .code-map__history-toolbar button:disabled {
-  opacity: 0.4;
+  border-style: dashed;
+  color: var(--text-mute);
   cursor: default;
 }
 
@@ -1967,8 +2007,10 @@ code,
 
 /* Story 1.9 (Phase 2): the Path Trace search toolbar + notice + step list —
    a single positioned wrapper (top-left, opposite the history toolbar's
-   top-right) so its children can lay out with plain flow instead of each
-   needing its own `position: absolute`. Matches `.code-map__history-
+   top-right; on a narrow map the history toolbar drops below this block's
+   search row instead, see FIX-4's container queries) so its children can
+   lay out with plain flow instead of each needing its own
+   `position: absolute`. Matches `.code-map__history-
    toolbar`'s own floated-chrome treatment (Code Map: "follow
    `.code-map__history-toolbar`: absolute, z-index over canvas,
    non-blocking") rather than a new visual language. */
@@ -1980,7 +2022,15 @@ code,
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  width: min(320px, calc(100vw - 1.5rem));
+  width: calc(min(320px, 100vw - 1.5rem) + 2 * var(--code-map-focus-gutter));
+  /* FIX-4: stops --code-map-bottom-clearance above the map's bottom edge
+     (clear of <Controls> and the signal-toggle panel) and scrolls past that;
+     the focus gutter keeps its children's focus rings inside the scroll box
+     (the padding is cancelled by the margin, so nothing moves). */
+  max-height: calc(100cqh - 0.75rem - var(--code-map-bottom-clearance) + 2 * var(--code-map-focus-gutter));
+  overflow-y: auto;
+  padding: var(--code-map-focus-gutter);
+  margin: calc(-1 * var(--code-map-focus-gutter));
 }
 
 .code-map__path-trace-toolbar {
@@ -2004,7 +2054,7 @@ code,
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  padding: 0.4rem 0.6rem;
+  padding: var(--code-map-toolbar-pad-y) 0.6rem;
   border: 1px solid var(--border-control);
   background: var(--panel-alt);
   font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
@@ -2018,8 +2068,12 @@ code,
 }
 
 .code-map__path-trace-field:has(.code-map__path-trace-input:disabled) {
-  opacity: 0.6;
+  border-style: dashed;
   cursor: default;
+}
+
+.code-map__path-trace-input:disabled {
+  color: var(--text-mute);
 }
 
 .code-map__path-trace-prompt {
@@ -2084,7 +2138,7 @@ code,
 
 .code-map__path-trace-toolbar button {
   flex-shrink: 0;
-  padding: 0.4rem 0.75rem;
+  padding: var(--code-map-toolbar-pad-y) 0.75rem;
   border-radius: 0;
   border: 1px solid var(--border-control);
   background: var(--panel-alt);
@@ -2098,7 +2152,8 @@ code,
 }
 
 .code-map__path-trace-toolbar button:disabled {
-  opacity: 0.4;
+  border-style: dashed;
+  color: var(--text-mute);
   cursor: default;
 }
 
@@ -2184,8 +2239,13 @@ code,
   font-size: 11px;
 }
 
-.code-map__path-trace-step:hover {
+.code-map__path-trace-step:hover:not(:disabled) {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.code-map__path-trace-step:disabled {
+  color: var(--text-mute);
+  cursor: default;
 }
 
 .code-map__path-trace-step:focus-visible {
@@ -2402,7 +2462,9 @@ code,
    own "absolute, z-index over canvas, non-blocking" convention, Code Map)
    but positioned top-center, the one corner not already claimed by those
    two (top-right/top-left) or by `.code-map__signal-toggle-panel`/
-   `<Controls>`'s own default (bottom-right/bottom-left). Stays mounted
+   `<Controls>`'s own default (bottom-right/bottom-left). On a map narrower
+   than 1040px it moves to the top-right corner and the history toolbar
+   drops below the search row (FIX-4's container queries). Stays mounted
    regardless of `fetchState`/the three PR-Review Actionable Notices below
    it (Boundaries & Constraints: "the base-ref input/trigger stays visible
    alongside the notice") — `z-index: 5` (same value the other two floated
@@ -2419,7 +2481,16 @@ code,
   flex-direction: column;
   align-items: center;
   gap: 0.5rem;
-  width: min(360px, calc(100vw - 1.5rem));
+  width: calc(min(360px, 100vw - 1.5rem) + 2 * var(--code-map-focus-gutter));
+  /* FIX-4: stops --code-map-bottom-clearance above the map's bottom edge
+     (clear of <Controls> and the signal-toggle panel) and scrolls past that;
+     the focus gutter keeps its children's focus rings inside the scroll box
+     (the padding is cancelled by the margin, so nothing moves; vertical
+     only here, since `translateX(-50%)` already centres the wider box). */
+  max-height: calc(100cqh - 0.75rem - var(--code-map-bottom-clearance) + 2 * var(--code-map-focus-gutter));
+  overflow-y: auto;
+  padding: var(--code-map-focus-gutter);
+  margin: calc(-1 * var(--code-map-focus-gutter)) 0;
 }
 
 .code-map__pr-review-toolbar {
@@ -2445,7 +2516,8 @@ code,
 }
 
 .code-map__pr-review-input:disabled {
-  opacity: 0.6;
+  border-style: dashed;
+  color: var(--text-mute);
 }
 
 .code-map__pr-review-toolbar button {
@@ -2464,7 +2536,8 @@ code,
 }
 
 .code-map__pr-review-toolbar button:disabled {
-  opacity: 0.4;
+  border-style: dashed;
+  color: var(--text-mute);
   cursor: default;
 }
 
@@ -2550,7 +2623,8 @@ code,
 }
 
 .code-map__blast-radius-stepper-controls button:disabled {
-  opacity: 0.4;
+  border-style: dashed;
+  color: var(--text-mute);
   cursor: default;
 }
 
@@ -2564,6 +2638,85 @@ code,
   text-align: center;
   color: var(--text-mute);
   font-size: 11px;
+}
+
+/* FIX-4: the three top toolbars never overlap. Measured against the map
+   (`.code-map`'s `size` container), not the viewport: the map is what
+   narrows as the window zooms (a 1100px window at 200% is a 550px map).
+   Above each breakpoint nothing changes.
+
+   - Code Map Mode: Path Trace (320px, top-left) and history (~155px,
+     top-right) share one line down to ~500px in a headless render; the live
+     run saw them collide at 550px, so the history toolbar drops below 600px.
+     600 keeps the next zoom step (629px, 175%) on one line.
+   - PR Review Mode: the centred 360px PR Review block clears the 320px Path
+     Trace block only from 12 + 320 + 8 + 180 = 520px of half-width, so at
+     1040px. Below that, PR Review moves to the top-right corner, the two
+     blocks split the width (never past their own 320/360px), and the
+     history toolbar drops.
+
+   "Drops" means: directly below the search row, left-aligned in the Path
+   Trace column. The search row and the history buttons are pinned to
+   `--code-map-toolbar-row`, and the search row reserves a band of that
+   height under itself (its `margin-bottom`), so the Path Trace results
+   start after the history toolbar instead of under it, and neither shares
+   a column with PR Review. The history toolbar comes after the Path Trace
+   block in the DOM, so Tab order (search, results, history) matches.
+
+   At every width, each column (see their own rules) also stops
+   `--code-map-bottom-clearance` above the map's bottom edge and scrolls past
+   that, so a long result or notice never runs under `<Controls>`, the
+   signal-toggle panel or the refresh-error notice on a narrow or short map.
+   The Path Trace steps panel, a scroll box of its own, shrinks first; the
+   column scrolls only if what is left still does not fit. */
+@container code-map (width < 600px) {
+  .code-map:has(> .code-map__path-trace) > .code-map__history-toolbar {
+    top: calc(0.75rem + var(--code-map-toolbar-row) + 0.5rem);
+    right: auto;
+    left: 0.75rem;
+  }
+
+  .code-map:has(> .code-map__path-trace) > .code-map__history-toolbar button,
+  .code-map:has(> .code-map__history-toolbar) > .code-map__path-trace :is(.code-map__path-trace-field, .code-map__path-trace-toolbar button) {
+    box-sizing: border-box;
+    height: var(--code-map-toolbar-row);
+    line-height: var(--code-map-toolbar-line);
+  }
+
+  .code-map:has(> .code-map__history-toolbar) > .code-map__path-trace > .code-map__path-trace-toolbar {
+    margin-bottom: calc(var(--code-map-toolbar-row) + 0.5rem);
+  }
+
+}
+
+@container code-map (width < 1040px) {
+  .code-map:has(> .code-map__pr-review):has(> .code-map__path-trace) > .code-map__history-toolbar {
+    top: calc(0.75rem + var(--code-map-toolbar-row) + 0.5rem);
+    right: auto;
+    left: 0.75rem;
+  }
+
+  .code-map:has(> .code-map__pr-review):has(> .code-map__path-trace) > .code-map__history-toolbar button,
+  .code-map:has(> .code-map__pr-review):has(> .code-map__history-toolbar) > .code-map__path-trace :is(.code-map__path-trace-field, .code-map__path-trace-toolbar button) {
+    box-sizing: border-box;
+    height: var(--code-map-toolbar-row);
+    line-height: var(--code-map-toolbar-line);
+  }
+
+  .code-map:has(> .code-map__pr-review):has(> .code-map__history-toolbar) > .code-map__path-trace > .code-map__path-trace-toolbar {
+    margin-bottom: calc(var(--code-map-toolbar-row) + 0.5rem);
+  }
+
+  .code-map:has(> .code-map__pr-review) > .code-map__path-trace {
+    width: calc(min(320px, (100cqw - 2rem) / 2) + 2 * var(--code-map-focus-gutter));
+  }
+
+  .code-map:has(> .code-map__path-trace) > .code-map__pr-review {
+    left: auto;
+    right: calc(0.75rem - var(--code-map-focus-gutter));
+    transform: none;
+    width: calc(min(360px, (100cqw - 2rem) / 2) + 2 * var(--code-map-focus-gutter));
+  }
 }
 
 /* Story 3.2 (Phase 2): PR Review Mode's combined blast-radius highlight —
@@ -3113,14 +3266,35 @@ code,
 }
 
 /* P0-3: a failed map refresh — the last completed map stays mounted beneath
-   this notice (CodeMap.tsx `refreshError`). Bottom-centred so it clears both
-   the top-left Path Trace and top-right history toolbars. */
+   this notice (CodeMap.tsx `refreshError`). Bottom-centred in a 40rem lane,
+   below the top toolbars, whose columns stop `--code-map-bottom-clearance`
+   above the bottom edge to leave it room. FIX-4: it shares the bottom edge
+   with React Flow's `<Controls>` (bottom-left) and the signal-toggle panel
+   (bottom-right), so the lane never reaches into either corner: on a map
+   narrower than 40rem plus both clearances it shrinks to the space between
+   them. The notice keeps its own fit-content width, centred in the lane;
+   the lane itself lets clicks through to the canvas. */
 .code-map__refresh-error {
   position: absolute;
   bottom: 1rem;
-  left: 50%;
-  transform: translateX(-50%);
+  left: max(50% - 20rem, var(--code-map-controls-clearance));
+  right: max(50% - 20rem, var(--code-map-corner-clearance));
   z-index: 5;
-  max-width: min(40rem, calc(100% - 2rem));
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.code-map__refresh-error > * {
+  pointer-events: auto;
+}
+
+/* FIX-4: its Retry floats over the canvas, so disabled keeps the notice's
+   opaque background showing through instead of the shared notice's
+   `opacity` fade (reset here, scoped to this one notice). */
+.code-map__refresh-error .actionable-notice__action button:disabled {
+  opacity: 1;
+  border-style: dashed;
+  color: var(--text-mute);
 }
 

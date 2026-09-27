@@ -6268,7 +6268,9 @@ export function CodeMap({
           every other corner is already claimed (`.code-map__history-
           toolbar` top-right, `.code-map__path-trace` top-left,
           `.code-map__signal-toggle-panel` bottom-right via `@xyflow/react`'s
-          own `Panel`, `<Controls>`'s default bottom-left) — and rendered as
+          own `Panel`, `<Controls>`'s default bottom-left). FIX-4: on a map
+          narrower than 1040px it moves top-right and the history toolbar
+          drops below the search row (styles.css container queries) — and rendered as
           a plain absolutely-positioned sibling here, not inside `<ReactFlow>`
           via its own `Panel` the way the signal toggles are: a `Panel` only
           exists while `<ReactFlow>` itself is mounted, which the fetch-error
@@ -6653,31 +6655,6 @@ export function CodeMap({
         </ReactFlow>
       )}
 
-      {/* P0-2b: also gated off Health Audit Mode — this floats over the
-          canvas, and there is no canvas there to traverse. */}
-      {surfaces.canvas && (
-        // Story 1.4 Code Map: "New lightweight Back/Forward toolbar ...
-        // disabled at either end of history" — renderer-local chrome over
-        // the ephemeral `history` state, never persisted/IPC'd (AD-2
-        // restated). Gated on `surfaces.canvas`, the same flag as the
-        // `<ReactFlow>` it floats over, so Back/Forward never renders
-        // without a map underneath to traverse. A PR Review diff-scope
-        // notice does not gate it: that notice sits above the map.
-        <div className="code-map__history-toolbar" role="toolbar" aria-label="Map traversal history">
-          <button type="button" onClick={goBack} disabled={history.index <= 0} aria-label="Back">
-            ← Back
-          </button>
-          <button
-            type="button"
-            onClick={goForward}
-            disabled={history.index >= history.stack.length - 1}
-            aria-label="Forward"
-          >
-            Forward →
-          </button>
-        </div>
-      )}
-
       {/* P0-2b: `pathTraceInput`, NOT `canvas` — search stays reachable in
           Health Audit Mode too; submitting there switches to Code Map Mode so
           the route lands on a canvas (`resolvePathTraceSubmit`). The RESULT
@@ -6687,10 +6664,14 @@ export function CodeMap({
         // Story 1.9 (Phase 2): the always-reachable Path Trace search
         // affordance — persistent/non-modal, mirroring the history
         // toolbar's own `role="toolbar"`/absolute-over-canvas pattern just
-        // above (Boundaries & Constraints: "never a `role="dialog"`
+        // below (Boundaries & Constraints: "never a `role="dialog"`
         // overlay ... must stay usable while the map is still interacted
         // with"). Positioned opposite the history toolbar (top-left vs.
-        // top-right) so the two never overlap. A PR Review diff-scope notice
+        // top-right); on a narrow map (FIX-4, styles.css container queries)
+        // the history toolbar drops below this search row instead, so the
+        // two never overlap — which is why the history toolbar follows this
+        // block in the DOM: Tab order then matches that narrow visual order
+        // (search, results, history). A PR Review diff-scope notice
         // does not gate it — search stays reachable in exactly those
         // states.
         <div className="code-map__path-trace">
@@ -6844,6 +6825,34 @@ export function CodeMap({
             )}
             </>
           )}
+        </div>
+      )}
+
+      {/* P0-2b: also gated off Health Audit Mode — this floats over the
+          canvas, and there is no canvas there to traverse. */}
+      {surfaces.canvas && (
+        // Story 1.4 Code Map: "New lightweight Back/Forward toolbar ...
+        // disabled at either end of history" — renderer-local chrome over
+        // the ephemeral `history` state, never persisted/IPC'd (AD-2
+        // restated). Gated on `surfaces.canvas`, the same flag as the
+        // `<ReactFlow>` it floats over, so Back/Forward never renders
+        // without a map underneath to traverse. A PR Review diff-scope
+        // notice does not gate it: that notice sits above the map. FIX-4:
+        // rendered after the Path Trace block so Tab order follows the
+        // narrow-map layout, where this drops below the search row; its
+        // wide-map placement (top-right) is absolute, so order doesn't move it.
+        <div className="code-map__history-toolbar" role="toolbar" aria-label="Map traversal history">
+          <button type="button" onClick={goBack} disabled={history.index <= 0} aria-label="Back">
+            ← Back
+          </button>
+          <button
+            type="button"
+            onClick={goForward}
+            disabled={history.index >= history.stack.length - 1}
+            aria-label="Forward"
+          >
+            Forward →
+          </button>
         </div>
       )}
 

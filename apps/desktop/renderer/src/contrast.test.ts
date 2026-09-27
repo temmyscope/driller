@@ -35,13 +35,15 @@ const STYLES = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.ur
 
 // ---------------------------------------------------------------------------
 // A small CSS reader: enough for this one stylesheet (no nested rules beyond
-// `@media`/`@supports`, no braces inside values).
+// `@media`/`@supports`/`@container`, no braces inside values).
 // ---------------------------------------------------------------------------
 
 interface CssRule {
   /** Top-level comma-separated selectors, whitespace-normalised. */
   selectors: string[];
   declarations: Array<[property: string, value: string]>;
+  /** Enclosing at-rule preludes, outermost first (`[]` at top level). */
+  atRules: string[];
 }
 
 function matchingBrace(text: string, open: number): number {
@@ -89,17 +91,21 @@ function parseDeclarations(body: string): Array<[string, string]> {
 function parseRules(css: string): CssRule[] {
   const text = css.replace(/\/\*[\s\S]*?\*\//g, '');
   const rules: CssRule[] = [];
-  const walk = (start: number, end: number): void => {
+  const walk = (start: number, end: number, atRules: string[]): void => {
     let preludeStart = start;
     let i = start;
     while (i < end) {
       if (text[i] === '{') {
         const prelude = text.slice(preludeStart, i).trim();
         const close = matchingBrace(text, i);
-        if (prelude.startsWith('@media') || prelude.startsWith('@supports')) {
-          walk(i + 1, close);
+        if (prelude.startsWith('@media') || prelude.startsWith('@supports') || prelude.startsWith('@container')) {
+          walk(i + 1, close, [...atRules, prelude.replace(/\s+/g, ' ')]);
         } else if (!prelude.startsWith('@')) {
-          rules.push({ selectors: splitTopLevel(prelude), declarations: parseDeclarations(text.slice(i + 1, close)) });
+          rules.push({
+            selectors: splitTopLevel(prelude),
+            declarations: parseDeclarations(text.slice(i + 1, close)),
+            atRules,
+          });
         }
         i = close + 1;
         preludeStart = i;
@@ -109,7 +115,7 @@ function parseRules(css: string): CssRule[] {
       }
     }
   };
-  walk(0, text.length);
+  walk(0, text.length, []);
   return rules;
 }
 
@@ -300,5 +306,133 @@ describe('styles.css reverse sweep', () => {
         .map(([property, value]) => `${rule.selectors.join(', ')} { ${property}: ${value} }`);
     });
     assert.deepEqual(offenders, []);
+  });
+});
+
+// FIX-4: controls floated over the canvas. An `opacity` fade on one of them
+// fades its opaque background too, so dense Node cards show through the
+// label; disabled dims only the text (and, where there is one, the edge).
+// Every `:disabled`/`[aria-disabled]` rule whose selector names one of these
+// is scanned, wherever it sits (including inside `@container`).
+const FLOATED_CONTROL =
+  /\.code-map__(history-toolbar|path-trace|pr-review|blast-radius-stepper|refresh-error|action--service-unavailable)/;
+const FLOATED_BUTTONS = [
+  '.code-map__history-toolbar button',
+  '.code-map__path-trace-toolbar button',
+  '.code-map__pr-review-toolbar button',
+  '.code-map__blast-radius-stepper-controls button',
+  '.code-map__refresh-error .actionable-notice__action button',
+];
+/** A background that lets what is under it show through. */
+const SEE_THROUGH =
+  /transparent|rgba\(|hsla\(|\/\s*[\d.]+%?\s*\)|#([0-9a-fA-F]{4}|[0-9a-fA-F]{8})\b|color-mix\([^)]*transparent|^none$/;
+
+/** The merged declarations of every rule with exactly `selector` among its selectors. */
+function declarationsFor(selector: string): Map<string, string> {
+  const matching = RULES.filter((rule) => rule.selectors.includes(selector));
+  assert.ok(matching.length > 0, `styles.css has a \`${selector}\` rule`);
+  return new Map(matching.flatMap((rule) => rule.declarations));
+}
+
+describe('styles.css floated-control disabled state (FIX-4)', () => {
+  it('no disabled rule for a control floated over the canvas fades or sees through', () => {
+    const offenders = RULES.flatMap((rule) =>
+      rule.selectors
+        .filter((part) => FLOATED_CONTROL.test(part) && DISABLED_STATE.test(part.replace(/:not\([^)]*\)/g, '')))
+        .flatMap((part) =>
+          rule.declarations
+            .filter(
+              ([property, value]) =>
+                (property === 'opacity' && value !== '1') ||
+                (property === 'filter' && /opacity\(/.test(value)) ||
+                (/^background(-color)?$/.test(property) && SEE_THROUGH.test(value)),
+            )
+            .map(([property, value]) => `${[...rule.atRules, part].join(' ')} { ${property}: ${value} }`),
+        ),
+    );
+    assert.deepEqual(offenders, []);
+  });
+
+  it('the scan sees every floated disabled rule, including the refresh-error Retry', () => {
+    const scanned = RULES.flatMap((rule) =>
+      rule.selectors.filter((part) => FLOATED_CONTROL.test(part) && DISABLED_STATE.test(part.replace(/:not\([^)]*\)/g, ''))),
+    );
+    for (const expected of [
+      '.code-map__history-toolbar button:disabled',
+      '.code-map__path-trace-toolbar button:disabled',
+      '.code-map__path-trace-step:disabled',
+      '.code-map__path-trace-input:disabled',
+      '.code-map__pr-review-input:disabled',
+      '.code-map__pr-review-toolbar button:disabled',
+      '.code-map__blast-radius-stepper-controls button:disabled',
+      '.code-map__refresh-error .actionable-notice__action button:disabled',
+      '.code-map__action--service-unavailable:disabled',
+    ]) {
+      assert.ok(scanned.includes(expected), `scanned: ${expected}`);
+    }
+  });
+
+  for (const selector of FLOATED_BUTTONS) {
+    it(`\`${selector}:disabled\` keeps its background and dims text and edge`, () => {
+      const declarations = declarationsFor(`${selector}:disabled`);
+      assert.equal(declarations.get('color'), 'var(--text-mute)');
+      assert.equal(declarations.get('border-style'), 'dashed');
+      assert.ok(!declarations.has('background') && !declarations.has('background-color'), 'background left as is');
+    });
+  }
+
+  it('the refresh-error Retry resets the shared notice button\'s disabled opacity', () => {
+    const shared = declarationsFor('.actionable-notice__action button:disabled');
+    if (shared.has('opacity') && shared.get('opacity') !== '1') {
+      assert.equal(declarationsFor('.code-map__refresh-error .actionable-notice__action button:disabled').get('opacity'), '1');
+    }
+  });
+
+  it('the disabled Path Trace field and PR Review input keep their opaque background and dim text and edge', () => {
+    assert.equal(declarationsFor('.code-map__path-trace-field').get('background'), 'var(--panel-alt)');
+    assert.equal(declarationsFor('.code-map__pr-review-input').get('background'), 'var(--panel-alt)');
+    assert.equal(
+      declarationsFor('.code-map__path-trace-field:has(.code-map__path-trace-input:disabled)').get('border-style'),
+      'dashed',
+    );
+    assert.equal(declarationsFor('.code-map__path-trace-input:disabled').get('color'), 'var(--text-mute)');
+    const input = declarationsFor('.code-map__pr-review-input:disabled');
+    assert.equal(input.get('border-style'), 'dashed');
+    assert.equal(input.get('color'), 'var(--text-mute)');
+  });
+
+  it('ambiguous-candidate rows mute when disabled and only highlight on hover while enabled', () => {
+    const disabled = declarationsFor('.code-map__path-trace-step:disabled');
+    assert.equal(disabled.get('color'), 'var(--text-mute)');
+    assert.equal(disabled.get('cursor'), 'default');
+    assert.ok(declarationsFor('.code-map__path-trace-step:hover:not(:disabled)').has('background'));
+    assert.ok(
+      !RULES.some((rule) => rule.selectors.includes('.code-map__path-trace-step:hover')),
+      'no hover rule that also fires while disabled',
+    );
+  });
+
+  it('--text-mute is at least 4.5:1 on every --panel-alt definition', () => {
+    for (const text of hexDefinitionsOf('--text-mute')) {
+      for (const surface of hexDefinitionsOf('--panel-alt')) {
+        const ratio = contrastRatio(text, surface);
+        assert.ok(ratio >= 4.5, `--text-mute ${text} on --panel-alt ${surface} is ${ratio.toFixed(2)}:1`);
+      }
+    }
+  });
+});
+
+describe('styles.css floated-toolbar collision layout (FIX-4)', () => {
+  it('`.code-map` is the `code-map` size container', () => {
+    const declarations = declarationsFor('.code-map');
+    assert.equal(declarations.get('container'), 'code-map / size');
+  });
+
+  it('both `@container code-map` breakpoints exist', () => {
+    const preludes = new Set(RULES.flatMap((rule) => rule.atRules).filter((prelude) => prelude.startsWith('@container')));
+    assert.deepEqual([...preludes].sort(), [
+      '@container code-map (width < 1040px)',
+      '@container code-map (width < 600px)',
+    ]);
   });
 });
