@@ -20,9 +20,26 @@ import type { CodeMapNode, DeterministicRiskSignal, RiskSignal } from '@driller/
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 
 import {
+  beginMetricsTableDrag,
   buildPrReviewMetricRows,
+  canvasResizeEffect,
+  clampMetricsTableHeight,
   CODE_MAP_CANVAS_HEIGHT,
   CodeMapCanvasFrame,
+  codeMapTableHeightStyle,
+  endMetricsTableDrag,
+  METRICS_TABLE_DEFAULT_HEIGHT,
+  METRICS_TABLE_DRAGGING_ATTRIBUTE,
+  METRICS_TABLE_KEY_STEP,
+  METRICS_TABLE_MIN_HEIGHT,
+  metricsTableDragHeight,
+  metricsTableHeightBounds,
+  metricsTableHeightFor,
+  metricsTableKeyStep,
+  metricsTableValueText,
+  MetricsTableDivider,
+  type MetricsTableDividerPointerEvent,
+  moveMetricsTableDrag,
   prReviewMetricsTableFor,
   type CodeMapMode,
   type DiffScopeState,
@@ -402,5 +419,332 @@ describe('CodeMapCanvasFrame', () => {
     assert.deepEqual(frame.props.style, { height: CODE_MAP_CANVAS_HEIGHT });
     assert.equal(CODE_MAP_CANVAS_HEIGHT, 'calc(100% - var(--code-map-table-height))');
     assert.equal(frame.props.children, child);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-3b: the resizable divider
+// ---------------------------------------------------------------------------
+
+describe('clampMetricsTableHeight', () => {
+  it('holds a height between the min and 60% of the map', () => {
+    assert.equal(METRICS_TABLE_MIN_HEIGHT, 96);
+    assert.equal(clampMetricsTableHeight(200, 1000), 200);
+    assert.equal(clampMetricsTableHeight(10, 1000), METRICS_TABLE_MIN_HEIGHT);
+    assert.equal(clampMetricsTableHeight(900, 1000), 600);
+    assert.equal(clampMetricsTableHeight(601, 1000), 600);
+    assert.deepEqual(metricsTableHeightBounds(1000), { min: 96, max: 600 });
+  });
+
+  it('a tiny map: the table stays at the min, never more than the map', () => {
+    // 120 * 0.6 = 72 < 96: the min wins over the 60% cap.
+    assert.deepEqual(metricsTableHeightBounds(120), { min: 96, max: 96 });
+    assert.equal(clampMetricsTableHeight(10, 120), 96);
+    assert.equal(clampMetricsTableHeight(500, 120), 96);
+    // Shorter than the min itself: the table takes the map, the canvas 0 — never negative.
+    assert.equal(clampMetricsTableHeight(500, 50), 50);
+    assert.equal(clampMetricsTableHeight(500, 0), 0);
+    assert.equal(clampMetricsTableHeight(Number.NaN, 1000), 96);
+  });
+
+  it('defaults to 35% of the map, and re-clamps the last height when the map shrinks', () => {
+    assert.equal(METRICS_TABLE_DEFAULT_HEIGHT, 0.35);
+    assert.equal(metricsTableHeightFor(null, 1000), 350);
+    assert.equal(metricsTableHeightFor(null, 200), 96);
+    assert.equal(metricsTableHeightFor(500, 1000), 500);
+    assert.equal(metricsTableHeightFor(500, 600), 360);
+  });
+
+  it('a drag up grows the table, down shrinks it, within the bounds', () => {
+    assert.equal(metricsTableDragHeight(300, 500, 400, 1000), 400);
+    assert.equal(metricsTableDragHeight(300, 500, 600, 1000), 200);
+    assert.equal(metricsTableDragHeight(300, 500, -1000, 1000), 600);
+    assert.equal(metricsTableDragHeight(300, 500, 2000, 1000), 96);
+  });
+});
+
+describe('metricsTableKeyStep', () => {
+  it('ArrowUp grows and ArrowDown shrinks by 24px', () => {
+    assert.equal(METRICS_TABLE_KEY_STEP, 24);
+    assert.equal(metricsTableKeyStep('ArrowUp', 300, 1000), 324);
+    assert.equal(metricsTableKeyStep('ArrowDown', 300, 1000), 276);
+  });
+
+  it('PageUp/PageDown step 25% of the map', () => {
+    assert.equal(metricsTableKeyStep('PageUp', 300, 1000), 550);
+    assert.equal(metricsTableKeyStep('PageDown', 350, 1000), 100);
+  });
+
+  it('Home/End jump to the min and max', () => {
+    assert.equal(metricsTableKeyStep('Home', 300, 1000), 96);
+    assert.equal(metricsTableKeyStep('End', 300, 1000), 600);
+  });
+
+  it('steps stay within the bounds: ArrowDown at min stays at min', () => {
+    assert.equal(metricsTableKeyStep('ArrowDown', 96, 1000), 96);
+    assert.equal(metricsTableKeyStep('ArrowUp', 590, 1000), 600);
+    assert.equal(metricsTableKeyStep('PageDown', 150, 1000), 96);
+  });
+
+  it('an unknown key is not handled', () => {
+    for (const key of ['Tab', 'Enter', ' ', 'ArrowLeft', 'a']) {
+      assert.equal(metricsTableKeyStep(key, 300, 1000), null, key);
+    }
+  });
+});
+
+describe('codeMapTableHeightStyle', () => {
+  it('writes the height as the CSS variable only with the table and a measured map', () => {
+    assert.deepEqual(codeMapTableHeightStyle(true, 350, 1000), { '--code-map-table-height': '350px' });
+    assert.equal(codeMapTableHeightStyle(false, 350, 1000), undefined);
+    assert.equal(codeMapTableHeightStyle(true, 0, 0), undefined);
+  });
+});
+
+describe('MetricsTableDivider', () => {
+  const renderDivider = (height: number, mapHeight: number, onResize: (h: number) => void = () => {}) =>
+    renderTree(MetricsTableDivider({ height, mapHeight, onResize }))[0]!;
+
+  it('is a focusable horizontal separator carrying the table height and its bounds', () => {
+    const divider = renderDivider(350, 1000);
+    assert.equal(divider.type, 'div');
+    assert.equal(divider.props.role, 'separator');
+    assert.equal(divider.props.tabIndex, 0);
+    assert.equal(divider.props['aria-orientation'], 'horizontal');
+    assert.equal(divider.props['aria-label'], 'Resize metrics table');
+    assert.equal(divider.props['aria-valuenow'], 350);
+    assert.equal(divider.props['aria-valuemin'], 96);
+    assert.equal(divider.props['aria-valuemax'], 600);
+    assert.equal(divider.props.className, 'code-map__metrics-divider');
+    assert.equal(divider.props['aria-valuetext'], '350 px, 35% of map');
+    assert.equal(metricsTableValueText(96, 0), '96 px');
+  });
+
+  const key = (divider: RenderedElement, name: string) => {
+    let prevented = false;
+    (divider.props.onKeyDown as (e: unknown) => void)({
+      key: name,
+      preventDefault: () => {
+        prevented = true;
+      },
+    });
+    return prevented;
+  };
+
+  it('a key step commits the new height and never scrolls the page', () => {
+    const resized: number[] = [];
+    const divider = renderDivider(300, 1000, (h) => resized.push(h));
+    assert.equal(key(divider, 'ArrowUp'), true);
+    assert.equal(key(divider, 'End'), true);
+    assert.deepEqual(resized, [324, 600]);
+  });
+
+  it('ArrowDown at min: prevented, but no resize', () => {
+    const resized: number[] = [];
+    assert.equal(key(renderDivider(96, 1000, (h) => resized.push(h)), 'ArrowDown'), true);
+    assert.deepEqual(resized, []);
+  });
+
+  it('an unknown key is left to the browser and resizes nothing', () => {
+    const resized: number[] = [];
+    assert.equal(key(renderDivider(300, 1000, (h) => resized.push(h)), 'Tab'), false);
+    assert.deepEqual(resized, []);
+  });
+});
+
+describe('the divider drag', () => {
+  const fakeDivider = () => {
+    const writes: Array<[string, string]> = [];
+    const attributes: Record<string, string> = {};
+    const captured = new Set<number>();
+    const parentAttributes = new Set<string>();
+    const target = {
+      parentElement: {
+        style: { setProperty: (name: string, value: string) => writes.push([name, value]) },
+        setAttribute: (name: string) => parentAttributes.add(name),
+        removeAttribute: (name: string) => parentAttributes.delete(name),
+      },
+      setAttribute: (name: string, value: string) => {
+        attributes[name] = value;
+      },
+      setPointerCapture: (id: number) => captured.add(id),
+      hasPointerCapture: (id: number) => captured.has(id),
+      releasePointerCapture: (id: number) => captured.delete(id),
+    };
+    const event = (clientY: number, overrides: Partial<MetricsTableDividerPointerEvent> = {}): MetricsTableDividerPointerEvent => ({
+      pointerId: 1,
+      button: 0,
+      clientY,
+      preventDefault: () => {},
+      currentTarget: target,
+      ...overrides,
+    });
+    return { writes, attributes, captured, parentAttributes, event };
+  };
+
+  it('captures the pointer, writes only the CSS variable while moving, and commits once on release', () => {
+    const d = fakeDivider();
+    const resized: number[] = [];
+    beginMetricsTableDrag(d.event(500), 300);
+    assert.ok(d.captured.has(1));
+    assert.ok(d.parentAttributes.has(METRICS_TABLE_DRAGGING_ATTRIBUTE));
+    moveMetricsTableDrag(d.event(450), 1000);
+    moveMetricsTableDrag(d.event(-5000), 1000);
+    assert.deepEqual(d.writes, [
+      ['--code-map-table-height', '350px'],
+      ['--code-map-table-height', '600px'],
+    ]);
+    assert.equal(d.attributes['aria-valuenow'], '600');
+    assert.equal(d.attributes['aria-valuetext'], '600 px, 60% of map');
+    assert.equal(resized.length, 0);
+    endMetricsTableDrag(d.event(-5000), (h) => resized.push(h));
+    assert.deepEqual(resized, [600]);
+    assert.equal(d.captured.size, 0);
+    assert.equal(d.parentAttributes.size, 0);
+    // The lostpointercapture after pointerup finds no drag.
+    endMetricsTableDrag(d.event(-5000), (h) => resized.push(h));
+    moveMetricsTableDrag(d.event(0), 1000);
+    assert.deepEqual(resized, [600]);
+    assert.equal(d.writes.length, 2);
+  });
+
+  it('a lost capture (release outside the window) ends the drag', () => {
+    const d = fakeDivider();
+    const resized: number[] = [];
+    beginMetricsTableDrag(d.event(500), 300);
+    moveMetricsTableDrag(d.event(600), 1000);
+    d.captured.clear();
+    endMetricsTableDrag(d.event(600), (h) => resized.push(h));
+    assert.deepEqual(resized, [200]);
+  });
+
+  it('a click without movement, or a drag back to the start, commits nothing', () => {
+    const d = fakeDivider();
+    const resized: number[] = [];
+    beginMetricsTableDrag(d.event(500), 350);
+    endMetricsTableDrag(d.event(500), (h) => resized.push(h));
+    beginMetricsTableDrag(d.event(500), 350);
+    moveMetricsTableDrag(d.event(400), 1000);
+    moveMetricsTableDrag(d.event(500), 1000);
+    endMetricsTableDrag(d.event(500), (h) => resized.push(h));
+    assert.equal(resized.length, 0);
+    assert.equal(d.parentAttributes.size, 0);
+  });
+
+  it('a move or release from another pointer is ignored', () => {
+    const d = fakeDivider();
+    const resized: number[] = [];
+    beginMetricsTableDrag(d.event(500), 300);
+    moveMetricsTableDrag(d.event(400, { pointerId: 2 }), 1000);
+    assert.deepEqual(d.writes, []);
+    endMetricsTableDrag(d.event(400, { pointerId: 2 }), (h) => resized.push(h));
+    assert.equal(resized.length, 0);
+    assert.ok(d.captured.has(1));
+    assert.ok(d.parentAttributes.has(METRICS_TABLE_DRAGGING_ATTRIBUTE));
+    moveMetricsTableDrag(d.event(400), 1000);
+    endMetricsTableDrag(d.event(400), (h) => resized.push(h));
+    assert.deepEqual(resized, [400]);
+  });
+
+  it("the divider's pointer props: cancel and lost capture both end and commit", () => {
+    for (const prop of ['onPointerUp', 'onPointerCancel', 'onLostPointerCapture']) {
+      const d = fakeDivider();
+      const resized: number[] = [];
+      const divider = renderTree(MetricsTableDivider({ height: 300, mapHeight: 1000, onResize: (h) => resized.push(h) }))[0]!;
+      const call = (name: string, e: MetricsTableDividerPointerEvent) => (divider.props[name] as (e: unknown) => void)(e);
+      call('onPointerDown', d.event(500));
+      call('onPointerMove', d.event(450));
+      call(prop, d.event(450));
+      assert.deepEqual(resized, [350], prop);
+      assert.equal(d.parentAttributes.size, 0, prop);
+    }
+  });
+
+  it('ignores a non-primary button', () => {
+    const d = fakeDivider();
+    beginMetricsTableDrag(d.event(500, { button: 2 }), 300);
+    moveMetricsTableDrag(d.event(400), 1000);
+    assert.equal(d.captured.size, 0);
+    assert.deepEqual(d.writes, []);
+  });
+});
+
+describe('styles.css: the divider', () => {
+  const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+  const block = (selector: string) => {
+    const start = css.indexOf(`\n${selector} {`);
+    assert.ok(start >= 0, selector);
+    return css.slice(start, css.indexOf('\n}', start));
+  };
+
+  it('a 1px border rule inside the table band, border-strong on hover, focus ring, row-resize, flat', () => {
+    const divider = block('.code-map__metrics-divider');
+    assert.match(divider, /bottom: calc\(var\(--code-map-table-height\) - 6px\);/);
+    assert.match(divider, /height: 6px;/);
+    assert.match(divider, /border-top: 1px solid var\(--border\);/);
+    assert.match(divider, /cursor: row-resize;/);
+    assert.doesNotMatch(divider, /shadow/);
+    assert.match(block('.code-map__metrics-divider:hover'), /border-top-color: var\(--border-strong\);/);
+    assert.match(block('.code-map__metrics-divider:focus-visible'), /outline: 2px solid var\(--accent\);/);
+  });
+});
+
+describe('canvasResizeEffect: a divider drag defers the canvas size', () => {
+  const a = { width: 800, height: 400 };
+  const b = { width: 800, height: 300 };
+  it('commits a changed size when no drag is on, defers it mid-drag, ignores an unchanged one', () => {
+    assert.equal(canvasResizeEffect(false, a, b), 'commit');
+    assert.equal(canvasResizeEffect(true, a, b), 'defer');
+    assert.equal(canvasResizeEffect(true, a, { ...a }), 'none');
+    assert.equal(canvasResizeEffect(false, a, { ...a }), 'none');
+  });
+});
+
+describe('styles.css: short maps and drags', () => {
+  const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+  it('the floated columns keep a floor under a tall table band', () => {
+    assert.match(css, /--code-map-column-min-height: 6rem;/);
+    for (const selector of ['.code-map__path-trace', '.code-map__pr-review']) {
+      const start = css.indexOf(`\n${selector} {`);
+      assert.ok(start >= 0, selector);
+      const rule = css.slice(start, css.indexOf('\n}', start));
+      assert.match(rule, /max-height: max\(\s*var\(--code-map-column-min-height\),\s*calc\(100cqh - 0\.75rem - var\(--code-map-bottom-clearance\)/, selector);
+    }
+  });
+  it('no text selection on the map while dragging', () => {
+    assert.match(css, /\n\.code-map\[data-metrics-table-dragging\] \{\s*user-select: none;/);
+    assert.equal(METRICS_TABLE_DRAGGING_ATTRIBUTE, 'data-metrics-table-dragging');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wiring inside the hooked `CodeMap` — pinned on its source text, as it
+// can't be rendered without a DOM.
+// ---------------------------------------------------------------------------
+
+describe('CodeMap source: the divider wiring', () => {
+  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
+  it('the divider renders only with the table, directly before it', () => {
+    assert.equal(src.split('<MetricsTableDivider').length - 1, 1);
+    assert.match(
+      src,
+      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable \{\.\.\.prReviewMetricsTableProps\} \/>\s*<\/>\s*\)\}/,
+    );
+  });
+  it('.code-map carries the height style and the measured ref', () => {
+    assert.match(
+      src,
+      /className="code-map"\s+id=\{MODAL_FOCUS_FALLBACK_ID\}\s+tabIndex=\{-1\}\s+ref=\{setMapElement\}\s+style=\{codeMapTableHeightStyle\(prReviewMetricsTableProps !== null, metricsTableHeight, mapHeight\)\}/,
+    );
+  });
+  it('onResize sets the requested height and flushes the deferred canvas size', () => {
+    assert.match(src, /<MetricsTableDivider\s+height=\{metricsTableHeight\}\s+mapHeight=\{mapHeight\}\s+onResize=\{handleMetricsTableResize\}/);
+    assert.match(src, /\(height: number\) => \{\s*setRequestedMetricsTableHeight\(height\);\s*flushCanvasSize\(\);\s*\}/);
+  });
+  it('the canvas observer defers while the dragging attribute is on .code-map', () => {
+    assert.match(
+      src,
+      /el\.parentElement\?\.hasAttribute\(METRICS_TABLE_DRAGGING_ATTRIBUTE\)[\s\S]{0,40}\n\s*if \(canvasResizeEffect\(dragging, committedContainerSizeRef\.current, next\) === 'commit'\)/,
+    );
   });
 });

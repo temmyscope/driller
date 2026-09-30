@@ -1039,6 +1039,9 @@ code,
      bottom clearance above and `.code-map__refresh-error`'s `bottom` add it,
      so nothing floats over the table. */
   --code-map-table-height: 0px;
+  /* P4-3b review: the floated columns' smallest max-height — room for a
+     toolbar row and a line under it, whatever the table band takes. */
+  --code-map-column-min-height: 6rem;
   /* FIX-4: the bottom corners the refresh-error notice keeps clear of:
      `<Controls>` (bottom-left: 15px panel margin, one 26px button column, a
      gap) and the signal-toggle panel (bottom-right: its two checkbox rows'
@@ -2110,7 +2113,13 @@ code,
      (clear of <Controls> and the signal-toggle panel) and scrolls past that;
      the focus gutter keeps its children's focus rings inside the scroll box
      (the padding is cancelled by the margin, so nothing moves). */
-  max-height: calc(100cqh - 0.75rem - var(--code-map-bottom-clearance) + 2 * var(--code-map-focus-gutter));
+  /* P4-3b review: floored at --code-map-column-min-height, so a 60% table
+     on a short map can't collapse the column's controls (the base-ref
+     input, the search row); the column may then overlap the table band. */
+  max-height: max(
+    var(--code-map-column-min-height),
+    calc(100cqh - 0.75rem - var(--code-map-bottom-clearance) + 2 * var(--code-map-focus-gutter))
+  );
   overflow-y: auto;
   padding: var(--code-map-focus-gutter);
   margin: calc(-1 * var(--code-map-focus-gutter));
@@ -2570,7 +2579,13 @@ code,
      the focus gutter keeps its children's focus rings inside the scroll box
      (the padding is cancelled by the margin, so nothing moves; vertical
      only here, since `translateX(-50%)` already centres the wider box). */
-  max-height: calc(100cqh - 0.75rem - var(--code-map-bottom-clearance) + 2 * var(--code-map-focus-gutter));
+  /* P4-3b review: floored at --code-map-column-min-height, so a 60% table
+     on a short map can't collapse the column's controls (the base-ref
+     input, the search row); the column may then overlap the table band. */
+  max-height: max(
+    var(--code-map-column-min-height),
+    calc(100cqh - 0.75rem - var(--code-map-bottom-clearance) + 2 * var(--code-map-focus-gutter))
+  );
   overflow-y: auto;
   padding: var(--code-map-focus-gutter);
   margin: calc(-1 * var(--code-map-focus-gutter)) 0;
@@ -3635,10 +3650,41 @@ code,
   box-sizing: border-box;
   overflow: auto;
   z-index: 5;
-  border-top: 1px solid var(--border-strong);
   background: var(--panel);
   color: var(--text);
   font-size: 11px;
+}
+
+/* P4-3b: the resizable divider between the canvas and the table
+   (`MetricsTableDivider`). It lies over the table's top 6px — its 1px
+   `{colors.border}` rule is the table's top edge, the rest is grab area over
+   the header's top padding — so it never covers the canvas. Flat: no grip,
+   no shadow (DESIGN.md Elevation & Depth). */
+.code-map__metrics-divider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--code-map-table-height) - 6px);
+  height: 6px;
+  box-sizing: border-box;
+  z-index: 6;
+  border-top: 1px solid var(--border);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+/* P4-3b review: no text selection across the map while the divider drags. */
+.code-map[data-metrics-table-dragging] {
+  user-select: none;
+}
+
+.code-map__metrics-divider:hover {
+  border-top-color: var(--border-strong);
+}
+
+.code-map__metrics-divider:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .code-map__metrics-table:focus-visible {

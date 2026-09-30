@@ -63,7 +63,7 @@
  * the shared `ActionableNotice` shape (P1-7).
  */
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from 'react';
 import {
   Background,
   Controls,
@@ -3497,6 +3497,258 @@ export function metricCellAccessibleName(signal: DeterministicRiskSignal): strin
   return `${formatCountNumber(signal.value)}${signal.severity === 'severe' ? ' (severe)' : ''}`;
 }
 
+/**
+ * P4-3b: the metrics table's smallest height — its sticky header plus two
+ * rows (11px text, 0.3–0.35rem vertical padding each).
+ */
+export const METRICS_TABLE_MIN_HEIGHT = 96;
+/** P4-3b: the table's default height, as a share of the map height, before any resize. */
+export const METRICS_TABLE_DEFAULT_HEIGHT = 0.35;
+/** P4-3b: the table's largest share of the map height; the canvas keeps the rest (FR-11). */
+export const METRICS_TABLE_MAX_SHARE = 0.6;
+/** P4-3b: ArrowUp/ArrowDown's step, in px. */
+export const METRICS_TABLE_KEY_STEP = 24;
+/** P4-3b: PageUp/PageDown's step, as a share of the map height. */
+export const METRICS_TABLE_PAGE_SHARE = 0.25;
+
+/**
+ * P4-3b: the table height's range for a map (`.code-map`) of `mapHeight`
+ * px — `METRICS_TABLE_MIN_HEIGHT` to 60% of the map. On a map too short for
+ * both, the max is the min; the min itself never passes the map, so the
+ * canvas's share is never negative.
+ */
+export function metricsTableHeightBounds(mapHeight: number): { min: number; max: number } {
+  const map = Number.isFinite(mapHeight) ? Math.max(0, mapHeight) : 0;
+  const min = Math.min(METRICS_TABLE_MIN_HEIGHT, map);
+  return { min, max: Math.max(min, Math.floor(map * METRICS_TABLE_MAX_SHARE)) };
+}
+
+/** P4-3b: `requested` held within `metricsTableHeightBounds(mapHeight)`, in whole px. */
+export function clampMetricsTableHeight(requested: number, mapHeight: number): number {
+  const { min, max } = metricsTableHeightBounds(mapHeight);
+  if (!Number.isFinite(requested)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, Math.round(requested)));
+}
+
+/**
+ * P4-3b: the height to show — the user's last height (`null` before any
+ * resize: `METRICS_TABLE_DEFAULT_HEIGHT` of the map), re-clamped against
+ * the current map, so a window resize re-clamps it on the next render.
+ */
+export function metricsTableHeightFor(requested: number | null, mapHeight: number): number {
+  return clampMetricsTableHeight(requested ?? mapHeight * METRICS_TABLE_DEFAULT_HEIGHT, mapHeight);
+}
+
+/**
+ * P4-3b: the divider's keyboard steps — the next height for `key`, or `null`
+ * for a key the divider doesn't handle (left to the browser: Tab, …).
+ * ArrowUp/PageUp grow the table (the divider moves up).
+ */
+export function metricsTableKeyStep(key: string, height: number, mapHeight: number): number | null {
+  const page = mapHeight * METRICS_TABLE_PAGE_SHARE;
+  switch (key) {
+    case 'ArrowUp':
+      return clampMetricsTableHeight(height + METRICS_TABLE_KEY_STEP, mapHeight);
+    case 'ArrowDown':
+      return clampMetricsTableHeight(height - METRICS_TABLE_KEY_STEP, mapHeight);
+    case 'PageUp':
+      return clampMetricsTableHeight(height + page, mapHeight);
+    case 'PageDown':
+      return clampMetricsTableHeight(height - page, mapHeight);
+    case 'Home':
+      return metricsTableHeightBounds(mapHeight).min;
+    case 'End':
+      return metricsTableHeightBounds(mapHeight).max;
+    default:
+      return null;
+  }
+}
+
+/** P4-3b: the height mid-drag — dragging up (smaller `clientY`) grows the table. */
+export function metricsTableDragHeight(startHeight: number, startY: number, clientY: number, mapHeight: number): number {
+  return clampMetricsTableHeight(startHeight + (startY - clientY), mapHeight);
+}
+
+/**
+ * P4-3b: `.code-map`'s inline style — the table height as
+ * `--code-map-table-height` while the table shows and the map is measured.
+ * Otherwise nothing: the stylesheet's `0px`, or its `min(13rem, 40cqh)`
+ * fallback until the first measurement.
+ */
+export function codeMapTableHeightStyle(tableShown: boolean, height: number, mapHeight: number): CSSProperties | undefined {
+  return tableShown && mapHeight > 0 ? ({ '--code-map-table-height': `${height}px` } as CSSProperties) : undefined;
+}
+
+/**
+ * P4-3b review: set on `.code-map` while the divider is dragged — the
+ * canvas ResizeObserver defers its React state until release, and the
+ * stylesheet turns off text selection.
+ */
+export const METRICS_TABLE_DRAGGING_ATTRIBUTE = 'data-metrics-table-dragging';
+
+/** P4-3b review: the divider's `aria-valuetext` — "350 px, 35% of map". */
+export function metricsTableValueText(height: number, mapHeight: number): string {
+  return mapHeight > 0 ? `${height} px, ${Math.round((height / mapHeight) * 100)}% of map` : `${height} px`;
+}
+
+/**
+ * P4-3b review: what a canvas size report does to React state.
+ * - `'none'`: the committed size (`containerSize`) already matches;
+ * - `'defer'`: a divider drag is on — only `containerSizeRef` takes it, so a
+ *   drag never re-renders `CodeMap` (nor re-runs `computeLOD`) per move;
+ * - `'commit'`: `setContainerSize` and `clearRouteClamp`.
+ * A release re-asks with `dragging` false, flushing the deferred size once.
+ */
+export function canvasResizeEffect(
+  dragging: boolean,
+  committed: { width: number; height: number },
+  next: { width: number; height: number },
+): 'none' | 'defer' | 'commit' {
+  if (committed.width === next.width && committed.height === next.height) {
+    return 'none';
+  }
+  return dragging ? 'defer' : 'commit';
+}
+
+/** P4-3b: the slice of a pointer event the divider's drag handlers read. */
+export interface MetricsTableDividerPointerEvent {
+  pointerId: number;
+  button: number;
+  clientY: number;
+  preventDefault(): void;
+  currentTarget: {
+    parentElement: {
+      style: { setProperty(name: string, value: string): void };
+      setAttribute(name: string, value: string): void;
+      removeAttribute(name: string): void;
+    } | null;
+    setAttribute(name: string, value: string): void;
+    setPointerCapture(pointerId: number): void;
+    hasPointerCapture(pointerId: number): boolean;
+    releasePointerCapture(pointerId: number): void;
+  };
+}
+
+interface MetricsTableDrag {
+  pointerId: number;
+  startY: number;
+  startHeight: number;
+  height: number;
+}
+
+// Keyed by the divider element, so the component stays hookless.
+const metricsTableDrags = new WeakMap<object, MetricsTableDrag>();
+
+/** P4-3b: a primary-button press starts a drag and captures the pointer. */
+export function beginMetricsTableDrag(event: MetricsTableDividerPointerEvent, height: number): void {
+  if (event.button !== 0) {
+    return;
+  }
+  event.preventDefault();
+  event.currentTarget.setPointerCapture(event.pointerId);
+  event.currentTarget.parentElement?.setAttribute(METRICS_TABLE_DRAGGING_ATTRIBUTE, '');
+  metricsTableDrags.set(event.currentTarget, {
+    pointerId: event.pointerId,
+    startY: event.clientY,
+    startHeight: height,
+    height,
+  });
+}
+
+/**
+ * P4-3b: a drag step writes only the CSS variable on `.code-map` (the
+ * divider's parent) and the divider's `aria-valuenow` — no React state, so a
+ * drag never re-renders `CodeMap` per pointer move.
+ */
+export function moveMetricsTableDrag(event: MetricsTableDividerPointerEvent, mapHeight: number): void {
+  const drag = metricsTableDrags.get(event.currentTarget);
+  if (!drag || drag.pointerId !== event.pointerId) {
+    return;
+  }
+  const next = metricsTableDragHeight(drag.startHeight, drag.startY, event.clientY, mapHeight);
+  if (next === drag.height) {
+    return;
+  }
+  drag.height = next;
+  event.currentTarget.parentElement?.style.setProperty('--code-map-table-height', `${next}px`);
+  event.currentTarget.setAttribute('aria-valuenow', String(next));
+  event.currentTarget.setAttribute('aria-valuetext', metricsTableValueText(next, mapHeight));
+}
+
+/**
+ * P4-3b: release, cancel or a lost capture (a release outside the window)
+ * ends the drag and commits its height to React state once, if it moved. Idempotent: the
+ * `lostpointercapture` after a `pointerup` finds no drag.
+ */
+export function endMetricsTableDrag(event: MetricsTableDividerPointerEvent, onResize: (height: number) => void): void {
+  const drag = metricsTableDrags.get(event.currentTarget);
+  if (!drag || drag.pointerId !== event.pointerId) {
+    return;
+  }
+  metricsTableDrags.delete(event.currentTarget);
+  event.currentTarget.parentElement?.removeAttribute(METRICS_TABLE_DRAGGING_ATTRIBUTE);
+  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+  // A click without movement commits nothing, so an untouched table keeps
+  // tracking the default share of the map.
+  if (drag.height !== drag.startHeight) {
+    onResize(drag.height);
+  }
+}
+
+/**
+ * P4-3b: the separator between the canvas and the metrics table — Arrow keys
+ * step 24px, PageUp/PageDown a quarter of the map, Home/End jump to the
+ * bounds; a pointer drag resizes. `height` is the table's current height and
+ * `mapHeight` `.code-map`'s; both in px.
+ *
+ * MUST STAY HOOKLESS: `CodeMap.prReviewMetrics.test.ts` renders it by calling
+ * it as a plain function (no DOM runner).
+ */
+export function MetricsTableDivider({
+  height,
+  mapHeight,
+  onResize,
+}: {
+  height: number;
+  mapHeight: number;
+  onResize: (height: number) => void;
+}) {
+  const { min, max } = metricsTableHeightBounds(mapHeight);
+  return (
+    <div
+      className="code-map__metrics-divider"
+      role="separator"
+      tabIndex={0}
+      aria-orientation="horizontal"
+      aria-label="Resize metrics table"
+      aria-valuenow={height}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuetext={metricsTableValueText(height, mapHeight)}
+      onKeyDown={(event) => {
+        const next = metricsTableKeyStep(event.key, height, mapHeight);
+        if (next === null) {
+          return;
+        }
+        // Handled keys never scroll the page, even at a bound.
+        event.preventDefault();
+        if (next !== height) {
+          onResize(next);
+        }
+      }}
+      onPointerDown={(event) => beginMetricsTableDrag(event, height)}
+      onPointerMove={(event) => moveMetricsTableDrag(event, mapHeight)}
+      onPointerUp={(event) => endMetricsTableDrag(event, onResize)}
+      onPointerCancel={(event) => endMetricsTableDrag(event, onResize)}
+      onLostPointerCapture={(event) => endMetricsTableDrag(event, onResize)}
+    />
+  );
+}
+
 const PR_REVIEW_METRICS_CAPTION_ID = 'code-map-metrics-table-caption';
 
 function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }) {
@@ -6698,11 +6950,22 @@ export function CodeMap({
   // band. A callback ref into state, so the observer re-attaches whenever
   // the canvas remounts (e.g. back from Health Audit Mode).
   const [canvasElement, setCanvasElement] = useState<HTMLDivElement | null>(null);
+  // P4-3b: `.code-map`'s own height — canvas plus metrics table — which the
+  // divider's clamp is a share of. Measured separately from the canvas
+  // (whose height already has the table taken off), so the table's own
+  // height never feeds back into its bounds. `null` height: no resize yet
+  // (the default share); kept for the session, across mode switches.
+  const [mapElement, setMapElement] = useState<HTMLDivElement | null>(null);
+  const [mapHeight, setMapHeight] = useState(0);
+  const [requestedMetricsTableHeight, setRequestedMetricsTableHeight] = useState<number | null>(null);
   const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
   // FIX-1: the same size as a ref, so `fitViewToPath` reads the latest value
   // without depending on it (a resize must never re-create — and so never
   // re-trigger — the route fit and throw away the user's own pan/zoom).
   const containerSizeRef = useRef({ width: 0, height: 0 });
+  // P4-3b review: the size last written to `containerSize` — a divider drag
+  // moves `containerSizeRef` ahead of it until `flushCanvasSize`.
+  const committedContainerSizeRef = useRef({ width: 0, height: 0 });
   // Clusters the user has clicked/activated to expand (Boundaries &
   // Constraints: "Clicking a cluster removes it from the cluster set for
   // this render"). A cluster's `id` is derived from its current
@@ -7575,17 +7838,57 @@ export function CodeMap({
         return;
       }
       const { width, height } = entry.contentRect;
-      const previous = containerSizeRef.current;
-      if (previous.width !== width || previous.height !== height) {
+      const next = { width, height };
+      containerSizeRef.current = next;
+      // P4-3b review: mid-drag, only the ref follows the canvas (fits read
+      // it); the state and the route-clamp reset wait for the release
+      // (`flushCanvasSize`), so a divider drag never re-renders per move.
+      const dragging = el.parentElement?.hasAttribute(METRICS_TABLE_DRAGGING_ATTRIBUTE) ?? false;
+      if (canvasResizeEffect(dragging, committedContainerSizeRef.current, next) === 'commit') {
         // FIX-1: a resized view is no longer the fitted one.
         clearRouteClamp();
+        committedContainerSizeRef.current = next;
+        setContainerSize(next);
       }
-      containerSizeRef.current = { width, height };
-      setContainerSize({ width, height });
     });
     observer.observe(el);
     return () => observer.disconnect();
   }, [canvasElement, clearRouteClamp]);
+
+  // P4-3b: tracks `.code-map`'s height for the metrics divider's clamp; a
+  // window resize re-renders, and `metricsTableHeightFor` re-clamps.
+  useEffect(() => {
+    const el = mapElement;
+    if (!el) {
+      return undefined;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) {
+        setMapHeight(entry.contentRect.height);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [mapElement]);
+
+  // P4-3b review: on a divider release, commits the canvas size the drag
+  // deferred (see the observer above) — one render, one route-clamp reset.
+  const flushCanvasSize = useCallback(() => {
+    const next = containerSizeRef.current;
+    if (canvasResizeEffect(false, committedContainerSizeRef.current, next) === 'commit') {
+      clearRouteClamp();
+      committedContainerSizeRef.current = next;
+      setContainerSize(next);
+    }
+  }, [clearRouteClamp]);
+  const handleMetricsTableResize = useCallback(
+    (height: number) => {
+      setRequestedMetricsTableHeight(height);
+      flushCanvasSize();
+    },
+    [flushCanvasSize],
+  );
 
   // Dev-only per-frame timing (Code Map's Profiling methodology): a CDP
   // harness drives synthetic pan/zoom against the fixture and reads
@@ -8652,6 +8955,7 @@ export function CodeMap({
     surfaces,
   } = prReviewView;
   const prReviewMetricsTableProps = prReviewMetricsTableFor(prReviewView);
+  const metricsTableHeight = metricsTableHeightFor(requestedMetricsTableHeight, mapHeight);
 
   // P0-2b: `reactFlowInstanceRef` is written once, in `handleInit`, and was
   // never cleared because before this spec the canvas only ever unmounted with
@@ -8684,7 +8988,15 @@ export function CodeMap({
   return (
     // P2-7 + P2-8: the id (and `tabIndex={-1}`) make this the modal layers'
     // focus fallback when a closed layer's opener has left the document.
-    <div className="code-map" id={MODAL_FOCUS_FALLBACK_ID} tabIndex={-1}>
+    // P4-3b: the inline `--code-map-table-height` is the divider's height;
+    // the canvas frame, bottom clearance and refresh error all follow it.
+    <div
+      className="code-map"
+      id={MODAL_FOCUS_FALLBACK_ID}
+      tabIndex={-1}
+      ref={setMapElement}
+      style={codeMapTableHeightStyle(prReviewMetricsTableProps !== null, metricsTableHeight, mapHeight)}
+    >
       {/* Story 3.1 (Phase 2): the base-ref input + trigger — rendered
           whenever `mode === 'prReview'`, independent of `fetchState`
           entirely (Boundaries & Constraints: "the base-ref input/trigger
@@ -9338,8 +9650,19 @@ export function CodeMap({
           `prReviewMetricsTableFor` gates it: PR Review, a showable map with
           its canvas, a resolved diff scope and at least one row. After the
           history toolbar and before the overlays, so Tab order follows the
-          layout: the top toolbars first, then the table at the bottom. */}
-      {prReviewMetricsTableProps !== null && <PrReviewMetricsTable {...prReviewMetricsTableProps} />}
+          layout: the top toolbars first, then the table at the bottom.
+          P4-3b: its divider comes right before it, in the DOM and Tab order,
+          and only with it. */}
+      {prReviewMetricsTableProps !== null && (
+        <>
+          <MetricsTableDivider
+            height={metricsTableHeight}
+            mapHeight={mapHeight}
+            onResize={handleMetricsTableResize}
+          />
+          <PrReviewMetricsTable {...prReviewMetricsTableProps} />
+        </>
+      )}
 
       {sourceOverlayOpen(sourceView) && (
         <div
