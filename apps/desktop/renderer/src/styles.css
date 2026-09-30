@@ -1032,7 +1032,13 @@ code,
      `showInteractive={false}`), which is taller than the bottom-right
      signal-toggle panel, plus 3rem more so a refresh-error notice wrapped
      to three lines between the two corners still fits under the columns. */
-  --code-map-bottom-clearance: calc(15px + 3 * 26px + 3rem);
+  --code-map-bottom-clearance: calc(15px + 3 * 26px + 3rem + var(--code-map-table-height));
+  /* P4-3a: the PR Review metrics table's fixed band below the canvas — 0
+     without the table. The canvas frame's inline height (`CodeMap.tsx`
+     `CODE_MAP_CANVAS_HEIGHT`) subtracts it, and the
+     bottom clearance above and `.code-map__refresh-error`'s `bottom` add it,
+     so nothing floats over the table. */
+  --code-map-table-height: 0px;
   /* FIX-4: the bottom corners the refresh-error notice keeps clear of:
      `<Controls>` (bottom-left: 15px panel margin, one 26px button column, a
      gap) and the signal-toggle panel (bottom-right: its two checkbox rows'
@@ -3578,7 +3584,7 @@ code,
    the lane itself lets clicks through to the canvas. */
 .code-map__refresh-error {
   position: absolute;
-  bottom: 1rem;
+  bottom: calc(1rem + var(--code-map-table-height));
   left: max(50% - 20rem, var(--code-map-controls-clearance));
   right: max(50% - 20rem, var(--code-map-corner-clearance));
   z-index: 5;
@@ -3600,3 +3606,105 @@ code,
   color: var(--text-mute);
 }
 
+/* P4-3a: the PR Review metrics table (DESIGN.md
+   `components.pr-review-metrics-table`) — a fixed-height band below the
+   canvas, full width; the canvas shrinks by `--code-map-table-height`
+   (see `.code-map`). Flat and sharp-cornered. Changed rows carry the
+   `row-changed-background` tint and a `row-changed-rule` (2px accent) on
+   their leading edge, matching their canvas card's accent edge. */
+.code-map:has(> .code-map__metrics-table) {
+  /* Capped at 40% of the map so a short window keeps its canvas and the PR
+     Review column. `cqh` resolves where the variable is used — always inside
+     `.code-map`, the size container. */
+  --code-map-table-height: min(13rem, 40cqh);
+}
+
+/* P4-3a: the canvas's own box (`CodeMapCanvasFrame`) — `<ReactFlow>` fills
+   it, and it is what the ResizeObserver measures. Its height is inline. */
+.code-map__canvas {
+  position: relative;
+  width: 100%;
+}
+
+.code-map__metrics-table {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--code-map-table-height);
+  box-sizing: border-box;
+  overflow: auto;
+  z-index: 5;
+  border-top: 1px solid var(--border-strong);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.code-map__metrics-table:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.code-map__metrics-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.code-map__metrics-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0.35rem 0.6rem;
+  background: var(--panel-alt);
+  color: var(--text-mute);
+  font-weight: normal;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.code-map__metrics-table tbody :is(th, td) {
+  padding: 0.3rem 0.6rem;
+  font-weight: normal;
+  text-align: left;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+.code-map__metrics-table tbody tr:nth-child(even) {
+  background: var(--panel-alt);
+}
+
+.code-map__metrics-table-row--changed,
+.code-map__metrics-table tbody tr.code-map__metrics-table-row--changed:nth-child(even) {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.code-map__metrics-table-row--changed > :first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.code-map__metrics-table-module {
+  margin-left: 0.6rem;
+  color: var(--text-mute);
+}
+
+.code-map__metrics-table-coverage-gap {
+  margin-left: 0.4rem;
+  color: var(--risk-red);
+}
+
+.code-map__metrics-table-cell--severe {
+  color: var(--risk-red);
+}
+
+.code-map__metrics-table-cell--empty {
+  color: var(--text-mute);
+}
+
+.code-map__metrics-table-missing {
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  color: var(--text-mute);
+}

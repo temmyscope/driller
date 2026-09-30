@@ -3252,6 +3252,12 @@ export interface PrReviewView {
    * (`CHANGED_CONTRACTS_APPROXIMATE_NOTE`).
    */
   changedContractsApproximate: boolean;
+  /**
+   * P4-3a: the changed-Node metrics table below the canvas, or `null` for
+   * none. Non-null only in PR Review Mode, with a showable map, for a
+   * resolved diff scope with at least one row — never an empty table.
+   */
+  metricsTable: PrReviewMetricRows | null;
   /** Which surfaces are on — see `CodeMapSurfaces`. */
   surfaces: CodeMapSurfaces;
 }
@@ -3290,13 +3296,308 @@ export function resolvePrReviewView(
       ? diffScopeState.status
       : null;
   const resolved = mode === 'prReview' && showable && diffScopeState.status === 'resolved' ? diffScopeState : null;
+  const metricRows =
+    resolved !== null && fetchState.status === 'ready' ? buildPrReviewMetricRows(fetchState.nodes, resolved.nodeIds) : null;
   return {
     noticeStatus,
     topLevelFiles: resolved?.topLevelFiles ?? NO_TOP_LEVEL_FILES,
     changedContracts: resolved?.changedContracts ?? NO_CHANGED_CONTRACTS,
     changedContractsApproximate: resolved?.changedContractsApproximate === true,
+    metricsTable: metricRows !== null && metricRows.rows.length > 0 ? metricRows : null,
     surfaces: resolveCodeMapSurfaces(mode, showable),
   };
+}
+
+/**
+ * P4-3a: one changed Node's row in the PR Review metrics table. Every value
+ * is read straight from the Node's own `riskSignals`; `null` means the Node
+ * carries no such signal and renders `—`, never "covered" (the renderer
+ * cannot tell "no gap" from "no LCOV file") and never a zero.
+ */
+export interface PrReviewMetricRow {
+  id: string;
+  /** The bare identifier, verbatim from source. */
+  name: string;
+  file: string;
+  startLine: number;
+  /** `nodeModuleLine(file)` — `null` for a file at the project root. */
+  moduleLine: string | null;
+  /** The index coverage gap (FR-2, `summaryStatus === 'coverage-gap'`), not test coverage. */
+  coverageGap: boolean;
+  /** Phase 1a has changed rows only; affected hops arrive in phase 2. */
+  hop: 'changed';
+  complexity: DeterministicRiskSignal | null;
+  blastRadius: DeterministicRiskSignal | null;
+  /** A `test-coverage-gap` signal exists. `false` is "no gap signal", not "covered". */
+  testCoverageGap: boolean;
+  /** The ingested findings' count, highest severity and that finding's tool; `null` for none. */
+  findings: PrReviewMetricFindings | null;
+}
+
+export interface PrReviewMetricFindings {
+  count: number;
+  highestSeverity: IngestedRiskSignal['severity'];
+  sourceTool: string;
+}
+
+/** P4-3a: `buildPrReviewMetricRows`' result. */
+export interface PrReviewMetricRows {
+  rows: PrReviewMetricRow[];
+  /** Changed ids that resolve to no Node on the current map — counted, never dropped silently. */
+  missingChangedCount: number;
+}
+
+const compareStrings = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * P4-3a: the resolved diff scope as one row per changed Node that is on the
+ * current map, in a fixed order (file, then `startLine`, then id). Values
+ * come from the same `selectDeterministicSignals`/`selectIngestedSignals`
+ * the canvas card uses, so the table and the card can't disagree; the
+ * highest-severity finding is `selectIngestedSignals`' first (it sorts by
+ * `INGESTED_SEVERITY_RANK`). Changed ids with no Node on this map (a scope
+ * filter, or a refresh since the diff) are counted in `missingChangedCount`.
+ */
+export function buildPrReviewMetricRows(
+  nodes: readonly CodeMapNode[],
+  changedIds: ReadonlySet<string>,
+): PrReviewMetricRows {
+  const rows: PrReviewMetricRow[] = [];
+  const found = new Set<string>();
+  for (const node of nodes) {
+    if (!changedIds.has(node.id) || found.has(node.id)) {
+      continue;
+    }
+    found.add(node.id);
+    const deterministic = selectDeterministicSignals(node.riskSignals);
+    const ofType = (type: DeterministicRiskSignalType) => deterministic.find((signal) => signal.type === type) ?? null;
+    const ingested = selectIngestedSignals(node.riskSignals);
+    const highest = ingested[0];
+    rows.push({
+      id: node.id,
+      name: node.name,
+      file: node.file,
+      startLine: node.startLine,
+      moduleLine: nodeModuleLine(node.file),
+      coverageGap: node.summaryStatus === 'coverage-gap',
+      hop: 'changed',
+      complexity: ofType('complexity'),
+      blastRadius: ofType('blast-radius'),
+      testCoverageGap: ofType('test-coverage-gap') !== null,
+      findings:
+        highest === undefined
+          ? null
+          : { count: ingested.length, highestSeverity: highest.severity, sourceTool: highest.sourceTool },
+    });
+  }
+  rows.sort((a, b) => compareStrings(a.file, b.file) || a.startLine - b.startLine || compareStrings(a.id, b.id));
+  let missingChangedCount = 0;
+  for (const id of changedIds) {
+    if (!found.has(id)) {
+      missingChangedCount += 1;
+    }
+  }
+  return { rows, missingChangedCount };
+}
+
+/** P4-3a: the table's empty-cell text. Never "covered", never `0`. */
+export const METRIC_CELL_EMPTY = '—';
+
+/**
+ * P4-3a: one numeric metric cell — the visible value (`—` for an absent
+ * signal) and, for a present one, the accessible name ("42 (severe)", the
+ * header names the metric) and the full `formatDeterministicSignalLabel`
+ * wording as its tooltip.
+ */
+export function formatMetricSignalCell(signal: DeterministicRiskSignal | null): {
+  text: string;
+  label: string | null;
+  /** The full signal wording (`formatDeterministicSignalLabel`), for the mouse's tooltip. */
+  title: string | null;
+  severe: boolean;
+} {
+  if (signal === null) {
+    return { text: METRIC_CELL_EMPTY, label: null, title: null, severe: false };
+  }
+  return {
+    text: formatCountNumber(signal.value),
+    label: metricCellAccessibleName(signal),
+    title: formatDeterministicSignalLabel(signal),
+    severe: signal.severity === 'severe',
+  };
+}
+
+/** P4-3a: the findings cell — "3 · blocker · CodeRabbit", or `—` for none. */
+export function formatMetricFindingsCell(findings: PrReviewMetricFindings | null): string {
+  if (findings === null) {
+    return METRIC_CELL_EMPTY;
+  }
+  return `${formatCountNumber(findings.count)} · ${findings.highestSeverity} · ${findings.sourceTool}`;
+}
+
+/** P4-3a: the inert line for changed ids not on this map, or `null` for none. */
+export function formatMissingChangedNodes(count: number): string | null {
+  return count > 0 ? `${formatCount(count, 'changed Node', 'changed Nodes')} not on the current map` : null;
+}
+
+/**
+ * P4-3a: the blast-radius column's header. The per-Node signal counts Nodes
+ * within `BLAST_RADIUS_DEFAULT_HOPS`, not the stepper's depth, so the header
+ * names that fixed bound.
+ */
+export function prReviewBlastRadiusHeader(): string {
+  const hops: number = BLAST_RADIUS_DEFAULT_HOPS;
+  return `blast radius (${hops} hop${hops === 1 ? '' : 's'})`;
+}
+
+/**
+ * P4-3a: the canvas's height — `.code-map` minus the metrics table's band
+ * (`--code-map-table-height`, 0 without the table), so nothing floats over
+ * the table and the canvas resizes when the table appears or goes.
+ */
+export const CODE_MAP_CANVAS_HEIGHT = 'calc(100% - var(--code-map-table-height))';
+
+/**
+ * P4-3a review: the element that both HAS the canvas's size and is MEASURED
+ * for it — `canvasRef` goes on the same div whose height is
+ * `CODE_MAP_CANVAS_HEIGHT`, so the ResizeObserver behind route fits, the
+ * initial fit, LOD bounds and zoom-to-reveal reads the canvas, never
+ * `.code-map` (taller by the table). Hookless, so a test pins the pairing.
+ */
+export function CodeMapCanvasFrame({
+  canvasRef,
+  children,
+}: {
+  canvasRef: (element: HTMLDivElement | null) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="code-map__canvas" ref={canvasRef} style={{ height: CODE_MAP_CANVAS_HEIGHT }}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * P4-3a review: the metrics table's mount condition — the rows when
+ * `resolvePrReviewView` produced a table AND the canvas it sits under is
+ * mounted, else `null`.
+ */
+export function prReviewMetricsTableFor(
+  view: Pick<PrReviewView, 'metricsTable' | 'surfaces'>,
+): PrReviewMetricRows | null {
+  return view.surfaces.canvas ? view.metricsTable : null;
+}
+
+/**
+ * P4-3a review: a metric cell's accessible name — the value and "(severe)",
+ * without the metric's name, which the column header already gives.
+ */
+export function metricCellAccessibleName(signal: DeterministicRiskSignal): string {
+  return `${formatCountNumber(signal.value)}${signal.severity === 'severe' ? ' (severe)' : ''}`;
+}
+
+const PR_REVIEW_METRICS_CAPTION_ID = 'code-map-metrics-table-caption';
+
+function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }) {
+  const cell = formatMetricSignalCell(signal);
+  if (cell.label === null) {
+    return <td className="code-map__metrics-table-cell code-map__metrics-table-cell--empty">{cell.text}</td>;
+  }
+  return (
+    <td
+      className={
+        cell.severe
+          ? 'code-map__metrics-table-cell code-map__metrics-table-cell--severe'
+          : 'code-map__metrics-table-cell'
+      }
+    >
+      <span role="img" aria-label={cell.label} title={cell.title ?? undefined}>
+        {cell.severe && <span aria-hidden="true">{`${SEVERE_SIGNAL_GLYPH} `}</span>}
+        {cell.text}
+      </span>
+    </td>
+  );
+}
+
+/**
+ * P4-3a: the PR Review metrics table (DESIGN.md
+ * `components.pr-review-metrics-table`) — a native `<table>` in a fixed-height
+ * region below the canvas, one row per changed Node, text values only (bars
+ * and sorting are phase 3). Signal-family toggles don't hide columns, as
+ * with Health Audit rows.
+ *
+ * MUST STAY HOOKLESS: `CodeMap.prReviewMetrics.test.ts` renders it by calling
+ * it as a plain function (no DOM runner).
+ */
+export function PrReviewMetricsTable({ rows, missingChangedCount }: PrReviewMetricRows) {
+  const missing = formatMissingChangedNodes(missingChangedCount);
+  return (
+    // A scroll region, so it takes a focus stop for keyboard scrolling, like
+    // `.code-map__health-grid`.
+    <section className="code-map__metrics-table" aria-labelledby={PR_REVIEW_METRICS_CAPTION_ID} tabIndex={0}>
+      <table>
+        <caption id={PR_REVIEW_METRICS_CAPTION_ID} className="visually-hidden">
+          Changed Nodes' risk metrics
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">node</th>
+            <th scope="col">hop</th>
+            <th scope="col">complexity</th>
+            <th scope="col">{prReviewBlastRadiusHeader()}</th>
+            <th scope="col">tests</th>
+            <th scope="col">findings</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.id} className="code-map__metrics-table-row code-map__metrics-table-row--changed">
+              <th scope="row" className="code-map__metrics-table-node" title={row.id}>
+                <code className="code-map__metrics-table-name">{row.name}</code>
+                {row.moduleLine !== null && <span className="code-map__metrics-table-module">{row.moduleLine}</span>}
+                {/* Same-name rows (two `handle`s in one file) differ here for
+                    assistive tech, not only in the `title`. */}
+                <span className="visually-hidden">{`, ${row.file} line ${row.startLine}`}</span>
+                {row.coverageGap && (
+                  <span
+                    className="code-map__metrics-table-coverage-gap"
+                    role="img"
+                    aria-label="Coverage gap"
+                    title="Coverage gap — no summary"
+                  >
+                    ⚠
+                  </span>
+                )}
+              </th>
+              <td className="code-map__metrics-table-cell">{row.hop}</td>
+              <MetricSignalCell signal={row.complexity} />
+              <MetricSignalCell signal={row.blastRadius} />
+              <td
+                className={
+                  row.testCoverageGap
+                    ? 'code-map__metrics-table-cell'
+                    : 'code-map__metrics-table-cell code-map__metrics-table-cell--empty'
+                }
+              >
+                {row.testCoverageGap ? 'gap' : METRIC_CELL_EMPTY}
+              </td>
+              <td
+                className={
+                  row.findings === null
+                    ? 'code-map__metrics-table-cell code-map__metrics-table-cell--empty'
+                    : 'code-map__metrics-table-cell'
+                }
+              >
+                {formatMetricFindingsCell(row.findings)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {missing !== null && <p className="code-map__metrics-table-missing">{missing}</p>}
+    </section>
+  );
 }
 
 /** P4-2 phase 3a: how many files the top-level-change notice names before "+N more". */
@@ -6392,7 +6693,11 @@ export function CodeMap({
   const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 1 });
   // The `<ReactFlow>` container's own pixel size (via `ResizeObserver` below)
   // — the other half of translating `viewport` into world-space bounds.
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  // P4-3a review: the observed element is `CodeMapCanvasFrame`'s div (the
+  // canvas itself), not `.code-map`, which is taller by the metrics table's
+  // band. A callback ref into state, so the observer re-attaches whenever
+  // the canvas remounts (e.g. back from Health Audit Mode).
+  const [canvasElement, setCanvasElement] = useState<HTMLDivElement | null>(null);
   const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
   // FIX-1: the same size as a ref, so `fitViewToPath` reads the latest value
   // without depending on it (a resize must never re-create — and so never
@@ -7260,7 +7565,7 @@ export function CodeMap({
   // Tracks the `<ReactFlow>` container's own pixel size — the other input
   // (alongside `viewport`) `computeLOD`'s `viewportBounds` is derived from.
   useEffect(() => {
-    const el = containerRef.current;
+    const el = canvasElement;
     if (!el) {
       return undefined;
     }
@@ -7280,7 +7585,7 @@ export function CodeMap({
     });
     observer.observe(el);
     return () => observer.disconnect();
-  }, [clearRouteClamp]);
+  }, [canvasElement, clearRouteClamp]);
 
   // Dev-only per-frame timing (Code Map's Profiling methodology): a CDP
   // harness drives synthetic pan/zoom against the fixture and reads
@@ -8334,13 +8639,19 @@ export function CodeMap({
   // annotates the map; it never gates a surface. A diff-scope `'error'` is
   // not a notice status: it renders inline in the PR Review toolbar, same
   // convention as `pathTrace.status === 'error'`.
+  // P4-3a: memoised — the metrics rows are an O(Nodes) pass over the map.
+  const prReviewView = useMemo(
+    () => resolvePrReviewView(mode, fetchState, diffScopeState),
+    [mode, fetchState, diffScopeState],
+  );
   const {
     noticeStatus: prReviewNoticeStatus,
     topLevelFiles: prReviewTopLevelFiles,
     changedContracts: prReviewChangedContracts,
     changedContractsApproximate: prReviewChangedContractsApproximate,
     surfaces,
-  } = resolvePrReviewView(mode, fetchState, diffScopeState);
+  } = prReviewView;
+  const prReviewMetricsTableProps = prReviewMetricsTableFor(prReviewView);
 
   // P0-2b: `reactFlowInstanceRef` is written once, in `handleInit`, and was
   // never cleared because before this spec the canvas only ever unmounted with
@@ -8373,7 +8684,7 @@ export function CodeMap({
   return (
     // P2-7 + P2-8: the id (and `tabIndex={-1}`) make this the modal layers'
     // focus fallback when a closed layer's opener has left the document.
-    <div className="code-map" ref={containerRef} id={MODAL_FOCUS_FALLBACK_ID} tabIndex={-1}>
+    <div className="code-map" id={MODAL_FOCUS_FALLBACK_ID} tabIndex={-1}>
       {/* Story 3.1 (Phase 2): the base-ref input + trigger — rendered
           whenever `mode === 'prReview'`, independent of `fetchState`
           entirely (Boundaries & Constraints: "the base-ref input/trigger
@@ -8655,150 +8966,156 @@ export function CodeMap({
         // `.code-map` div is sized via `position: absolute; inset: 0`
         // (styles.css), but `<ReactFlow>`'s own root element still needs an
         // explicit width/height or it collapses to 0×0 and renders nothing.
-        <ReactFlow<CodeMapAnyFlowNode>
-          style={{ width: '100%', height: '100%', visibility: awaitingFirstFit ? 'hidden' : undefined }}
-          nodes={renderedNodes}
-          edges={renderedEdges}
-          nodeTypes={nodeTypes}
-          onNodeClick={handleNodeClick}
-          // Story 1.4, FR4: clicking an edge re-centers the map on the
-          // connected Node without leaving map context — additive to
-          // Story 1.3's existing click-a-Node's-body-opens-source
-          // behavior (`onNodeClick`), never a replacement for it.
-          onEdgeClick={handleEdgeClick}
-          onInit={handleInit}
-          onMove={handleMove}
-          onMoveStart={handleMoveStart}
-          maxZoom={MAP_MAX_ZOOM}
-          // Without this, `@xyflow/react`'s default `minZoom` (0.5) clamps
-          // `fitView` (and manual zoom-out) well above `LOD_ZOOM_THRESHOLD`
-          // at any map size — found via live CDP verification. Only fixture
-          // sessions get the very low floor; real usage keeps a much higher
-          // one (`MIN_ZOOM_REAL`'s comment above — review finding).
-          minZoom={isDevFixtureMode ? MIN_ZOOM_FIXTURE : MIN_ZOOM_REAL}
-          // AD-2's viewport-culling half — confirmed present on the
-          // installed `@xyflow/react` (12.11.6); this phase's own code only
-          // needed to build the clustering half (`computeLOD`) alongside it.
-          onlyRenderVisibleElements
-          // FIX-3: no `fitView` — the first view comes from `initialViewport`
-          // (the effect after `measuredViewportSize`), which never opens
-          // below `ROUTE_MIN_READABLE_ZOOM`.
-          colorMode="dark"
-          // No editing surface (Non-Goal) — the Handles on each Node card
-          // exist only so edges can attach visually; without this, they
-          // render as live, draggable connection points, implying an
-          // editing capability that doesn't exist (review finding).
-          proOptions={{ hideAttribution: true }}
-        >
-          {/* DESIGN.md `canvas.grid`: a `{colors.border}` dot grid at the
-              `{spacing.canvas-grid}` (40px) cell size — the "dot-grid canvas
-              like a schematic notebook" Brand & Style calls out. `gap`/
-              `color` are `@xyflow/react`'s own props for this (no CSS hook
-              exists for either); the canvas background itself is set via
-              `.code-map .react-flow` in styles.css, not here. */}
-          <Background gap={40} color="var(--border)" />
-          <Controls
-            showInteractive={false}
-            onZoomIn={clearRouteClamp}
-            onZoomOut={clearRouteClamp}
-            onFitView={clearRouteClamp}
-          />
-          <ReactFlowStoreBridge storeRef={reactFlowStoreRef} />
-          {/* Story 2.1 (Phase 3): driller's first custom map-level control —
-              a `Panel`-hosted checkbox toggling the whole deterministic
-              `riskSignals` layer's visibility (Boundaries & Constraints:
-              renderer-local `useState`, no persistence, no IPC — only the
-              whole family toggles, never individual signal types within
-              it). Review round (patch): `bottom-right`, not `top-right` —
-              every other corner is already claimed by pre-existing chrome
-              this phase doesn't touch: `.code-map__history-toolbar`
-              (top-right, Story 1.4), `.code-map__path-trace` (top-left,
-              Story 1.9), and React Flow's own `<Controls>` default
-              (bottom-left) — `top-right` would have sat directly on top of
-              the history toolbar (same corner, same `z-index: 5`, nearly
-              identical offset). `bottom-right` is the one corner nothing
-              else claims. Review round (patch): `role="group"
-              aria-label="Risk signal layer controls"` — this Panel had
-              neither, unlike `.code-map__history-toolbar`'s own
-              `role="toolbar" aria-label=...` a few lines below, which this
-              comment already cites as the chrome convention to match (Blind
-              Hunter). Visible label reads "Risk signals", not "Deterministic
-              signals" — `family: 'deterministic'` is this codebase's own
-              internal taxonomy (distinguishing it from Story 2.2/2.3's
-              future `llm-judgment`/`ingested` families), not end-user
-              copy — a user with no visibility into that distinction
-              couldn't infer what the checkbox does from the internal term
-              alone (Blind Hunter). */}
-          <Panel
-            position="bottom-right"
-            className="code-map__signal-toggle-panel"
-            role="group"
-            aria-label="Risk signal layer controls"
+        // P4-3a: the frame is the canvas's size — `.code-map` minus the
+        // metrics table's band — and the element the ResizeObserver
+        // measures, so fits, LOD bounds and zoom-to-reveal all see the canvas
+        // the user sees, and `<Controls>`/the signal toggles sit above the table.
+        <CodeMapCanvasFrame canvasRef={setCanvasElement}>
+          <ReactFlow<CodeMapAnyFlowNode>
+            style={{ width: '100%', height: '100%', visibility: awaitingFirstFit ? 'hidden' : undefined }}
+            nodes={renderedNodes}
+            edges={renderedEdges}
+            nodeTypes={nodeTypes}
+            onNodeClick={handleNodeClick}
+            // Story 1.4, FR4: clicking an edge re-centers the map on the
+            // connected Node without leaving map context — additive to
+            // Story 1.3's existing click-a-Node's-body-opens-source
+            // behavior (`onNodeClick`), never a replacement for it.
+            onEdgeClick={handleEdgeClick}
+            onInit={handleInit}
+            onMove={handleMove}
+            onMoveStart={handleMoveStart}
+            maxZoom={MAP_MAX_ZOOM}
+            // Without this, `@xyflow/react`'s default `minZoom` (0.5) clamps
+            // `fitView` (and manual zoom-out) well above `LOD_ZOOM_THRESHOLD`
+            // at any map size — found via live CDP verification. Only fixture
+            // sessions get the very low floor; real usage keeps a much higher
+            // one (`MIN_ZOOM_REAL`'s comment above — review finding).
+            minZoom={isDevFixtureMode ? MIN_ZOOM_FIXTURE : MIN_ZOOM_REAL}
+            // AD-2's viewport-culling half — confirmed present on the
+            // installed `@xyflow/react` (12.11.6); this phase's own code only
+            // needed to build the clustering half (`computeLOD`) alongside it.
+            onlyRenderVisibleElements
+            // FIX-3: no `fitView` — the first view comes from `initialViewport`
+            // (the effect after `measuredViewportSize`), which never opens
+            // below `ROUTE_MIN_READABLE_ZOOM`.
+            colorMode="dark"
+            // No editing surface (Non-Goal) — the Handles on each Node card
+            // exist only so edges can attach visually; without this, they
+            // render as live, draggable connection points, implying an
+            // editing capability that doesn't exist (review finding).
+            proOptions={{ hideAttribution: true }}
           >
-            <label className="code-map__signal-toggle">
-              <input
-                type="checkbox"
-                checked={showDeterministicSignals}
-                onChange={(event) => setShowDeterministicSignals(event.target.checked)}
-              />
-              Risk signals
-            </label>
-            {/* Story 2.2 (Phase 3): the LLM-judgment layer's own checkbox —
-                added to this same Panel rather than a new one (Boundaries &
-                Constraints: "not a second floating Panel" — every remaining
-                map corner is already claimed, per Story 2.1 Phase 3's own
-                review-round finding cited on the Panel above). A fully
-                independent `useState`/handler — never reads or writes
-                `showDeterministicSignals`. Visible label reads "AI
-                judgment", matching the callout's own "AI judgment:" framing
-                (this story's Intent) rather than the internal `'llm-
-                judgment'` family name. */}
-            <label className="code-map__signal-toggle">
-              <input
-                type="checkbox"
-                checked={showLlmJudgment}
-                onChange={(event) => setShowLlmJudgment(event.target.checked)}
-              />
-              AI judgment
-            </label>
-            {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings layer's own
-                checkbox — added to this same Panel rather than a new one
-                (same "not a second floating Panel" reasoning Story 2.2
-                Phase 3's own comment above already cites), a fully
-                independent `useState`/handler that never reads or writes
-                `showDeterministicSignals`/`showLlmJudgment`. Visible label
-                reads "PR-bot findings" — a user with no visibility into the
-                internal `'ingested'` family name couldn't infer what the
-                checkbox does from that term alone (same reasoning the
-                Panel's own doc comment above applies to "Risk signals"/"AI
-                judgment"). */}
-            <label className="code-map__signal-toggle">
-              <input
-                type="checkbox"
-                checked={showIngestedFindings}
-                onChange={(event) => setShowIngestedFindings(event.target.checked)}
-              />
-              PR-bot findings
-            </label>
-            {/* P4-2 phase 3c: "Show types & modules" — draws the folded
-                Types/Interfaces/Modules back on the canvas, render only; off
-                by default and remembered per project. The hint says what it
-                doesn't do: no risk number moves. */}
-            <label className="code-map__signal-toggle" title={SHOW_FOLDED_KINDS_HINT}>
-              <input
-                type="checkbox"
-                checked={showFoldedKinds}
-                onChange={(event) => changeShowFoldedKinds(event.target.checked)}
-                aria-describedby={SHOW_FOLDED_KINDS_HINT_ID}
-              />
-              Show types &amp; modules
-            </label>
-            <span id={SHOW_FOLDED_KINDS_HINT_ID} className="code-map__signal-toggle-hint">
-              Risk numbers unchanged
-              <span className="visually-hidden">: {SHOW_FOLDED_KINDS_HINT}</span>
-            </span>
-          </Panel>
-        </ReactFlow>
+            {/* DESIGN.md `canvas.grid`: a `{colors.border}` dot grid at the
+                `{spacing.canvas-grid}` (40px) cell size — the "dot-grid canvas
+                like a schematic notebook" Brand & Style calls out. `gap`/
+                `color` are `@xyflow/react`'s own props for this (no CSS hook
+                exists for either); the canvas background itself is set via
+                `.code-map .react-flow` in styles.css, not here. */}
+            <Background gap={40} color="var(--border)" />
+            <Controls
+              showInteractive={false}
+              onZoomIn={clearRouteClamp}
+              onZoomOut={clearRouteClamp}
+              onFitView={clearRouteClamp}
+            />
+            <ReactFlowStoreBridge storeRef={reactFlowStoreRef} />
+            {/* Story 2.1 (Phase 3): driller's first custom map-level control —
+                a `Panel`-hosted checkbox toggling the whole deterministic
+                `riskSignals` layer's visibility (Boundaries & Constraints:
+                renderer-local `useState`, no persistence, no IPC — only the
+                whole family toggles, never individual signal types within
+                it). Review round (patch): `bottom-right`, not `top-right` —
+                every other corner is already claimed by pre-existing chrome
+                this phase doesn't touch: `.code-map__history-toolbar`
+                (top-right, Story 1.4), `.code-map__path-trace` (top-left,
+                Story 1.9), and React Flow's own `<Controls>` default
+                (bottom-left) — `top-right` would have sat directly on top of
+                the history toolbar (same corner, same `z-index: 5`, nearly
+                identical offset). `bottom-right` is the one corner nothing
+                else claims. Review round (patch): `role="group"
+                aria-label="Risk signal layer controls"` — this Panel had
+                neither, unlike `.code-map__history-toolbar`'s own
+                `role="toolbar" aria-label=...` a few lines below, which this
+                comment already cites as the chrome convention to match (Blind
+                Hunter). Visible label reads "Risk signals", not "Deterministic
+                signals" — `family: 'deterministic'` is this codebase's own
+                internal taxonomy (distinguishing it from Story 2.2/2.3's
+                future `llm-judgment`/`ingested` families), not end-user
+                copy — a user with no visibility into that distinction
+                couldn't infer what the checkbox does from the internal term
+                alone (Blind Hunter). */}
+            <Panel
+              position="bottom-right"
+              className="code-map__signal-toggle-panel"
+              role="group"
+              aria-label="Risk signal layer controls"
+            >
+              <label className="code-map__signal-toggle">
+                <input
+                  type="checkbox"
+                  checked={showDeterministicSignals}
+                  onChange={(event) => setShowDeterministicSignals(event.target.checked)}
+                />
+                Risk signals
+              </label>
+              {/* Story 2.2 (Phase 3): the LLM-judgment layer's own checkbox —
+                  added to this same Panel rather than a new one (Boundaries &
+                  Constraints: "not a second floating Panel" — every remaining
+                  map corner is already claimed, per Story 2.1 Phase 3's own
+                  review-round finding cited on the Panel above). A fully
+                  independent `useState`/handler — never reads or writes
+                  `showDeterministicSignals`. Visible label reads "AI
+                  judgment", matching the callout's own "AI judgment:" framing
+                  (this story's Intent) rather than the internal `'llm-
+                  judgment'` family name. */}
+              <label className="code-map__signal-toggle">
+                <input
+                  type="checkbox"
+                  checked={showLlmJudgment}
+                  onChange={(event) => setShowLlmJudgment(event.target.checked)}
+                />
+                AI judgment
+              </label>
+              {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings layer's own
+                  checkbox — added to this same Panel rather than a new one
+                  (same "not a second floating Panel" reasoning Story 2.2
+                  Phase 3's own comment above already cites), a fully
+                  independent `useState`/handler that never reads or writes
+                  `showDeterministicSignals`/`showLlmJudgment`. Visible label
+                  reads "PR-bot findings" — a user with no visibility into the
+                  internal `'ingested'` family name couldn't infer what the
+                  checkbox does from that term alone (same reasoning the
+                  Panel's own doc comment above applies to "Risk signals"/"AI
+                  judgment"). */}
+              <label className="code-map__signal-toggle">
+                <input
+                  type="checkbox"
+                  checked={showIngestedFindings}
+                  onChange={(event) => setShowIngestedFindings(event.target.checked)}
+                />
+                PR-bot findings
+              </label>
+              {/* P4-2 phase 3c: "Show types & modules" — draws the folded
+                  Types/Interfaces/Modules back on the canvas, render only; off
+                  by default and remembered per project. The hint says what it
+                  doesn't do: no risk number moves. */}
+              <label className="code-map__signal-toggle" title={SHOW_FOLDED_KINDS_HINT}>
+                <input
+                  type="checkbox"
+                  checked={showFoldedKinds}
+                  onChange={(event) => changeShowFoldedKinds(event.target.checked)}
+                  aria-describedby={SHOW_FOLDED_KINDS_HINT_ID}
+                />
+                Show types &amp; modules
+              </label>
+              <span id={SHOW_FOLDED_KINDS_HINT_ID} className="code-map__signal-toggle-hint">
+                Risk numbers unchanged
+                <span className="visually-hidden">: {SHOW_FOLDED_KINDS_HINT}</span>
+              </span>
+            </Panel>
+          </ReactFlow>
+        </CodeMapCanvasFrame>
       )}
 
       {/* P0-2b: `pathTraceInput`, NOT `canvas` — search stays reachable in
@@ -9015,6 +9332,14 @@ export function CodeMap({
           </button>
         </div>
       )}
+
+      {/* P4-3a: the changed-Node metrics table, in the fixed-height band
+          `--code-map-table-height` (styles.css) keeps free below the canvas.
+          `prReviewMetricsTableFor` gates it: PR Review, a showable map with
+          its canvas, a resolved diff scope and at least one row. After the
+          history toolbar and before the overlays, so Tab order follows the
+          layout: the top toolbars first, then the table at the bottom. */}
+      {prReviewMetricsTableProps !== null && <PrReviewMetricsTable {...prReviewMetricsTableProps} />}
 
       {sourceOverlayOpen(sourceView) && (
         <div

@@ -51,7 +51,7 @@ type ReadyNode = Extract<FetchState, { status: 'ready' }>['nodes'][number];
 
 const SHOWABLE: FetchState = {
   status: 'ready',
-  nodes: [{ id: 'src/a.ts#a', name: 'a' } as unknown as ReadyNode],
+  nodes: [{ id: 'src/a.ts#a', name: 'a', file: 'src/a.ts', startLine: 1, riskSignals: [] } as unknown as ReadyNode],
   edges: [],
   hiddenByScope: 0,
   appliedScope: [],
