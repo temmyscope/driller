@@ -52,8 +52,20 @@ import {
   METRICS_TABLE_AFFECTED_ROW_CAP,
   nodesWithinDepth,
   type BlastRadiusState,
+  defaultPrReviewMetricSort,
+  formatMetricSortAnnouncement,
+  formatSortedWithinCapNote,
+  METRIC_BAR_HEADER_NOTE,
+  metricBar,
+  metricBarWidths,
+  nextPrReviewMetricSort,
+  PR_REVIEW_METRIC_COLUMNS,
   PrReviewMetricsTable,
+  type PrReviewMetricRow,
   type PrReviewMetricRows,
+  type PrReviewMetricSort,
+  type PrReviewMetricSortColumn,
+  sortPrReviewMetricRows,
   resolvePrReviewView,
   SEVERE_SIGNAL_GLYPH,
 } from './CodeMap';
@@ -153,18 +165,38 @@ describe('buildPrReviewMetricRows', () => {
     assert.equal(missingChangedCount, 0);
   });
 
-  it('orders by file, then startLine, then id', () => {
+  it('orders by blast radius descending (none last), then id — P4-3d review: the default comparator, not file/line', () => {
     assert.deepEqual(
       rows.map((r) => r.id),
-      ['src/a.ts::load', 'src/b.ts::refund', 'src/b.ts::pay'],
+      ['src/b.ts::refund', 'src/b.ts::pay', 'src/a.ts::load'],
     );
+    // No blast radius anywhere: file and line no longer matter, id decides.
     const tie = buildPrReviewMetricRows(
       [node('z', { startLine: 3 }), node('m', { startLine: 3 }), node('a', { startLine: 9 })],
       new Set(['z', 'm', 'a']), null, 0,
     );
     assert.deepEqual(
       tie.rows.map((r) => r.id),
-      ['m', 'z', 'a'],
+      ['a', 'm', 'z'],
+    );
+  });
+
+  it('changed rows with differing blast values: highest first, equal ones by id, absent last', () => {
+    const table = buildPrReviewMetricRows(
+      [
+        node('src/a.ts::first', { file: 'src/a.ts', startLine: 1, riskSignals: [det('blast-radius', 2)] }),
+        node('src/z.ts::wide', { file: 'src/z.ts', startLine: 99, riskSignals: [det('blast-radius', 70, 'severe')] }),
+        node('src/m.ts::none', { file: 'src/m.ts' }),
+        node('src/q.ts::tieB', { file: 'src/q.ts', riskSignals: [det('blast-radius', 30)] }),
+        node('src/b.ts::tieA', { file: 'src/b.ts', riskSignals: [det('blast-radius', 30)] }),
+      ],
+      new Set(['src/a.ts::first', 'src/z.ts::wide', 'src/m.ts::none', 'src/q.ts::tieB', 'src/b.ts::tieA']),
+      null,
+      0,
+    );
+    assert.deepEqual(
+      table.rows.map((r) => r.id),
+      ['src/z.ts::wide', 'src/b.ts::tieA', 'src/q.ts::tieB', 'src/a.ts::first', 'src/m.ts::none'],
     );
   });
 
@@ -200,7 +232,7 @@ describe('buildPrReviewMetricRows', () => {
   it('flags the index coverage gap from summaryStatus', () => {
     assert.deepEqual(
       rows.map((r) => r.coverageGap),
-      [false, true, false],
+      [true, false, false],
     );
   });
 
@@ -277,8 +309,13 @@ describe('resolvePrReviewView: the metrics table gate', () => {
 // PrReviewMetricsTable
 // ---------------------------------------------------------------------------
 
-function render(table: PrReviewMetricRows, blastRadiusStatus: BlastRadiusState['status'] = 'idle'): RenderedElement[] {
-  return renderTree(PrReviewMetricsTable({ ...table, blastRadiusStatus }));
+function render(
+  table: PrReviewMetricRows,
+  blastRadiusStatus: BlastRadiusState['status'] = 'idle',
+  sort: PrReviewMetricSort | null = null,
+  onSort: (sort: PrReviewMetricSort) => void = () => {},
+): RenderedElement[] {
+  return renderTree(PrReviewMetricsTable({ ...table, blastRadiusStatus, sort, onSort }));
 }
 
 const byType = (elements: RenderedElement[], type: string) => elements.filter((e) => e.type === type);
@@ -294,9 +331,17 @@ describe('PrReviewMetricsTable', () => {
   it('is a native table with six scope="col" headers, blast radius naming its fixed bound', () => {
     assert.equal(byType(elements, 'table').length, 1);
     const headers = renderTree(byType(elements, 'thead')[0]?.props.children).filter((e) => e.type === 'th');
+    // P4-3d: the bar columns add their visually hidden "relative" note.
     assert.deepEqual(
       headers.map((h) => textOf(h)),
-      ['node', 'hop', 'complexity', `blast radius (${BLAST_RADIUS_DEFAULT_HOPS} hops)`, 'tests', 'findings'],
+      [
+        'node',
+        'hop',
+        `complexity ${METRIC_BAR_HEADER_NOTE}`,
+        `blast radius (${BLAST_RADIUS_DEFAULT_HOPS} hops) ${METRIC_BAR_HEADER_NOTE}`,
+        'tests',
+        'findings',
+      ],
     );
     assert.ok(headers.every((h) => h.props.scope === 'col'));
   });
@@ -308,7 +353,7 @@ describe('PrReviewMetricsTable', () => {
   });
 
   it('cells: identifier, module, hop, values, tests gap and findings', () => {
-    const pay = rowsOf(elements)[2]!;
+    const pay = rowsOf(elements)[1]!;
     const cells = cellsOf(pay).map((c) => textOf(c));
     assert.deepEqual(cells, [
       'paysrc/billing/, src/billing/b.ts line 40',
@@ -347,25 +392,25 @@ describe('PrReviewMetricsTable', () => {
   });
 
   it('absent signals render —, and nothing anywhere says "covered"', () => {
-    const load = rowsOf(elements)[0]!;
+    const load = rowsOf(elements)[2]!;
     assert.deepEqual(
       cellsOf(load).map((c) => textOf(c)),
       ['loadsrc/, src/a.ts line 10', 'changed', '3', METRIC_CELL_EMPTY, METRIC_CELL_EMPTY, METRIC_CELL_EMPTY],
     );
     assert.equal(METRIC_CELL_EMPTY, '—');
-    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle' })).toLowerCase();
+    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {} })).toLowerCase();
     assert.ok(!allText.includes('covered'), allText);
     assert.ok(!allText.includes('%'), allText);
   });
 
   it('shows the index coverage-gap glyph on a coverage-gap Node', () => {
-    const refund = rowsOf(elements)[1]!;
+    const refund = rowsOf(elements)[0]!;
     const glyph = renderTree(refund.props.children).find(
       (e) => e.props.className === 'code-map__metrics-table-coverage-gap',
     );
     assert.equal(textOf(glyph), '⚠');
     assert.equal(
-      rowsOf(elements)[0] && renderTree(rowsOf(elements)[0]!.props.children).some(
+      rowsOf(elements)[2] && renderTree(rowsOf(elements)[2]!.props.children).some(
         (e) => e.props.className === 'code-map__metrics-table-coverage-gap',
       ),
       false,
@@ -736,7 +781,7 @@ describe('CodeMap source: the divider wiring', () => {
     assert.equal(src.split('<MetricsTableDivider').length - 1, 1);
     assert.match(
       src,
-      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable \{\.\.\.prReviewMetricsTableProps\} \/>\s*<\/>\s*\)\}/,
+      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}\s+sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}\s+\/>\s*<\/>\s*\)\}/,
     );
   });
   it('.code-map carries the height style and the measured ref', () => {
@@ -815,7 +860,7 @@ describe('buildPrReviewMetricRows: affected rows', () => {
     }
   });
 
-  it('changed rows keep phase 1a order and lead; affected rows: hop ascending, blast radius descending, then id', () => {
+  it('changed rows lead (blast radius descending, then id); affected rows: hop ascending, blast radius descending, then id', () => {
     const nodes = [
       node('z-far', { riskSignals: [det('blast-radius', 500)] }),
       node('b-none'),
@@ -836,7 +881,7 @@ describe('buildPrReviewMetricRows: affected rows', () => {
     const table = buildPrReviewMetricRows(nodes, new Set(changed), distances, 2);
     assert.deepEqual(
       table.rows.map((r) => r.id),
-      ['src/a.ts::load', 'src/b.ts::refund', 'src/b.ts::pay', 'j-high', 'k-high', 'm-low', 'a-none', 'b-none', 'z-far'],
+      ['src/b.ts::refund', 'src/b.ts::pay', 'src/a.ts::load', 'j-high', 'k-high', 'm-low', 'a-none', 'b-none', 'z-far'],
     );
     assert.deepEqual(
       table.rows.map((r) => r.hop),
@@ -1174,5 +1219,496 @@ describe('CodeMap source: the affected-row wiring', () => {
     assert.deepEqual(trigger[0]!.deps, ['mode', 'projectPath', 'diffScopeState', 'blastRadiusState.status', 'graphServiceAvailable']);
     assert.ok(!trigger[0]!.deps.includes('blastRadiusDepth'));
     assert.match(trigger[0]!.text, /blastRadiusState\.status !== 'idle'\n\s*\) \{\n\s*return;/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-3d: real column sorting, the announcement, and the relative bars
+// ---------------------------------------------------------------------------
+
+/**
+ * Two changed and three affected rows, built so every column has ties and
+ * missing values: complexity 5 twice, blast radius 50 twice, two `alpha`s.
+ */
+const SORTABLE_NODES = [
+  node('src/a.ts::alpha', {
+    file: 'src/a.ts',
+    riskSignals: [det('complexity', 5), det('blast-radius', 10), det('test-coverage-gap', 1), finding('major', 'A')],
+  }),
+  node('src/b.ts::beta', { file: 'src/b.ts', riskSignals: [det('blast-radius', 3, 'severe')] }),
+  node('x::gamma', { file: 'src/x.ts', riskSignals: [det('complexity', 5), finding('minor', 'B'), finding('info', 'C')] }),
+  node('x::delta', {
+    file: 'src/x.ts',
+    riskSignals: [det('complexity', 20, 'severe'), det('blast-radius', 50), det('test-coverage-gap', 1)],
+  }),
+  node('y::alpha', { file: 'src/y.ts', riskSignals: [det('complexity', 1), det('blast-radius', 50), finding('blocker', 'D')] }),
+];
+const SORTABLE = buildPrReviewMetricRows(
+  SORTABLE_NODES,
+  new Set(['src/a.ts::alpha', 'src/b.ts::beta']),
+  new Map([
+    ['x::gamma', 1],
+    ['x::delta', 1],
+    ['y::alpha', 2],
+  ]),
+  2,
+);
+const idsOf = (rows: readonly PrReviewMetricRow[]) => rows.map((r) => r.id);
+/** A rendered row's Node id — its node cell's `title`. */
+const rowIdOf = (row: RenderedElement) => cellsOf(row)[0]?.props.title;
+const sortBy = (column: PrReviewMetricSortColumn, direction: PrReviewMetricSort['direction']) => ({ column, direction });
+
+describe('sortPrReviewMetricRows', () => {
+  const EXPECTED: Record<PrReviewMetricSortColumn, Record<PrReviewMetricSort['direction'], string[]>> = {
+    node: {
+      // name, then file; id breaks nothing here (names and files differ).
+      ascending: ['src/a.ts::alpha', 'y::alpha', 'src/b.ts::beta', 'x::delta', 'x::gamma'],
+      descending: ['x::gamma', 'x::delta', 'src/b.ts::beta', 'y::alpha', 'src/a.ts::alpha'],
+    },
+    hop: {
+      // `changed` before 1, 2; ties by id ascending in both directions.
+      ascending: ['src/a.ts::alpha', 'src/b.ts::beta', 'x::delta', 'x::gamma', 'y::alpha'],
+      descending: ['y::alpha', 'x::delta', 'x::gamma', 'src/a.ts::alpha', 'src/b.ts::beta'],
+    },
+    complexity: {
+      // 5 twice → id; `—` (beta) last in both directions.
+      descending: ['x::delta', 'src/a.ts::alpha', 'x::gamma', 'y::alpha', 'src/b.ts::beta'],
+      ascending: ['y::alpha', 'src/a.ts::alpha', 'x::gamma', 'x::delta', 'src/b.ts::beta'],
+    },
+    blastRadius: {
+      // 50 twice → id; `—` (gamma) last in both directions.
+      descending: ['x::delta', 'y::alpha', 'src/a.ts::alpha', 'src/b.ts::beta', 'x::gamma'],
+      ascending: ['src/b.ts::beta', 'src/a.ts::alpha', 'x::delta', 'y::alpha', 'x::gamma'],
+    },
+    tests: {
+      // `gap` before `—`, and `—` last either way — so both directions agree.
+      descending: ['src/a.ts::alpha', 'x::delta', 'src/b.ts::beta', 'x::gamma', 'y::alpha'],
+      ascending: ['src/a.ts::alpha', 'x::delta', 'src/b.ts::beta', 'x::gamma', 'y::alpha'],
+    },
+    findings: {
+      // count, then the highest finding's severity (blocker over major).
+      descending: ['x::gamma', 'y::alpha', 'src/a.ts::alpha', 'src/b.ts::beta', 'x::delta'],
+      ascending: ['src/a.ts::alpha', 'y::alpha', 'x::gamma', 'src/b.ts::beta', 'x::delta'],
+    },
+  };
+
+  for (const { column } of PR_REVIEW_METRIC_COLUMNS) {
+    for (const direction of ['ascending', 'descending'] as const) {
+      it(`${column} ${direction}`, () => {
+        assert.deepEqual(idsOf(sortPrReviewMetricRows(SORTABLE.rows, sortBy(column, direction))), EXPECTED[column][direction]);
+      });
+    }
+  }
+
+  it('equal values break on id ascending, whatever order the rows come in (stable across re-sorts)', () => {
+    const reversed = [...SORTABLE.rows].reverse();
+    for (const { column } of PR_REVIEW_METRIC_COLUMNS) {
+      for (const direction of ['ascending', 'descending'] as const) {
+        const sort = sortBy(column, direction);
+        const once = sortPrReviewMetricRows(SORTABLE.rows, sort);
+        assert.deepEqual(idsOf(sortPrReviewMetricRows(reversed, sort)), idsOf(once), `${column} ${direction}`);
+        assert.deepEqual(idsOf(sortPrReviewMetricRows(once, sort)), idsOf(once), `${column} ${direction} re-sorted`);
+      }
+    }
+  });
+
+  it('`—` sorts last in both directions, for every column that can be missing', () => {
+    for (const column of ['complexity', 'blastRadius', 'tests', 'findings'] as const) {
+      for (const direction of ['ascending', 'descending'] as const) {
+        const sorted = sortPrReviewMetricRows(SORTABLE.rows, sortBy(column, direction));
+        const missing = (r: PrReviewMetricRow) =>
+          column === 'complexity' ? r.complexity === null
+          : column === 'blastRadius' ? r.blastRadius === null
+          : column === 'tests' ? !r.testCoverageGap
+          : r.findings === null;
+        const firstMissing = sorted.findIndex(missing);
+        assert.ok(firstMissing > 0, `${column} ${direction}`);
+        assert.ok(sorted.slice(firstMissing).every(missing), `${column} ${direction}: ${idsOf(sorted).join(', ')}`);
+      }
+    }
+  });
+
+  it('the default order: changed first, then hop, blast radius descending, id — the builder\'s own order, restored by null', () => {
+    // The builder's affected tuples and the comparator agree on every row.
+    const many = buildPrReviewMetricRows(
+      [...THREE, ...affectedNodes('b', 30, (i) => (i * 7) % 11), ...affectedNodes('c', 30)],
+      new Set(THREE.map((n) => n.id)),
+      hops([[affectedNodes('b', 30), 1], [affectedNodes('c', 30), 2]]),
+      2,
+    );
+    assert.deepEqual(idsOf([...many.rows].sort(defaultPrReviewMetricSort)), idsOf(many.rows));
+    assert.deepEqual(idsOf(SORTABLE.rows), ['src/a.ts::alpha', 'src/b.ts::beta', 'x::delta', 'x::gamma', 'y::alpha']);
+    const shuffled = sortPrReviewMetricRows(SORTABLE.rows, sortBy('findings', 'descending'));
+    assert.deepEqual(idsOf(sortPrReviewMetricRows(shuffled, null)), idsOf(SORTABLE.rows));
+    assert.deepEqual(idsOf([...shuffled].sort(defaultPrReviewMetricSort)), idsOf(SORTABLE.rows));
+  });
+
+  it('sorting reorders every row — changed rows too, keeping their hop — and never pulls in a row past the cap', () => {
+    const changed = THREE.map((n) => n.id);
+    // 52 affected: the two past the cap have the largest complexity.
+    const many = Array.from({ length: 52 }, (_, i) =>
+      node(`n-${String(i).padStart(3, '0')}`, {
+        riskSignals: [det('blast-radius', 100 - i), det('complexity', i >= 50 ? 999 : i)],
+      }),
+    );
+    const capped = buildPrReviewMetricRows([...THREE, ...many], new Set(changed), hops([[many, 1]]), 1);
+    assert.equal(capped.hiddenAffectedCount, 2);
+    const sorted = sortPrReviewMetricRows(capped.rows, sortBy('complexity', 'descending'));
+    assert.deepEqual(new Set(idsOf(sorted)), new Set(idsOf(capped.rows)));
+    assert.ok(!sorted.some((r) => r.id === 'n-050' || r.id === 'n-051'));
+    assert.equal(sorted[0]?.id, 'n-049');
+    // THREE's `pay` (complexity 42) sits among the affected rows, still changed.
+    const pay = sorted.findIndex((r) => r.id === 'src/b.ts::pay');
+    assert.ok(pay > 0 && sorted[pay]?.hop === 'changed');
+    const rendered = render(capped, 'resolved', sortBy('complexity', 'descending'));
+    const bodyRows = byType(rendered, 'tr').filter((tr) => byType(renderTree(tr.props.children), 'td').length > 0);
+    assert.equal(bodyRows.at(-1)?.props.className, 'code-map__metrics-cap', 'the cap line stays last');
+    assert.equal(textOf(bodyRows.at(-1)), '+2 more affected Nodes — reduce depth');
+  });
+});
+
+describe('nextPrReviewMetricSort and the announcement', () => {
+  it('numeric columns start descending, node and hop ascending; the active column flips', () => {
+    for (const column of ['complexity', 'blastRadius', 'tests', 'findings'] as const) {
+      assert.deepEqual(nextPrReviewMetricSort(null, column), sortBy(column, 'descending'));
+      assert.deepEqual(nextPrReviewMetricSort(sortBy(column, 'descending'), column), sortBy(column, 'ascending'));
+      assert.deepEqual(nextPrReviewMetricSort(sortBy(column, 'ascending'), column), sortBy(column, 'descending'));
+    }
+    for (const column of ['node', 'hop'] as const) {
+      assert.deepEqual(nextPrReviewMetricSort(null, column), sortBy(column, 'ascending'));
+      assert.deepEqual(nextPrReviewMetricSort(sortBy(column, 'ascending'), column), sortBy(column, 'descending'));
+    }
+    // Another column starts at its own first direction, not the current one's.
+    assert.deepEqual(nextPrReviewMetricSort(sortBy('complexity', 'ascending'), 'hop'), sortBy('hop', 'ascending'));
+    assert.deepEqual(nextPrReviewMetricSort(sortBy('node', 'descending'), 'findings'), sortBy('findings', 'descending'));
+  });
+
+  it('says the column and the direction, and nothing for the default order', () => {
+    assert.equal(formatMetricSortAnnouncement(sortBy('blastRadius', 'descending')), 'Sorted by blast radius, descending.');
+    assert.equal(formatMetricSortAnnouncement(sortBy('complexity', 'descending')), 'Sorted by complexity, descending.');
+    assert.equal(formatMetricSortAnnouncement(sortBy('complexity', 'ascending')), 'Sorted by complexity, ascending.');
+    assert.equal(formatMetricSortAnnouncement(null), '');
+  });
+});
+
+describe('PrReviewMetricsTable: sort headers and the live region', () => {
+  const headersOf = (els: RenderedElement[]) =>
+    renderTree(byType(els, 'thead')[0]?.props.children).filter((e) => e.type === 'th');
+  const statusOf = (els: RenderedElement[]) => els.filter((e) => e.props.role === 'status');
+
+  it('every header is a scope="col" th holding one native button', () => {
+    const headers = headersOf(render(SORTABLE));
+    assert.equal(headers.length, PR_REVIEW_METRIC_COLUMNS.length);
+    for (const th of headers) {
+      assert.equal(th.props.scope, 'col');
+      const buttons = byType(renderTree(th.props.children), 'button');
+      assert.equal(buttons.length, 1);
+      assert.equal(buttons[0]?.props.type, 'button');
+    }
+  });
+
+  it('only the active column carries aria-sort; the default order carries none', () => {
+    assert.ok(headersOf(render(SORTABLE)).every((th) => th.props['aria-sort'] === undefined));
+    for (const direction of ['ascending', 'descending'] as const) {
+      const headers = headersOf(render(SORTABLE, 'idle', sortBy('complexity', direction)));
+      assert.deepEqual(
+        headers.map((th) => th.props['aria-sort']),
+        [undefined, undefined, direction, undefined, undefined, undefined],
+      );
+      assert.ok(!('aria-sort' in headers[0]!.props) || headers[0]!.props['aria-sort'] === undefined);
+    }
+  });
+
+  it('activating a header hands the next sort to onSort: descending, then ascending', () => {
+    const sorts: PrReviewMetricSort[] = [];
+    const click = (sort: PrReviewMetricSort | null, index: number) => {
+      const th = headersOf(render(SORTABLE, 'idle', sort, (next) => sorts.push(next)))[index]!;
+      (byType(renderTree(th.props.children), 'button')[0]!.props.onClick as () => void)();
+    };
+    click(null, 2);
+    click(sorts[0]!, 2);
+    click(null, 0);
+    assert.deepEqual(sorts, [sortBy('complexity', 'descending'), sortBy('complexity', 'ascending'), sortBy('node', 'ascending')]);
+  });
+
+  it('renders rows in the sorted order, with the changed rule still on changed rows', () => {
+    const rows = rowsOf(render(SORTABLE, 'idle', sortBy('complexity', 'descending')));
+    assert.deepEqual(
+      rows.map(rowIdOf),
+      ['x::delta', 'src/a.ts::alpha', 'x::gamma', 'y::alpha', 'src/b.ts::beta'],
+    );
+    assert.deepEqual(
+      rows.map((r) => String(r.props.className).includes('--changed')),
+      [false, true, false, false, true],
+    );
+  });
+
+  it('the visually hidden status region is always mounted and follows the sort and its direction', () => {
+    const [idle, ...more] = statusOf(render(SORTABLE));
+    assert.equal(more.length, 0);
+    assert.equal(idle?.props.className, 'visually-hidden');
+    assert.equal(textOf(idle), '');
+    assert.equal(textOf(statusOf(render(SORTABLE, 'idle', sortBy('complexity', 'descending')))[0]), 'Sorted by complexity, descending.');
+    assert.equal(textOf(statusOf(render(SORTABLE, 'idle', sortBy('complexity', 'ascending')))[0]), 'Sorted by complexity, ascending.');
+    assert.equal(textOf(statusOf(render(SORTABLE, 'idle', sortBy('blastRadius', 'descending')))[0]), 'Sorted by blast radius, descending.');
+  });
+
+  it('the bar columns say the bar is relative, hidden and as a title; the others carry no note', () => {
+    const headers = headersOf(render(SORTABLE));
+    PR_REVIEW_METRIC_COLUMNS.forEach(({ column, bar }, i) => {
+      const button = byType(renderTree(headers[i]!.props.children), 'button')[0]!;
+      const note = renderTree(button.props.children).find((e) => e.props.className === 'visually-hidden');
+      assert.equal(bar, column === 'complexity' || column === 'blastRadius', column);
+      assert.equal(button.props.title, bar ? METRIC_BAR_HEADER_NOTE : undefined, column);
+      assert.equal(note === undefined ? null : textOf(note), bar ? ` ${METRIC_BAR_HEADER_NOTE}` : null, column);
+    });
+    assert.equal(METRIC_BAR_HEADER_NOTE, "(bar: relative to this table's max)");
+  });
+
+  it('the active header shows a direction arrow, hidden from assistive tech (aria-sort says it)', () => {
+    const headers = headersOf(render(SORTABLE, 'idle', sortBy('hop', 'ascending')));
+    const arrows = headers.map((th) =>
+      renderTree(th.props.children).find((e) => e.props.className === 'code-map__metrics-sort-indicator'),
+    );
+    assert.equal(textOf(arrows[1]), '↑');
+    assert.equal(arrows[1]?.props['aria-hidden'], 'true');
+    assert.ok(arrows.filter((a, i) => i !== 1).every((a) => a === undefined));
+    const down = headersOf(render(SORTABLE, 'idle', sortBy('hop', 'descending')))[1]!;
+    assert.equal(textOf(renderTree(down.props.children).find((e) => e.props.className === 'code-map__metrics-sort-indicator')), '↓');
+  });
+});
+
+describe('the relative bars', () => {
+  const barsIn = (cell: RenderedElement) =>
+    renderTree(cell.props.children).filter((e) => String(e.props.className ?? '').startsWith('code-map__metrics-bar'));
+  const rowById = (els: RenderedElement[], id: string) => rowsOf(els).find((r) => rowIdOf(r) === id)!;
+
+  it('metricBarWidths: each bar column\'s max over the rows given; 0 without values', () => {
+    assert.deepEqual(metricBarWidths(SORTABLE.rows), { complexity: 20, blastRadius: 50 });
+    assert.deepEqual(metricBarWidths([]), { complexity: 0, blastRadius: 0 });
+  });
+
+  it('metricBar: width relative to the column max; no bar for a missing signal or a 0 max', () => {
+    assert.deepEqual(metricBar(det('complexity', 5), 20), { width: '25%', severe: false });
+    assert.deepEqual(metricBar(det('complexity', 20, 'severe'), 20), { width: '100%', severe: true });
+    assert.deepEqual(metricBar(det('complexity', 1), 3), { width: '33.33%', severe: false });
+    assert.equal(metricBar(null, 20), null);
+    assert.equal(metricBar(det('complexity', 0), 0), null);
+  });
+
+  it('colour comes from severity only: a small severe value is red, a large moderate one neutral', () => {
+    assert.equal(metricBar(det('blast-radius', 1, 'severe'), 1000)?.severe, true);
+    assert.equal(metricBar(det('blast-radius', 1000), 1000)?.severe, false);
+    const els = render(
+      buildPrReviewMetricRows(
+        [node('small', { riskSignals: [det('blast-radius', 1, 'severe')] }), node('big', { riskSignals: [det('blast-radius', 1000)] })],
+        new Set(['small', 'big']),
+        null,
+        0,
+      ),
+    );
+    const fill = (id: string) => barsIn(cellsOf(rowById(els, id))[3]!).find((e) => e.type === 'span' && !String(e.props.className).includes('track'));
+    assert.equal(fill('small')?.props.className, 'code-map__metrics-bar code-map__metrics-bar--severe');
+    assert.deepEqual(fill('small')?.props.style, { width: '0.1%' });
+    assert.equal(fill('big')?.props.className, 'code-map__metrics-bar');
+    assert.deepEqual(fill('big')?.props.style, { width: '100%' });
+  });
+
+  it('a severe bar keeps its text value, the ! glyph and "(severe)"; the bar is aria-hidden', () => {
+    const els = render(SORTABLE);
+    const delta = cellsOf(rowById(els, 'x::delta'))[2]!;
+    const [track, fill] = barsIn(delta);
+    assert.equal(track?.props.className, 'code-map__metrics-bar-track');
+    assert.equal(track?.props['aria-hidden'], 'true');
+    assert.equal(fill?.props.className, 'code-map__metrics-bar code-map__metrics-bar--severe');
+    assert.equal(textOf(delta), `${SEVERE_SIGNAL_GLYPH} 20`);
+    assert.ok(renderTree(delta.props.children).some((e) => e.props['aria-label'] === '20 (severe)'));
+  });
+
+  it('bars only on complexity and blast radius; a missing value has none', () => {
+    const els = render(SORTABLE);
+    const alpha = cellsOf(rowById(els, 'src/a.ts::alpha'));
+    assert.deepEqual(alpha.map((c) => barsIn(c).length), [0, 0, 2, 2, 0, 0]);
+    const beta = cellsOf(rowById(els, 'src/b.ts::beta'));
+    assert.deepEqual(beta.map((c) => barsIn(c).length), [0, 0, 0, 2, 0, 0]);
+  });
+
+  it('every complexity value 0: no bars, and the values still show 0', () => {
+    const els = render(
+      buildPrReviewMetricRows(
+        [node('p', { riskSignals: [det('complexity', 0)] }), node('q', { riskSignals: [det('complexity', 0)] })],
+        new Set(['p', 'q']),
+        null,
+        0,
+      ),
+    );
+    for (const row of rowsOf(els)) {
+      const complexity = cellsOf(row)[2]!;
+      assert.equal(barsIn(complexity).length, 0);
+      assert.equal(textOf(complexity), '0');
+    }
+  });
+
+  it('the max is over the rendered rows only — a larger value past the affected cap never shrinks the bars', () => {
+    const many = Array.from({ length: 52 }, (_, i) =>
+      node(`n-${String(i).padStart(3, '0')}`, {
+        riskSignals: [det('blast-radius', 100 - i), det('complexity', i >= 50 ? 999 : i)],
+      }),
+    );
+    const capped = buildPrReviewMetricRows(many, new Set(), hops([[many, 1]]), 1);
+    assert.equal(metricBarWidths(capped.rows).complexity, 49);
+    const els = render(capped);
+    const fill = barsIn(cellsOf(rowById(els, 'n-049'))[2]!)[1];
+    assert.deepEqual(fill?.props.style, { width: '100%' });
+  });
+});
+
+describe('styles.css: the sort buttons and the bars', () => {
+  const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+  const rule = (selector: string) => {
+    const start = css.indexOf(`\n${selector} {`);
+    assert.ok(start >= 0, selector);
+    return css.slice(start, css.indexOf('\n}', start));
+  };
+  it('the bar track is --border, the fill neutral --text-dim, severe --risk-red — no green, no amber', () => {
+    assert.match(rule('.code-map__metrics-bar-track'), /background: var\(--border\);/);
+    assert.match(rule('.code-map__metrics-bar'), /background: var\(--text-dim\);/);
+    assert.match(rule('.code-map__metrics-bar--severe'), /background: var\(--risk-red\);/);
+    for (const selector of ['.code-map__metrics-bar-track', '.code-map__metrics-bar', '.code-map__metrics-bar--severe']) {
+      assert.doesNotMatch(rule(selector), /healthy|amber|radius/, selector);
+    }
+  });
+  it('the header button takes the toolbar buttons\' focus-visible ring', () => {
+    const toolbar = rule('.code-map__pr-review-toolbar button:focus-visible');
+    assert.equal(rule('.code-map__metrics-sort:focus-visible').split('{')[1], toolbar.split('{')[1]);
+  });
+});
+
+describe('CodeMap source: the sort wiring', () => {
+  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
+  const hooks = topLevelHooks(src);
+  it('the sort is reset to the default order at every diff-scope reset point, and by no mode-keyed hook', () => {
+    const scopeResets = hooks.filter((hook) => /setDiffScopeState\(\{ status: '(idle|loading)' \}\)/.test(hook.text));
+    assert.equal(scopeResets.length, 4, 'project change, loadCodeMap, refreshCodeMap, handleComputeDiffScope');
+    for (const hook of scopeResets) {
+      assert.ok(hook.text.includes('setPrReviewMetricSort(null);'), hook.name ?? 'the project effect');
+    }
+    assert.equal(src.split('setPrReviewMetricSort(null);').length - 1, 4);
+    for (const hook of hooks.filter((h) => h.text.includes('setPrReviewMetricSort('))) {
+      assert.ok(!hook.deps.includes('mode'), hook.name ?? 'an effect');
+    }
+  });
+  it('the table gets the state and its setter — a sort is local, never a fetch', () => {
+    assert.match(src, /const \[prReviewMetricSort, setPrReviewMetricSort\] = useState<PrReviewMetricSort \| null>\(null\);/);
+    assert.match(src, /sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-3d review round 1
+// ---------------------------------------------------------------------------
+
+describe('P4-3d review: node collation', () => {
+  it('sorts names case-insensitively, punctuation first; code-unit order breaks a case-only tie', () => {
+    const table = buildPrReviewMetricRows(
+      [node('m::Zeta'), node('m::alpha'), node('m::_private'), node('n::Alpha')],
+      new Set(['m::Zeta', 'm::alpha', 'm::_private', 'n::Alpha']),
+      null,
+      0,
+    );
+    assert.deepEqual(
+      sortPrReviewMetricRows(table.rows, sortBy('node', 'ascending')).map((r) => r.name),
+      ['_private', 'Alpha', 'alpha', 'Zeta'],
+    );
+    assert.deepEqual(
+      sortPrReviewMetricRows(table.rows, sortBy('node', 'descending')).map((r) => r.name),
+      ['Zeta', 'alpha', 'Alpha', '_private'],
+    );
+  });
+});
+
+describe('P4-3d review: the sorted-within-cap note', () => {
+  const changed = THREE.map((n) => n.id);
+  const many = affectedNodes('n', 52);
+  const capped = buildPrReviewMetricRows([...THREE, ...many], new Set(changed), hops([[many, 1]]), 1);
+  const notes = (els: RenderedElement[]) =>
+    byType(els, 'tr').filter((tr) => tr.props.className === 'code-map__metrics-sort-note');
+
+  it('formats the rows shown and the Nodes past the cap; null in the default order or without a cap', () => {
+    assert.equal(
+      formatSortedWithinCapNote(sortBy('complexity', 'descending'), 53, 2),
+      'Sorted within the 53 rows shown — 2 more affected Nodes are past the cap; reduce depth to include them.',
+    );
+    assert.equal(
+      formatSortedWithinCapNote(sortBy('node', 'ascending'), 51, 1),
+      'Sorted within the 51 rows shown — 1 more affected Node is past the cap; reduce depth to include them.',
+    );
+    assert.equal(formatSortedWithinCapNote(null, 53, 2), null);
+    assert.equal(formatSortedWithinCapNote(sortBy('hop', 'ascending'), 53, 0), null);
+  });
+
+  it('shows only for a user sort on a capped table, inert, in its own tbody above the rows', () => {
+    const els = render(capped, 'resolved', sortBy('complexity', 'descending'));
+    const [note, ...rest] = notes(els);
+    assert.ok(note);
+    assert.equal(rest.length, 0);
+    assert.equal(textOf(note), formatSortedWithinCapNote(sortBy('complexity', 'descending'), 53, 2));
+    const bodies = byType(els, 'tbody');
+    assert.equal(bodies.length, 2);
+    assert.equal(renderTree(bodies[0]!.props.children).filter((e) => e.type === 'tr').length, 1, 'the note alone');
+    const cells = byType(renderTree(note.props.children), 'td');
+    assert.equal(cells[0]?.props.colSpan, PR_REVIEW_METRIC_COLUMNS.length);
+    for (const element of [note, ...renderTree(note.props.children)]) {
+      assert.equal(element.props.onClick, undefined);
+      assert.equal(element.props.tabIndex, undefined);
+    }
+    // The announcement, the caption and the cap line are unchanged.
+    assert.equal(textOf(els.find((e) => e.props.role === 'status')), 'Sorted by complexity, descending.');
+    assert.equal(textOf(byType(els, 'caption')[0]), "Changed and affected Nodes' risk metrics");
+    assert.equal(textOf(byType(els, 'tr').find((tr) => tr.props.className === 'code-map__metrics-cap')), '+2 more affected Nodes — reduce depth');
+    // Default order on a capped table, or a sort with nothing past the cap: no note.
+    assert.equal(notes(render(capped, 'resolved', null)).length, 0);
+    assert.equal(notes(render({ ...capped, hiddenAffectedCount: 0 }, 'resolved', sortBy('complexity', 'descending'))).length, 0);
+    assert.equal(byType(render(capped, 'resolved', null), 'tbody').length, 1);
+  });
+
+  it('is muted, like the cap line', () => {
+    const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+    const start = css.indexOf('\n.code-map__metrics-sort-note {');
+    assert.ok(start >= 0);
+    assert.match(css.slice(start, css.indexOf('\n}', start)), /color: var\(--text-mute\);/);
+  });
+});
+
+describe('P4-3d review: an active sort persists across a depth step', () => {
+  const changed = THREE.map((n) => n.id);
+  const near = affectedNodes('near', 3, (i) => i + 1);
+  const far = [node('far', { riskSignals: [det('complexity', 500), det('blast-radius', 1)] })];
+  const distances = hops([
+    [near, 1],
+    [far, 2],
+  ]);
+  const sort = sortBy('complexity', 'descending');
+
+  it('the same sort applies to the rows at the new depth', () => {
+    const atOne = rowsOf(render(buildPrReviewMetricRows([...THREE, ...near, ...far], new Set(changed), distances, 1), 'resolved', sort));
+    const atTwo = rowsOf(render(buildPrReviewMetricRows([...THREE, ...near, ...far], new Set(changed), distances, 2), 'resolved', sort));
+    assert.equal(atTwo.length, atOne.length + 1);
+    assert.equal(rowIdOf(atTwo[0]!), 'far', 'the new row lands where the sort puts it, not at the end');
+    assert.equal(rowIdOf(atOne[0]!), 'src/b.ts::pay');
+  });
+
+  it('nothing a step re-runs resets the sort: the stepper only sets the depth, and no sort reset depends on it', () => {
+    const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
+    const steppers = src.match(/onClick=\{\(\) => setBlastRadiusDepth\([^\n]*\)\}/g) ?? [];
+    assert.equal(steppers.length, 2);
+    assert.ok(steppers.every((handler) => !handler.includes('setPrReviewMetricSort')));
+    for (const hook of topLevelHooks(src).filter((h) => h.text.includes('setPrReviewMetricSort('))) {
+      assert.ok(!hook.deps.includes('blastRadiusDepth'), hook.name ?? 'an effect');
+      assert.ok(!hook.deps.includes('blastRadiusState'), hook.name ?? 'an effect');
+    }
+    // Only the four diff-scope resets and the table's onSort set the sort.
+    assert.equal(src.split('setPrReviewMetricSort(').length - 1, 4);
+    assert.equal(src.split('onSort={setPrReviewMetricSort}').length - 1, 1);
   });
 });

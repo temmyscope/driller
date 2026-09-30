@@ -3751,6 +3751,61 @@ code,
   color: var(--text-mute);
 }
 
+/* P4-3d: the sort buttons fill their header cell and look like its text;
+   focus takes the toolbar buttons' `:focus-visible` ring. */
+.code-map__metrics-sort {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.code-map__metrics-sort:hover {
+  color: var(--text);
+}
+
+.code-map__metrics-sort:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.code-map__metrics-sort-indicator {
+  margin-left: 0.3rem;
+}
+
+/* P4-3d: the relative bar beside a complexity or blast-radius value
+   (DESIGN.md `bar-track`, `bar-fill-moderate`, `bar-fill-severe` —
+   Decision 3: neutral or severe, from the signal's `severity` only). Its
+   length is inline, relative to the column max; flat, sharp-cornered. */
+.code-map__metrics-bar-track {
+  display: inline-block;
+  width: 4rem;
+  height: 4px;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+  background: var(--border);
+}
+
+.code-map__metrics-bar {
+  display: block;
+  height: 100%;
+  background: var(--text-dim);
+}
+
+.code-map__metrics-bar--severe {
+  background: var(--risk-red);
+}
+
+/* P4-3d review: the inert "Sorted within the N rows shown" note above the
+   rows of a sorted, capped table — muted, like the cap line. */
+.code-map__metrics-sort-note {
+  color: var(--text-mute);
+}
+
 /* P4-3c: affected rows take the plain zebra above, never the changed rule —
    the hop column is what sets them apart. The "+N more affected Nodes" cap
    line is inert, muted text. */

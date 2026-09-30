@@ -3450,8 +3450,9 @@ export function buildPrReviewMetricRows(
       affected.push({ node, hop: distance, blast: blastRadiusSortValue(node) });
     }
   }
-  rows.sort((a, b) => compareStrings(a.file, b.file) || a.startLine - b.startLine || compareStrings(a.id, b.id));
-  affected.sort((a, b) => a.hop - b.hop || b.blast - a.blast || compareStrings(a.node.id, b.node.id));
+  rows.sort(defaultPrReviewMetricSort);
+  // `defaultPrReviewMetricSort`'s own comparator, on the light tuples.
+  affected.sort((a, b) => compareDefaultOrder(a.hop, a.blast, a.node.id, b.hop, b.blast, b.node.id));
   let missingChangedCount = 0;
   for (const id of changedIds) {
     if (!found.has(id)) {
@@ -3636,6 +3637,225 @@ export function prReviewMetricsTableFor(
 export function metricCellAccessibleName(signal: DeterministicRiskSignal): string {
   return `${formatCountNumber(signal.value)}${signal.severity === 'severe' ? ' (severe)' : ''}`;
 }
+
+/**
+ * P4-3d: the table's sortable columns, in header order. `label` is the
+ * column's name in the header and in the sort announcement; `firstDirection`
+ * is where a click on an inactive column starts (numeric columns descending,
+ * node and hop ascending); `bar` marks the two columns that draw a relative
+ * bar (Decision 3 — no others without asking first).
+ */
+export type PrReviewMetricSortColumn = 'node' | 'hop' | 'complexity' | 'blastRadius' | 'tests' | 'findings';
+export type PrReviewMetricSortDirection = 'ascending' | 'descending';
+/** P4-3d: a user sort. `null` in its place is the default order (no column active). */
+export interface PrReviewMetricSort {
+  column: PrReviewMetricSortColumn;
+  direction: PrReviewMetricSortDirection;
+}
+
+export const PR_REVIEW_METRIC_COLUMNS: readonly {
+  column: PrReviewMetricSortColumn;
+  label: string;
+  firstDirection: PrReviewMetricSortDirection;
+  bar: boolean;
+}[] = [
+  { column: 'node', label: 'node', firstDirection: 'ascending', bar: false },
+  { column: 'hop', label: 'hop', firstDirection: 'ascending', bar: false },
+  { column: 'complexity', label: 'complexity', firstDirection: 'descending', bar: true },
+  { column: 'blastRadius', label: 'blast radius', firstDirection: 'descending', bar: true },
+  { column: 'tests', label: 'tests', firstDirection: 'descending', bar: false },
+  { column: 'findings', label: 'findings', firstDirection: 'descending', bar: false },
+];
+
+/**
+ * P4-3d: the default order's one comparator — changed first (hop `changed`
+ * ranks -1), then hop ascending, then blast-radius value descending (absent
+ * is -1, so last), then id. Shared by `defaultPrReviewMetricSort` and the
+ * builder's affected tuples, so the cap follows exactly this order.
+ */
+function compareDefaultOrder(
+  hopA: PrReviewMetricRow['hop'],
+  blastA: number,
+  idA: string,
+  hopB: PrReviewMetricRow['hop'],
+  blastB: number,
+  idB: string,
+): number {
+  const rank = (hop: PrReviewMetricRow['hop']) => (hop === 'changed' ? -1 : hop);
+  return rank(hopA) - rank(hopB) || blastB - blastA || compareStrings(idA, idB);
+}
+
+/**
+ * P4-3d: the default order — changed rows first, then hop ascending, then
+ * blast-radius value descending (none last), then id; changed rows among
+ * themselves by blast radius, then id (review round 1: the frozen
+ * comparator, replacing P4-3a's file/line order). `buildPrReviewMetricRows`
+ * emits rows in this order and applies the affected cap to it, so a scope's
+ * rows are already in it; `sortPrReviewMetricRows(rows, null)` restores it.
+ */
+export function defaultPrReviewMetricSort(a: PrReviewMetricRow, b: PrReviewMetricRow): number {
+  return compareDefaultOrder(a.hop, a.blastRadius?.value ?? -1, a.id, b.hop, b.blastRadius?.value ?? -1, b.id);
+}
+
+type MetricSortKey = readonly (string | number)[];
+
+/**
+ * P4-3d: a row's key for a column, or `null` for a missing value (`—`),
+ * which sorts last in both directions. Hop: `changed` is 0, before 1, 2, ….
+ * Tests: `gap` is the only value, so `—` rows follow it either way.
+ * Findings: count, then severity (`INGESTED_SEVERITY_RANK`, negated so a
+ * descending sort puts `blocker` first).
+ */
+function metricSortKey(row: PrReviewMetricRow, column: PrReviewMetricSortColumn): MetricSortKey | null {
+  switch (column) {
+    case 'node':
+      return [row.name, row.file];
+    case 'hop':
+      return [row.hop === 'changed' ? 0 : row.hop];
+    case 'complexity':
+      return row.complexity === null ? null : [row.complexity.value];
+    case 'blastRadius':
+      return row.blastRadius === null ? null : [row.blastRadius.value];
+    case 'tests':
+      return row.testCoverageGap ? [1] : null;
+    case 'findings':
+      return row.findings === null ? null : [row.findings.count, -INGESTED_SEVERITY_RANK[row.findings.highestSeverity]];
+  }
+}
+
+/**
+ * P4-3d review: the node column's collation — case-insensitive
+ * (`sensitivity: 'base'`), with the code-unit order as the deterministic
+ * fallback when two names collate equal ("Alpha"/"alpha").
+ */
+function collateMetricText(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { sensitivity: 'base' }) || compareStrings(a, b);
+}
+
+function compareMetricSortKeys(a: MetricSortKey, b: MetricSortKey): number {
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i]!;
+    const y = b[i]!;
+    const order = typeof x === 'number' && typeof y === 'number' ? x - y : collateMetricText(String(x), String(y));
+    if (order !== 0) {
+      return order;
+    }
+  }
+  return 0;
+}
+
+/**
+ * P4-3d: the rows in `sort`'s order — or the default order for `null`. A
+ * missing value sorts last in both directions, and ties break on id
+ * ascending in both, so the order is deterministic and stable across
+ * re-sorts. Every row moves, changed ones too (their hop cell and rule stay
+ * on the row). It sorts only the rows it is given: the affected cap was
+ * applied to the default order before, so a sort never pulls a hidden row in.
+ */
+export function sortPrReviewMetricRows(
+  rows: readonly PrReviewMetricRow[],
+  sort: PrReviewMetricSort | null,
+): PrReviewMetricRow[] {
+  if (sort === null) {
+    return [...rows].sort(defaultPrReviewMetricSort);
+  }
+  const sign = sort.direction === 'ascending' ? 1 : -1;
+  return rows
+    .map((row) => ({ row, key: metricSortKey(row, sort.column) }))
+    .sort((a, b) => {
+      if (a.key === null || b.key === null) {
+        if (a.key !== b.key) {
+          return a.key === null ? 1 : -1;
+        }
+      } else {
+        const order = compareMetricSortKeys(a.key, b.key) * sign;
+        if (order !== 0) {
+          return order;
+        }
+      }
+      return compareStrings(a.row.id, b.row.id);
+    })
+    .map((entry) => entry.row);
+}
+
+/**
+ * P4-3d: the sort after activating `column`'s header — the active column
+ * flips direction; any other column starts at its `firstDirection`.
+ */
+export function nextPrReviewMetricSort(
+  current: PrReviewMetricSort | null,
+  column: PrReviewMetricSortColumn,
+): PrReviewMetricSort {
+  if (current !== null && current.column === column) {
+    return { column, direction: current.direction === 'ascending' ? 'descending' : 'ascending' };
+  }
+  const first = PR_REVIEW_METRIC_COLUMNS.find((entry) => entry.column === column)?.firstDirection ?? 'ascending';
+  return { column, direction: first };
+}
+
+/** P4-3d: the live region's text — "Sorted by blast radius, descending." — or empty for the default order. */
+export function formatMetricSortAnnouncement(sort: PrReviewMetricSort | null): string {
+  if (sort === null) {
+    return '';
+  }
+  const label = PR_REVIEW_METRIC_COLUMNS.find((entry) => entry.column === sort.column)?.label ?? sort.column;
+  return `Sorted by ${label}, ${sort.direction}.`;
+}
+
+/**
+ * P4-3d: each bar column's max over the rows it is given — the rows the
+ * table renders, so rows past the affected cap never count. 0 when no row
+ * has the signal (or every value is 0): that column draws no bar.
+ */
+export function metricBarWidths(rows: readonly PrReviewMetricRow[]): { complexity: number; blastRadius: number } {
+  let complexity = 0;
+  let blastRadius = 0;
+  for (const row of rows) {
+    complexity = Math.max(complexity, row.complexity?.value ?? 0);
+    blastRadius = Math.max(blastRadius, row.blastRadius?.value ?? 0);
+  }
+  return { complexity, blastRadius };
+}
+
+/**
+ * P4-3d: a cell's bar — its width as a share of the column max, and its
+ * fill from the signal's own `severity` only (never its value): neutral for
+ * `moderate`, `--risk-red` for `severe`. `null` (no bar) for an absent
+ * signal or a column max of 0.
+ */
+export function metricBar(
+  signal: DeterministicRiskSignal | null,
+  columnMax: number,
+): { width: string; severe: boolean } | null {
+  if (signal === null || !(columnMax > 0)) {
+    return null;
+  }
+  const share = Math.min(Math.max(signal.value, 0), columnMax) / columnMax;
+  return { width: `${Number((share * 100).toFixed(2))}%`, severe: signal.severity === 'severe' };
+}
+
+/**
+ * P4-3d review: the note above the rows when a user sort is active on a
+ * capped table — the sort covers only the rows shown, never the Nodes past
+ * the cap. `null` in the default order or with nothing past the cap.
+ */
+export function formatSortedWithinCapNote(
+  sort: PrReviewMetricSort | null,
+  shownRows: number,
+  hiddenAffected: number,
+): string | null {
+  if (sort === null || hiddenAffected <= 0) {
+    return null;
+  }
+  const hidden =
+    hiddenAffected === 1
+      ? '1 more affected Node is'
+      : `${formatCount(hiddenAffected, 'more affected Node', 'more affected Nodes')} are`;
+  return `Sorted within the ${formatCount(shownRows, 'row', 'rows')} shown — ${hidden} past the cap; reduce depth to include them.`;
+}
+
+/** P4-3d: the bar columns' header note, visually hidden and as the header's `title`. */
+export const METRIC_BAR_HEADER_NOTE = "(bar: relative to this table's max)";
 
 /**
  * P4-3b: the metrics table's smallest height — its sticky header plus two
@@ -3893,11 +4113,17 @@ const PR_REVIEW_METRICS_CAPTION_ID = 'code-map-metrics-table-caption';
 /** P4-3c: the table's column count — node, hop, complexity, blast radius, tests, findings. */
 const PR_REVIEW_METRICS_COLUMN_COUNT = 6;
 
-function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }) {
+/**
+ * P4-3d: `columnMax` (`metricBarWidths`) adds the relative bar beside the
+ * text value — `aria-hidden`, since the value, the `!` glyph and "(severe)"
+ * already say everything; omit it for a column without bars.
+ */
+function MetricSignalCell({ signal, columnMax }: { signal: DeterministicRiskSignal | null; columnMax?: number }) {
   const cell = formatMetricSignalCell(signal);
   if (cell.label === null) {
     return <td className="code-map__metrics-table-cell code-map__metrics-table-cell--empty">{cell.text}</td>;
   }
+  const bar = columnMax === undefined ? null : metricBar(signal, columnMax);
   return (
     <td
       className={
@@ -3910,8 +4136,22 @@ function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }
         {cell.severe && <span aria-hidden="true">{`${SEVERE_SIGNAL_GLYPH} `}</span>}
         {cell.text}
       </span>
+      {bar !== null && (
+        <span className="code-map__metrics-bar-track" aria-hidden="true">
+          <span
+            className={bar.severe ? 'code-map__metrics-bar code-map__metrics-bar--severe' : 'code-map__metrics-bar'}
+            style={{ width: bar.width }}
+          />
+        </span>
+      )}
     </td>
   );
+}
+
+/** P4-3d: the table's sort, and the setter a header activation hands the next sort to. */
+export interface PrReviewMetricsTableSortProps {
+  sort: PrReviewMetricSort | null;
+  onSort: (sort: PrReviewMetricSort) => void;
 }
 
 /**
@@ -3919,14 +4159,26 @@ function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }
  * `components.pr-review-metrics-table`) — a native `<table>` in a fixed-height
  * region below the canvas, one row per changed Node, then (P4-3c) the
  * affected rows at the stepper's depth up to the cap and the inert "+N more"
- * line; text values only (bars and sorting are phase 3). Signal-family toggles don't hide columns, as
- * with Health Audit rows.
+ * line. P4-3d: header buttons sort every row (`sort`, reset to the default
+ * order with the diff scope by `CodeMap`), announced through an always-mounted
+ * `role="status"`; complexity and blast radius carry relative bars.
+ * Signal-family toggles don't hide columns, as with Health Audit rows.
  *
  * MUST STAY HOOKLESS: `CodeMap.prReviewMetrics.test.ts` renders it by calling
  * it as a plain function (no DOM runner).
  */
-export function PrReviewMetricsTable({ blastRadiusStatus, ...table }: PrReviewMetricsTableProps) {
-  const { rows, missingChangedCount, hiddenAffectedCount, missingAffectedCount } = table;
+export function PrReviewMetricsTable({
+  blastRadiusStatus,
+  sort,
+  onSort,
+  ...table
+}: PrReviewMetricsTableProps & PrReviewMetricsTableSortProps) {
+  const { missingChangedCount, hiddenAffectedCount, missingAffectedCount } = table;
+  // P4-3d: sorted here, from the rows already capped in the default order —
+  // the cap line stays last, after every row, whatever the sort.
+  const rows = sortPrReviewMetricRows(table.rows, sort);
+  const barMax = metricBarWidths(table.rows);
+  const sortedWithinCap = formatSortedWithinCapNote(sort, rows.length, hiddenAffectedCount);
   const missing = formatMissingChangedNodes(missingChangedCount);
   const hiddenAffected = formatHiddenAffectedNodes(hiddenAffectedCount);
   const missingAffected = formatMissingAffectedNodes(missingAffectedCount);
@@ -3946,14 +4198,41 @@ export function PrReviewMetricsTable({ blastRadiusStatus, ...table }: PrReviewMe
         </caption>
         <thead>
           <tr>
-            <th scope="col">node</th>
-            <th scope="col">hop</th>
-            <th scope="col">complexity</th>
-            <th scope="col">{prReviewBlastRadiusHeader()}</th>
-            <th scope="col">tests</th>
-            <th scope="col">findings</th>
+            {/* P4-3d: real sorting — only the active column carries
+                `aria-sort`; a native button in each header. */}
+            {PR_REVIEW_METRIC_COLUMNS.map(({ column, label, bar }) => {
+              const direction = sort !== null && sort.column === column ? sort.direction : undefined;
+              return (
+                <th key={column} scope="col" aria-sort={direction}>
+                  <button
+                    type="button"
+                    className="code-map__metrics-sort"
+                    title={bar ? METRIC_BAR_HEADER_NOTE : undefined}
+                    onClick={() => onSort(nextPrReviewMetricSort(sort, column))}
+                  >
+                    {column === 'blastRadius' ? prReviewBlastRadiusHeader() : label}
+                    {bar && <span className="visually-hidden">{` ${METRIC_BAR_HEADER_NOTE}`}</span>}
+                    {direction !== undefined && (
+                      <span className="code-map__metrics-sort-indicator" aria-hidden="true">
+                        {direction === 'ascending' ? '↑' : '↓'}
+                      </span>
+                    )}
+                  </button>
+                </th>
+              );
+            })}
           </tr>
         </thead>
+        {/* P4-3d review: a sort on a capped table says it covers only the
+            rows shown. Inert; its own tbody, so the rows' zebra keeps its
+            parity. */}
+        {sortedWithinCap !== null && (
+          <tbody>
+            <tr className="code-map__metrics-sort-note">
+              <td colSpan={PR_REVIEW_METRICS_COLUMN_COUNT}>{sortedWithinCap}</td>
+            </tr>
+          </tbody>
+        )}
         <tbody>
           {rows.map((row) => (
             <tr
@@ -3982,8 +4261,8 @@ export function PrReviewMetricsTable({ blastRadiusStatus, ...table }: PrReviewMe
                 )}
               </th>
               <td className="code-map__metrics-table-cell">{String(row.hop)}</td>
-              <MetricSignalCell signal={row.complexity} />
-              <MetricSignalCell signal={row.blastRadius} />
+              <MetricSignalCell signal={row.complexity} columnMax={barMax.complexity} />
+              <MetricSignalCell signal={row.blastRadius} columnMax={barMax.blastRadius} />
               <td
                 className={
                   row.testCoverageGap
@@ -4017,6 +4296,10 @@ export function PrReviewMetricsTable({ blastRadiusStatus, ...table }: PrReviewMe
       {missingAffected !== null && (
         <p className="code-map__metrics-table-missing code-map__metrics-table-missing--affected">{missingAffected}</p>
       )}
+      {/* P4-3d: always mounted, so a sort change is announced, not missed as a new region. */}
+      <p className="visually-hidden" role="status">
+        {formatMetricSortAnnouncement(sort)}
+      </p>
     </section>
   );
 }
@@ -7028,6 +7311,11 @@ export function CodeMap({
   // clamped to that result's own max depth via `initialBlastRadiusDepth`.
   const [blastRadiusState, setBlastRadiusState] = useState<BlastRadiusState>({ status: 'idle' });
   const [blastRadiusDepth, setBlastRadiusDepth] = useState(BLAST_RADIUS_DEFAULT_HOPS);
+  // P4-3d: the metrics table's user sort; `null` is the default order. Reset
+  // beside the blast radius at each diff-scope reset point (project change,
+  // `loadCodeMap`, `refreshCodeMap`, and the start of `handleComputeDiffScope`),
+  // so a new diff scope opens in the default order. A mode toggle keeps it.
+  const [prReviewMetricSort, setPrReviewMetricSort] = useState<PrReviewMetricSort | null>(null);
   // Correlates an `expandBlastRadius` response back to the auto-trigger (or
   // reset) that started/invalidated it — same stale-response guard shape as
   // `diffScopeRequestIdRef` just above: bumped on every reset point (project
@@ -7272,6 +7560,7 @@ export function CodeMap({
     // this reload the same way `diffScopeRequestIdRef` just above does.
     setBlastRadiusState({ status: 'idle' });
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
+    setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
     if (import.meta.env.DEV && fixtureNodeCount !== undefined) {
       // Dynamic import, gated directly on the statically-known
@@ -7370,6 +7659,7 @@ export function CodeMap({
     diffScopeRequestIdRef.current += 1;
     setBlastRadiusState({ status: 'idle' });
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
+    setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
     // The decision lives in `resolveRefreshOutcome` (sessionView.ts, unit
     // tested); this only carries it out.
@@ -7545,6 +7835,7 @@ export function CodeMap({
     // reasoning as the reset above.
     setBlastRadiusState({ status: 'idle' });
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
+    setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
   }, [projectPath, clearDiffScopeSync]);
 
@@ -7596,6 +7887,7 @@ export function CodeMap({
     // `.catch` below anymore, since this one already covers both outcomes.
     setBlastRadiusState({ status: 'idle' });
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
+    setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
     window.driller
       .computeDiffScope(projectPath, trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined)
@@ -9826,7 +10118,11 @@ export function CodeMap({
             mapHeight={mapHeight}
             onResize={handleMetricsTableResize}
           />
-          <PrReviewMetricsTable {...prReviewMetricsTableProps} />
+          <PrReviewMetricsTable
+            {...prReviewMetricsTableProps}
+            sort={prReviewMetricSort}
+            onSort={setPrReviewMetricSort}
+          />
         </>
       )}
 
