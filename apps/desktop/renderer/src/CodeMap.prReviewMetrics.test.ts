@@ -67,6 +67,10 @@ import {
   type PrReviewMetricSortColumn,
   sortPrReviewMetricRows,
   resolvePrReviewView,
+  activateMetricsRowFromCell,
+  HEALTH_ROW_AFFORDANCE,
+  METRICS_ROW_BUTTON_CLASS,
+  type MetricsRowButtonTarget,
   SEVERE_SIGNAL_GLYPH,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
@@ -314,8 +318,9 @@ function render(
   blastRadiusStatus: BlastRadiusState['status'] = 'idle',
   sort: PrReviewMetricSort | null = null,
   onSort: (sort: PrReviewMetricSort) => void = () => {},
+  onActivateNode: (node: CodeMapNode) => void = () => {},
 ): RenderedElement[] {
-  return renderTree(PrReviewMetricsTable({ ...table, blastRadiusStatus, sort, onSort }));
+  return renderTree(PrReviewMetricsTable({ ...table, blastRadiusStatus, sort, onSort, onActivateNode }));
 }
 
 const byType = (elements: RenderedElement[], type: string) => elements.filter((e) => e.type === type);
@@ -356,7 +361,7 @@ describe('PrReviewMetricsTable', () => {
     const pay = rowsOf(elements)[1]!;
     const cells = cellsOf(pay).map((c) => textOf(c));
     assert.deepEqual(cells, [
-      'paysrc/billing/, src/billing/b.ts line 40',
+      'paysrc/billing/, src/billing/b.ts line 40, open Node detail',
       'changed',
       `${SEVERE_SIGNAL_GLYPH} 42`,
       '9',
@@ -388,17 +393,17 @@ describe('PrReviewMetricsTable', () => {
       new Set(['a::handle', 'b::handle']), null, 0,
     );
     const nodeCells = rowsOf(render(twins)).map((row) => textOf(cellsOf(row)[0]));
-    assert.deepEqual(nodeCells, ['handlesrc/, src/a.ts line 3', 'handlesrc/, src/a.ts line 30']);
+    assert.deepEqual(nodeCells, ['handlesrc/, src/a.ts line 3, open Node detail', 'handlesrc/, src/a.ts line 30, open Node detail']);
   });
 
   it('absent signals render —, and nothing anywhere says "covered"', () => {
     const load = rowsOf(elements)[2]!;
     assert.deepEqual(
       cellsOf(load).map((c) => textOf(c)),
-      ['loadsrc/, src/a.ts line 10', 'changed', '3', METRIC_CELL_EMPTY, METRIC_CELL_EMPTY, METRIC_CELL_EMPTY],
+      ['loadsrc/, src/a.ts line 10, open Node detail', 'changed', '3', METRIC_CELL_EMPTY, METRIC_CELL_EMPTY, METRIC_CELL_EMPTY],
     );
     assert.equal(METRIC_CELL_EMPTY, '—');
-    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {} })).toLowerCase();
+    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} })).toLowerCase();
     assert.ok(!allText.includes('covered'), allText);
     assert.ok(!allText.includes('%'), allText);
   });
@@ -781,7 +786,7 @@ describe('CodeMap source: the divider wiring', () => {
     assert.equal(src.split('<MetricsTableDivider').length - 1, 1);
     assert.match(
       src,
-      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}\s+sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}\s+\/>\s*<\/>\s*\)\}/,
+      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}\s+sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}\s+onActivateNode=\{openNodeDetail\}\s+\/>\s*<\/>\s*\)\}/,
     );
   });
   it('.code-map carries the height style and the measured ref', () => {
@@ -1710,5 +1715,256 @@ describe('P4-3d review: an active sort persists across a depth step', () => {
     // Only the four diff-scope resets and the table's onSort set the sort.
     assert.equal(src.split('setPrReviewMetricSort(').length - 1, 4);
     assert.equal(src.split('onSort={setPrReviewMetricSort}').length - 1, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-3e: row activation — a row opens Node detail
+// ---------------------------------------------------------------------------
+
+/** Anything a user could activate or tab to: a native control, an interactive role, a focus stop or a handler. */
+function isActivatable(element: RenderedElement): boolean {
+  const { props } = element;
+  if (typeof element.type === 'string' && ['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(element.type)) {
+    return true;
+  }
+  if (typeof props.role === 'string' && ['button', 'link', 'row', 'gridcell'].includes(props.role)) {
+    return true;
+  }
+  if (props.href !== undefined || props.tabIndex !== undefined) {
+    return true;
+  }
+  return ['onClick', 'onKeyDown', 'onKeyUp', 'onMouseDown', 'onMouseUp', 'onPointerDown', 'onPointerUp'].some(
+    (handler) => typeof props[handler] === 'function',
+  );
+}
+
+const rowButtonsOf = (row: RenderedElement) =>
+  renderTree(row.props.children).filter((e) => e.type === 'button');
+
+/** A fake row button for the click delegate: records focus calls; `inside` are the targets it contains. */
+function fakeButton(inside: readonly unknown[] = []): MetricsRowButtonTarget & { focused: unknown[] } {
+  const focused: unknown[] = [];
+  return {
+    focused,
+    focus: (options?: FocusOptions) => {
+      focused.push(options);
+    },
+    contains: (other) => inside.includes(other),
+  };
+}
+
+/**
+ * Clicks a rendered `<tr>` as if on `target`, with `button` as its row button
+ * and the document selection collapsed or not (`window` stubbed: no DOM here).
+ */
+function clickRow(row: RenderedElement, button: MetricsRowButtonTarget | null, target: unknown, textSelected = false): void {
+  const onClick = row.props.onClick as (event: unknown) => void;
+  assert.equal(typeof onClick, 'function', 'the row carries the click delegate');
+  const global = globalThis as unknown as { window?: unknown };
+  const had = 'window' in global;
+  const previous = global.window;
+  global.window = { getSelection: () => ({ isCollapsed: !textSelected }) };
+  try {
+    onClick({ target, currentTarget: { querySelector: (selector: string) => (selector === `.${METRICS_ROW_BUTTON_CLASS}` ? button : null) } });
+  } finally {
+    if (had) {
+      global.window = previous;
+    } else {
+      delete global.window;
+    }
+  }
+}
+
+describe('PrReviewMetricsTable: row activation (P4-3e)', () => {
+  const table = buildPrReviewMetricRows(THREE, new Set(THREE.map((n) => n.id)), null, 0);
+
+  it('each row has exactly one control: a native button in its node cell; the row is no tab stop', () => {
+    const rows = rowsOf(render(table));
+    assert.equal(rows.length, 3);
+    for (const row of rows) {
+      const buttons = rowButtonsOf(row);
+      assert.equal(buttons.length, 1, 'one button per row');
+      const button = buttons[0]!;
+      assert.equal(button.props.type, 'button');
+      assert.equal(button.props.className, METRICS_ROW_BUTTON_CLASS);
+      assert.equal(button.props.tabIndex, undefined);
+      const nodeCell = cellsOf(row)[0]!;
+      assert.equal(nodeCell.type, 'th');
+      assert.ok(renderTree(nodeCell.props.children).includes(button), 'the button sits in the node cell');
+      // Inside the row, the button is the only activatable element.
+      assert.deepEqual(renderTree(row.props.children).filter(isActivatable), [button]);
+      // The row itself: a click delegate only — no role, no tab stop, no key handler.
+      assert.equal(row.props.tabIndex, undefined);
+      assert.equal(row.props.role, undefined);
+      assert.equal(row.props.onKeyDown, undefined);
+    }
+  });
+
+  it("the button's name is the node cell's content, then the reused HEALTH_ROW_AFFORDANCE, with no aria-label", () => {
+    assert.equal(HEALTH_ROW_AFFORDANCE, 'open Node detail');
+    for (const row of rowsOf(render(table))) {
+      const button = rowButtonsOf(row)[0]!;
+      assert.equal(button.props['aria-label'], undefined);
+      const name = textOf(button);
+      assert.ok(name.endsWith(`, ${HEALTH_ROW_AFFORDANCE}`), name);
+      assert.equal(name, textOf(cellsOf(row)[0]), 'the whole node cell is the button');
+    }
+    const refund = rowButtonsOf(rowsOf(render(table))[0]!)[0]!;
+    assert.equal(textOf(refund), `refundsrc/billing/, src/billing/b.ts line 5⚠, ${HEALTH_ROW_AFFORDANCE}`);
+  });
+
+  it('Enter/Space/click on the button hands over that row\'s own Node object, and nothing else runs', () => {
+    const opened: CodeMapNode[] = [];
+    const sorts: PrReviewMetricSort[] = [];
+    const rows = rowsOf(render(table, 'idle', null, (s) => sorts.push(s), (n) => opened.push(n)));
+    for (const row of rows) {
+      (rowButtonsOf(row)[0]!.props.onClick as () => void)();
+    }
+    const byId = new Map(THREE.map((n) => [n.id, n]));
+    assert.equal(opened.length, 3);
+    rows.forEach((row, i) => assert.equal(opened[i], byId.get(rowIdOf(row) as string), 'the same object, not a copy'));
+    assert.deepEqual(sorts, [], 'activation never touches the sort');
+  });
+
+  it('two same-named Nodes each open their own Node', () => {
+    const a = node('a::handle', { name: 'handle', startLine: 3 });
+    const b = node('b::handle', { name: 'handle', startLine: 30 });
+    const opened: CodeMapNode[] = [];
+    const rows = rowsOf(render(buildPrReviewMetricRows([a, b], new Set([a.id, b.id]), null, 0), 'idle', null, () => {}, (n) => opened.push(n)));
+    for (const row of rows) {
+      (rowButtonsOf(row)[0]!.props.onClick as () => void)();
+    }
+    assert.equal(opened.length, 2);
+    assert.equal(opened[0], a);
+    assert.equal(opened[1], b);
+    // …and by the row click delegate too.
+    opened.length = 0;
+    clickRow(rows[1]!, fakeButton(), { cell: 'findings' });
+    assert.deepEqual(opened, [b]);
+    assert.equal(opened[0], b);
+  });
+
+  it('a click on another cell focuses the row button first (the modal layer\'s opener), then opens its Node once', () => {
+    const opened: CodeMapNode[] = [];
+    const row = rowsOf(render(table, 'idle', null, () => {}, (n) => opened.push(n)))[1]!;
+    const button = fakeButton();
+    clickRow(row, button, { cell: 'findings' });
+    assert.deepEqual(button.focused, [{ preventScroll: true }]);
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0], THREE[0], 'pay');
+  });
+
+  it("a click on the button itself is left to the button's own handler — bubbling never opens twice", () => {
+    const opened: CodeMapNode[] = [];
+    const row = rowsOf(render(table, 'idle', null, () => {}, (n) => opened.push(n)))[1]!;
+    const nameInsideButton = { part: 'the <code> name' };
+    const button = fakeButton([nameInsideButton]);
+    // The browser runs the button's onClick, then the bubbled row onClick.
+    (rowButtonsOf(row)[0]!.props.onClick as () => void)();
+    clickRow(row, button, nameInsideButton);
+    assert.equal(opened.length, 1);
+    assert.deepEqual(button.focused, []);
+  });
+
+  it('activateMetricsRowFromCell: with no button found, it still opens the Node', () => {
+    const opened: CodeMapNode[] = [];
+    activateMetricsRowFromCell(null, null, false, THREE[1]!, (n) => opened.push(n));
+    assert.deepEqual(opened, [THREE[1]]);
+  });
+
+  it('selecting a cell\'s text (drag or double-click) never opens Node detail, nor moves focus', () => {
+    const opened: CodeMapNode[] = [];
+    const row = rowsOf(render(table, 'idle', null, () => {}, (n) => opened.push(n)))[1]!;
+    const button = fakeButton();
+    clickRow(row, button, { cell: 'complexity' }, true);
+    assert.equal(opened.length, 0);
+    assert.equal(button.focused.length, 0);
+    activateMetricsRowFromCell(button, null, true, THREE[0]!, (n) => opened.push(n));
+    assert.equal(opened.length, 0);
+    // A collapsed selection (a plain click) still opens it.
+    clickRow(row, button, { cell: 'complexity' }, false);
+    assert.equal(opened.length, 1);
+  });
+
+  it('the cap line, the sorted-within-cap note, the off-map lines and the caption never activate', () => {
+    const capped: PrReviewMetricRows = { ...table, hiddenAffectedCount: 4, missingChangedCount: 1, missingAffectedCount: 2 };
+    const elements = render(capped, 'loading', sortBy('complexity', 'descending'));
+    const cap = elements.find((e) => e.props.className === 'code-map__metrics-cap');
+    const note = elements.find((e) => e.props.className === 'code-map__metrics-sort-note');
+    const missing = elements.filter((e) => String(e.props.className ?? '').includes('code-map__metrics-table-missing'));
+    const caption = byType(elements, 'caption');
+    assert.ok(cap && note);
+    assert.equal(missing.length, 2);
+    assert.equal(caption.length, 1);
+    for (const inert of [cap, note, ...missing, ...caption]) {
+      assert.deepEqual([inert, ...renderTree(inert.props.children)].filter(isActivatable), [], String(inert.props.className));
+    }
+    // Everything activatable in the table: the region, the six sort buttons, and one row + one button per data row.
+    const activatable = elements.filter(isActivatable);
+    const rows = rowsOf(elements);
+    assert.equal(activatable.length, 1 + 6 + rows.length * 2);
+  });
+
+  it('rows are keyed by Node id, so a re-sort or depth step keeps each row (and its button) for focus return', () => {
+    const keysOf = (elements: RenderedElement[]) =>
+      rowsOf(elements).map((row) => (row as unknown as { key: string | null }).key);
+    const unsorted = keysOf(render(table));
+    const sorted = keysOf(render(table, 'idle', sortBy('node', 'ascending')));
+    assert.deepEqual(unsorted, rowsOf(render(table)).map(rowIdOf));
+    assert.deepEqual(new Set(sorted), new Set(unsorted));
+    assert.notDeepEqual(sorted, unsorted, 'the sort really reorders');
+  });
+});
+
+describe('styles.css: row activation (P4-3e)', () => {
+  const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+  const block = (selector: string) => {
+    const at = css.indexOf(`${selector} {`);
+    assert.ok(at >= 0, selector);
+    return css.slice(at, css.indexOf('}', at));
+  };
+
+  it('the row button reads as the cell text, with a pointer', () => {
+    const rule = block('.code-map__metrics-row-button');
+    for (const decl of ['border: none;', 'background: transparent;', 'font: inherit;', 'color: inherit;', 'cursor: pointer;']) {
+      assert.ok(rule.includes(decl), decl);
+    }
+  });
+
+  it("hover follows the Health Audit row's accent 15% fill, on the cells, over the zebra", () => {
+    const rule = block('.code-map__metrics-table tbody tr.code-map__metrics-table-row:hover > *');
+    assert.match(rule, /background: color-mix\(in srgb, var\(--accent\) 15%, transparent\);/);
+    assert.match(block('.code-map__health-row-button:hover'), /color-mix\(in srgb, var\(--accent\) 15%, transparent\)/);
+  });
+
+  it('focus draws the focus ring inset around the row on its cells (no tr outline), keeping the changed rule', () => {
+    const focused = '.code-map__metrics-table tbody tr.code-map__metrics-table-row:has(.code-map__metrics-row-button:focus-visible)';
+    const shadows = (rule: string) => (rule.match(/inset [^,;]+/g) ?? []).map((x) => x.trim()).sort();
+    const top = 'inset 0 2px 0 var(--accent)';
+    const bottom = 'inset 0 -2px 0 var(--accent)';
+    const changedRule = 'inset 2px 0 0 var(--accent)';
+    assert.deepEqual(shadows(block(`${focused} > *`)), [top, bottom].sort());
+    assert.deepEqual(shadows(block(`${focused} > :first-child`)), [changedRule, top, bottom].sort());
+    assert.deepEqual(shadows(block(`${focused} > :last-child`)), ['inset -2px 0 0 var(--accent)', top, bottom].sort());
+    for (const cell of ['> *', '> :first-child', '> :last-child']) {
+      assert.ok(!/background|outline/.test(block(`${focused} ${cell}`)), 'backgrounds untouched; no outline');
+    }
+    assert.ok(!css.includes(`${focused} {`), 'no outline on the tr itself');
+    // The changed rule is the first cell's left shadow, in both states.
+    assert.match(block('.code-map__metrics-table-row--changed > :first-child'), /box-shadow: inset 2px 0 0 var\(--accent\);/);
+  });
+
+  it('the scroll region pads its top, so a focused row clears the sticky header', () => {
+    assert.match(block('.code-map__metrics-table'), /scroll-padding-top: 2rem;/);
+  });
+});
+
+describe('CodeMap source: row activation wiring (P4-3e)', () => {
+  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
+  it('the one table mount activates through openNodeDetail, never activateNode', () => {
+    assert.equal(src.split('<PrReviewMetricsTable').length - 1, 1);
+    assert.equal(src.split('onActivateNode={openNodeDetail}').length - 1, 2, 'the Health Audit grid and the table');
+    assert.ok(!src.includes('onActivateNode={activateNode}'));
   });
 });

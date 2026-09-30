@@ -3649,6 +3649,10 @@ code,
   height: var(--code-map-table-height);
   box-sizing: border-box;
   overflow: auto;
+  /* P4-3e review: a row focused by Tab (or on focus return) scrolls clear of
+     the sticky header — about its height (11px text + 0.35rem padding each
+     side + the 1px rule). */
+  scroll-padding-top: 2rem;
   z-index: 5;
   background: var(--panel);
   color: var(--text);
@@ -3731,6 +3735,68 @@ code,
 
 .code-map__metrics-table-row--changed > :first-child {
   box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* P4-3e: a row opens Node detail. The row's one control is
+   `.code-map__metrics-row-button`, a native button in the node cell, reset
+   to read as the cell's text (the `.code-map__health-row-button` treatment);
+   a click on any other cell runs the same action, so the whole row takes the
+   pointer cursor and the hover fill.
+
+   Hover: the Health Audit row's `color-mix({colors.accent} 15%, transparent)`,
+   painted on the cells, so it lies OVER the row's zebra or changed tint
+   rather than replacing it, and under the changed rule's inset shadow.
+
+   Focus: DESIGN.md `focus-ring` (2px `{colors.accent}`), drawn inset around
+   the whole row when its button has keyboard focus. Review round 1: drawn on
+   the CELLS as inset box-shadows (top and bottom on every cell, left on the
+   first, right on the last), not as an outline on the `<tr>`, which a
+   `border-collapse` table may not paint. The first cell's list restates the
+   `row-changed-rule` (`inset 2px 0 0 {colors.accent}`), so a changed row keeps
+   it; backgrounds (zebra, changed tint, hover) are untouched. The button's own
+   ring is off, since the row's ring already marks it. */
+.code-map__metrics-table tbody tr.code-map__metrics-table-row {
+  cursor: pointer;
+}
+
+.code-map__metrics-table tbody tr.code-map__metrics-table-row:hover > * {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.code-map__metrics-table tbody tr.code-map__metrics-table-row:has(.code-map__metrics-row-button:focus-visible) > * {
+  box-shadow:
+    inset 0 2px 0 var(--accent),
+    inset 0 -2px 0 var(--accent);
+}
+
+.code-map__metrics-table tbody tr.code-map__metrics-table-row:has(.code-map__metrics-row-button:focus-visible) > :first-child {
+  box-shadow:
+    inset 2px 0 0 var(--accent),
+    inset 0 2px 0 var(--accent),
+    inset 0 -2px 0 var(--accent);
+}
+
+.code-map__metrics-table tbody tr.code-map__metrics-table-row:has(.code-map__metrics-row-button:focus-visible) > :last-child {
+  box-shadow:
+    inset -2px 0 0 var(--accent),
+    inset 0 2px 0 var(--accent),
+    inset 0 -2px 0 var(--accent);
+}
+
+.code-map__metrics-row-button {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.code-map__metrics-row-button:focus-visible {
+  outline: none;
 }
 
 .code-map__metrics-table-module {

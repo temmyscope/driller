@@ -3335,6 +3335,12 @@ export function resolvePrReviewView(
  */
 export interface PrReviewMetricRow {
   id: string;
+  /**
+   * P4-3e: the Node itself — the row's activation hands THIS object to
+   * `onActivateNode`, never a name or id the callee would resolve, so two
+   * same-named rows each open their own Node (the Health Audit row pact).
+   */
+  node: CodeMapNode;
   /** The bare identifier, verbatim from source. */
   name: string;
   file: string;
@@ -3495,6 +3501,7 @@ function prReviewMetricRow(node: CodeMapNode, hop: PrReviewMetricRow['hop']): Pr
   const highest = ingested[0];
   return {
     id: node.id,
+    node,
     name: node.name,
     file: node.file,
     startLine: node.startLine,
@@ -4154,6 +4161,50 @@ export interface PrReviewMetricsTableSortProps {
   onSort: (sort: PrReviewMetricSort) => void;
 }
 
+/** P4-3e: the table's activation — `CodeMap` passes `openNodeDetail`, as the Health Audit grid does. */
+export interface PrReviewMetricsTableActivationProps {
+  onActivateNode: (node: CodeMapNode) => void;
+}
+
+/** P4-3e: the one control in a metrics row — a native button in the node cell. */
+export const METRICS_ROW_BUTTON_CLASS = 'code-map__metrics-row-button';
+
+/** P4-3e: the row button, as the row's click delegate sees it. */
+export interface MetricsRowButtonTarget {
+  focus: (options?: FocusOptions) => void;
+  contains: (other: Node | null) => boolean;
+}
+
+/**
+ * P4-3e: a click anywhere on a metrics row runs the row button's action.
+ * A click on (or inside) the button itself is left to the button's own
+ * `onClick` — it bubbles here too, and must not open Node detail twice.
+ * Anywhere else, the button takes focus first (without scrolling), so it is
+ * what `useModalLayer` captures as the opener and returns focus to on close;
+ * otherwise the opener would be the table's scroll region, which a press on
+ * a plain cell focuses. The row is never a second tab stop. `textSelected`
+ * is the document selection's state at click time (non-collapsed = the user
+ * was selecting text), passed in so this stays pure.
+ */
+export function activateMetricsRowFromCell(
+  button: MetricsRowButtonTarget | null,
+  target: Node | null,
+  textSelected: boolean,
+  node: CodeMapNode,
+  onActivateNode: (node: CodeMapNode) => void,
+): void {
+  if (button !== null && button.contains(target)) {
+    return;
+  }
+  // Review round 1: a drag or double-click that selects a cell's text also
+  // ends in a click; selecting a value to copy it must not open Node detail.
+  if (textSelected) {
+    return;
+  }
+  button?.focus({ preventScroll: true });
+  onActivateNode(node);
+}
+
 /**
  * P4-3a: the PR Review metrics table (DESIGN.md
  * `components.pr-review-metrics-table`) — a native `<table>` in a fixed-height
@@ -4171,8 +4222,9 @@ export function PrReviewMetricsTable({
   blastRadiusStatus,
   sort,
   onSort,
+  onActivateNode,
   ...table
-}: PrReviewMetricsTableProps & PrReviewMetricsTableSortProps) {
+}: PrReviewMetricsTableProps & PrReviewMetricsTableSortProps & PrReviewMetricsTableActivationProps) {
   const { missingChangedCount, hiddenAffectedCount, missingAffectedCount } = table;
   // P4-3d: sorted here, from the rows already capped in the default order —
   // the cap line stays last, after every row, whatever the sort.
@@ -4242,23 +4294,44 @@ export function PrReviewMetricsTable({
                   ? 'code-map__metrics-table-row code-map__metrics-table-row--changed'
                   : 'code-map__metrics-table-row'
               }
+              // P4-3e: a click on any cell runs the row button's action; the
+              // row itself is no control and no tab stop.
+              onClick={(event) =>
+                activateMetricsRowFromCell(
+                  event.currentTarget.querySelector<HTMLButtonElement>(`.${METRICS_ROW_BUTTON_CLASS}`),
+                  event.target as Node,
+                  !(window.getSelection()?.isCollapsed ?? true),
+                  row.node,
+                  onActivateNode,
+                )
+              }
             >
               <th scope="row" className="code-map__metrics-table-node" title={row.id}>
-                <code className="code-map__metrics-table-name">{row.name}</code>
-                {row.moduleLine !== null && <span className="code-map__metrics-table-module">{row.moduleLine}</span>}
-                {/* Same-name rows (two `handle`s in one file) differ here for
-                    assistive tech, not only in the `title`. */}
-                <span className="visually-hidden">{`, ${row.file} line ${row.startLine}`}</span>
-                {row.coverageGap && (
-                  <span
-                    className="code-map__metrics-table-coverage-gap"
-                    role="img"
-                    aria-label="Coverage gap"
-                    title="Coverage gap — no summary"
-                  >
-                    ⚠
-                  </span>
-                )}
+                {/* P4-3e: the row's one control, as `HealthAuditClusterRow`'s
+                    button — Enter, Space, the tab stop and the role come from
+                    the platform. It hands over ITS OWN Node object. No
+                    `aria-label`: the name is the cell's content, then the
+                    visually hidden `HEALTH_ROW_AFFORDANCE`. Keyed rows keep
+                    this element across re-sorts and depth steps, so closing
+                    Node detail returns focus to it. */}
+                <button type="button" className={METRICS_ROW_BUTTON_CLASS} onClick={() => onActivateNode(row.node)}>
+                  <code className="code-map__metrics-table-name">{row.name}</code>
+                  {row.moduleLine !== null && <span className="code-map__metrics-table-module">{row.moduleLine}</span>}
+                  {/* Same-name rows (two `handle`s in one file) differ here for
+                      assistive tech, not only in the `title`. */}
+                  <span className="visually-hidden">{`, ${row.file} line ${row.startLine}`}</span>
+                  {row.coverageGap && (
+                    <span
+                      className="code-map__metrics-table-coverage-gap"
+                      role="img"
+                      aria-label="Coverage gap"
+                      title="Coverage gap — no summary"
+                    >
+                      ⚠
+                    </span>
+                  )}
+                  <span className="visually-hidden">{`, ${HEALTH_ROW_AFFORDANCE}`}</span>
+                </button>
               </th>
               <td className="code-map__metrics-table-cell">{String(row.hop)}</td>
               <MetricSignalCell signal={row.complexity} columnMax={barMax.complexity} />
@@ -4966,7 +5039,7 @@ export function formatRemainingClusters(remainingClusterCount: number): string {
  * hand-built label can — the row's name is, by construction, exactly what the
  * row shows plus this one phrase.
  */
-const HEALTH_ROW_AFFORDANCE = 'open Node detail';
+export const HEALTH_ROW_AFFORDANCE = 'open Node detail';
 
 /**
  * P0-2b: one Node's row inside a cluster card. Values are the Node's real
@@ -10110,7 +10183,12 @@ export function CodeMap({
           history toolbar and before the overlays, so Tab order follows the
           layout: the top toolbars first, then the table at the bottom.
           P4-3b: its divider comes right before it, in the DOM and Tab order,
-          and only with it. */}
+          and only with it.
+          P4-3e: a row opens Node detail through `openNodeDetail`, never
+          `activateNode` — no mode switch, no Path Trace side effect, no
+          viewport move, and no `focusedNodeIdRef` write (P0-2c's accepted
+          degradation, above). `useModalLayer` returns focus to the row's
+          button on close, or to `.code-map` if the row has gone. */}
       {prReviewMetricsTableProps !== null && (
         <>
           <MetricsTableDivider
@@ -10122,6 +10200,7 @@ export function CodeMap({
             {...prReviewMetricsTableProps}
             sort={prReviewMetricSort}
             onSort={setPrReviewMetricSort}
+            onActivateNode={openNodeDetail}
           />
         </>
       )}
