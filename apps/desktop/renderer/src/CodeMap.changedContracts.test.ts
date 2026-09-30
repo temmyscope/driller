@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { ChangedContract, CodeMapNode, FoldedModule, FoldedType } from '@driller/ipc-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 
 import {
   activateCanvasCard,
@@ -43,11 +44,15 @@ import {
   resolvePrReviewView,
   saveShowFoldedKinds,
   SHOW_FOLDED_KINDS_HINT,
+  type BlastRadiusState,
   type DiffScopeState,
   type FetchState,
   type FoldedCanvasNode,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
+
+/** P4-3c: no blast radius — these tests are about the diff scope alone. */
+const IDLE_BLAST_RADIUS: BlastRadiusState = { status: 'idle' };
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -194,11 +199,11 @@ describe('PR Review: changed contracts', () => {
 
   it('resolvePrReviewView passes them through in PR Review with a map only', () => {
     const showable = ready([node('a')]);
-    const view = resolvePrReviewView('prReview', showable, resolved([codeMapNode], [], true));
+    const view = resolvePrReviewView('prReview', showable, resolved([codeMapNode], [], true), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
     assert.deepEqual([view.changedContracts, view.changedContractsApproximate], [[codeMapNode], true]);
-    assert.deepEqual(resolvePrReviewView('codeMap', showable, resolved([codeMapNode])).changedContracts, []);
+    assert.deepEqual(resolvePrReviewView('codeMap', showable, resolved([codeMapNode]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).changedContracts, []);
     assert.deepEqual(
-      resolvePrReviewView('prReview', { status: 'loading' }, resolved([codeMapNode])).changedContracts,
+      resolvePrReviewView('prReview', { status: 'loading' }, resolved([codeMapNode]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).changedContracts,
       [],
     );
   });

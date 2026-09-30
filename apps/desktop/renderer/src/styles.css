@@ -3718,7 +3718,9 @@ code,
   white-space: nowrap;
 }
 
-.code-map__metrics-table tbody tr:nth-child(even) {
+/* P4-3c review: the zebra is for data rows only — the inert "+N more" cap
+   line never takes a stripe. */
+.code-map__metrics-table tbody tr.code-map__metrics-table-row:nth-child(even) {
   background: var(--panel-alt);
 }
 
@@ -3747,6 +3749,21 @@ code,
 
 .code-map__metrics-table-cell--empty {
   color: var(--text-mute);
+}
+
+/* P4-3c: affected rows take the plain zebra above, never the changed rule —
+   the hop column is what sets them apart. The "+N more affected Nodes" cap
+   line is inert, muted text. */
+.code-map__metrics-cap {
+  color: var(--text-mute);
+}
+
+/* P4-3c: the caption, shown only while the blast radius computes. Its top
+   padding clears the P4-3b divider's 6px grab strip over the table's top. */
+.code-map__metrics-table-caption {
+  padding: calc(6px + 0.35rem) 0.6rem 0.35rem;
+  color: var(--text-mute);
+  text-align: left;
 }
 
 .code-map__metrics-table-missing {

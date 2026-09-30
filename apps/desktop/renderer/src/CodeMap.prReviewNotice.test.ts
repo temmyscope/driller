@@ -22,12 +22,14 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { TopLevelChangedFile } from '@driller/ipc-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 
 import { ACTIONABLE_NOTICE_GLYPHS, ACTIONABLE_NOTICE_SPOKEN_PREFIX } from './ActionableNotice';
 import {
   type CodeMapMode,
   DIFF_SCOPE_NOTICE_TONES,
   type DiffScopeNoticeStatus,
+  type BlastRadiusState,
   type DiffScopeState,
   type FetchState,
   PR_REVIEW_NOTICE_ID,
@@ -42,6 +44,9 @@ import {
   topLevelFileSourceTarget,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
+
+/** P4-3c: no blast radius — these tests are about the diff scope alone. */
+const IDLE_BLAST_RADIUS: BlastRadiusState = { status: 'idle' };
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -98,7 +103,7 @@ describe('hasShowableMap', () => {
 describe('resolvePrReviewView: a PR Review notice keeps the map', () => {
   for (const status of NOTICE_STATUSES) {
     it(`"${status}" with a showable map: notice on, canvas + Path Trace input + results on`, () => {
-      const view = resolvePrReviewView('prReview', SHOWABLE, { status });
+      const view = resolvePrReviewView('prReview', SHOWABLE, { status }, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
       assert.equal(view.noticeStatus, status);
       assert.equal(view.surfaces.canvas, true, 'canvas (and the history toolbar over it)');
       assert.equal(view.surfaces.pathTraceInput, true, 'Path Trace input');
@@ -111,7 +116,7 @@ describe('resolvePrReviewView: a PR Review notice keeps the map', () => {
 describe('resolvePrReviewView: when there is no notice', () => {
   for (const state of NON_NOTICE_STATES) {
     it(`PR Review, diff scope "${state.status}": no notice, surfaces on`, () => {
-      const view = resolvePrReviewView('prReview', SHOWABLE, state);
+      const view = resolvePrReviewView('prReview', SHOWABLE, state, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
       assert.equal(view.noticeStatus, null);
       assert.equal(view.surfaces.canvas, true);
       assert.equal(view.surfaces.pathTraceInput, true);
@@ -122,7 +127,7 @@ describe('resolvePrReviewView: when there is no notice', () => {
   for (const mode of otherModes) {
     for (const status of NOTICE_STATUSES) {
       it(`${mode} with a leftover "${status}" diff scope (after a mode switch): no notice`, () => {
-        assert.equal(resolvePrReviewView(mode, SHOWABLE, { status }).noticeStatus, null);
+        assert.equal(resolvePrReviewView(mode, SHOWABLE, { status }, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).noticeStatus, null);
       });
     }
   }
@@ -130,7 +135,7 @@ describe('resolvePrReviewView: when there is no notice', () => {
   for (const [name, fetchState] of Object.entries(NOT_SHOWABLE)) {
     for (const status of NOTICE_STATUSES) {
       it(`PR Review "${status}" with no showable map (${name}): no notice, no surfaces`, () => {
-        const view = resolvePrReviewView('prReview', fetchState, { status });
+        const view = resolvePrReviewView('prReview', fetchState, { status }, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
         assert.equal(view.noticeStatus, null);
         assert.deepEqual(view.surfaces, ALL_SURFACES_OFF);
       });
@@ -233,10 +238,10 @@ describe('PR Review: top-level-only changes', () => {
   });
 
   it("resolvePrReviewView passes a resolved diff scope's top-level files through, in PR Review with a map only", () => {
-    assert.deepEqual(resolvePrReviewView('prReview', SHOWABLE, resolved([file('x.ts')])).topLevelFiles, [file('x.ts')]);
-    assert.deepEqual(resolvePrReviewView('prReview', SHOWABLE, resolved()).topLevelFiles, []);
-    assert.deepEqual(resolvePrReviewView('codeMap', SHOWABLE, resolved([file('x.ts')])).topLevelFiles, []);
-    assert.deepEqual(resolvePrReviewView('prReview', NOT_SHOWABLE.loading!, resolved([file('x.ts')])).topLevelFiles, []);
+    assert.deepEqual(resolvePrReviewView('prReview', SHOWABLE, resolved([file('x.ts')]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).topLevelFiles, [file('x.ts')]);
+    assert.deepEqual(resolvePrReviewView('prReview', SHOWABLE, resolved(), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).topLevelFiles, []);
+    assert.deepEqual(resolvePrReviewView('codeMap', SHOWABLE, resolved([file('x.ts')]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).topLevelFiles, []);
+    assert.deepEqual(resolvePrReviewView('prReview', NOT_SHOWABLE.loading!, resolved([file('x.ts')]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).topLevelFiles, []);
   });
 
   it('says "Changed: top-level code in x.ts." in the notice region, as an info notice; the file opens its top-level code', () => {

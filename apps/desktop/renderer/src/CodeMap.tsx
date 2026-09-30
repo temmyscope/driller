@@ -323,7 +323,7 @@ export const DIFF_SCOPE_NOTICE_TONES: Readonly<Record<DiffScopeNoticeStatus, Act
  * the toolbar already said "Computing…" for the new one), not once it
  * resolves/rejects.
  */
-type BlastRadiusState =
+export type BlastRadiusState =
   | { status: 'idle' }
   | { status: 'loading' }
   | { status: 'resolved'; hopDistances: Map<string, number>; maxDepth: number }
@@ -3256,8 +3256,9 @@ export interface PrReviewView {
    * P4-3a: the changed-Node metrics table below the canvas, or `null` for
    * none. Non-null only in PR Review Mode, with a showable map, for a
    * resolved diff scope with at least one row — never an empty table.
+   * P4-3c: with the blast radius's affected rows at the stepper's depth.
    */
-  metricsTable: PrReviewMetricRows | null;
+  metricsTable: PrReviewMetricsTableProps | null;
   /** Which surfaces are on — see `CodeMapSurfaces`. */
   surfaces: CodeMapSurfaces;
 }
@@ -3280,11 +3281,19 @@ const NO_CHANGED_CONTRACTS: readonly ChangedContract[] = [];
  * `diffScopeState` survives a mode switch, so the notice is also gated on
  * `mode` — a `'no-changes'` left over from PR Review shows nothing in Code
  * Map Mode.
+ *
+ * P4-3c: `blastRadiusState` and `blastRadiusDepth` add the affected rows —
+ * `hopDistances` sliced at the stepper's depth, locally, never a new IPC
+ * call. A loading blast radius keeps the changed rows and says so in the
+ * table's caption; an error, or nothing reachable, keeps the changed rows
+ * only. Both survive a mode switch, as `diffScopeState` does.
  */
 export function resolvePrReviewView(
   mode: CodeMapMode,
   fetchState: FetchState,
   diffScopeState: DiffScopeState,
+  blastRadiusState: BlastRadiusState,
+  blastRadiusDepth: number,
 ): PrReviewView {
   const showable = hasShowableMap(fetchState);
   const noticeStatus =
@@ -3297,13 +3306,23 @@ export function resolvePrReviewView(
       : null;
   const resolved = mode === 'prReview' && showable && diffScopeState.status === 'resolved' ? diffScopeState : null;
   const metricRows =
-    resolved !== null && fetchState.status === 'ready' ? buildPrReviewMetricRows(fetchState.nodes, resolved.nodeIds) : null;
+    resolved !== null && fetchState.status === 'ready'
+      ? buildPrReviewMetricRows(
+          fetchState.nodes,
+          resolved.nodeIds,
+          blastRadiusState.status === 'resolved' ? blastRadiusState.hopDistances : null,
+          blastRadiusDepth,
+        )
+      : null;
   return {
     noticeStatus,
     topLevelFiles: resolved?.topLevelFiles ?? NO_TOP_LEVEL_FILES,
     changedContracts: resolved?.changedContracts ?? NO_CHANGED_CONTRACTS,
     changedContractsApproximate: resolved?.changedContractsApproximate === true,
-    metricsTable: metricRows !== null && metricRows.rows.length > 0 ? metricRows : null,
+    metricsTable:
+      metricRows !== null && metricRows.rows.length > 0
+        ? { ...metricRows, blastRadiusStatus: blastRadiusState.status }
+        : null,
     surfaces: resolveCodeMapSurfaces(mode, showable),
   };
 }
@@ -3324,8 +3343,8 @@ export interface PrReviewMetricRow {
   moduleLine: string | null;
   /** The index coverage gap (FR-2, `summaryStatus === 'coverage-gap'`), not test coverage. */
   coverageGap: boolean;
-  /** Phase 1a has changed rows only; affected hops arrive in phase 2. */
-  hop: 'changed';
+  /** `'changed'` for a changed Node; for an affected one (P4-3c), its hop distance from the change. */
+  hop: 'changed' | number;
   complexity: DeterministicRiskSignal | null;
   blastRadius: DeterministicRiskSignal | null;
   /** A `test-coverage-gap` signal exists. `false` is "no gap signal", not "covered". */
@@ -3342,9 +3361,47 @@ export interface PrReviewMetricFindings {
 
 /** P4-3a: `buildPrReviewMetricRows`' result. */
 export interface PrReviewMetricRows {
+  /** The changed rows, then (P4-3c) at most `METRICS_TABLE_AFFECTED_ROW_CAP` affected rows. */
   rows: PrReviewMetricRow[];
   /** Changed ids that resolve to no Node on the current map — counted, never dropped silently. */
   missingChangedCount: number;
+  /** P4-3c: affected rows past the cap — the "+N more affected Nodes" line. On-map Nodes only. */
+  hiddenAffectedCount: number;
+  /**
+   * P4-3c review: ids in the blast-radius slice that are neither changed nor
+   * on the current map — no rows, but counted, so every id in the slice is
+   * accounted for: affected rows + `hiddenAffectedCount` + this + the slice's
+   * changed ids = the slice (`nodesWithinDepth`), the toolbar's count.
+   */
+  missingAffectedCount: number;
+}
+
+/** P4-3c: `PrReviewMetricsTable`'s props — the rows, and the blast radius's status (for the caption). */
+export interface PrReviewMetricsTableProps extends PrReviewMetricRows {
+  blastRadiusStatus: BlastRadiusState['status'];
+}
+
+/**
+ * P4-3c: how many affected rows the table lists (Decision 2, 2026-09-30) —
+ * the nearest and widest-reaching, after ordering. Changed rows are never
+ * capped. A 2-hop radius can pass 1,000 Nodes; this protects AD-14's budget.
+ */
+export const METRICS_TABLE_AFFECTED_ROW_CAP = 50;
+
+/**
+ * P4-3c: the blast radius at the stepper's depth — every id whose hop
+ * distance is at most `depth`. The one slice both the canvas highlight
+ * (`blastRadiusNodeIds`) and the table's affected rows read, so they can't
+ * disagree.
+ */
+export function nodesWithinDepth(hopDistances: ReadonlyMap<string, number>, depth: number): Set<string> {
+  const ids = new Set<string>();
+  for (const [nodeId, distance] of hopDistances) {
+    if (distance <= depth) {
+      ids.add(nodeId);
+    }
+  }
+  return ids;
 }
 
 const compareStrings = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -3357,47 +3414,100 @@ const compareStrings = (a: string, b: string): number => (a < b ? -1 : a > b ? 1
  * highest-severity finding is `selectIngestedSignals`' first (it sorts by
  * `INGESTED_SEVERITY_RANK`). Changed ids with no Node on this map (a scope
  * filter, or a refresh since the diff) are counted in `missingChangedCount`.
+ *
+ * P4-3c: then one affected row per on-map Node in `nodesWithinDepth(
+ * hopDistances, depth)` — hop ascending, then blast-radius value descending,
+ * then id — capped at `METRICS_TABLE_AFFECTED_ROW_CAP` after that ordering,
+ * the rest counted in `hiddenAffectedCount`. A changed id is never also an
+ * affected row, even if `hopDistances` (seeds excluded by contract) lists
+ * it. Affected ids not on this map are not rows; they are counted in
+ * `missingAffectedCount`, never in `hiddenAffectedCount`.
  */
 export function buildPrReviewMetricRows(
   nodes: readonly CodeMapNode[],
   changedIds: ReadonlySet<string>,
+  hopDistances: ReadonlyMap<string, number> | null,
+  depth: number,
 ): PrReviewMetricRows {
   const rows: PrReviewMetricRow[] = [];
+  // P4-3c review: affected Nodes are sorted as light tuples; full rows are
+  // built only for the ones the cap keeps (a 2-hop radius can pass 1,000).
+  const affected: { node: CodeMapNode; hop: number; blast: number }[] = [];
+  const within = hopDistances === null ? EMPTY_ID_SET : nodesWithinDepth(hopDistances, depth);
   const found = new Set<string>();
   for (const node of nodes) {
-    if (!changedIds.has(node.id) || found.has(node.id)) {
+    if (found.has(node.id)) {
       continue;
     }
-    found.add(node.id);
-    const deterministic = selectDeterministicSignals(node.riskSignals);
-    const ofType = (type: DeterministicRiskSignalType) => deterministic.find((signal) => signal.type === type) ?? null;
-    const ingested = selectIngestedSignals(node.riskSignals);
-    const highest = ingested[0];
-    rows.push({
-      id: node.id,
-      name: node.name,
-      file: node.file,
-      startLine: node.startLine,
-      moduleLine: nodeModuleLine(node.file),
-      coverageGap: node.summaryStatus === 'coverage-gap',
-      hop: 'changed',
-      complexity: ofType('complexity'),
-      blastRadius: ofType('blast-radius'),
-      testCoverageGap: ofType('test-coverage-gap') !== null,
-      findings:
-        highest === undefined
-          ? null
-          : { count: ingested.length, highestSeverity: highest.severity, sourceTool: highest.sourceTool },
-    });
+    if (changedIds.has(node.id)) {
+      found.add(node.id);
+      rows.push(prReviewMetricRow(node, 'changed'));
+      continue;
+    }
+    const distance = hopDistances?.get(node.id);
+    if (distance !== undefined && within.has(node.id)) {
+      found.add(node.id);
+      affected.push({ node, hop: distance, blast: blastRadiusSortValue(node) });
+    }
   }
   rows.sort((a, b) => compareStrings(a.file, b.file) || a.startLine - b.startLine || compareStrings(a.id, b.id));
+  affected.sort((a, b) => a.hop - b.hop || b.blast - a.blast || compareStrings(a.node.id, b.node.id));
   let missingChangedCount = 0;
   for (const id of changedIds) {
     if (!found.has(id)) {
       missingChangedCount += 1;
     }
   }
-  return { rows, missingChangedCount };
+  let missingAffectedCount = 0;
+  for (const id of within) {
+    if (!found.has(id) && !changedIds.has(id)) {
+      missingAffectedCount += 1;
+    }
+  }
+  const shown = affected.slice(0, METRICS_TABLE_AFFECTED_ROW_CAP);
+  return {
+    rows: [...rows, ...shown.map((entry) => prReviewMetricRow(entry.node, entry.hop))],
+    missingChangedCount,
+    hiddenAffectedCount: affected.length - shown.length,
+    missingAffectedCount,
+  };
+}
+
+/**
+ * P4-3c review: an affected Node's blast-radius value for ordering — the
+ * same first `blast-radius` signal `selectDeterministicSignals` keeps for
+ * the row, or -1 for none (after every present value).
+ */
+function blastRadiusSortValue(node: CodeMapNode): number {
+  for (const signal of node.riskSignals) {
+    if (signal.family === 'deterministic' && signal.type === 'blast-radius') {
+      return signal.value;
+    }
+  }
+  return -1;
+}
+
+function prReviewMetricRow(node: CodeMapNode, hop: PrReviewMetricRow['hop']): PrReviewMetricRow {
+  const deterministic = selectDeterministicSignals(node.riskSignals);
+  const ofType = (type: DeterministicRiskSignalType) => deterministic.find((signal) => signal.type === type) ?? null;
+  const ingested = selectIngestedSignals(node.riskSignals);
+  const highest = ingested[0];
+  return {
+    id: node.id,
+    name: node.name,
+    file: node.file,
+    startLine: node.startLine,
+    moduleLine: nodeModuleLine(node.file),
+    coverageGap: node.summaryStatus === 'coverage-gap',
+    hop,
+    complexity: ofType('complexity'),
+    blastRadius: ofType('blast-radius'),
+    testCoverageGap: ofType('test-coverage-gap') !== null,
+    findings:
+      highest === undefined
+        ? null
+        : { count: ingested.length, highestSeverity: highest.severity, sourceTool: highest.sourceTool },
+  };
 }
 
 /** P4-3a: the table's empty-cell text. Never "covered", never `0`. */
@@ -3433,6 +3543,36 @@ export function formatMetricFindingsCell(findings: PrReviewMetricFindings | null
     return METRIC_CELL_EMPTY;
   }
   return `${formatCountNumber(findings.count)} · ${findings.highestSeverity} · ${findings.sourceTool}`;
+}
+
+/**
+ * P4-3c: the inert cap line — "+250 more affected Nodes — reduce depth", or
+ * `null` when nothing is past the cap.
+ */
+export function formatHiddenAffectedNodes(count: number): string | null {
+  return count > 0 ? `+${formatCount(count, 'more affected Node', 'more affected Nodes')} — reduce depth` : null;
+}
+
+/** P4-3c review: the inert line for affected ids not on this map, or `null` for none. */
+export function formatMissingAffectedNodes(count: number): string | null {
+  return count > 0 ? `${formatCount(count, 'affected Node', 'affected Nodes')} not on the current map` : null;
+}
+
+/**
+ * P4-3c review: the table's caption. While the blast radius computes it
+ * shows and says so, in the toolbar's wording; otherwise it is visually
+ * hidden and names affected Nodes only when the table accounts for any.
+ */
+export function prReviewMetricsCaption(
+  table: PrReviewMetricRows,
+  blastRadiusStatus: BlastRadiusState['status'],
+): { text: string; visible: boolean } {
+  if (blastRadiusStatus === 'loading') {
+    return { text: "Changed Nodes' risk metrics. Computing blast radius…", visible: true };
+  }
+  const anyAffected =
+    table.rows.some((row) => row.hop !== 'changed') || table.hiddenAffectedCount > 0 || table.missingAffectedCount > 0;
+  return { text: anyAffected ? "Changed and affected Nodes' risk metrics" : "Changed Nodes' risk metrics", visible: false };
 }
 
 /** P4-3a: the inert line for changed ids not on this map, or `null` for none. */
@@ -3485,7 +3625,7 @@ export function CodeMapCanvasFrame({
  */
 export function prReviewMetricsTableFor(
   view: Pick<PrReviewView, 'metricsTable' | 'surfaces'>,
-): PrReviewMetricRows | null {
+): PrReviewMetricsTableProps | null {
   return view.surfaces.canvas ? view.metricsTable : null;
 }
 
@@ -3750,6 +3890,8 @@ export function MetricsTableDivider({
 }
 
 const PR_REVIEW_METRICS_CAPTION_ID = 'code-map-metrics-table-caption';
+/** P4-3c: the table's column count — node, hop, complexity, blast radius, tests, findings. */
+const PR_REVIEW_METRICS_COLUMN_COUNT = 6;
 
 function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }) {
   const cell = formatMetricSignalCell(signal);
@@ -3775,22 +3917,32 @@ function MetricSignalCell({ signal }: { signal: DeterministicRiskSignal | null }
 /**
  * P4-3a: the PR Review metrics table (DESIGN.md
  * `components.pr-review-metrics-table`) — a native `<table>` in a fixed-height
- * region below the canvas, one row per changed Node, text values only (bars
- * and sorting are phase 3). Signal-family toggles don't hide columns, as
+ * region below the canvas, one row per changed Node, then (P4-3c) the
+ * affected rows at the stepper's depth up to the cap and the inert "+N more"
+ * line; text values only (bars and sorting are phase 3). Signal-family toggles don't hide columns, as
  * with Health Audit rows.
  *
  * MUST STAY HOOKLESS: `CodeMap.prReviewMetrics.test.ts` renders it by calling
  * it as a plain function (no DOM runner).
  */
-export function PrReviewMetricsTable({ rows, missingChangedCount }: PrReviewMetricRows) {
+export function PrReviewMetricsTable({ blastRadiusStatus, ...table }: PrReviewMetricsTableProps) {
+  const { rows, missingChangedCount, hiddenAffectedCount, missingAffectedCount } = table;
   const missing = formatMissingChangedNodes(missingChangedCount);
+  const hiddenAffected = formatHiddenAffectedNodes(hiddenAffectedCount);
+  const missingAffected = formatMissingAffectedNodes(missingAffectedCount);
+  const caption = prReviewMetricsCaption(table, blastRadiusStatus);
   return (
     // A scroll region, so it takes a focus stop for keyboard scrolling, like
     // `.code-map__health-grid`.
     <section className="code-map__metrics-table" aria-labelledby={PR_REVIEW_METRICS_CAPTION_ID} tabIndex={0}>
       <table>
-        <caption id={PR_REVIEW_METRICS_CAPTION_ID} className="visually-hidden">
-          Changed Nodes' risk metrics
+        {/* P4-3c: while the blast radius computes, the caption shows and
+            says so (the toolbar's wording); the changed rows are already here. */}
+        <caption
+          id={PR_REVIEW_METRICS_CAPTION_ID}
+          className={caption.visible ? 'code-map__metrics-table-caption' : 'visually-hidden'}
+        >
+          {caption.text}
         </caption>
         <thead>
           <tr>
@@ -3804,7 +3956,14 @@ export function PrReviewMetricsTable({ rows, missingChangedCount }: PrReviewMetr
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={row.id} className="code-map__metrics-table-row code-map__metrics-table-row--changed">
+            <tr
+              key={row.id}
+              className={
+                row.hop === 'changed'
+                  ? 'code-map__metrics-table-row code-map__metrics-table-row--changed'
+                  : 'code-map__metrics-table-row'
+              }
+            >
               <th scope="row" className="code-map__metrics-table-node" title={row.id}>
                 <code className="code-map__metrics-table-name">{row.name}</code>
                 {row.moduleLine !== null && <span className="code-map__metrics-table-module">{row.moduleLine}</span>}
@@ -3822,7 +3981,7 @@ export function PrReviewMetricsTable({ rows, missingChangedCount }: PrReviewMetr
                   </span>
                 )}
               </th>
-              <td className="code-map__metrics-table-cell">{row.hop}</td>
+              <td className="code-map__metrics-table-cell">{String(row.hop)}</td>
               <MetricSignalCell signal={row.complexity} />
               <MetricSignalCell signal={row.blastRadius} />
               <td
@@ -3845,9 +4004,19 @@ export function PrReviewMetricsTable({ rows, missingChangedCount }: PrReviewMetr
               </td>
             </tr>
           ))}
+          {/* P4-3c: the affected rows' cap. Inert: no handler, no focus
+              stop — the only action is the depth stepper above. */}
+          {hiddenAffected !== null && (
+            <tr className="code-map__metrics-cap">
+              <td colSpan={PR_REVIEW_METRICS_COLUMN_COUNT}>{hiddenAffected}</td>
+            </tr>
+          )}
         </tbody>
       </table>
       {missing !== null && <p className="code-map__metrics-table-missing">{missing}</p>}
+      {missingAffected !== null && (
+        <p className="code-map__metrics-table-missing code-map__metrics-table-missing--affected">{missingAffected}</p>
+      )}
     </section>
   );
 }
@@ -8193,13 +8362,8 @@ export function CodeMap({
     if (mode !== 'prReview' || blastRadiusState.status !== 'resolved') {
       return EMPTY_ID_SET;
     }
-    const ids = new Set<string>();
-    for (const [nodeId, distance] of blastRadiusState.hopDistances) {
-      if (distance <= blastRadiusDepth) {
-        ids.add(nodeId);
-      }
-    }
-    return ids;
+    // P4-3c: the same slice the metrics table's affected rows read.
+    return nodesWithinDepth(blastRadiusState.hopDistances, blastRadiusDepth);
   }, [mode, blastRadiusState, blastRadiusDepth]);
 
   /**
@@ -8943,9 +9107,11 @@ export function CodeMap({
   // not a notice status: it renders inline in the PR Review toolbar, same
   // convention as `pathTrace.status === 'error'`.
   // P4-3a: memoised — the metrics rows are an O(Nodes) pass over the map.
+  // P4-3c: the blast radius and the stepper's depth give the affected rows,
+  // so a step re-derives them locally — no IPC call.
   const prReviewView = useMemo(
-    () => resolvePrReviewView(mode, fetchState, diffScopeState),
-    [mode, fetchState, diffScopeState],
+    () => resolvePrReviewView(mode, fetchState, diffScopeState, blastRadiusState, blastRadiusDepth),
+    [mode, fetchState, diffScopeState, blastRadiusState, blastRadiusDepth],
   );
   const {
     noticeStatus: prReviewNoticeStatus,
