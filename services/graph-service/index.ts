@@ -1470,6 +1470,10 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // `riskSignals` (FR7 reproducibility). `undefined` when
     // `coverage/lcov.info` doesn't exist or doesn't parse — never thrown,
     // so it can never fail this fetch (Boundaries & Constraints).
+    // P4-3f review round 1: the report also carries the `FN:`/`FNDA:`
+    // records and the listed files newer than it, which decide
+    // `testCoverageHit` (the table's `covered`); `test-coverage-gap` still
+    // reads its `DA:` lines alone.
     const coverage = await loadLcovCoverage(projectRoot);
     // P1-1: severity for `blast-radius`/`hotspot` is project-relative, so
     // `attachProjectRiskSignals` builds every Node's signals, rates them in

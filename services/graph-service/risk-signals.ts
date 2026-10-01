@@ -18,7 +18,7 @@ import type {
   RiskSignal,
   RiskSignalLocation,
 } from '@driller/ipc-contracts';
-import { hasCoverageGap, type LcovCoverage } from './lcov';
+import { hasCoverageData, hasCoverageGap, hasFunctionHit, type LcovCoverage, type LcovReport } from './lcov';
 import type { CodeMapNodeWithSignalSources } from './mcp-client';
 import { getNodeRecord, type NodeRecord } from './node-record-store';
 
@@ -287,7 +287,7 @@ export function attachProjectRiskSignals(
   annotatedNodes: readonly CodeMapNode[],
   sources: readonly CodeMapNodeWithSignalSources[],
   adjacency: BidirectionalAdjacency,
-  coverage: LcovCoverage | undefined,
+  coverage: LcovReport | undefined,
   getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
 ): CodeMapNode[] {
   if (annotatedNodes.length !== sources.length) {
@@ -296,7 +296,7 @@ export function attachProjectRiskSignals(
     );
   }
   const rated = assignDeterministicSeverities(
-    sources.map((source) => buildRiskSignals(source, adjacency, coverage, getRecord)),
+    sources.map((source) => buildRiskSignals(source, adjacency, coverage?.lines, getRecord)),
   );
   return annotatedNodes.map((node, i) => {
     const source = sources[i]!;
@@ -309,8 +309,26 @@ export function attachProjectRiskSignals(
       hotspotChangeCount: _hotspotChangeCount,
       // P4-2 phase 1: the backend test flag is fetch-internal, never wire data.
       isTest: _isTest,
+      // P4-3 phase 5: never carried in from upstream; set below from this
+      // fetch's own `coverage` only.
+      testCoverageAvailable: _testCoverageAvailable,
+      testCoverageHit: _testCoverageHit,
       ...cleanNode
     } = node as CodeMapNodeWithSignalSources;
-    return { ...cleanNode, riskSignals: rated[i]! };
+    // P4-3 phase 5: from the same `coverage` value that decides
+    // `test-coverage-gap` — set only when LCOV loaded AND lists this Node's
+    // file; omitted (never `false`) otherwise.
+    const coverageAvailable = coverage !== undefined && hasCoverageData(coverage.lines, node.file);
+    // P4-3f review round 1: the per-Node proof — function-level, and never
+    // for a file newer than the report (`hasFunctionHit`). Only alongside
+    // the file-level flag.
+    const coverageHit =
+      coverageAvailable && hasFunctionHit(coverage, node.file, node.startLine, node.endLine);
+    return {
+      ...cleanNode,
+      riskSignals: rated[i]!,
+      ...(coverageAvailable ? { testCoverageAvailable: true as const } : {}),
+      ...(coverageHit ? { testCoverageHit: true as const } : {}),
+    };
   });
 }

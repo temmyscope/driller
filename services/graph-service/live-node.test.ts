@@ -146,7 +146,8 @@ describe('parity with the Code Map fetch path', () => {
     const population = [raw, ...PEERS];
     const adjacency = buildBidirectionalAdjacency(population, []);
     const annotated = annotateNodesWithSummaryState(population, gaps);
-    const node = attachProjectRiskSignals(annotated, population, adjacency, coverage).find((n) => n.id === raw.id);
+    const report = coverage && { lines: coverage, functions: new Map(), staleFiles: new Set<string>() };
+    const node = attachProjectRiskSignals(annotated, population, adjacency, report).find((n) => n.id === raw.id);
     assert.ok(node !== undefined);
     return node;
   }

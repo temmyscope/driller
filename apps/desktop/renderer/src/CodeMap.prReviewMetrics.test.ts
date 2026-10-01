@@ -72,6 +72,11 @@ import {
   METRICS_ROW_BUTTON_CLASS,
   type MetricsRowButtonTarget,
   SEVERE_SIGNAL_GLYPH,
+  formatMetricTestsCell,
+  METRIC_TESTS_COVERED_LABEL,
+  METRIC_TESTS_NO_DATA_TITLE,
+  METRIC_TESTS_UNPROVEN_TITLE,
+  metricTestsState,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
@@ -1286,9 +1291,11 @@ describe('sortPrReviewMetricRows', () => {
       ascending: ['src/b.ts::beta', 'src/a.ts::alpha', 'x::delta', 'y::alpha', 'x::gamma'],
     },
     tests: {
-      // `gap` before `—`, and `—` last either way — so both directions agree.
-      descending: ['src/a.ts::alpha', 'x::delta', 'src/b.ts::beta', 'x::gamma', 'y::alpha'],
+      // P4-3f: `gap` < `—` < `covered`; `—` is a value here, so it flips
+      // with the direction (no `covered` row in this fixture — see the P4-3f
+      // suite). Ties by id ascending in both directions.
       ascending: ['src/a.ts::alpha', 'x::delta', 'src/b.ts::beta', 'x::gamma', 'y::alpha'],
+      descending: ['src/b.ts::beta', 'x::gamma', 'y::alpha', 'src/a.ts::alpha', 'x::delta'],
     },
     findings: {
       // count, then the highest finding's severity (blocker over major).
@@ -1317,14 +1324,13 @@ describe('sortPrReviewMetricRows', () => {
     }
   });
 
-  it('`—` sorts last in both directions, for every column that can be missing', () => {
-    for (const column of ['complexity', 'blastRadius', 'tests', 'findings'] as const) {
+  it('`—` sorts last in both directions, for every column that can be missing (not tests: P4-3f)', () => {
+    for (const column of ['complexity', 'blastRadius', 'findings'] as const) {
       for (const direction of ['ascending', 'descending'] as const) {
         const sorted = sortPrReviewMetricRows(SORTABLE.rows, sortBy(column, direction));
         const missing = (r: PrReviewMetricRow) =>
           column === 'complexity' ? r.complexity === null
           : column === 'blastRadius' ? r.blastRadius === null
-          : column === 'tests' ? !r.testCoverageGap
           : r.findings === null;
         const firstMissing = sorted.findIndex(missing);
         assert.ok(firstMissing > 0, `${column} ${direction}`);
@@ -1373,13 +1379,13 @@ describe('sortPrReviewMetricRows', () => {
 });
 
 describe('nextPrReviewMetricSort and the announcement', () => {
-  it('numeric columns start descending, node and hop ascending; the active column flips', () => {
-    for (const column of ['complexity', 'blastRadius', 'tests', 'findings'] as const) {
+  it('numeric columns start descending, node, hop and (P4-3f) tests ascending; the active column flips', () => {
+    for (const column of ['complexity', 'blastRadius', 'findings'] as const) {
       assert.deepEqual(nextPrReviewMetricSort(null, column), sortBy(column, 'descending'));
       assert.deepEqual(nextPrReviewMetricSort(sortBy(column, 'descending'), column), sortBy(column, 'ascending'));
       assert.deepEqual(nextPrReviewMetricSort(sortBy(column, 'ascending'), column), sortBy(column, 'descending'));
     }
-    for (const column of ['node', 'hop'] as const) {
+    for (const column of ['node', 'hop', 'tests'] as const) {
       assert.deepEqual(nextPrReviewMetricSort(null, column), sortBy(column, 'ascending'));
       assert.deepEqual(nextPrReviewMetricSort(sortBy(column, 'ascending'), column), sortBy(column, 'descending'));
     }
@@ -1966,5 +1972,134 @@ describe('CodeMap source: row activation wiring (P4-3e)', () => {
     assert.equal(src.split('<PrReviewMetricsTable').length - 1, 1);
     assert.equal(src.split('onActivateNode={openNodeDetail}').length - 1, 2, 'the Health Audit grid and the table');
     assert.ok(!src.includes('onActivateNode={activateNode}'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-3f: honest coverage — `covered` only with the LCOV flag
+// ---------------------------------------------------------------------------
+
+describe('the tests column: gap, covered, — (P4-3f)', () => {
+  /**
+   * Every combination of the gap signal, the file flag and (review round 1)
+   * the per-Node hit proof, including malformed values the main process
+   * would strip.
+   */
+  const COMBOS = [
+    { id: 'c::gapFlagHit', gap: true, flag: true, hit: true, expected: 'gap' },
+    { id: 'c::gapFlag', gap: true, flag: true, hit: undefined, expected: 'gap' },
+    { id: 'c::gapNoFlag', gap: true, flag: undefined, hit: undefined, expected: 'gap' },
+    { id: 'c::hit', gap: false, flag: true, hit: true, expected: 'covered' },
+    { id: 'c::loaded', gap: false, flag: true, hit: undefined, expected: 'unproven' },
+    { id: 'c::hitNoFlag', gap: false, flag: undefined, hit: true, expected: 'none' },
+    { id: 'c::none', gap: false, flag: undefined, hit: undefined, expected: 'none' },
+    { id: 'c::bogus', gap: false, flag: 'yes', hit: 'yes', expected: 'none' },
+    { id: 'c::false', gap: false, flag: true, hit: false, expected: 'unproven' },
+  ] as const;
+  const comboNodes = COMBOS.map(({ id, gap, flag, hit }) =>
+    node(id, {
+      riskSignals: gap ? [det('test-coverage-gap', 1)] : [],
+      ...(flag === undefined ? {} : { testCoverageAvailable: flag as unknown as true }),
+      ...(hit === undefined ? {} : { testCoverageHit: hit as unknown as true }),
+    }),
+  );
+  const table = buildPrReviewMetricRows(comboNodes, new Set(COMBOS.map((c) => c.id)), null, 0);
+  const byId = new Map(table.rows.map((row) => [row.id, row]));
+
+  it('metricTestsState: gap first; covered only with both flags exactly true; else unproven or none', () => {
+    for (const { id, expected } of COMBOS) {
+      assert.equal(metricTestsState(byId.get(id)!), expected, id);
+    }
+    for (const gap of [true, false]) {
+      for (const available of [true, false]) {
+        for (const hit of [true, false]) {
+          const state = metricTestsState({ testCoverageGap: gap, testCoverageAvailable: available, testCoverageHit: hit });
+          const expected = gap ? 'gap' : !available ? 'none' : hit ? 'covered' : 'unproven';
+          assert.equal(state, expected, JSON.stringify({ gap, available, hit }));
+        }
+      }
+    }
+  });
+
+  it('the row reads both flags strictly: only `true` counts', () => {
+    assert.equal(byId.get('c::hit')?.testCoverageAvailable, true);
+    assert.equal(byId.get('c::hit')?.testCoverageHit, true);
+    assert.equal(byId.get('c::none')?.testCoverageAvailable, false);
+    assert.equal(byId.get('c::bogus')?.testCoverageAvailable, false);
+    assert.equal(byId.get('c::bogus')?.testCoverageHit, false);
+    assert.equal(byId.get('c::false')?.testCoverageHit, false);
+  });
+
+  it('formatMetricTestsCell: covered names exactly what is proven; each — says why', () => {
+    assert.deepEqual(formatMetricTestsCell('gap'), { text: 'gap', label: null, title: null, empty: false });
+    assert.deepEqual(formatMetricTestsCell('covered'), {
+      text: 'covered',
+      label: METRIC_TESTS_COVERED_LABEL,
+      title: METRIC_TESTS_COVERED_LABEL,
+      empty: false,
+    });
+    assert.equal(METRIC_TESTS_COVERED_LABEL, 'Test coverage: function entered at least once by tests (LCOV)');
+    assert.deepEqual(formatMetricTestsCell('unproven'), {
+      text: METRIC_CELL_EMPTY,
+      label: null,
+      title: METRIC_TESTS_UNPROVEN_TITLE,
+      empty: true,
+    });
+    assert.equal(METRIC_TESTS_UNPROVEN_TITLE, 'No function-level coverage proof for this Node (LCOV)');
+    assert.deepEqual(formatMetricTestsCell('none'), {
+      text: METRIC_CELL_EMPTY,
+      label: null,
+      title: METRIC_TESTS_NO_DATA_TITLE,
+      empty: true,
+    });
+    assert.equal(METRIC_TESTS_NO_DATA_TITLE, 'No LCOV data for this file');
+  });
+
+  it('renders each combination: covered only on the proven, gap-free row; never a percentage', () => {
+    const elements = render(table);
+    const TITLES = { none: METRIC_TESTS_NO_DATA_TITLE, unproven: METRIC_TESTS_UNPROVEN_TITLE } as Record<string, string>;
+    for (const row of rowsOf(elements)) {
+      const id = String(cellsOf(row)[0]?.props.title);
+      const testsCell = cellsOf(row)[4]!;
+      const expected = COMBOS.find((c) => c.id === id)!.expected;
+      const empty = expected === 'none' || expected === 'unproven';
+      assert.equal(textOf(testsCell), empty ? METRIC_CELL_EMPTY : expected, id);
+      const named = renderTree(testsCell.props.children).find((e) => e.props.role === 'img');
+      if (expected === 'covered') {
+        assert.equal(named?.props['aria-label'], METRIC_TESTS_COVERED_LABEL, id);
+        assert.equal(testsCell.props.className, 'code-map__metrics-table-cell');
+      } else {
+        assert.equal(named, undefined, id);
+      }
+      if (empty) {
+        assert.equal(testsCell.props.title, TITLES[expected], id);
+        assert.match(String(testsCell.props.className), /code-map__metrics-table-cell--empty/);
+      } else {
+        assert.equal(testsCell.props.title, undefined, id);
+      }
+    }
+    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} }));
+    assert.equal(allText.split('covered').length - 1, 1, 'exactly one covered cell');
+    assert.ok(!allText.includes('%'), allText);
+  });
+
+  it('no LCOV at all (no Node flagged): no cell says covered', () => {
+    const plain = buildPrReviewMetricRows(
+      comboNodes.map(({ testCoverageAvailable: _flag, testCoverageHit: _hit, ...rest }) => rest),
+      new Set(COMBOS.map((c) => c.id)),
+      null,
+      0,
+    );
+    const text = textOf(PrReviewMetricsTable({ ...plain, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} }));
+    assert.ok(!text.toLowerCase().includes('covered'), text);
+  });
+
+  it('sorts gap < — (either kind) < covered: ascending leads with gaps, descending with covered; ties by id', () => {
+    const gaps = ['c::gapFlag', 'c::gapFlagHit', 'c::gapNoFlag'];
+    const dashes = ['c::bogus', 'c::false', 'c::hitNoFlag', 'c::loaded', 'c::none'];
+    assert.deepEqual(idsOf(sortPrReviewMetricRows(table.rows, sortBy('tests', 'ascending'))), [...gaps, ...dashes, 'c::hit']);
+    assert.deepEqual(idsOf(sortPrReviewMetricRows(table.rows, sortBy('tests', 'descending'))), ['c::hit', ...dashes, ...gaps]);
+    // A first click on the header leads with the gaps, as before P4-3f.
+    assert.deepEqual(nextPrReviewMetricSort(null, 'tests'), sortBy('tests', 'ascending'));
   });
 });

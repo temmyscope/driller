@@ -17,7 +17,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { register } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -148,6 +148,8 @@ interface Posted {
     usesTypes?: unknown;
     similarTo?: { id: string; score: number }[];
     similarToTotal?: number;
+    testCoverageAvailable?: unknown;
+    testCoverageHit?: unknown;
     riskSignals?: { type?: string; value?: number }[];
   }[];
   edges?: { source: string; target: string }[];
@@ -673,6 +675,114 @@ describe('graphService:scopeChanged through index.ts', () => {
     assert.equal(similar(await fetchMap(), 'w'), undefined);
     send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
     await fetchMap();
+  });
+
+  it('P4-3 phase 5: testCoverageAvailable only for files LCOV lists, testCoverageHit only with FN proof, the same in the map reply and lookup_node', { timeout: 20_000 }, async () => {
+    send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
+    const coverageDir = path.join(PROJECT, 'coverage');
+    const flags = (reply: Posted) =>
+      Object.fromEntries(
+        (reply.nodes ?? []).map((node) => [
+          node.id,
+          [
+            'testCoverageAvailable' in node ? node.testCoverageAvailable : 'absent',
+            'testCoverageHit' in node ? node.testCoverageHit : 'absent',
+            (node.riskSignals ?? []).some((signal) => signal.type === 'test-coverage-gap') ? 'gap' : 'no-gap',
+          ],
+        ]),
+      );
+    const NONE = {
+      w: ['absent', 'absent', 'no-gap'],
+      a: ['absent', 'absent', 'no-gap'],
+      d: ['absent', 'absent', 'no-gap'],
+      x: ['absent', 'absent', 'no-gap'],
+    };
+    // P4-3f review round 1: the listed sources must exist, and be older than
+    // the report, or nothing in them is proven hit.
+    const sources = ['web/a.ts', 'app/b.ts', 'webapp/d.ts'];
+    const past = new Date(Date.now() - 60_000);
+    for (const file of sources) {
+      mkdirSync(path.join(PROJECT, path.dirname(file)), { recursive: true });
+      writeFileSync(path.join(PROJECT, file), 'export function f() {}\n');
+      utimesSync(path.join(PROJECT, file), past, past);
+    }
+    try {
+      // No coverage/lcov.info: no Node has the flag.
+      rmSync(coverageDir, { recursive: true, force: true });
+      assert.deepEqual(flags(await fetchMap()), NONE);
+
+      // Malformed (no SF: section parses): no flags either.
+      mkdirSync(coverageDir, { recursive: true });
+      writeFileSync(path.join(coverageDir, 'lcov.info'), 'not lcov at all\nDA:1,1\n');
+      assert.deepEqual(flags(await fetchMap()), NONE);
+
+      // web/a.ts: w's function called (flag + hit); app/b.ts listed with
+      // nothing hit (a: flag + gap); webapp/d.ts: line 1 hit by module load
+      // but x never called (flag, no gap, NO hit); docs/c.ts omitted (d).
+      writeFileSync(
+        path.join(coverageDir, 'lcov.info'),
+        [
+          'TN:',
+          'SF:web/a.ts', 'FN:1,w', 'FNDA:3,w', 'DA:1,3', 'DA:2,0', 'end_of_record',
+          'SF:./app/b.ts', 'FN:1,a', 'FNDA:0,a', 'DA:1,0', 'DA:2,0', 'end_of_record',
+          'SF:webapp/d.ts', 'FN:1,x', 'FNDA:0,x', 'DA:1,1', 'DA:2,0', 'end_of_record',
+          '',
+        ].join('\n'),
+      );
+      const map = await fetchMap();
+      assert.deepEqual(flags(map), {
+        w: [true, true, 'no-gap'],
+        a: [true, 'absent', 'gap'],
+        d: ['absent', 'absent', 'no-gap'],
+        x: [true, 'absent', 'no-gap'],
+      });
+
+      // lookup_node, through the registered handler and the real live
+      // derivation, reports the same flag as the renderer's reply.
+      const { getNodes, getFolded, getFoldedTypes } = capturedGetters();
+      const { MCP_SERVER_VERSION, registerLookupNodeTool } = await import('./mcp-server');
+      const { deriveLiveNode } = await import('./live-node');
+      assert.equal(MCP_SERVER_VERSION, '1.6.0');
+      let handler: ((args: { nodeId: string }) => Promise<{ content: { text: string }[] }>) | undefined;
+      let description = '';
+      registerLookupNodeTool(
+        {
+          registerTool: (_name: string, config: { description?: string }, cb: typeof handler) => {
+            description = config.description ?? '';
+            handler = cb;
+          },
+        } as unknown as Parameters<typeof registerLookupNodeTool>[0],
+        getNodes as Parameters<typeof registerLookupNodeTool>[1],
+        (node) => deriveLiveNode(node, { getRecord: () => undefined, coverageGapFiles: new Set() }),
+        getFolded as Parameters<typeof registerLookupNodeTool>[3],
+        getFoldedTypes as Parameters<typeof registerLookupNodeTool>[4],
+      );
+      assert.ok(handler);
+      for (const id of ['w', 'a', 'd', 'x']) {
+        const viaTool = JSON.parse((await handler({ nodeId: id })).content[0]!.text);
+        assert.equal(viaTool.status, 'ok');
+        const fromMap = map.nodes?.find((node) => node.id === id);
+        assert.equal('testCoverageAvailable' in viaTool.node, fromMap !== undefined && 'testCoverageAvailable' in fromMap, id);
+        assert.equal(viaTool.node.testCoverageAvailable, fromMap?.testCoverageAvailable, id);
+        assert.equal('testCoverageHit' in viaTool.node, fromMap !== undefined && 'testCoverageHit' in fromMap, id);
+        assert.equal(viaTool.node.testCoverageHit, fromMap?.testCoverageHit, id);
+      }
+      assert.match(description, /'testCoverageAvailable': true/);
+      assert.match(description, /'testCoverageHit': true, when present, means the function was entered at least once by tests \(LCOV\)/);
+      assert.match(description, /says nothing about a percentage/);
+
+      // P4-3f review round 1: web/a.ts edited after the report — w loses the
+      // hit; its flag and (absent) gap signal are unchanged.
+      utimesSync(path.join(PROJECT, 'web/a.ts'), new Date(), new Date(Date.now() + 60_000));
+      assert.deepEqual(flags(await fetchMap()).w, [true, 'absent', 'no-gap']);
+    } finally {
+      rmSync(coverageDir, { recursive: true, force: true });
+      for (const file of sources) {
+        rmSync(path.join(PROJECT, file), { force: true });
+      }
+    }
+    // With the report gone again, the next fetch drops every flag.
+    assert.deepEqual(flags(await fetchMap()), NONE);
   });
 
   it('P4-2 phase 3b: folded types follow the indexing scope, and name only in-scope users', { timeout: 20_000 }, async () => {

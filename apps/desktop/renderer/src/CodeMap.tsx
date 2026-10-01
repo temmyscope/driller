@@ -3330,8 +3330,9 @@ export function resolvePrReviewView(
 /**
  * P4-3a: one changed Node's row in the PR Review metrics table. Every value
  * is read straight from the Node's own `riskSignals`; `null` means the Node
- * carries no such signal and renders `—`, never "covered" (the renderer
- * cannot tell "no gap" from "no LCOV file") and never a zero.
+ * carries no such signal and renders `—`, never a zero. P4-3f: the tests
+ * cell says "covered" only when LCOV lists the Node's file, its function
+ * records prove a test entered it, and there is no gap (`metricTestsState`).
  */
 export interface PrReviewMetricRow {
   id: string;
@@ -3355,6 +3356,18 @@ export interface PrReviewMetricRow {
   blastRadius: DeterministicRiskSignal | null;
   /** A `test-coverage-gap` signal exists. `false` is "no gap signal", not "covered". */
   testCoverageGap: boolean;
+  /**
+   * P4-3f: `node.testCoverageAvailable === true` — LCOV line data exists for
+   * the Node's file. Only with this and no gap does the tests cell say
+   * `covered` (`metricTestsState`).
+   */
+  testCoverageAvailable: boolean;
+  /**
+   * P4-3f review round 1: `node.testCoverageHit === true` — LCOV's function
+   * records prove a test entered this Node. `covered` needs this too: line
+   * data alone can't tell a called function from a merely loaded one.
+   */
+  testCoverageHit: boolean;
   /** The ingested findings' count, highest severity and that finding's tool; `null` for none. */
   findings: PrReviewMetricFindings | null;
 }
@@ -3511,6 +3524,8 @@ function prReviewMetricRow(node: CodeMapNode, hop: PrReviewMetricRow['hop']): Pr
     complexity: ofType('complexity'),
     blastRadius: ofType('blast-radius'),
     testCoverageGap: ofType('test-coverage-gap') !== null,
+    testCoverageAvailable: node.testCoverageAvailable === true,
+    testCoverageHit: node.testCoverageHit === true,
     findings:
       highest === undefined
         ? null
@@ -3544,6 +3559,60 @@ export function formatMetricSignalCell(signal: DeterministicRiskSignal | null): 
     severe: signal.severity === 'severe',
   };
 }
+
+/**
+ * P4-3f: the tests cell's state, in precedence order: `gap` when the
+ * `test-coverage-gap` signal exists; else `covered` only when LCOV lists the
+ * Node's file (`testCoverageAvailable`) AND (review round 1) its function
+ * records prove a test entered the Node (`testCoverageHit`); else
+ * `unproven` (`—`: the file has LCOV data, but nothing proves this Node ran)
+ * or `none` (`—`: no LCOV data for this file). `covered` never without both.
+ */
+export type PrReviewMetricTestsState = 'gap' | 'covered' | 'unproven' | 'none';
+
+export function metricTestsState(
+  row: Pick<PrReviewMetricRow, 'testCoverageGap' | 'testCoverageAvailable' | 'testCoverageHit'>,
+): PrReviewMetricTestsState {
+  if (row.testCoverageGap) {
+    return 'gap';
+  }
+  if (!row.testCoverageAvailable) {
+    return 'none';
+  }
+  return row.testCoverageHit ? 'covered' : 'unproven';
+}
+
+/** P4-3f: the `covered` cell's accessible name — literally what is proven; never a percentage. */
+export const METRIC_TESTS_COVERED_LABEL = 'Test coverage: function entered at least once by tests (LCOV)';
+/** P4-3f: the `—` tests cell's tooltip when LCOV doesn't list the file. */
+export const METRIC_TESTS_NO_DATA_TITLE = 'No LCOV data for this file';
+/** P4-3f review round 1: the `—` tests cell's tooltip when the file is listed but nothing proves this Node ran. */
+export const METRIC_TESTS_UNPROVEN_TITLE = 'No function-level coverage proof for this Node (LCOV)';
+
+/**
+ * P4-3f: the tests cell — its visible text, the accessible name (`covered`
+ * only; `gap` and `—` are named by their text) and the tooltip.
+ */
+export function formatMetricTestsCell(state: PrReviewMetricTestsState): {
+  text: string;
+  label: string | null;
+  title: string | null;
+  empty: boolean;
+} {
+  switch (state) {
+    case 'gap':
+      return { text: 'gap', label: null, title: null, empty: false };
+    case 'covered':
+      return { text: 'covered', label: METRIC_TESTS_COVERED_LABEL, title: METRIC_TESTS_COVERED_LABEL, empty: false };
+    case 'unproven':
+      return { text: METRIC_CELL_EMPTY, label: null, title: METRIC_TESTS_UNPROVEN_TITLE, empty: true };
+    case 'none':
+      return { text: METRIC_CELL_EMPTY, label: null, title: METRIC_TESTS_NO_DATA_TITLE, empty: true };
+  }
+}
+
+/** P4-3f: the tests column's sort rank — `gap` < `—` (either kind) < `covered`, so ascending leads with gaps. */
+const METRIC_TESTS_SORT_RANK: Record<PrReviewMetricTestsState, number> = { gap: 0, unproven: 1, none: 1, covered: 2 };
 
 /** P4-3a: the findings cell — "3 · blocker · CodeRabbit", or `—` for none. */
 export function formatMetricFindingsCell(findings: PrReviewMetricFindings | null): string {
@@ -3670,7 +3739,9 @@ export const PR_REVIEW_METRIC_COLUMNS: readonly {
   { column: 'hop', label: 'hop', firstDirection: 'ascending', bar: false },
   { column: 'complexity', label: 'complexity', firstDirection: 'descending', bar: true },
   { column: 'blastRadius', label: 'blast radius', firstDirection: 'descending', bar: true },
-  { column: 'tests', label: 'tests', firstDirection: 'descending', bar: false },
+  // P4-3f: ascending first, so a first click still leads with `gap` (the
+  // order is `gap` < `—` < `covered`), as it did when `gap` was the only value.
+  { column: 'tests', label: 'tests', firstDirection: 'ascending', bar: false },
   { column: 'findings', label: 'findings', firstDirection: 'descending', bar: false },
 ];
 
@@ -3709,7 +3780,10 @@ type MetricSortKey = readonly (string | number)[];
 /**
  * P4-3d: a row's key for a column, or `null` for a missing value (`—`),
  * which sorts last in both directions. Hop: `changed` is 0, before 1, 2, ….
- * Tests: `gap` is the only value, so `—` rows follow it either way.
+ * Tests (P4-3f): never missing — `gap` < `—` < `covered`
+ * (`METRIC_TESTS_SORT_RANK`); here `—` is a value ("no LCOV data for this
+ * file"), not an absent one, so it sits between the two and flips with the
+ * direction like them.
  * Findings: count, then severity (`INGESTED_SEVERITY_RANK`, negated so a
  * descending sort puts `blocker` first).
  */
@@ -3724,7 +3798,7 @@ function metricSortKey(row: PrReviewMetricRow, column: PrReviewMetricSortColumn)
     case 'blastRadius':
       return row.blastRadius === null ? null : [row.blastRadius.value];
     case 'tests':
-      return row.testCoverageGap ? [1] : null;
+      return [METRIC_TESTS_SORT_RANK[metricTestsState(row)]];
     case 'findings':
       return row.findings === null ? null : [row.findings.count, -INGESTED_SEVERITY_RANK[row.findings.highestSeverity]];
   }
@@ -4155,6 +4229,32 @@ function MetricSignalCell({ signal, columnMax }: { signal: DeterministicRiskSign
   );
 }
 
+/**
+ * P4-3f: the tests cell. `covered` is named by `METRIC_TESTS_COVERED_LABEL`
+ * through the same `role="img"` span as a metric value; `—` carries its
+ * "No LCOV data for this file" tooltip; `gap` is unchanged.
+ */
+function MetricTestsCell({ state }: { state: PrReviewMetricTestsState }) {
+  const cell = formatMetricTestsCell(state);
+  const className = cell.empty
+    ? 'code-map__metrics-table-cell code-map__metrics-table-cell--empty'
+    : 'code-map__metrics-table-cell';
+  if (cell.label === null) {
+    return (
+      <td className={className} title={cell.title ?? undefined}>
+        {cell.text}
+      </td>
+    );
+  }
+  return (
+    <td className={className}>
+      <span role="img" aria-label={cell.label} title={cell.title ?? undefined}>
+        {cell.text}
+      </span>
+    </td>
+  );
+}
+
 /** P4-3d: the table's sort, and the setter a header activation hands the next sort to. */
 export interface PrReviewMetricsTableSortProps {
   sort: PrReviewMetricSort | null;
@@ -4336,15 +4436,7 @@ export function PrReviewMetricsTable({
               <td className="code-map__metrics-table-cell">{String(row.hop)}</td>
               <MetricSignalCell signal={row.complexity} columnMax={barMax.complexity} />
               <MetricSignalCell signal={row.blastRadius} columnMax={barMax.blastRadius} />
-              <td
-                className={
-                  row.testCoverageGap
-                    ? 'code-map__metrics-table-cell'
-                    : 'code-map__metrics-table-cell code-map__metrics-table-cell--empty'
-                }
-              >
-                {row.testCoverageGap ? 'gap' : METRIC_CELL_EMPTY}
-              </td>
+              <MetricTestsCell state={metricTestsState(row)} />
               <td
                 className={
                   row.findings === null

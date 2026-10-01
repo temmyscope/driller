@@ -11,6 +11,7 @@ import {
   isSimilarImplementation,
   joinNaturally,
   sanitizeNodeSimilarTo,
+  sanitizeNodeTestCoverageAvailable,
   toOkCodeMapResult,
   toValidatedDiffScopeResult,
 } from './code-map-reply';
@@ -36,6 +37,7 @@ describe('toOkCodeMapResult', () => {
       droppedFoldedTypes: 0,
       droppedFoldedModules: 0,
       droppedSimilarTo: 0,
+      droppedTestCoverageAvailable: 0,
     });
   });
 
@@ -243,6 +245,83 @@ describe('similarTo per element (P4-2 phase 4)', () => {
       assert.ok(!('similarTo' in cleaned) && !('similarToTotal' in cleaned), JSON.stringify(fields));
       assert.equal(dropped, typeof fields.similarTo === 'string' ? 1 : 0);
     }
+  });
+});
+
+describe('testCoverageAvailable (P4-3 phase 5)', () => {
+  const node = (fields: Record<string, unknown> = {}) => ({
+    id: 'a.f',
+    name: 'f',
+    file: 'src/a.ts',
+    startLine: 1,
+    endLine: 2,
+    kind: 'Function',
+    summaryStatus: 'pending',
+    riskSignals: [],
+    ...fields,
+  });
+
+  it('keeps a true flag, and a Node without one, as the same object', () => {
+    const covered = node({ testCoverageAvailable: true });
+    const plain = node();
+    const { result, droppedTestCoverageAvailable } = toOkCodeMapResult(
+      reply({ nodes: [covered, plain], foldedTypes: [] }),
+    );
+    assert.equal(result.nodes[0], covered);
+    assert.equal(result.nodes[1], plain);
+    assert.equal(result.nodes[0]?.testCoverageAvailable, true);
+    assert.equal(droppedTestCoverageAvailable, 0);
+  });
+
+  it('strips every non-true value (false, "yes", 1, null, {}) and counts each', () => {
+    const bad = [false, 'yes', 'true', 1, 0, null, {}];
+    const { result, droppedTestCoverageAvailable } = toOkCodeMapResult(
+      reply({ nodes: bad.map((value, i) => node({ id: `n${i}`, testCoverageAvailable: value })), foldedTypes: [] }),
+    );
+    for (const [i, cleaned] of result.nodes.entries()) {
+      assert.ok(!('testCoverageAvailable' in cleaned), JSON.stringify(bad[i]));
+      assert.equal(cleaned.id, `n${i}`);
+      assert.deepEqual(cleaned.riskSignals, []);
+    }
+    assert.equal(droppedTestCoverageAvailable, bad.length);
+  });
+
+  it('an own undefined key is removed without counting as malformed', () => {
+    const { node: cleaned, dropped } = sanitizeNodeTestCoverageAvailable(node({ testCoverageAvailable: undefined }) as never);
+    assert.ok(!('testCoverageAvailable' in cleaned));
+    assert.equal(dropped, 0);
+  });
+
+  it('review round 1: testCoverageHit is kept only as `true` and only beside a surviving testCoverageAvailable', () => {
+    const both = node({ testCoverageAvailable: true, testCoverageHit: true });
+    assert.equal(sanitizeNodeTestCoverageAvailable(both as never).node, both);
+    const cases: [Record<string, unknown>, Record<string, unknown>, number][] = [
+      [{ testCoverageAvailable: true, testCoverageHit: false }, { testCoverageAvailable: true }, 1],
+      [{ testCoverageAvailable: true, testCoverageHit: 'yes' }, { testCoverageAvailable: true }, 1],
+      [{ testCoverageHit: true }, {}, 1],
+      [{ testCoverageAvailable: 'yes', testCoverageHit: true }, {}, 2],
+      [{ testCoverageAvailable: false, testCoverageHit: false }, {}, 2],
+      [{ testCoverageAvailable: true, testCoverageHit: undefined }, { testCoverageAvailable: true }, 0],
+    ];
+    for (const [fields, kept, dropped] of cases) {
+      const result = sanitizeNodeTestCoverageAvailable(node(fields) as never);
+      const flags = Object.fromEntries(
+        Object.entries(result.node).filter(([key]) => key === 'testCoverageAvailable' || key === 'testCoverageHit'),
+      );
+      assert.deepEqual(flags, kept, JSON.stringify(fields));
+      assert.equal(result.dropped, dropped, JSON.stringify(fields));
+      assert.equal(result.node.id, 'a.f');
+    }
+  });
+
+  it('is sanitised alongside similarTo on the same Node', () => {
+    const { result, droppedSimilarTo, droppedTestCoverageAvailable } = toOkCodeMapResult(
+      reply({ nodes: [node({ similarTo: [null], similarToTotal: 1, testCoverageAvailable: 'yes' })], foldedTypes: [] }),
+    );
+    const [cleaned] = result.nodes;
+    assert.ok(cleaned && !('similarTo' in cleaned) && !('testCoverageAvailable' in cleaned));
+    assert.equal(droppedSimilarTo, 1);
+    assert.equal(droppedTestCoverageAvailable, 1);
   });
 });
 

@@ -10,6 +10,7 @@ import { describe, it } from 'node:test';
 import type { BidirectionalAdjacency } from '@driller/graph-contracts';
 import type { CodeMapNode, DeterministicRiskSignalType, RiskSignal } from '@driller/ipc-contracts';
 
+import type { LcovCoverage, LcovReport } from './lcov';
 import { deriveLiveNode } from './live-node';
 import type { CodeMapNodeWithSignalSources } from './mcp-client';
 import {
@@ -300,6 +301,153 @@ describe('attachProjectRiskSignals — the fetch path', () => {
     assert.throws(() =>
       attachProjectRiskSignals([...annotated].reverse(), sources, adjacency, undefined, noRecord),
     );
+  });
+});
+
+describe('attachProjectRiskSignals — testCoverageAvailable / testCoverageHit (P4-3 phase 5)', () => {
+  /**
+   * Nodes on lines 5–9 in: `hit.ts` (line 7 hit, function at 5 called),
+   * `loaded.ts` (line 5 hit by module load, function at 5 never called),
+   * `cold.ts` (listed, nothing hit in range), `absent.ts` (not in the report).
+   */
+  const FILES = ['src/hit.ts', 'src/loaded.ts', 'src/cold.ts', 'src/absent.ts'];
+  function coverageCase(coverage: LcovReport | undefined) {
+    const sources: CodeMapNodeWithSignalSources[] = FILES.map((file, i) => ({
+      id: `c${i}`,
+      name: `c${i}`,
+      file,
+      startLine: 5,
+      endLine: 9,
+      kind: 'Function',
+      summaryStatus: 'pending',
+      riskSignals: [],
+    }));
+    const adjacency: BidirectionalAdjacency = {
+      validNodeIds: new Set(sources.map((node) => node.id)),
+      forward: new Map(),
+      backward: new Map(),
+    };
+    const nodes = attachProjectRiskSignals(
+      sources.map((source) => ({ ...source })),
+      sources,
+      adjacency,
+      coverage,
+      () => undefined,
+    );
+    return Object.fromEntries(
+      nodes.map((node) => [
+        node.file,
+        {
+          flag: 'testCoverageAvailable' in node ? node.testCoverageAvailable : 'absent',
+          hit: 'testCoverageHit' in node ? node.testCoverageHit : 'absent',
+          gap: node.riskSignals.some((signal) => signal.family === 'deterministic' && signal.type === 'test-coverage-gap'),
+        },
+      ]),
+    );
+  }
+
+  const fn = (hits: number, line = 5) => new Map([['f', { lines: new Set([line]), hits }]]);
+  const reportOf = (lines: LcovCoverage, functions: [string, ReturnType<typeof fn>][] = [], stale: string[] = []): LcovReport => ({
+    lines,
+    functions: new Map(functions),
+    staleFiles: new Set(stale),
+  });
+  const REPORT = reportOf(
+    new Map([
+      ['src/hit.ts', new Set([1, 5, 7])],
+      ['src/loaded.ts', new Set([5, 9])],
+      ['src/cold.ts', new Set([1, 20])],
+    ]),
+    [
+      ['src/hit.ts', fn(2)],
+      ['src/loaded.ts', fn(0)],
+      ['src/cold.ts', fn(0)],
+    ],
+  );
+
+  it('flag for listed files; hit only with function-level proof; the gap signal is unchanged', () => {
+    assert.deepEqual(coverageCase(REPORT), {
+      'src/hit.ts': { flag: true, hit: true, gap: false },
+      // The honesty case: line data says no gap, but no test entered it.
+      'src/loaded.ts': { flag: true, hit: 'absent', gap: false },
+      'src/cold.ts': { flag: true, hit: 'absent', gap: true },
+      'src/absent.ts': { flag: 'absent', hit: 'absent', gap: false },
+    });
+  });
+
+  it('no FN records at all (line data only): the flag, but never a hit', () => {
+    const result = coverageCase(reportOf(REPORT.lines));
+    assert.deepEqual(result['src/hit.ts'], { flag: true, hit: 'absent', gap: false });
+  });
+
+  it('a file newer than the report: no hit, the flag and the gap signal unchanged', () => {
+    const result = coverageCase({ ...REPORT, staleFiles: new Set(['src/hit.ts', 'src/cold.ts']) });
+    assert.deepEqual(result['src/hit.ts'], { flag: true, hit: 'absent', gap: false });
+    assert.deepEqual(result['src/cold.ts'], { flag: true, hit: 'absent', gap: true });
+  });
+
+  it('a function record without line data for the file never yields a hit (no flag, no hit)', () => {
+    const result = coverageCase(reportOf(new Map(), [['src/absent.ts', fn(4)]]));
+    assert.deepEqual(result['src/absent.ts'], { flag: 'absent', hit: 'absent', gap: false });
+  });
+
+  it('no LCOV (missing or unparseable → undefined): no Node has either flag, and none has a gap', () => {
+    for (const result of Object.values(coverageCase(undefined))) {
+      assert.deepEqual(result, { flag: 'absent', hit: 'absent', gap: false });
+    }
+  });
+
+  it('an empty report lists no file: no flag anywhere', () => {
+    for (const result of Object.values(coverageCase(reportOf(new Map())))) {
+      assert.deepEqual(result, { flag: 'absent', hit: 'absent', gap: false });
+    }
+  });
+
+  it('a listed file with an empty hit set still carries the flag, with a gap', () => {
+    assert.deepEqual(coverageCase(reportOf(new Map([['src/absent.ts', new Set<number>()]])))['src/absent.ts'], {
+      flag: true,
+      hit: 'absent',
+      gap: true,
+    });
+  });
+
+  it('never carries either flag in from upstream: only this fetch\'s coverage decides', () => {
+    const source = {
+      id: 'u',
+      name: 'u',
+      file: 'src/absent.ts',
+      startLine: 1,
+      endLine: 2,
+      kind: 'Function',
+      summaryStatus: 'pending',
+      riskSignals: [],
+      testCoverageAvailable: true,
+      testCoverageHit: true,
+    } as const satisfies CodeMapNodeWithSignalSources;
+    const adjacency: BidirectionalAdjacency = { validNodeIds: new Set(['u']), forward: new Map(), backward: new Map() };
+    const [node] = attachProjectRiskSignals([{ ...source }], [source], adjacency, REPORT, () => undefined);
+    assert.ok(node !== undefined && !('testCoverageAvailable' in node) && !('testCoverageHit' in node));
+  });
+
+  it('lookup_node (deriveLiveNode over the cached Node) carries the same flags', () => {
+    const source: CodeMapNodeWithSignalSources = {
+      id: 'h',
+      name: 'h',
+      file: 'src/hit.ts',
+      startLine: 5,
+      endLine: 9,
+      kind: 'Function',
+      summaryStatus: 'pending',
+      riskSignals: [],
+    };
+    const adjacency: BidirectionalAdjacency = { validNodeIds: new Set(['h']), forward: new Map(), backward: new Map() };
+    const [cached] = attachProjectRiskSignals([{ ...source }], [source], adjacency, REPORT, () => undefined);
+    assert.ok(cached !== undefined);
+    assert.equal(cached.testCoverageAvailable, true);
+    assert.equal(cached.testCoverageHit, true);
+    const live = deriveLiveNode(cached, { getRecord: () => undefined, coverageGapFiles: new Set() });
+    assert.equal(live.testCoverageAvailable, true);
+    assert.equal(live.testCoverageHit, true);
   });
 });
 

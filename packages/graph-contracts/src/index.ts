@@ -1274,6 +1274,28 @@ export interface CodeMapNode {
   similarTo?: SimilarImplementation[];
   /** P4-2 phase 4: how many similar implementations exist before the cap. Present exactly when `similarTo` is; never below `similarTo.length`. */
   similarToTotal?: number;
+  /**
+   * P4-3 phase 5: LCOV line data exists for this Node's file; says nothing
+   * about the percentage. `true` only when the project's
+   * `coverage/lcov.info` loaded and has an `SF:` section for `file` — the
+   * same LCOV data that decides the `test-coverage-gap` signal. Absent,
+   * never `false`, when LCOV didn't load or doesn't list the file (the
+   * tri-state convention of `stale`/`testedBy`). With no
+   * `test-coverage-gap` signal it means at least one line in the Node's
+   * range was hit.
+   */
+  testCoverageAvailable?: true;
+  /**
+   * P4-3f review round 1: LCOV's function records prove a test entered this
+   * Node at least once — an `FN:` record starting in its range with an
+   * `FNDA:` count above 0 (`DA:` line hits alone never count: a module load
+   * hits a declaration's own line). Absent, never `false`, when there is no
+   * such record, its count is 0, or the Node's file is newer than the
+   * report. Only set alongside `testCoverageAvailable`. Says nothing about
+   * a percentage. This, not `testCoverageAvailable`, is what lets the table
+   * say "covered".
+   */
+  testCoverageHit?: true;
 }
 
 /**

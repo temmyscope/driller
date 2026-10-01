@@ -22,6 +22,13 @@
  * (`isSimilarImplementation`, `sanitizeNodeSimilarTo`); malformed elements
  * are dropped and counted in `droppedSimilarTo`, and `similarToTotal` is
  * kept consistent with what survives.
+ *
+ * P4-3 phase 5: each Node's `testCoverageAvailable` (and, review round 1,
+ * `testCoverageHit`) is kept only when it is exactly `true`
+ * (`sanitizeNodeTestCoverageAvailable`; a hit also needs the flag); any
+ * other present value is stripped and counted in
+ * `droppedTestCoverageAvailable`, so a malformed flag can never make the
+ * table say "covered".
  */
 import type {
   ChangedContract,
@@ -192,6 +199,40 @@ export function sanitizeNodeSimilarTo(node: CodeMapNode): { node: CodeMapNode; d
   return { node: { ...rest, similarTo: kept, similarToTotal: totalOk ? (rawTotal as number) : kept.length }, dropped };
 }
 
+/**
+ * P4-3 phase 5: a Node with its `testCoverageAvailable` validated. The flag
+ * is `true` or absent (never `false`), so any other present value (`false`,
+ * `"yes"`, `1`, `null`) is removed and counted as 1 dropped. Returns the same
+ * Node when the flag is `true` or absent.
+ *
+ * P4-3f review round 1: `testCoverageHit` (the per-Node proof that lets the
+ * table say "covered") the same way, and additionally only alongside a
+ * surviving `testCoverageAvailable: true` — a lone hit is removed and
+ * counted, so the claim can only shrink at this boundary, never grow.
+ */
+export function sanitizeNodeTestCoverageAvailable(node: CodeMapNode): { node: CodeMapNode; dropped: number } {
+  const hasFlag = 'testCoverageAvailable' in node;
+  const hasHit = 'testCoverageHit' in node;
+  if (!hasFlag && !hasHit) {
+    return { node, dropped: 0 };
+  }
+  const rawFlag: unknown = node.testCoverageAvailable;
+  const rawHit: unknown = node.testCoverageHit;
+  const keepFlag = rawFlag === true;
+  const keepHit = keepFlag && rawHit === true;
+  if ((!hasFlag || keepFlag) && (!hasHit || keepHit)) {
+    return { node, dropped: 0 };
+  }
+  const { testCoverageAvailable: _flag, testCoverageHit: _hit, ...rest } = node;
+  // An own key holding `undefined` says nothing, so it is removed without
+  // counting as malformed.
+  const dropped = (hasFlag && !keepFlag && rawFlag !== undefined ? 1 : 0) + (hasHit && !keepHit && rawHit !== undefined ? 1 : 0);
+  return {
+    node: { ...rest, ...(keepFlag ? { testCoverageAvailable: true as const } : {}), ...(keepHit ? { testCoverageHit: true as const } : {}) },
+    dropped,
+  };
+}
+
 /** P4-2 phase 3c: a well-formed `TopLevelChangedFile`: string `file`, a valid line range. */
 export function isTopLevelChangedFile(value: unknown): value is TopLevelChangedFile {
   return isRecord(value) && isString(value.file) && isLineRange(value.startLine, value.endLine);
@@ -275,6 +316,8 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   droppedFoldedModules: number;
   /** P4-2 phase 4: how many `similarTo` elements, across all Nodes, were malformed and dropped. */
   droppedSimilarTo: number;
+  /** P4-3 phase 5: how many `testCoverageAvailable` / `testCoverageHit` values were malformed (or a hit without the flag), stripped. */
+  droppedTestCoverageAvailable: number;
 } {
   const replaced: ReplacedCodeMapField[] = [];
   const rawHidden: unknown = message.hiddenByScope;
@@ -310,6 +353,7 @@ export function toOkCodeMapResult(message: CodeMapReply): {
     replaced.push('foldedModules');
   }
   let droppedSimilarTo = 0;
+  let droppedTestCoverageAvailable = 0;
   const nodes = Array.isArray(message.nodes)
     ? message.nodes.map((node) => {
         if (!isRecord(node)) {
@@ -317,7 +361,9 @@ export function toOkCodeMapResult(message: CodeMapReply): {
         }
         const sanitized = sanitizeNodeSimilarTo(node);
         droppedSimilarTo += sanitized.dropped;
-        return sanitized.node;
+        const flagged = sanitizeNodeTestCoverageAvailable(sanitized.node);
+        droppedTestCoverageAvailable += flagged.dropped;
+        return flagged.node;
       })
     : message.nodes;
   return {
@@ -334,5 +380,6 @@ export function toOkCodeMapResult(message: CodeMapReply): {
     droppedFoldedTypes,
     droppedFoldedModules,
     droppedSimilarTo,
+    droppedTestCoverageAvailable,
   };
 }

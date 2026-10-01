@@ -795,8 +795,15 @@ function spawnGraphService(): void {
           // with one warning per reply.
           // P4-2 phase 3c: and each folded Module.
           // P4-2 phase 4: and each Node's "Similar implementations" entries.
-          const { result, replaced, droppedFoldedTypes, droppedFoldedModules, droppedSimilarTo } =
-            toOkCodeMapResult(message);
+          // P4-3 phase 5: and each Node's `testCoverageAvailable` flag.
+          const {
+            result,
+            replaced,
+            droppedFoldedTypes,
+            droppedFoldedModules,
+            droppedSimilarTo,
+            droppedTestCoverageAvailable,
+          } = toOkCodeMapResult(message);
           if (replaced.length > 0) {
             console.warn(`Code Map reply had malformed ${joinNaturally(replaced)}; replaced with the empty default.`);
           }
@@ -813,6 +820,11 @@ function spawnGraphService(): void {
           if (droppedSimilarTo > 0) {
             console.warn(
               `Code Map reply had ${droppedSimilarTo} malformed similar implementation${droppedSimilarTo === 1 ? '' : 's'}; dropped.`,
+            );
+          }
+          if (droppedTestCoverageAvailable > 0) {
+            console.warn(
+              `Code Map reply had ${droppedTestCoverageAvailable} malformed test-coverage flag${droppedTestCoverageAvailable === 1 ? '' : 's'}; dropped.`,
             );
           }
           settlePendingCodeMapRequest(result);
