@@ -138,7 +138,12 @@ const drillerApi: DrillerApi = {
     };
   },
 
-  getCodeMap: (): Promise<CodeMapResult> => ipcRenderer.invoke(IpcChannels.codeMapGet),
+  // P4-4 phase 1b: the section is passed only when given, so an omitted one
+  // reaches main as no argument at all (the whole scope).
+  getCodeMap: (section?: string): Promise<CodeMapResult> =>
+    section === undefined
+      ? ipcRenderer.invoke(IpcChannels.codeMapGet)
+      : ipcRenderer.invoke(IpcChannels.codeMapGet, section),
 
   readSourceRange: (file: string, startLine: number, endLine: number): Promise<ReadSourceRangeResult> =>
     ipcRenderer.invoke(IpcChannels.sourceReadRange, file, startLine, endLine),

@@ -85,6 +85,7 @@ import type {
   BlastRadiusExpansionResult,
   ChangedContract,
   CodeMapEdge,
+  CodeMapResult,
   CodeMapNode,
   DeterministicRiskSignal,
   DeterministicRiskSignalType,
@@ -265,6 +266,17 @@ export type DiffScopeState =
  * literal list rather than risking the two drifting apart.
  */
 export type DiffScopeNoticeStatus = 'no-changes' | 'not-a-git-repo' | 'no-base-ref-resolvable';
+
+/**
+ * P4-4 phase 1b: the error-state sentence for a Code Map fetch that did not
+ * return a map. `unknown-section` is only possible once a section is
+ * requested (P4-4d's Section bar); until then it is shown as an error.
+ */
+export function codeMapFailureMessage(result: Exclude<CodeMapResult, { status: 'ok' }>): string {
+  return result.status === 'unknown-section'
+    ? `The section "${result.section}" is not in this project's included subfolders.`
+    : result.message;
+}
 
 /**
  * One specific, concrete sentence per non-happy-path state (UX & Interaction
@@ -7939,7 +7951,9 @@ export function CodeMap({
             foldedModules: result.foldedModules,
           });
         } else {
-          setFetchState({ status: 'error', message: result.message });
+          // P4-4 phase 1b: no section is requested yet, so an unknown-section
+          // reply is shown as the error state until P4-4d's Section bar.
+          setFetchState({ status: 'error', message: codeMapFailureMessage(result) });
         }
       })
       .catch((error: unknown) => {
@@ -8054,7 +8068,7 @@ export function CodeMap({
                 foldedTypes: result.foldedTypes,
                 foldedModules: result.foldedModules,
               }
-            : { kind: 'failed', message: result.message },
+            : { kind: 'failed', message: codeMapFailureMessage(result) },
         );
       })
       .catch((error: unknown) => {

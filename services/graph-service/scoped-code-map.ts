@@ -18,7 +18,12 @@
  * It never fetches and never awaits: everything it reads is in `RawCodeMap`
  * (plus the Node record store, through the injectable `getRecord`).
  */
-import { buildBidirectionalAdjacency, type FoldedModule, type FoldedType } from '@driller/graph-contracts';
+import {
+  buildBidirectionalAdjacency,
+  type FoldedModule,
+  type FoldedType,
+  type SectionNodeCount,
+} from '@driller/graph-contracts';
 import type { CodeMapEdge, CodeMapNode } from '@driller/ipc-contracts';
 
 import { attachFoldedModuleLinks, scopeFoldedModules } from './fold-modules';
@@ -27,7 +32,7 @@ import type { LcovReport } from './lcov';
 import { getNodeRecord, type NodeRecord } from './node-record-store';
 import type { ProductionCodeMapResult } from './production-code-map';
 import { toProjectRelativePosixPath } from './project-path';
-import { isFileInScope } from './project-scope';
+import { isFileInScope, sectionOfFile } from './project-scope';
 import { attachProjectRiskSignals } from './risk-signals';
 import { attachSimilar } from './similar';
 import { annotateNodesWithSummaryState } from './summary-generator';
@@ -47,6 +52,38 @@ export const KEEP_ALL_FILES: KeepFile = () => true;
 /** The `KeepFile` for an indexing-scope allowlist: `KEEP_ALL_FILES` when it is empty. */
 export function keepFileForScope(includedPaths: readonly string[]): KeepFile {
   return includedPaths.length === 0 ? KEEP_ALL_FILES : (file) => isFileInScope(file, includedPaths);
+}
+
+/**
+ * P4-4 phase 1b: the `KeepFile` for one section of `includedPaths` — the
+ * files whose nearest allowlist entry (`sectionOfFile`) is `section`. Not
+ * `isFileInScope(file, [section])`: with nested entries (`apps`,
+ * `apps/web`), the `apps` section never keeps `apps/web/**`.
+ */
+export function keepFileForSection(section: string, includedPaths: readonly string[]): KeepFile {
+  return (file) => sectionOfFile(file, includedPaths) === section;
+}
+
+/**
+ * P4-4 phase 1b: the Section bar's per-section Node counts — one entry per
+ * `includedPaths` path, in its order, counting the whole-scope `nodes` each
+ * one owns under the nearest-section rule. Every whole-scope Node has
+ * exactly one owner, so the counts sum to `nodes.length`. `[]` for an empty
+ * allowlist.
+ */
+export function countSectionNodes(
+  projectRoot: string,
+  nodes: readonly { file: string }[],
+  includedPaths: readonly string[],
+): SectionNodeCount[] {
+  const counts = new Map(includedPaths.map((entry) => [entry, 0]));
+  for (const node of nodes) {
+    const owner = sectionOfFile(toProjectRelativePosixPath(projectRoot, node.file, 'section count'), includedPaths);
+    if (owner !== undefined) {
+      counts.set(owner, (counts.get(owner) ?? 0) + 1);
+    }
+  }
+  return [...counts].map(([path, nodeCount]) => ({ path, nodeCount }));
 }
 
 /**

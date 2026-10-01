@@ -29,6 +29,15 @@
  * other present value is stripped and counted in
  * `droppedTestCoverageAvailable`, so a malformed flag can never make the
  * table say "covered".
+ *
+ * P4-4 phase 1b: `section` must be a string or `null` (anything else
+ * becomes `null`, named in `replaced`), and `sections` is validated per
+ * element (`isSectionNodeCount`): a non-array becomes `[]` (named in
+ * `replaced`), each malformed element is dropped and counted in
+ * `droppedSections`. An unknown-section reply goes through
+ * `toUnknownSectionResult`. Whether a reply is for the request being
+ * settled is checked before either (`code-map-requests.ts`'s
+ * `routeCodeMapReply`).
  */
 import type {
   ChangedContract,
@@ -38,14 +47,23 @@ import type {
   FoldedModule,
   FoldedType,
   GraphServiceCodeMapMessage,
+  SectionNodeCount,
   SimilarImplementation,
   TopLevelChangedFile,
 } from '@driller/ipc-contracts';
 
 type CodeMapReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMap' }>;
+type UnknownSectionReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMapUnknownSection' }>;
 type OkCodeMapResult = Extract<CodeMapResult, { status: 'ok' }>;
+type UnknownSectionCodeMapResult = Extract<CodeMapResult, { status: 'unknown-section' }>;
 
-export type ReplacedCodeMapField = 'hiddenByScope' | 'appliedScope' | 'foldedTypes' | 'foldedModules';
+export type ReplacedCodeMapField =
+  | 'hiddenByScope'
+  | 'appliedScope'
+  | 'foldedTypes'
+  | 'foldedModules'
+  | 'section'
+  | 'sections';
 
 const isString = (value: unknown): value is string => typeof value === 'string';
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
@@ -90,6 +108,38 @@ export function isFoldedType(value: unknown): value is FoldedType {
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
+
+/**
+ * P4-4 phase 1b: whether `value` is a well-formed `SectionNodeCount`: a
+ * string `path` and a non-negative integer `nodeCount`.
+ */
+export function isSectionNodeCount(value: unknown): value is SectionNodeCount {
+  return (
+    isRecord(value) &&
+    isString(value.path) &&
+    Number.isInteger(value.nodeCount) &&
+    (value.nodeCount as number) >= 0
+  );
+}
+
+/**
+ * P4-4 phase 1b: an unknown-section reply as the renderer may read it.
+ * `section` must be a string (else `null`: the caller settles an error);
+ * `knownSections` keeps only its string elements (a non-array becomes
+ * `[]`), and `dropped` counts what was removed.
+ */
+export function toUnknownSectionResult(
+  message: UnknownSectionReply,
+): { result: UnknownSectionCodeMapResult; dropped: number } | null {
+  const rawSection: unknown = message.section;
+  if (!isString(rawSection)) {
+    return null;
+  }
+  const rawKnown: unknown = message.knownSections;
+  const known = Array.isArray(rawKnown) ? rawKnown.filter(isString) : [];
+  const dropped = Array.isArray(rawKnown) ? rawKnown.length - known.length : 1;
+  return { result: { status: 'unknown-section', section: rawSection, knownSections: known }, dropped };
+}
 
 /**
  * P4-2 phase 3c: whether `value` has every field the renderer reads off a
@@ -318,6 +368,8 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   droppedSimilarTo: number;
   /** P4-3 phase 5: how many `testCoverageAvailable` / `testCoverageHit` values were malformed (or a hit without the flag), stripped. */
   droppedTestCoverageAvailable: number;
+  /** P4-4 phase 1b: how many `sections` elements were malformed and dropped. */
+  droppedSections: number;
 } {
   const replaced: ReplacedCodeMapField[] = [];
   const rawHidden: unknown = message.hiddenByScope;
@@ -352,6 +404,22 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   } else {
     replaced.push('foldedModules');
   }
+  const rawSection: unknown = message.section;
+  let section: string | null = null;
+  if (rawSection === null || isString(rawSection)) {
+    section = rawSection;
+  } else {
+    replaced.push('section');
+  }
+  const rawSections: unknown = message.sections;
+  let sections: SectionNodeCount[] = [];
+  let droppedSections = 0;
+  if (Array.isArray(rawSections)) {
+    sections = rawSections.filter(isSectionNodeCount);
+    droppedSections = rawSections.length - sections.length;
+  } else {
+    replaced.push('sections');
+  }
   let droppedSimilarTo = 0;
   let droppedTestCoverageAvailable = 0;
   const nodes = Array.isArray(message.nodes)
@@ -375,11 +443,14 @@ export function toOkCodeMapResult(message: CodeMapReply): {
       appliedScope,
       foldedTypes,
       foldedModules,
+      section,
+      sections,
     },
     replaced,
     droppedFoldedTypes,
     droppedFoldedModules,
     droppedSimilarTo,
     droppedTestCoverageAvailable,
+    droppedSections,
   };
 }

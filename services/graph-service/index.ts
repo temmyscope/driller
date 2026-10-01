@@ -190,8 +190,10 @@ import { capFoldedTypeUsedBy } from './fold-types';
 import { fetchProductionCodeMap } from './production-code-map';
 import {
   buildScopedCodeMap,
+  countSectionNodes,
   filterCodeMapToScope,
   keepFileForScope,
+  keepFileForSection,
   type ActiveRawCodeMap,
   type RawCodeMap,
 } from './scoped-code-map';
@@ -869,10 +871,26 @@ function isShutdownRequest(data: unknown): data is GraphServiceShutdownRequest {
 }
 
 function isGetCodeMapRequest(data: unknown): data is GraphServiceGetCodeMapRequest {
+  if (typeof data !== 'object' || data === null || (data as { type?: unknown }).type !== 'graphService:getCodeMap') {
+    return false;
+  }
+  // P4-4 phase 1b: an optional string `section` (absent = the whole scope).
+  const section = (data as { section?: unknown }).section;
+  return section === undefined || typeof section === 'string';
+}
+
+/**
+ * P4-4 phase 1b: a `graphService:getCodeMap` whose `section` is not a
+ * string. Main validates before sending, so this is defensive: it is
+ * answered with an explicit error instead of being dropped, which would
+ * leave main's request pending until its backstop timeout.
+ */
+function isMalformedGetCodeMapRequest(data: unknown): boolean {
   return (
     typeof data === 'object' &&
     data !== null &&
-    (data as { type?: unknown }).type === 'graphService:getCodeMap'
+    (data as { type?: unknown }).type === 'graphService:getCodeMap' &&
+    !isGetCodeMapRequest(data)
   );
 }
 
@@ -1396,11 +1414,25 @@ async function handleIndexRequest(
  * the combined guard below only makes that existing invariant visible to the
  * type checker, it changes no observable behavior.
  */
-async function handleGetCodeMapRequest(): Promise<void> {
+async function handleGetCodeMapRequest(section?: string): Promise<void> {
   if (activeProject === undefined || activeProjectPath === undefined) {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
       message: 'No project has finished indexing yet.',
+      // P4-4c review round 1: echoed, so main can drop a stale error.
+      section: section ?? null,
+    });
+    return;
+  }
+  // P4-4 phase 1b (AD-13 "Section scope"): a section must be an entry of the
+  // allowlist at request time (exact match); anything else — including any
+  // section while the allowlist is empty — is the explicit `unknown-section`
+  // state, never an empty map. Checked before the fetch, so it costs none.
+  if (section !== undefined && !activeIncludedPaths.includes(section)) {
+    postCodeMapMessage({
+      type: 'graphService:codeMapUnknownSection',
+      section,
+      knownSections: [...activeIncludedPaths],
     });
     return;
   }
@@ -1460,6 +1492,11 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // adjacency, project-relative severity and the LCOV flags — is
     // `buildScopedCodeMap` (`scoped-code-map.ts`, where each step's
     // reasoning now lives). Severity is relative to the in-scope set.
+    //
+    // P4-4 phase 1b: this whole-scope build is made for every request,
+    // sectioned or not — it is what the caches and the summary, judgment and
+    // staleness kicks below receive, so `lookup_node`, diff scope, Blast
+    // Radius expansion and MCP never see a section.
     const {
       nodes: nodesWithRiskSignals,
       edges,
@@ -1468,22 +1505,57 @@ async function handleGetCodeMapRequest(): Promise<void> {
       foldedModules,
       hiddenByScope,
     } = buildScopedCodeMap(raw, keepFileForScope(appliedScope));
-    postCodeMapMessage({
-      type: 'graphService:codeMap',
-      nodes: nodesWithRiskSignals,
-      edges,
-      // P2-5: how many Nodes the scope filter removed — reported with the
-      // map (and the scope that removed them) so an empty map can say the
-      // scope hid everything. Test Nodes never reach the scope filter, so
-      // they are never counted here.
-      hiddenByScope,
-      appliedScope,
-      // Capped per type for the reply only (`usedByTotal` stays the full
-      // count); the cache below keeps every user for `lookup_node`.
-      foldedTypes: capFoldedTypeUsedBy(foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
-      // P4-2 phase 3c: for the "Show types & modules" canvas toggle only.
-      foldedModules,
-    });
+    // P4-4 phase 1b: the Section bar's tab counts, over the whole-scope Nodes
+    // (nearest-section rule, so they sum to the whole-scope count).
+    const sections = countSectionNodes(projectRoot, normalizedNodes, appliedScope);
+    if (section === undefined) {
+      postCodeMapMessage({
+        type: 'graphService:codeMap',
+        nodes: nodesWithRiskSignals,
+        edges,
+        // P2-5: how many Nodes the scope filter removed — reported with the
+        // map (and the scope that removed them) so an empty map can say the
+        // scope hid everything. Test Nodes never reach the scope filter, so
+        // they are never counted here.
+        hiddenByScope,
+        appliedScope,
+        // Capped per type for the reply only (`usedByTotal` stays the full
+        // count); the cache below keeps every user for `lookup_node`.
+        foldedTypes: capFoldedTypeUsedBy(foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
+        // P4-2 phase 3c: for the "Show types & modules" canvas toggle only.
+        foldedModules,
+        section: null,
+        sections,
+      });
+    } else if (!appliedScope.includes(section)) {
+      // P4-4 phase 1b: the allowlist changed during the fetch and dropped
+      // this section. Still explicit, against the scope the map was built
+      // with; the whole-scope caches below are refreshed as usual.
+      postCodeMapMessage({
+        type: 'graphService:codeMapUnknownSection',
+        section,
+        knownSections: [...appliedScope],
+      });
+    } else {
+      // P4-4 phase 1b: the reply is a second run of the same pipeline over
+      // this section's files alone (nearest-section rule), so its edges,
+      // folded types/Modules and every severity cut are the section's own —
+      // never filtered out of, or subtracted from, the whole-scope build.
+      const sectionMap = buildScopedCodeMap(raw, keepFileForSection(section, appliedScope));
+      postCodeMapMessage({
+        type: 'graphService:codeMap',
+        nodes: sectionMap.nodes,
+        edges: sectionMap.edges,
+        // P2-5's meaning is kept: the Nodes the allowlist removed. Other
+        // sections' Nodes are not counted.
+        hiddenByScope,
+        appliedScope,
+        foldedTypes: capFoldedTypeUsedBy(sectionMap.foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
+        foldedModules: sectionMap.foldedModules,
+        section,
+        sections,
+      });
+    }
     // Review round (patch): passes `nodesWithRiskSignals`, not
     // `normalizedNodes` — `startSummaryGenerationForProject` caches its
     // argument into the module-level `activeCodeMapNodes` (its own doc
@@ -1531,6 +1603,7 @@ async function handleGetCodeMapRequest(): Promise<void> {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
       message: error instanceof Error ? error.message : String(error),
+      section: section ?? null,
     });
   }
 }
@@ -2659,7 +2732,11 @@ process.parentPort?.on('message', (event) => {
     return;
   }
   if (!isShuttingDown && isGetCodeMapRequest(event.data)) {
-    void handleGetCodeMapRequest();
+    void handleGetCodeMapRequest(event.data.section);
+    return;
+  }
+  if (!isShuttingDown && isMalformedGetCodeMapRequest(event.data)) {
+    postCodeMapMessage({ type: 'graphService:codeMapError', message: 'Invalid section.' });
     return;
   }
   if (!isShuttingDown && isPathTraceRequest(event.data)) {

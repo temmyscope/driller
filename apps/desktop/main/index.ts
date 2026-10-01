@@ -75,7 +75,15 @@ import {
   setCloudApiKey,
 } from './backend-settings';
 import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection } from './app-menu';
-import { joinNaturally, toOkCodeMapResult, toValidatedDiffScopeResult } from './code-map-reply';
+import { toValidatedDiffScopeResult } from './code-map-reply';
+import {
+  createCodeMapRequester,
+  INVALID_SECTION_RESULT,
+  isCodeMapMessage,
+  parseCodeMapSectionArg,
+  PROJECT_CHANGED_RESULT,
+  routeCodeMapReply,
+} from './code-map-requests';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
@@ -104,18 +112,17 @@ let isGraphServiceShuttingDown = false;
 // error) can re-send the index request without requiring the user to
 // re-pick the folder.
 let currentProjectPath: string | null = null;
-// Resolver + shared Promise for an in-flight `codeMap:get` renderer request
-// (Story 1.3): `requestCodeMap` posts a fire-and-forget `graphService:
-// getCodeMap` message to the subprocess (there is no invoke-style round
-// trip over `utilityProcess.postMessage`); `pendingCodeMapResolve` is what
-// turns the subprocess's eventual `graphService:codeMap`/
-// `graphService:codeMapError` reply back into the `ipcMain.handle` Promise
-// the renderer is awaiting. `pendingCodeMapPromise` is handed to a second
-// overlapping caller (e.g. a fast double-click on Retry) so it shares the
-// one in-flight result instead of getting an immediate, spurious "already
-// in progress" failure (review finding).
-let pendingCodeMapResolve: ((result: CodeMapResult) => void) | null = null;
-let pendingCodeMapPromise: Promise<CodeMapResult> | null = null;
+// The in-flight `codeMap:get` renderer request (Story 1.3) lives in
+// `codeMapRequests` (declared below, after its timeout): `requestCodeMap`
+// posts a fire-and-forget `graphService:getCodeMap` message to the
+// subprocess (there is no invoke-style round trip over
+// `utilityProcess.postMessage`), and the subprocess's eventual reply settles
+// the `ipcMain.handle` Promise the renderer is awaiting. A second
+// overlapping caller for the same section (e.g. a fast double-click on
+// Retry) shares the one in-flight result instead of getting an immediate,
+// spurious "already in progress" failure (review finding). P4-4 phase 1b: a
+// caller for another section waits for it to settle, then sends its own
+// (`code-map-requests.ts`).
 
 // A pure backstop, slightly exceeding `fetchCodeMap`'s own internal timeout
 // (mcp-client.ts's `DEFAULT_TIMEOUT_MS`, 30 minutes) — for a hang that
@@ -127,6 +134,22 @@ let pendingCodeMapPromise: Promise<CodeMapResult> | null = null;
 // `requestCodeMap`'s own doc comment that it "rejects nothing... never
 // hanging").
 const CODE_MAP_REQUEST_TIMEOUT_MS = 30 * 60 * 1000 + 10_000;
+
+// P4-4 phase 1b: one Code Map request outstanding at a time, shared per
+// section (`code-map-requests.ts`).
+const codeMapRequests = createCodeMapRequester({
+  isRunning: () => graphService !== null,
+  send: (section) => {
+    if (!graphService) {
+      throw new Error('Graph Service is not running.');
+    }
+    graphService.postMessage({
+      type: 'graphService:getCodeMap',
+      ...(section === null ? {} : { section }),
+    } satisfies GraphServiceGetCodeMapRequest);
+  },
+  timeoutMs: CODE_MAP_REQUEST_TIMEOUT_MS,
+});
 
 // Story 1.8 (Phase 4): a dedicated, much shorter backstop than
 // `CODE_MAP_REQUEST_TIMEOUT_MS` (sized for a whole-project fetch) — a
@@ -159,7 +182,7 @@ const REGENERATE_NODE_TIMEOUT_MS = 2 * (3 * 60 * 1000) + 10_000;
 
 // Story 1.8 (Phase 4): correlates each in-flight `node:regenerate` request
 // to its eventual Graph Service reply — a generalized, id-keyed version of
-// `pendingCodeMapResolve`'s single slot (Design Notes: "this app's first
+// `codeMapRequests`'s single slot (Design Notes: "this app's first
 // id-keyed *mutating* IPC request/reply pattern"). Settled by whichever
 // comes first: the 'message' handler below (a genuine
 // `graphService:regenerateNodeResult` reply for that `nodeId`), the 'exit'
@@ -275,13 +298,13 @@ let nextBlastRadiusRequestId = 0;
 const BLAST_RADIUS_REQUEST_TIMEOUT_MS = 30 * 1000 + 10_000;
 
 // Story 1.9 (Phase 1): a single-slot resolver for an in-flight `path:trace`
-// request, mirroring `pendingCodeMapResolve`'s own single-slot shape rather
+// request, mirroring `codeMapRequests`'s own single-slot shape rather
 // than `pendingRegenerateResolvers`'s id-keyed Map — `requestPathTrace` has
 // no natural id to key overlapping calls by the way a Node's `nodeId` does
 // (two different queries in flight at once would need one slot each). Unlike
-// `pendingCodeMapResolve`, a second overlapping call is never given a shared
+// `codeMapRequests`, a second overlapping call is never given a shared
 // promise either (that's only safe for `requestCodeMap` because every caller
-// wants the exact same code map back) — a different query in flight would
+// for the same section wants the exact same code map back) — a different query in flight would
 // get the wrong result if it shared this slot, so `requestPathTrace` instead
 // rejects a second concurrent call outright with an explicit error, same
 // spirit as `requestRegenerateNode`'s per-nodeId "already in progress" guard.
@@ -390,19 +413,6 @@ function sendMcpServerStatus(message: McpServerStatusMessage): void {
   if (mainWindow && !mainWindow.webContents.isDestroyed()) {
     mainWindow.webContents.send(IpcChannels.mcpServerStatus, message);
   }
-}
-
-/**
- * True for a `graphService:codeMap`/`graphService:codeMapError` reply —
- * distinguished from a `GraphServiceStatusMessage` by `type` rather than
- * `state`, per `ipc-contracts`'s doc comment on `GraphServiceCodeMapMessage`.
- */
-function isCodeMapMessage(message: unknown): message is GraphServiceCodeMapMessage {
-  if (typeof message !== 'object' || message === null) {
-    return false;
-  }
-  const type = (message as { type?: unknown }).type;
-  return type === 'graphService:codeMap' || type === 'graphService:codeMapError';
 }
 
 /**
@@ -540,13 +550,7 @@ function isMcpServerStatusMessage(message: unknown): message is McpServerStatusM
  * of surfacing the matrix's required "explicit error/retry state."
  */
 function settlePendingCodeMapRequest(result: CodeMapResult): void {
-  const resolve = pendingCodeMapResolve;
-  if (!resolve) {
-    return;
-  }
-  pendingCodeMapResolve = null;
-  pendingCodeMapPromise = null;
-  resolve(result);
+  codeMapRequests.settleInFlight(result);
 }
 
 /**
@@ -789,48 +793,9 @@ function spawnGraphService(): void {
         | McpServerStatusMessage,
     ) => {
       if (isCodeMapMessage(message)) {
-        if (message.type === 'graphService:codeMap') {
-          // P2-5: the scope fields are validated here, at the process boundary.
-          // P4-2 phase 3b: and each folded type; malformed ones are dropped,
-          // with one warning per reply.
-          // P4-2 phase 3c: and each folded Module.
-          // P4-2 phase 4: and each Node's "Similar implementations" entries.
-          // P4-3 phase 5: and each Node's `testCoverageAvailable` flag.
-          const {
-            result,
-            replaced,
-            droppedFoldedTypes,
-            droppedFoldedModules,
-            droppedSimilarTo,
-            droppedTestCoverageAvailable,
-          } = toOkCodeMapResult(message);
-          if (replaced.length > 0) {
-            console.warn(`Code Map reply had malformed ${joinNaturally(replaced)}; replaced with the empty default.`);
-          }
-          if (droppedFoldedTypes > 0) {
-            console.warn(
-              `Code Map reply had ${droppedFoldedTypes} malformed folded type${droppedFoldedTypes === 1 ? '' : 's'}; dropped.`,
-            );
-          }
-          if (droppedFoldedModules > 0) {
-            console.warn(
-              `Code Map reply had ${droppedFoldedModules} malformed folded Module${droppedFoldedModules === 1 ? '' : 's'}; dropped.`,
-            );
-          }
-          if (droppedSimilarTo > 0) {
-            console.warn(
-              `Code Map reply had ${droppedSimilarTo} malformed similar implementation${droppedSimilarTo === 1 ? '' : 's'}; dropped.`,
-            );
-          }
-          if (droppedTestCoverageAvailable > 0) {
-            console.warn(
-              `Code Map reply had ${droppedTestCoverageAvailable} malformed test-coverage flag${droppedTestCoverageAvailable === 1 ? '' : 's'}; dropped.`,
-            );
-          }
-          settlePendingCodeMapRequest(result);
-        } else {
-          settlePendingCodeMapRequest({ status: 'error', message: message.message });
-        }
+        // P4-4c review round 1: the whole Code Map reply routing (echoed
+        // section check, validation, warnings) is `routeCodeMapReply`.
+        routeCodeMapReply(message, codeMapRequests);
         return;
       }
       if (isRegenerateNodeResultMessage(message)) {
@@ -968,6 +933,10 @@ function spawnGraphService(): void {
 function sendIndexRequest(projectPath: string): void {
   const backendConfig = getBackendConfig();
   const { includedPaths } = getProjectScope(projectPath);
+  // P4-4c review round 1: a Code Map request still queued behind the one in
+  // flight was asked for against the previous project / index — it is
+  // failed explicitly rather than run against this one.
+  codeMapRequests.failWaiting(PROJECT_CHANGED_RESULT);
   graphService?.postMessage(
     buildIndexRequest({
       projectPath,
@@ -997,11 +966,11 @@ function relayKeyChangeToGraphService(): boolean {
 /**
  * Relays a Code Map fetch to the Graph Service subprocess (Story 1.3) and
  * resolves once it replies. `utilityProcess.postMessage` has no built-in
- * request/response correlation, so `pendingCodeMapResolve` is what bridges
- * the fire-and-forget subprocess message to this Promise — settled by
- * whichever comes first: the 'message' handler above (a genuine reply),
- * the 'exit' handler (the subprocess died first), or `CODE_MAP_REQUEST_
- * TIMEOUT_MS` firing (a hang with no reply and no exit).
+ * request/response correlation, so `codeMapRequests` is what bridges the
+ * fire-and-forget subprocess message to this Promise — settled by whichever
+ * comes first: the 'message' handler above (a genuine reply), the 'exit'
+ * handler (the subprocess died first), or `CODE_MAP_REQUEST_TIMEOUT_MS`
+ * firing (a hang with no reply and no exit).
  *
  * Rejects nothing: every failure path (no subprocess running, the
  * subprocess's own error reply, it exiting mid-fetch, `postMessage` itself
@@ -1009,51 +978,15 @@ function relayKeyChangeToGraphService(): boolean {
  * — the matrix's "explicit error state... never blank/crash" applies here
  * exactly like the index flow.
  *
- * An overlapping call (e.g. a fast double-click on Retry) shares the one
- * in-flight `pendingCodeMapPromise` rather than getting an immediate,
+ * An overlapping call for the same section (e.g. a fast double-click on
+ * Retry) shares the one in-flight promise rather than getting an immediate,
  * spurious "already in progress" failure — both callers see the same
- * eventual result.
+ * eventual result. P4-4 phase 1b: `section` (omitted = the whole scope); an
+ * overlapping call for another section is sent only once the in-flight one
+ * settles, so each caller gets its own section's reply.
  */
-function requestCodeMap(): Promise<CodeMapResult> {
-  if (pendingCodeMapPromise) {
-    return pendingCodeMapPromise;
-  }
-  if (!graphService) {
-    return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
-  }
-  const service = graphService;
-
-  const promise = new Promise<CodeMapResult>((resolve) => {
-    pendingCodeMapResolve = resolve;
-  });
-  // Assigned before the postMessage attempt below (and before the timeout
-  // is armed) so a synchronous settle from either one can safely null this
-  // back out without a subsequent assignment resurrecting an
-  // already-resolved stale promise.
-  pendingCodeMapPromise = promise;
-
-  const timeoutTimer = setTimeout(() => {
-    settlePendingCodeMapRequest({
-      status: 'error',
-      message: 'Timed out waiting for the Graph Service to respond with the Code Map.',
-    });
-  }, CODE_MAP_REQUEST_TIMEOUT_MS);
-  void promise.finally(() => clearTimeout(timeoutTimer));
-
-  try {
-    service.postMessage({
-      type: 'graphService:getCodeMap',
-    } satisfies GraphServiceGetCodeMapRequest);
-  } catch (error) {
-    // A synchronous throw here would otherwise leave pendingCodeMapResolve
-    // set with nothing left to ever call it, leaking the request forever.
-    settlePendingCodeMapRequest({
-      status: 'error',
-      message: `Failed to send the Code Map request to the Graph Service: ${error instanceof Error ? error.message : String(error)}`,
-    });
-  }
-
-  return promise;
+function requestCodeMap(section?: string): Promise<CodeMapResult> {
+  return codeMapRequests.request(section);
 }
 
 /**
@@ -1853,7 +1786,12 @@ function registerIpcHandlers(): void {
     return { ok: true };
   });
 
-  ipcMain.handle(IpcChannels.codeMapGet, (): Promise<CodeMapResult> => requestCodeMap());
+  ipcMain.handle(IpcChannels.codeMapGet, (_event, section: unknown): Promise<CodeMapResult> => {
+    // P4-4 phase 1b: a non-string section from the renderer is rejected
+    // here and never sent to the Graph Service.
+    const parsed = parseCodeMapSectionArg(section);
+    return parsed.ok ? requestCodeMap(parsed.section) : Promise.resolve(INVALID_SECTION_RESULT);
+  });
 
   ipcMain.handle(
     IpcChannels.sourceReadRange,

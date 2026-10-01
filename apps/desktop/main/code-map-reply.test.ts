@@ -8,18 +8,20 @@ import { describe, it } from 'node:test';
 import type { GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
 
 import {
+  isSectionNodeCount,
   isSimilarImplementation,
   joinNaturally,
   sanitizeNodeSimilarTo,
   sanitizeNodeTestCoverageAvailable,
   toOkCodeMapResult,
+  toUnknownSectionResult,
   toValidatedDiffScopeResult,
 } from './code-map-reply';
 
 type Reply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMap' }>;
 
 const reply = (fields: Record<string, unknown>): Reply =>
-  ({ type: 'graphService:codeMap', nodes: [], edges: [], foldedModules: [], ...fields }) as unknown as Reply;
+  ({ type: 'graphService:codeMap', nodes: [], edges: [], foldedModules: [], section: null, sections: [], ...fields }) as unknown as Reply;
 
 describe('toOkCodeMapResult', () => {
   it('passes valid fields through unchanged, replacing nothing', () => {
@@ -32,12 +34,15 @@ describe('toOkCodeMapResult', () => {
         appliedScope: ['wbe'],
         foldedTypes: [],
         foldedModules: [],
+        section: null,
+        sections: [],
       },
       replaced: [],
       droppedFoldedTypes: 0,
       droppedFoldedModules: 0,
       droppedSimilarTo: 0,
       droppedTestCoverageAvailable: 0,
+      droppedSections: 0,
     });
   });
 
@@ -403,5 +408,75 @@ describe('toValidatedDiffScopeResult (P4-2 phase 3c)', () => {
       const { result } = toValidatedDiffScopeResult(reply as unknown as Result);
       assert.equal(result.status, 'error', JSON.stringify(reply));
     }
+  });
+});
+
+type UnknownSectionReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMapUnknownSection' }>;
+const unknownReply = (fields: Record<string, unknown>): UnknownSectionReply =>
+  ({ type: 'graphService:codeMapUnknownSection', ...fields }) as unknown as UnknownSectionReply;
+
+describe('section and sections (P4-4 phase 1b)', () => {
+  it('passes a string or null section and well-formed sections through', () => {
+    const sections = [
+      { path: 'web', nodeCount: 3 },
+      { path: 'api', nodeCount: 0 },
+    ];
+    for (const section of ['api', null]) {
+      const { result, replaced, droppedSections } = toOkCodeMapResult(
+        reply({ hiddenByScope: 0, appliedScope: ['web', 'api'], foldedTypes: [], section, sections }),
+      );
+      assert.equal(result.section, section);
+      assert.deepEqual(result.sections, sections);
+      assert.deepEqual(replaced, []);
+      assert.equal(droppedSections, 0);
+    }
+  });
+
+  for (const bad of [undefined, 42, ['api'], { path: 'api' }]) {
+    it(`a malformed section (${JSON.stringify(bad)}) becomes null and is named`, () => {
+      const { result, replaced } = toOkCodeMapResult(reply({ hiddenByScope: 0, appliedScope: [], foldedTypes: [], section: bad }));
+      assert.equal(result.section, null);
+      assert.deepEqual(replaced, ['section']);
+    });
+  }
+
+  it('a non-array sections becomes [] and is named', () => {
+    const { result, replaced } = toOkCodeMapResult(
+      reply({ hiddenByScope: 0, appliedScope: [], foldedTypes: [], sections: { web: 3 } }),
+    );
+    assert.deepEqual(result.sections, []);
+    assert.deepEqual(replaced, ['sections']);
+  });
+
+  it('drops each malformed sections element and counts it', () => {
+    const good = { path: 'web', nodeCount: 2 };
+    const { result, replaced, droppedSections } = toOkCodeMapResult(
+      reply({
+        hiddenByScope: 0,
+        appliedScope: [],
+        foldedTypes: [],
+        sections: [good, { path: 'api', nodeCount: -1 }, { path: 'x', nodeCount: 1.5 }, { path: 3, nodeCount: 1 }, null, { path: 'y' }],
+      }),
+    );
+    assert.deepEqual(result.sections, [good]);
+    assert.deepEqual(replaced, []);
+    assert.equal(droppedSections, 5);
+    assert.equal(isSectionNodeCount({ path: '', nodeCount: 0 }), true);
+  });
+
+  it('toUnknownSectionResult: validated, with non-string known sections dropped', () => {
+    assert.deepEqual(toUnknownSectionResult(unknownReply({ section: 'docs', knownSections: ['web', 'api'] })), {
+      result: { status: 'unknown-section', section: 'docs', knownSections: ['web', 'api'] },
+      dropped: 0,
+    });
+    assert.deepEqual(toUnknownSectionResult(unknownReply({ section: 'docs', knownSections: ['web', 7, null] })), {
+      result: { status: 'unknown-section', section: 'docs', knownSections: ['web'] },
+      dropped: 2,
+    });
+    assert.deepEqual(toUnknownSectionResult(unknownReply({ section: 'docs', knownSections: 'web' })), {
+      result: { status: 'unknown-section', section: 'docs', knownSections: [] },
+      dropped: 1,
+    });
+    assert.equal(toUnknownSectionResult(unknownReply({ section: 4, knownSections: [] })), null);
   });
 });

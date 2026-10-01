@@ -1643,3 +1643,27 @@ export type DiffScopeResult =
 export type BlastRadiusExpansionResult =
   | { status: 'resolved'; hopDistances: Record<string, number> }
   | { status: 'error'; message: string };
+
+/**
+ * P4-4 phase 1b (AD-13 "Section scope"): the explicit result state for a
+ * `section` that is not an entry of the project's current indexing-scope
+ * allowlist (or any `section` while the allowlist is empty) — never an
+ * empty result and never an error string. `section` echoes the value asked
+ * for; `knownSections` is the allowlist at request time, in its order.
+ */
+export interface UnknownSectionResult {
+  status: 'unknown-section';
+  section: string;
+  knownSections: string[];
+}
+
+/**
+ * P4-4 phase 1b: one allowlist entry and how many whole-scope map Nodes it
+ * owns under the nearest-section rule (a file belongs to the longest entry
+ * that contains it), for the Section bar's tab labels. One per entry, in
+ * allowlist order; the counts sum to the whole-scope Node count.
+ */
+export interface SectionNodeCount {
+  path: string;
+  nodeCount: number;
+}

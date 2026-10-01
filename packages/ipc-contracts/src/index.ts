@@ -31,6 +31,8 @@ import type {
   FoldedType,
   IndexCoverageSummary,
   PathTraceResult,
+  SectionNodeCount,
+  UnknownSectionResult,
 } from '@driller/graph-contracts';
 
 /**
@@ -75,6 +77,8 @@ export type {
   BlastRadiusExpansionResult,
   NodeLookupResult,
   CoverageSummaryResult,
+  UnknownSectionResult,
+  SectionNodeCount,
 } from '@driller/graph-contracts';
 
 /**
@@ -383,7 +387,24 @@ export type CodeMapResult =
        * Nodes; nothing that computes a number does.
        */
       foldedModules: FoldedModule[];
+      /**
+       * P4-4 phase 1b: the section this map is for — the requested
+       * allowlist entry, or `null` for the whole scope (no `section` asked
+       * for). With a section, `nodes`/`edges`/`foldedTypes`/`foldedModules`
+       * hold only that section's files (nearest-section rule) and every
+       * severity is cut over the section alone; `hiddenByScope` and
+       * `appliedScope` keep their whole-scope meaning.
+       */
+      section: string | null;
+      /**
+       * P4-4 phase 1b: one entry per `appliedScope` path, in allowlist order,
+       * with the whole-scope Nodes it owns (`[]` with no scope) — the Section
+       * bar's tab labels.
+       */
+      sections: SectionNodeCount[];
     }
+  /** P4-4 phase 1b: the requested `section` is not in the allowlist. */
+  | UnknownSectionResult
   | { status: 'error'; message: string };
 
 /**
@@ -425,6 +446,11 @@ export type OpenInEditorResult =
  */
 export interface GraphServiceGetCodeMapRequest {
   type: 'graphService:getCodeMap';
+  /**
+   * P4-4 phase 1b: one indexing-scope allowlist entry to map on its own.
+   * Omitted means the whole scope (never the string `"all"`).
+   */
+  section?: string;
 }
 
 /**
@@ -444,8 +470,28 @@ export type GraphServiceCodeMapMessage =
       foldedTypes: FoldedType[];
       /** P4-2 phase 3c: see `CodeMapResult.foldedModules`. */
       foldedModules: FoldedModule[];
+      /**
+       * P4-4 phase 1b: the request's `section` echoed (`null` when it had
+       * none) — main checks it against the request it is settling; see
+       * `CodeMapResult.section`.
+       */
+      section: string | null;
+      /** P4-4 phase 1b: see `CodeMapResult.sections`. */
+      sections: SectionNodeCount[];
     }
-  | { type: 'graphService:codeMapError'; message: string };
+  /** P4-4 phase 1b: see `UnknownSectionResult`; `section` echoes the request. */
+  | { type: 'graphService:codeMapUnknownSection'; section: string; knownSections: string[] }
+  | {
+      type: 'graphService:codeMapError';
+      message: string;
+      /**
+       * P4-4c review round 1: the request's `section` echoed (`null` for the
+       * whole scope) when the error is a reply to a Code Map request, so main
+       * can drop a stale one. Absent on an error that cannot echo one (a
+       * malformed request); main then settles the request in flight.
+       */
+      section?: string | null;
+    };
 
 // ---------------------------------------------------------------------------
 // Story 1.5 (Phase 1): local-model download/verify status (AD-18).
@@ -1320,8 +1366,11 @@ export interface DrillerApi {
    * Fetches the Code Map (Nodes + call/dependency edges) for the most
    * recently `indexed` project. Called once per successful `indexed` state
    * — never re-fetched on every render.
+   *
+   * P4-4 phase 1b: `section` (one indexing-scope allowlist entry) maps that
+   * section alone; omitted means the whole scope.
    */
-  getCodeMap: () => Promise<CodeMapResult>;
+  getCodeMap: (section?: string) => Promise<CodeMapResult>;
   /**
    * Reads a Node's exact source line range off disk, read-only (FR3/FR17
    * groundwork) — `file` is the Node's POSIX-relative path (AD-19),

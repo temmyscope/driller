@@ -78,7 +78,15 @@ const MOVED_GRAPH_SHAPES = [
  */
 const CONTRACT_CONSTANTS = ['TESTED_BY_MAX_TESTS', 'SIMILAR_TO_MIN_JACCARD', 'SIMILAR_TO_MAX_ENTRIES'] as const;
 
-const CONTRACT_HOME_NAMES: readonly string[] = [...OPERATION_RESULT_TYPES, ...MOVED_GRAPH_SHAPES, ...CONTRACT_CONSTANTS];
+/** P4-4 phase 1b (AD-13 "Section scope"): the section result state and the per-section Node count. */
+const SECTION_SCOPE_SHAPES = ['UnknownSectionResult', 'SectionNodeCount'] as const;
+
+const CONTRACT_HOME_NAMES: readonly string[] = [
+  ...OPERATION_RESULT_TYPES,
+  ...MOVED_GRAPH_SHAPES,
+  ...CONTRACT_CONSTANTS,
+  ...SECTION_SCOPE_SHAPES,
+];
 const HOME_SPECIFIER = '@driller/graph-contracts';
 
 const srcDir = path.dirname(fileURLToPath(import.meta.url));

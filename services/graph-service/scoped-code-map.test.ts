@@ -11,14 +11,27 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { before, describe, it } from 'node:test';
 
-import { FOLDED_TYPE_IPC_MAX_USED_BY } from '@driller/graph-contracts';
+import {
+  FOLDED_TYPE_IPC_MAX_USED_BY,
+  type CodeMapEdge,
+  type CodeMapNode,
+  type DeterministicRiskSignal,
+} from '@driller/graph-contracts';
 
 import { capFoldedTypeUsedBy } from './fold-types';
 import { loadLcovCoverage } from './lcov';
 import type { NodeRecord } from './node-record-store';
 import { fetchProductionCodeMap } from './production-code-map';
 import { isFileInScope, sectionOfFile } from './project-scope';
-import { buildScopedCodeMap, filterCodeMapToScope, KEEP_ALL_FILES, keepFileForScope, type RawCodeMap } from './scoped-code-map';
+import {
+  buildScopedCodeMap,
+  countSectionNodes,
+  filterCodeMapToScope,
+  KEEP_ALL_FILES,
+  keepFileForScope,
+  keepFileForSection,
+  type RawCodeMap,
+} from './scoped-code-map';
 import {
   FIXTURE_GAP_PATHS,
   FIXTURE_LCOV,
@@ -183,5 +196,68 @@ describe('filterCodeMapToScope', () => {
     // An absolute file is normalized for the match test only.
     const absolute = [{ id: 'c', file: '/repo/web/c.ts' }];
     assert.deepEqual(filterCodeMapToScope('/repo', absolute, [], ['web']).nodes, absolute);
+  });
+});
+
+/**
+ * P4-4 phase 1b: a section's severities are cut over the section alone (the
+ * shared fixture has no Node whose blast-radius rating flips, so this one is
+ * built for it), and the Section bar's counts.
+ */
+describe('P4-4 phase 1b: per-section severity and counts', () => {
+  const fn = (id: string, file: string) => ({
+    id,
+    name: id,
+    file,
+    startLine: 1,
+    endLine: 2,
+    kind: 'Function' as const,
+    summaryStatus: 'pending' as const,
+    riskSignals: [],
+  });
+  let sectionRaw: RawCodeMap;
+
+  before(async () => {
+    // api: a0 called by 10 Nodes (blast radius 10). web: a 20-Node clique
+    // (blast radius 19 each), which fills the whole scope's top 10%.
+    const api = Array.from({ length: 11 }, (_, i) => fn(`a${i}`, 'api/a.ts'));
+    const web = Array.from({ length: 20 }, (_, i) => fn(`w${i}`, 'web/w.ts'));
+    const edges: CodeMapEdge[] = [
+      ...api.slice(1).map((node) => ({ source: node.id, target: 'a0', kind: 'CALLS' as const })),
+      ...web.flatMap((a) =>
+        web.filter((b) => b !== a).map((b) => ({ source: a.id, target: b.id, kind: 'CALLS' as const })),
+      ),
+    ];
+    const projectRoot = mkdtempSync(path.join(os.tmpdir(), 'driller-section-severity-'));
+    const fetched = await fetchProductionCodeMap('stub-project', projectRoot, 'Code Map', {
+      fetch: async () => ({ nodes: [...api, ...web], edges }),
+    });
+    sectionRaw = { projectRoot, fetched, coverage: undefined, coverageGapFiles: new Set() };
+  });
+
+  const blastRadius = (nodes: readonly CodeMapNode[], id: string): string | undefined =>
+    nodes
+      .find((node) => node.id === id)
+      ?.riskSignals.find(
+        (signal): signal is DeterministicRiskSignal => signal.family === 'deterministic' && signal.type === 'blast-radius',
+      )?.severity;
+
+  it('a0 is severe in api and moderate across web + api', () => {
+    const noRecords = () => undefined;
+    const whole = buildScopedCodeMap(sectionRaw, keepFileForScope(['web', 'api']), noRecords);
+    const api = buildScopedCodeMap(sectionRaw, keepFileForSection('api', ['web', 'api']), noRecords);
+    assert.equal(blastRadius(whole.nodes, 'a0'), 'moderate');
+    assert.equal(blastRadius(api.nodes, 'a0'), 'severe');
+  });
+
+  it('countSectionNodes: one entry per path in order, nearest entry wins, sum = total', () => {
+    const nodes = ['apps/a.ts', 'apps/web/b.ts', 'apps/web/c.ts', 'web/d.ts', 'webapp/e.ts'].map((file) => ({ file }));
+    assert.deepEqual(countSectionNodes('/project', nodes.slice(0, 4), ['apps/web', 'web', 'apps']), [
+      { path: 'apps/web', nodeCount: 2 },
+      { path: 'web', nodeCount: 1 },
+      { path: 'apps', nodeCount: 1 },
+    ]);
+    assert.deepEqual(countSectionNodes('/project', nodes, []), []);
+    assert.deepEqual(countSectionNodes('/project', nodes, ['web']), [{ path: 'web', nodeCount: 1 }], 'webapp is not web');
   });
 });

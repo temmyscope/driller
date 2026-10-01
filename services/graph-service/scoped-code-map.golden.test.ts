@@ -23,6 +23,10 @@
  * (re-run without the flag), and is refused under CI.
  *
  * This file imports nothing the baseline lacks, so it runs there unchanged.
+ *
+ * P4-4 phase 1b: the omitted-section reply gained `section: null` and
+ * `sections`; they are stripped before the comparison (`snapshotScope`), so
+ * the golden itself is unchanged.
  */
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -42,7 +46,12 @@ const PROJECT = makeFixtureProject();
 /** Everything the golden records for one scope. */
 async function snapshotScope(scope: readonly string[]): Promise<Record<string, unknown>> {
   send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: scope });
-  const reply = await fetchMap();
+  // P4-4 phase 1b: the reply's two additions (`section: null`, `sections`)
+  // are left out of the comparison — every field the golden records must
+  // stay byte-identical. Their values are pinned by
+  // `scoped-code-map.section.test.ts`. (Absent on the baseline, so this is
+  // a no-op there.)
+  const { section: _section, sections: _sections, ...reply } = await fetchMap();
   const { getNodes, getFolded, getFoldedTypes } = getters();
   const traces: Record<string, unknown> = {};
   for (const query of FIXTURE_TRACE_QUERIES) {
