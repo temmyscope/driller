@@ -3737,6 +3737,42 @@ code,
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* P4-3g: a changed contract's pinned summary row. The contract itself
+   changed, so it takes `row-changed-background` and `row-changed-rule`, as a
+   changed Node row does (its dependents keep P4-2e's affected/⧉ treatment on
+   the canvas). Never zebra-striped: it is not a `.code-map__metrics-table-row`.
+   Its one control is P4-2e's `ChangedContractButton` (a
+   `.code-map__link-button`, with that class's own focus ring); a click on any
+   other cell runs it, so the row takes the pointer and the rows' hover fill.
+   The metric columns hold one cell, "→ 59 dependents", in `{colors.text-dim}`:
+   no bars, no severity. */
+.code-map__metrics-contract {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  cursor: pointer;
+}
+
+.code-map__metrics-contract > :first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.code-map__metrics-table tbody tr.code-map__metrics-contract:hover > * {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.code-map__metrics-contract-marker {
+  color: var(--text-dim);
+}
+
+.code-map__metrics-contract-dependents {
+  color: var(--text-dim);
+}
+
+/* P4-3g: the contract group's inert approximate note — muted, like the cap
+   line and the sorted-within-cap note. */
+.code-map__metrics-contract-note {
+  color: var(--text-mute);
+}
+
 /* P4-3e: a row opens Node detail. The row's one control is
    `.code-map__metrics-row-button`, a native button in the node cell, reset
    to read as the cell's text (the `.code-map__health-row-button` treatment);

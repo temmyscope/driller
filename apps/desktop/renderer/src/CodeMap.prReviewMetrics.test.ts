@@ -16,7 +16,7 @@ import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import type { CodeMapNode, DeterministicRiskSignal, RiskSignal } from '@driller/ipc-contracts';
+import type { ChangedContract, CodeMapNode, DeterministicRiskSignal, RiskSignal } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 
 import {
@@ -77,7 +77,18 @@ import {
   METRIC_TESTS_NO_DATA_TITLE,
   METRIC_TESTS_UNPROVEN_TITLE,
   metricTestsState,
+  CHANGED_CONTRACTS_APPROXIMATE_NOTE,
+  CHANGED_CONTRACTS_SHOWN,
+  ChangedContractButton,
+  ChangedContractList,
+  foldedTypeNoun,
+  formatContractDependents,
+  leadingChangedRowCount,
+  METRICS_CONTRACT_HOP,
+  MetricsContractRow,
+  prReviewMetricsCaption,
 } from './CodeMap';
+import { ACTIONABLE_NOTICE_GLYPHS } from './ActionableNotice';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
 // ---------------------------------------------------------------------------
@@ -153,6 +164,28 @@ const THREE = [
     riskSignals: [det('blast-radius', 120, 'severe')],
   }),
 ];
+
+/** P4-3g: a changed contract, as `CodeMap.changedContracts.test.ts`'s fixture builds one. */
+const contractFixture = (
+  name: string,
+  dependentIds: string[],
+  dependentCount = dependentIds.length,
+  kind: ChangedContract['kind'] = 'Interface',
+): ChangedContract => ({
+  id: `src/types.ts::${name}`,
+  name,
+  kind,
+  file: 'src/types.ts',
+  dependentCount,
+  dependentIds,
+});
+
+/** P4-3g: a table with no changed contracts — what every pre-P4-3g render test passes. */
+const NO_CONTRACT_PROPS = {
+  changedContracts: [] as readonly ChangedContract[],
+  changedContractsApproximate: false,
+  onOpenType: (_id: string) => {},
+};
 
 /** P4-3a cases: no blast radius. */
 const IDLE_BLAST_RADIUS: BlastRadiusState = { status: 'idle' };
@@ -281,7 +314,14 @@ describe('resolvePrReviewView: the metrics table gate', () => {
       assert.equal(resolvePrReviewView('prReview', map, state, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null, state.status);
       // A stray `nodeIds` (a leftover from an earlier resolved scope) must not
       // open the table either: the gate is the status, not the data.
-      const stray = { ...state, nodeIds: new Set(THREE.map((n) => n.id)) } as unknown as DiffScopeState;
+      // P4-3g: nor a stray `changedContracts` — the contract gate is the
+      // status too.
+      const stray = {
+        ...state,
+        nodeIds: new Set(THREE.map((n) => n.id)),
+        changedContracts: [contractFixture('CodeMapNode', ['src/a.ts::load'], 59)],
+        changedContractsApproximate: true,
+      } as unknown as DiffScopeState;
       assert.equal(resolvePrReviewView('prReview', map, stray, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null, `${state.status} + stray nodeIds`);
     }
   });
@@ -295,7 +335,7 @@ describe('resolvePrReviewView: the metrics table gate', () => {
     assert.equal(resolvePrReviewView('prReview', { status: 'error', message: 'x' }, scope, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null);
   });
 
-  it('no table for 0 changed Nodes (contract-only / top-level-only diff), or only off-map ids', () => {
+  it('no table for 0 changed Nodes and no contracts (top-level-only diff), or only off-map ids — P4-3g: a contract-only diff is tested below', () => {
     assert.equal(resolvePrReviewView('prReview', map, resolved([]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null);
     assert.equal(resolvePrReviewView('prReview', map, resolved(['gone::x']), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null);
   });
@@ -325,7 +365,7 @@ function render(
   onSort: (sort: PrReviewMetricSort) => void = () => {},
   onActivateNode: (node: CodeMapNode) => void = () => {},
 ): RenderedElement[] {
-  return renderTree(PrReviewMetricsTable({ ...table, blastRadiusStatus, sort, onSort, onActivateNode }));
+  return renderTree(PrReviewMetricsTable({ ...NO_CONTRACT_PROPS, ...table, blastRadiusStatus, sort, onSort, onActivateNode }));
 }
 
 const byType = (elements: RenderedElement[], type: string) => elements.filter((e) => e.type === type);
@@ -408,7 +448,7 @@ describe('PrReviewMetricsTable', () => {
       ['loadsrc/, src/a.ts line 10, open Node detail', 'changed', '3', METRIC_CELL_EMPTY, METRIC_CELL_EMPTY, METRIC_CELL_EMPTY],
     );
     assert.equal(METRIC_CELL_EMPTY, '—');
-    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} })).toLowerCase();
+    const allText = textOf(PrReviewMetricsTable({ ...NO_CONTRACT_PROPS, ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} })).toLowerCase();
     assert.ok(!allText.includes('covered'), allText);
     assert.ok(!allText.includes('%'), allText);
   });
@@ -791,7 +831,7 @@ describe('CodeMap source: the divider wiring', () => {
     assert.equal(src.split('<MetricsTableDivider').length - 1, 1);
     assert.match(
       src,
-      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}\s+sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}\s+onActivateNode=\{openNodeDetail\}\s+\/>\s*<\/>\s*\)\}/,
+      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}\s+sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}\s+onActivateNode=\{openNodeDetail\}\s+onOpenType=\{openType\}\s+\/>\s*<\/>\s*\)\}/,
     );
   });
   it('.code-map carries the height style and the measured ref', () => {
@@ -1194,7 +1234,8 @@ describe('CodeMap source: the affected-row wiring', () => {
   });
   it('the loading caption matches the toolbar wording', () => {
     assert.ok(src.includes('>\n              Computing blast radius…\n'), 'toolbar wording');
-    assert.ok(src.includes('Computing blast radius…"'), 'caption wording');
+    // P4-3g: the caption is a template literal now (it may name contracts).
+    assert.match(src, /Computing blast radius…[`"]/, 'caption wording');
   });
 
   // Mode switched away and back keeps the same rows at the same depth only
@@ -2078,7 +2119,7 @@ describe('the tests column: gap, covered, — (P4-3f)', () => {
         assert.equal(testsCell.props.title, undefined, id);
       }
     }
-    const allText = textOf(PrReviewMetricsTable({ ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} }));
+    const allText = textOf(PrReviewMetricsTable({ ...NO_CONTRACT_PROPS, ...table, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} }));
     assert.equal(allText.split('covered').length - 1, 1, 'exactly one covered cell');
     assert.ok(!allText.includes('%'), allText);
   });
@@ -2090,7 +2131,7 @@ describe('the tests column: gap, covered, — (P4-3f)', () => {
       null,
       0,
     );
-    const text = textOf(PrReviewMetricsTable({ ...plain, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} }));
+    const text = textOf(PrReviewMetricsTable({ ...NO_CONTRACT_PROPS, ...plain, blastRadiusStatus: 'idle', sort: null, onSort: () => {}, onActivateNode: () => {} }));
     assert.ok(!text.toLowerCase().includes('covered'), text);
   });
 
@@ -2101,5 +2142,413 @@ describe('the tests column: gap, covered, — (P4-3f)', () => {
     assert.deepEqual(idsOf(sortPrReviewMetricRows(table.rows, sortBy('tests', 'descending'))), ['c::hit', ...dashes, ...gaps]);
     // A first click on the header leads with the gaps, as before P4-3f.
     assert.deepEqual(nextPrReviewMetricSort(null, 'tests'), sortBy('tests', 'ascending'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-3g: a pinned summary row per changed contract
+// ---------------------------------------------------------------------------
+
+/** P4-3g: a resolved scope that also carries changed contracts. */
+const resolvedWith = (nodeIds: string[], contracts: ChangedContract[], approximate = false): DiffScopeState => ({
+  status: 'resolved',
+  resolvedBaseRef: 'abc123',
+  nodeIds: new Set(nodeIds),
+  topLevelFiles: [],
+  changedContracts: contracts,
+  changedContractsApproximate: approximate,
+});
+
+/** 59 dependents, but only 3 ids carried — as when `dependentIds` hits its cap. */
+const CODE_MAP_NODE = contractFixture('CodeMapNode', ['src/a.ts::load', 'src/b.ts::pay', 'src/b.ts::refund'], 59);
+const RESULT_TYPE = contractFixture('Result', ['src/a.ts::load'], 1, 'Type');
+
+function renderWithContracts(
+  table: PrReviewMetricRows,
+  contracts: readonly ChangedContract[],
+  {
+    approximate = false,
+    sort = null,
+    onOpenType = () => {},
+  }: { approximate?: boolean; sort?: PrReviewMetricSort | null; onOpenType?: (id: string) => void } = {},
+): RenderedElement[] {
+  return renderTree(
+    PrReviewMetricsTable({
+      ...table,
+      blastRadiusStatus: 'idle',
+      changedContracts: contracts,
+      changedContractsApproximate: approximate,
+      sort,
+      onSort: () => {},
+      onActivateNode: () => {},
+      onOpenType,
+    }),
+  );
+}
+
+const contractRowsOf = (elements: RenderedElement[]) =>
+  byType(elements, 'tr').filter((tr) => tr.props.className === 'code-map__metrics-contract');
+
+/** Every body row in document order, as a kind: changed / affected Node row, contract row, or an inert line. */
+function bodyRowKinds(elements: RenderedElement[]): string[] {
+  const kinds: string[] = [];
+  for (const body of byType(elements, 'tbody')) {
+    for (const tr of renderTree(body.props.children).filter((e) => e.type === 'tr')) {
+      const cls = String(tr.props.className ?? '');
+      if (cls === 'code-map__metrics-contract') {
+        kinds.push(`contract:${String(cellsOf(tr)[0]?.props.title)}`);
+      } else if (cls.includes('code-map__metrics-table-row--changed')) {
+        kinds.push('changed');
+      } else if (cls.includes('code-map__metrics-table-row')) {
+        kinds.push('affected');
+      } else {
+        kinds.push(cls);
+      }
+    }
+  }
+  return kinds;
+}
+
+describe('P4-3g: the table gate opens for changed rows OR changed contracts', () => {
+  const map = ready([unchanged, ...THREE]);
+
+  it('a contract-only diff (0 changed Nodes) shows a table of contract rows only', () => {
+    const view = resolvePrReviewView('prReview', map, resolvedWith([], [CODE_MAP_NODE]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
+    assert.notEqual(view.metricsTable, null);
+    assert.equal(view.metricsTable?.rows.length, 0);
+    assert.deepEqual(view.metricsTable?.changedContracts, [CODE_MAP_NODE]);
+    assert.equal(view.metricsTable?.changedContractsApproximate, false);
+    assert.equal(prReviewMetricsTableFor(view), view.metricsTable);
+    const rows = bodyRowKinds(renderWithContracts(view.metricsTable!, view.metricsTable!.changedContracts));
+    assert.deepEqual(rows, [`contract:${CODE_MAP_NODE.id}`]);
+  });
+
+  it('neither changed rows nor contracts: no table (never an empty one)', () => {
+    assert.equal(resolvePrReviewView('prReview', map, resolvedWith([], []), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null);
+    assert.equal(resolvePrReviewView('prReview', map, resolvedWith([], [], true), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null, 'the approximate flag alone opens nothing');
+    assert.equal(resolvePrReviewView('prReview', map, resolvedWith(['gone::x'], []), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null);
+  });
+
+  it('off-map changed ids plus a contract: the table, with its off-map line', () => {
+    const table = resolvePrReviewView('prReview', map, resolvedWith(['gone::x'], [CODE_MAP_NODE]), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable;
+    assert.deepEqual([table?.rows.length, table?.missingChangedCount, table?.changedContracts.length], [0, 1, 1]);
+  });
+
+  it('a contract-only scope still shows nothing outside PR Review, without a showable map, or without the canvas', () => {
+    const scope = resolvedWith([], [CODE_MAP_NODE]);
+    for (const mode of ['codeMap', 'healthAudit'] as CodeMapMode[]) {
+      assert.equal(resolvePrReviewView(mode, map, scope, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null, mode);
+    }
+    assert.equal(resolvePrReviewView('prReview', { status: 'loading' }, scope, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS).metricsTable, null);
+    const view = resolvePrReviewView('prReview', map, scope, IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
+    assert.equal(prReviewMetricsTableFor({ ...view, surfaces: { ...view.surfaces, canvas: false } }), null);
+  });
+
+  it('the table carries the same contracts and flag the toolbar list reads — nothing recomputed', () => {
+    const view = resolvePrReviewView('prReview', map, resolvedWith([THREE[0]!.id], [CODE_MAP_NODE, RESULT_TYPE], true), IDLE_BLAST_RADIUS, BLAST_RADIUS_DEFAULT_HOPS);
+    assert.equal(view.metricsTable?.changedContracts, view.changedContracts, 'the very same array');
+    assert.equal(view.metricsTable?.changedContractsApproximate, true);
+    assert.equal(view.changedContractsApproximate, true);
+  });
+});
+
+describe('P4-3g: the contract row', () => {
+  const empty = buildPrReviewMetricRows([], new Set(), null, 0);
+
+  it('node cell: the ⧉ marker, P4-2e\'s ChangedContractButton and the type noun; hop "contract"; one colSpan dependents cell', () => {
+    const elements = renderWithContracts(empty, [CODE_MAP_NODE]);
+    const [row] = contractRowsOf(elements);
+    assert.ok(row);
+    const cells = cellsOf(row);
+    assert.equal(cells.length, 3);
+    const [nodeCell, hop, dependents] = cells as [RenderedElement, RenderedElement, RenderedElement];
+    assert.equal(nodeCell.type, 'th');
+    assert.equal(nodeCell.props.scope, 'row');
+    assert.equal(nodeCell.props.title, CODE_MAP_NODE.id);
+    assert.equal(textOf(nodeCell), `⧉ CodeMapNode${foldedTypeNoun('Interface')}`);
+    const marker = renderTree(nodeCell.props.children).find((e) => e.props.className === 'code-map__metrics-contract-marker');
+    assert.equal(marker?.props['aria-hidden'], 'true');
+    // P4-2e's own button component, with its own accessible name.
+    const contractButton = renderTree(nodeCell.props.children).find((e) => e.type === ChangedContractButton);
+    assert.ok(contractButton, 'the node cell reuses ChangedContractButton');
+    const button = renderTree(nodeCell.props.children).find((e) => e.type === 'button');
+    assert.equal(button?.props['aria-label'], 'Open the type detail of CodeMapNode');
+    assert.equal(textOf(hop), METRICS_CONTRACT_HOP);
+    assert.equal(METRICS_CONTRACT_HOP, 'contract');
+    assert.equal(textOf(dependents), '→ 59 dependents');
+    assert.equal(dependents.props.className, 'code-map__metrics-contract-dependents');
+    const headers = renderTree(byType(elements, 'thead')[0]?.props.children).filter((e) => e.type === 'th');
+    assert.equal(2 + Number(dependents.props.colSpan), headers.length, 'the cells span exactly the table');
+    // A Type reads "type".
+    const result = cellsOf(contractRowsOf(renderWithContracts(empty, [RESULT_TYPE]))[0]!);
+    assert.equal(textOf(result[0]), '⧉ Resulttype');
+    assert.equal(textOf(result[2]), '→ 1 dependent');
+  });
+
+  it('shows the exact dependentCount (formatContractDependents), never the capped dependentIds.length', () => {
+    assert.equal(CODE_MAP_NODE.dependentIds.length, 3);
+    const elements = renderWithContracts(empty, [CODE_MAP_NODE]);
+    const text = textOf(cellsOf(contractRowsOf(elements)[0]!)[2]);
+    assert.equal(text, `→ ${formatContractDependents(CODE_MAP_NODE)}`);
+    assert.ok(text.includes('59'));
+    assert.ok(!text.includes('3 dependents'));
+  });
+
+  it('carries no risk values: no bars, no severity, no tests or findings value', () => {
+    const elements = renderWithContracts(empty, [CODE_MAP_NODE]);
+    const parts = renderTree(contractRowsOf(elements)[0]!.props.children);
+    assert.ok(!parts.some((e) => /metrics-bar|severe|coverage-gap/.test(String(e.props.className ?? ''))));
+    assert.ok(!parts.some((e) => e.props.role === 'img'));
+    const text = textOf(contractRowsOf(elements)[0]);
+    for (const word of ['gap', 'covered', SEVERE_SIGNAL_GLYPH, METRIC_CELL_EMPTY, '%']) {
+      assert.ok(!text.includes(word), word);
+    }
+  });
+
+  it('activation: the button calls onOpenType with the contract\'s id, never its name', () => {
+    const opened: string[] = [];
+    const elements = renderWithContracts(empty, [CODE_MAP_NODE], { onOpenType: (id) => opened.push(id) });
+    const button = renderTree(contractRowsOf(elements)[0]!.props.children).find((e) => e.type === 'button');
+    (button?.props.onClick as () => void)();
+    assert.deepEqual(opened, [CODE_MAP_NODE.id]);
+  });
+
+  it('a click on another cell focuses the button, then opens the type detail once; a click on the button bubbles without a second open', () => {
+    const opened: string[] = [];
+    const row = contractRowsOf(renderWithContracts(empty, [CODE_MAP_NODE], { onOpenType: (id) => opened.push(id) }))[0]!;
+    const inner = { inside: 'the button' };
+    const button = fakeButton([inner]);
+    const clickContractRow = (target: unknown, textSelected = false) => {
+      const global = globalThis as unknown as { window?: unknown };
+      const had = 'window' in global;
+      const previous = global.window;
+      global.window = { getSelection: () => ({ isCollapsed: !textSelected }) };
+      try {
+        (row.props.onClick as (event: unknown) => void)({ target, currentTarget: { querySelector: () => button } });
+      } finally {
+        if (had) {
+          global.window = previous;
+        } else {
+          delete global.window;
+        }
+      }
+    };
+    clickContractRow({ cell: 'dependents' });
+    assert.deepEqual(opened, [CODE_MAP_NODE.id]);
+    assert.deepEqual(button.focused, [{ preventScroll: true }], 'the button is the opener focus returns to');
+    clickContractRow(inner);
+    assert.deepEqual(opened, [CODE_MAP_NODE.id], 'the button\'s own click is not doubled');
+    clickContractRow({ cell: 'hop' }, true);
+    assert.deepEqual(opened, [CODE_MAP_NODE.id], 'selecting text opens nothing');
+  });
+
+  it('the contract row has one control (its button) and no extra tab stop', () => {
+    const row = contractRowsOf(renderWithContracts(empty, [CODE_MAP_NODE]))[0]!;
+    assert.equal(row.props.tabIndex, undefined);
+    const controls = renderTree(row.props.children).filter((e) => typeof e.type === 'string' && isActivatable(e));
+    assert.deepEqual(controls.map((e) => e.type), ['button']);
+  });
+
+  it('MetricsContractRow is hookless and renders on its own', () => {
+    const elements = renderTree(MetricsContractRow({ contract: RESULT_TYPE, onOpenType: () => {} }));
+    assert.equal(elements[0]?.type, 'tr');
+  });
+});
+
+describe('P4-3g: the contract group — placement, cap, approximate note', () => {
+  const affectedOne = affectedNodes('one', 2);
+  const map = [...THREE, ...affectedOne];
+  const changedIds = new Set([THREE[0]!.id]);
+  const table = buildPrReviewMetricRows(map, changedIds, hops([[affectedOne, 1]]), 1);
+
+  it('function + type changed: changed rows, then the contract rows, then affected rows', () => {
+    assert.deepEqual(bodyRowKinds(renderWithContracts(table, [CODE_MAP_NODE, RESULT_TYPE])), [
+      'changed',
+      `contract:${CODE_MAP_NODE.id}`,
+      `contract:${RESULT_TYPE.id}`,
+      'affected',
+      'affected',
+    ]);
+  });
+
+  it('the group is its own tbody, and without contracts the Node rows keep one tbody as before', () => {
+    const groups = byType(renderWithContracts(table, [CODE_MAP_NODE]), 'tbody');
+    assert.equal(groups.filter((g) => g.props.className === 'code-map__metrics-contracts').length, 1);
+    const plain = byType(renderWithContracts(table, []), 'tbody');
+    assert.equal(plain.length, 1);
+    assert.ok(!bodyRowKinds(renderWithContracts(table, [])).some((k) => k.startsWith('contract')));
+  });
+
+  it('under every user sort the group stays one pinned block, before the sorted Node rows, never sorted with them', () => {
+    const contracts = [RESULT_TYPE, CODE_MAP_NODE]; // given order, not alphabetical
+    for (const { column } of PR_REVIEW_METRIC_COLUMNS) {
+      for (const direction of ['ascending', 'descending'] as const) {
+        const sort = sortBy(column, direction);
+        const elements = renderWithContracts(SORTABLE, contracts, { sort });
+        const kinds = bodyRowKinds(elements);
+        assert.deepEqual(kinds.slice(0, 2), [`contract:${RESULT_TYPE.id}`, `contract:${CODE_MAP_NODE.id}`], `${column} ${direction}`);
+        assert.ok(kinds.slice(2).every((k) => !k.startsWith('contract')), `${column} ${direction}`);
+        // The Node rows are exactly P4-3d's sort, untouched by the group.
+        assert.deepEqual(rowsOf(elements).map(rowIdOf), idsOf(sortPrReviewMetricRows(SORTABLE.rows, sort)), `${column} ${direction}`);
+      }
+    }
+    // Back in the default order, between changed and affected again.
+    const kinds = bodyRowKinds(renderWithContracts(SORTABLE, contracts));
+    assert.deepEqual(kinds, ['changed', 'changed', `contract:${RESULT_TYPE.id}`, `contract:${CODE_MAP_NODE.id}`, 'affected', 'affected', 'affected']);
+  });
+
+  it('a sorted capped table: the group, then the sorted-within-cap note, then the rows, then the cap line; the note counts Node rows only', () => {
+    const many = affectedNodes('many', METRICS_TABLE_AFFECTED_ROW_CAP + 2);
+    const capped = buildPrReviewMetricRows([...THREE, ...many], new Set(THREE.map((n) => n.id)), hops([[many, 1]]), 1);
+    const sort = sortBy('complexity', 'descending');
+    const kinds = bodyRowKinds(renderWithContracts(capped, [CODE_MAP_NODE], { sort }));
+    assert.equal(kinds[0], `contract:${CODE_MAP_NODE.id}`);
+    assert.equal(kinds[1], 'code-map__metrics-sort-note');
+    assert.equal(kinds.at(-1), 'code-map__metrics-cap');
+    const note = byType(renderWithContracts(capped, [CODE_MAP_NODE], { sort }), 'tr').find((tr) => tr.props.className === 'code-map__metrics-sort-note');
+    assert.equal(textOf(note), formatSortedWithinCapNote(sort, capped.rows.length, 2));
+    // Default order: the cap line still closes the table, after the affected rows.
+    const plainKinds = bodyRowKinds(renderWithContracts(capped, [CODE_MAP_NODE]));
+    assert.equal(plainKinds.at(-1), 'code-map__metrics-cap');
+    assert.equal(plainKinds.indexOf(`contract:${CODE_MAP_NODE.id}`), THREE.length);
+  });
+
+  it('bars stay relative to the Node rows only', () => {
+    const elements = renderWithContracts(table, [CODE_MAP_NODE]);
+    const plain = renderWithContracts(table, []);
+    const widths = (els: RenderedElement[]) =>
+      els.filter((e) => e.props.className === 'code-map__metrics-bar' || e.props.className === 'code-map__metrics-bar code-map__metrics-bar--severe').map((e) => JSON.stringify(e.props.style));
+    assert.deepEqual(widths(elements), widths(plain));
+  });
+
+  it('7 contracts: 7 contract rows (uncapped), while the toolbar list keeps 5 + "+2 more"', () => {
+    const seven = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((name) => contractFixture(name, [], 2));
+    assert.equal(contractRowsOf(renderWithContracts(emptyNodeTable(), seven)).length, 7);
+    const toolbar = renderTree(ChangedContractList({ contracts: seven, approximate: false, onOpenType: () => {} }));
+    assert.equal(CHANGED_CONTRACTS_SHOWN, 5);
+    assert.equal(toolbar.filter((e) => e.type === 'summary').map((e) => textOf(e)).join(), '+2 more');
+  });
+
+  it('approximate: the group leads with an inert note — the warning glyph and CHANGED_CONTRACTS_APPROXIMATE_NOTE', () => {
+    const elements = renderWithContracts(table, [CODE_MAP_NODE], { approximate: true });
+    const group = byType(elements, 'tbody').find((g) => g.props.className === 'code-map__metrics-contracts')!;
+    const groupRows = renderTree(group.props.children).filter((e) => e.type === 'tr');
+    const note = groupRows[0]!;
+    assert.equal(note.props.className, 'code-map__metrics-contract-note');
+    assert.equal(groupRows[1]?.props.className, 'code-map__metrics-contract');
+    const text = textOf(note);
+    assert.ok(text.startsWith(ACTIONABLE_NOTICE_GLYPHS.warning), text);
+    assert.ok(text.includes(CHANGED_CONTRACTS_APPROXIMATE_NOTE), text);
+    const glyph = renderTree(note.props.children).find((e) => textOf(e) === ACTIONABLE_NOTICE_GLYPHS.warning && e.type === 'span');
+    assert.equal(glyph?.props['aria-hidden'], 'true');
+    const cell = cellsOf(note)[0]!;
+    const headers = renderTree(byType(elements, 'thead')[0]?.props.children).filter((e) => e.type === 'th');
+    assert.equal(cell.props.colSpan, headers.length);
+    assert.ok(!renderTree(note.props.children).concat(note).some(isActivatable), 'the note is inert');
+    // Not approximate: no note.
+    const plain = renderWithContracts(table, [CODE_MAP_NODE]);
+    assert.equal(byType(plain, 'tr').filter((tr) => tr.props.className === 'code-map__metrics-contract-note').length, 0);
+  });
+
+  it('leadingChangedRowCount: where the group goes in the default order', () => {
+    assert.equal(leadingChangedRowCount([]), 0);
+    assert.equal(leadingChangedRowCount([{ hop: 'changed' }, { hop: 'changed' }]), 2);
+    assert.equal(leadingChangedRowCount([{ hop: 'changed' }, { hop: 1 }, { hop: 2 }]), 1);
+    assert.equal(leadingChangedRowCount([{ hop: 1 }]), 0);
+  });
+});
+
+/** An empty Node table, for contract-only renders. */
+function emptyNodeTable(): PrReviewMetricRows {
+  return buildPrReviewMetricRows([], new Set(), null, 0);
+}
+
+describe('P4-3g: the caption names the contracts', () => {
+  const empty = buildPrReviewMetricRows([], new Set(), null, 0);
+  const changedOnly = buildPrReviewMetricRows(THREE, new Set(THREE.map((n) => n.id)), null, 0);
+
+  it('contract-only: "Changed contracts"; with Node rows: the P4-3c wording plus "and changed contracts"', () => {
+    assert.deepEqual(prReviewMetricsCaption(empty, 'idle', 1), { text: 'Changed contracts', visible: false });
+    assert.deepEqual(prReviewMetricsCaption(changedOnly, 'idle', 2), { text: "Changed Nodes' risk metrics and changed contracts", visible: false });
+    assert.deepEqual(prReviewMetricsCaption(changedOnly, 'loading', 1), {
+      text: "Changed Nodes' risk metrics and changed contracts. Computing blast radius…",
+      visible: true,
+    });
+    // Without contracts the P4-3c captions are unchanged.
+    assert.deepEqual(prReviewMetricsCaption(changedOnly, 'idle'), { text: "Changed Nodes' risk metrics", visible: false });
+    assert.deepEqual(prReviewMetricsCaption(changedOnly, 'loading', 0), { text: "Changed Nodes' risk metrics. Computing blast radius…", visible: true });
+  });
+
+  it('the rendered caption follows it', () => {
+    const caption = byType(renderWithContracts(empty, [CODE_MAP_NODE]), 'caption')[0];
+    assert.equal(textOf(caption), 'Changed contracts');
+  });
+});
+
+describe('styles.css: the contract rows (P4-3g)', () => {
+  const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+  const block = (selector: string) => {
+    const at = css.indexOf(`${selector} {`);
+    assert.ok(at >= 0, selector);
+    return css.slice(at, css.indexOf('}', at));
+  };
+
+  it('a contract row takes row-changed-background and row-changed-rule, as a changed Node row', () => {
+    assert.match(block('.code-map__metrics-contract'), /background: color-mix\(in srgb, var\(--accent\) 8%, transparent\);/);
+    assert.match(block('.code-map__metrics-contract > :first-child'), /box-shadow: inset 2px 0 0 var\(--accent\);/);
+  });
+
+  it('the dependents cell is text-dim; the approximate note is muted', () => {
+    assert.match(block('.code-map__metrics-contract-dependents'), /color: var\(--text-dim\);/);
+    assert.match(block('.code-map__metrics-contract-note'), /color: var\(--text-mute\);/);
+  });
+});
+
+describe('CodeMap source: the contract rows wiring (P4-3g)', () => {
+  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
+  it('the table mount opens a contract through openType, as the toolbar does', () => {
+    assert.match(src, /<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}[^>]*onOpenType=\{openType\}\s+\/>/);
+    assert.match(src, /<PrReviewDiffScopeNoticeRegion[\s\S]{0,600}onOpenType=\{openType\}/);
+  });
+  it('the toolbar contract list is still mounted', () => {
+    assert.match(src, /<ChangedContractList\s/);
+  });
+});
+
+describe('P4-3g review round 1', () => {
+  const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+  /** Every selector list (text before a `{`) that styles the metrics table's body rows. */
+  const rowSelectors = [...css.matchAll(/([^{}]+)\{/g)]
+    .map((m) => m[1]!.replace(/\/\*[\s\S]*?\*\//g, '').trim())
+    .filter((sel) => sel.includes('tbody tr'));
+
+  it('a contract-only table renders no empty Node-row tbody', () => {
+    const empty = buildPrReviewMetricRows([], new Set(), null, 0);
+    const bodies = byType(renderWithContracts(empty, [CODE_MAP_NODE]), 'tbody');
+    assert.deepEqual(bodies.map((b) => b.props.className), ['code-map__metrics-contracts']);
+    // Sorted too: the group alone.
+    const sorted = byType(renderWithContracts(empty, [CODE_MAP_NODE], { sort: sortBy('complexity', 'descending') }), 'tbody');
+    assert.deepEqual(sorted.map((b) => b.props.className), ['code-map__metrics-contracts']);
+    // With Node rows, or only a cap line, the trailing tbody is still there.
+    const withRows = buildPrReviewMetricRows(THREE, new Set(THREE.map((n) => n.id)), null, 0);
+    assert.equal(byType(renderWithContracts(withRows, []), 'tbody').length, 1);
+    const capOnly = byType(renderWithContracts({ ...empty, hiddenAffectedCount: 3 }, [CODE_MAP_NODE]), 'tbody');
+    assert.equal(capOnly.length, 2);
+  });
+
+  it('contract rows carry neither the Node-row class nor its changed modifier, so the zebra and the row focus ring never match them', () => {
+    const empty = buildPrReviewMetricRows([], new Set(), null, 0);
+    const row = contractRowsOf(renderWithContracts(empty, [CODE_MAP_NODE]))[0]!;
+    const classes = String(row.props.className).split(/\s+/);
+    assert.ok(!classes.includes('code-map__metrics-table-row'));
+    assert.ok(!classes.includes('code-map__metrics-table-row--changed'));
+    const zebra = rowSelectors.filter((sel) => sel.includes(':nth-child(even)'));
+    const ring = rowSelectors.filter((sel) => sel.includes(':has(') && sel.includes('focus-visible'));
+    assert.ok(zebra.length > 0 && ring.length > 0);
+    for (const sel of [...zebra, ...ring]) {
+      assert.match(sel, /tbody tr\.code-map__metrics-table-row/, sel);
+      assert.ok(!sel.includes('metrics-contract'), sel);
+      assert.ok(!/tbody tr(:|\s|$)/.test(sel), `unqualified tr: ${sel}`);
+    }
   });
 });

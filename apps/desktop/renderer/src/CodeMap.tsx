@@ -3257,6 +3257,8 @@ export interface PrReviewView {
    * none. Non-null only in PR Review Mode, with a showable map, for a
    * resolved diff scope with at least one row — never an empty table.
    * P4-3c: with the blast radius's affected rows at the stepper's depth.
+   * P4-3g: the gate is "at least one row OR at least one changed contract",
+   * so a contract-only diff shows its contract rows, never an empty table.
    */
   metricsTable: PrReviewMetricsTableProps | null;
   /** Which surfaces are on — see `CodeMapSurfaces`. */
@@ -3314,14 +3316,18 @@ export function resolvePrReviewView(
           blastRadiusDepth,
         )
       : null;
+  const changedContracts = resolved?.changedContracts ?? NO_CHANGED_CONTRACTS;
+  const changedContractsApproximate = resolved?.changedContractsApproximate === true;
   return {
     noticeStatus,
     topLevelFiles: resolved?.topLevelFiles ?? NO_TOP_LEVEL_FILES,
-    changedContracts: resolved?.changedContracts ?? NO_CHANGED_CONTRACTS,
-    changedContractsApproximate: resolved?.changedContractsApproximate === true,
+    changedContracts,
+    changedContractsApproximate,
+    // P4-3g: the contracts come from the same resolved scope only — a
+    // non-resolved state's leftover data never opens the table.
     metricsTable:
-      metricRows !== null && metricRows.rows.length > 0
-        ? { ...metricRows, blastRadiusStatus: blastRadiusState.status }
+      metricRows !== null && (metricRows.rows.length > 0 || changedContracts.length > 0)
+        ? { ...metricRows, blastRadiusStatus: blastRadiusState.status, changedContracts, changedContractsApproximate }
         : null,
     surfaces: resolveCodeMapSurfaces(mode, showable),
   };
@@ -3398,6 +3404,14 @@ export interface PrReviewMetricRows {
 /** P4-3c: `PrReviewMetricsTable`'s props — the rows, and the blast radius's status (for the caption). */
 export interface PrReviewMetricsTableProps extends PrReviewMetricRows {
   blastRadiusStatus: BlastRadiusState['status'];
+  /**
+   * P4-3g: the resolved scope's `changedContracts`, as P4-2e found them —
+   * one pinned summary row each, never capped, never sorted with the Node
+   * rows. Nothing is recomputed: the row shows `dependentCount` as-is.
+   */
+  changedContracts: readonly ChangedContract[];
+  /** P4-3g: the scope's `changedContractsApproximate` — the contract group then leads with the inert note. */
+  changedContractsApproximate: boolean;
 }
 
 /**
@@ -3643,13 +3657,23 @@ export function formatMissingAffectedNodes(count: number): string | null {
 export function prReviewMetricsCaption(
   table: PrReviewMetricRows,
   blastRadiusStatus: BlastRadiusState['status'],
+  contractCount = 0,
 ): { text: string; visible: boolean } {
+  // P4-3g: a table with contract rows says so; a contract-only table (no
+  // Node rows, nothing counted off the map) names the contracts alone.
+  const contracts = contractCount > 0 ? ' and changed contracts' : '';
   if (blastRadiusStatus === 'loading') {
-    return { text: "Changed Nodes' risk metrics. Computing blast radius…", visible: true };
+    return { text: `Changed Nodes' risk metrics${contracts}. Computing blast radius…`, visible: true };
   }
   const anyAffected =
     table.rows.some((row) => row.hop !== 'changed') || table.hiddenAffectedCount > 0 || table.missingAffectedCount > 0;
-  return { text: anyAffected ? "Changed and affected Nodes' risk metrics" : "Changed Nodes' risk metrics", visible: false };
+  if (contractCount > 0 && table.rows.length === 0 && !anyAffected && table.missingChangedCount === 0) {
+    return { text: 'Changed contracts', visible: false };
+  }
+  return {
+    text: `${anyAffected ? "Changed and affected Nodes' risk metrics" : "Changed Nodes' risk metrics"}${contracts}`,
+    visible: false,
+  };
 }
 
 /** P4-3a: the inert line for changed ids not on this map, or `null` for none. */
@@ -4264,6 +4288,12 @@ export interface PrReviewMetricsTableSortProps {
 /** P4-3e: the table's activation — `CodeMap` passes `openNodeDetail`, as the Health Audit grid does. */
 export interface PrReviewMetricsTableActivationProps {
   onActivateNode: (node: CodeMapNode) => void;
+  /**
+   * P4-3g: a contract row's button (P4-2e's `ChangedContractButton`) opens
+   * the type detail by the contract's id — `CodeMap`'s `openType`, as the
+   * toolbar's contract lines do.
+   */
+  onOpenType: (id: string) => void;
 }
 
 /** P4-3e: the one control in a metrics row — a native button in the node cell. */
@@ -4286,12 +4316,12 @@ export interface MetricsRowButtonTarget {
  * is the document selection's state at click time (non-collapsed = the user
  * was selecting text), passed in so this stays pure.
  */
-export function activateMetricsRowFromCell(
+export function activateMetricsRowFromCell<T>(
   button: MetricsRowButtonTarget | null,
   target: Node | null,
   textSelected: boolean,
-  node: CodeMapNode,
-  onActivateNode: (node: CodeMapNode) => void,
+  node: T,
+  onActivateNode: (node: T) => void,
 ): void {
   if (button !== null && button.contains(target)) {
     return;
@@ -4303,6 +4333,101 @@ export function activateMetricsRowFromCell(
   }
   button?.focus({ preventScroll: true });
   onActivateNode(node);
+}
+
+/**
+ * P4-3g: how many rows lead the default order as changed rows — where the
+ * contract group goes. Pure.
+ */
+export function leadingChangedRowCount(rows: readonly Pick<PrReviewMetricRow, 'hop'>[]): number {
+  const index = rows.findIndex((row) => row.hop !== 'changed');
+  return index === -1 ? rows.length : index;
+}
+
+/** P4-3g: a contract row's hop cell — a folded type has no hop distance. */
+export const METRICS_CONTRACT_HOP = 'contract';
+
+/**
+ * P4-3g: one changed contract's summary row — the canvas's ⧉ marker, P4-2e's
+ * `ChangedContractButton` and the type's noun; hop `contract`; then one cell
+ * across the metric columns, "→ 59 dependents" (`formatContractDependents`,
+ * the exact `dependentCount`). No bars, no severity, no tests or findings
+ * value: a folded type carries no risk signals. Styled as a changed row (the
+ * contract itself changed). A click on any cell runs the button's action
+ * through the same delegate as a Node row (`activateMetricsRowFromCell`), so
+ * `useModalLayer` captures the button as the opener and focus returns to it.
+ * Hookless.
+ */
+export function MetricsContractRow({
+  contract,
+  onOpenType,
+}: {
+  contract: ChangedContract;
+  onOpenType: (id: string) => void;
+}) {
+  return (
+    <tr
+      className="code-map__metrics-contract"
+      onClick={(event) =>
+        activateMetricsRowFromCell(
+          event.currentTarget.querySelector<HTMLButtonElement>('button'),
+          event.target as Node,
+          !(window.getSelection()?.isCollapsed ?? true),
+          contract.id,
+          onOpenType,
+        )
+      }
+    >
+      <th scope="row" className="code-map__metrics-table-node" title={contract.id}>
+        <span className="code-map__metrics-contract-marker" aria-hidden="true">
+          ⧉
+        </span>{' '}
+        <ChangedContractButton contract={contract} onOpenType={onOpenType} />
+        <span className="code-map__metrics-table-module">{foldedTypeNoun(contract.kind)}</span>
+      </th>
+      <td className="code-map__metrics-table-cell">{METRICS_CONTRACT_HOP}</td>
+      <td className="code-map__metrics-contract-dependents" colSpan={PR_REVIEW_METRICS_COLUMN_COUNT - 2}>
+        → {formatContractDependents(contract)}
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * P4-3g: the changed contracts' pinned tbody — the inert approximate note
+ * first when it applies, then one row per contract, uncapped (the toolbar
+ * keeps its own cap of `CHANGED_CONTRACTS_SHOWN`). `null` for no contracts.
+ * Hookless.
+ */
+export function MetricsContractGroup({
+  contracts,
+  approximate,
+  onOpenType,
+}: {
+  contracts: readonly ChangedContract[];
+  approximate: boolean;
+  onOpenType: (id: string) => void;
+}) {
+  if (contracts.length === 0) {
+    return null;
+  }
+  return (
+    <tbody className="code-map__metrics-contracts">
+      {approximate && (
+        <tr className="code-map__metrics-contract-note">
+          <td colSpan={PR_REVIEW_METRICS_COLUMN_COUNT}>
+            <span aria-hidden="true">{ACTIONABLE_NOTICE_GLYPHS.warning}</span>{' '}
+            <span className="visually-hidden">{`${ACTIONABLE_NOTICE_SPOKEN_PREFIX.warning} `}</span>
+            {/* The toolbar's own sentence (`ChangedContractList`). */}
+            Changed contracts are {CHANGED_CONTRACTS_APPROXIMATE_NOTE}.
+          </td>
+        </tr>
+      )}
+      {contracts.map((contract) => (
+        <MetricsContractRow key={contract.id} contract={contract} onOpenType={onOpenType} />
+      ))}
+    </tbody>
+  );
 }
 
 /**
@@ -4323,6 +4448,9 @@ export function PrReviewMetricsTable({
   sort,
   onSort,
   onActivateNode,
+  onOpenType,
+  changedContracts,
+  changedContractsApproximate,
   ...table
 }: PrReviewMetricsTableProps & PrReviewMetricsTableSortProps & PrReviewMetricsTableActivationProps) {
   const { missingChangedCount, hiddenAffectedCount, missingAffectedCount } = table;
@@ -4334,7 +4462,93 @@ export function PrReviewMetricsTable({
   const missing = formatMissingChangedNodes(missingChangedCount);
   const hiddenAffected = formatHiddenAffectedNodes(hiddenAffectedCount);
   const missingAffected = formatMissingAffectedNodes(missingAffectedCount);
-  const caption = prReviewMetricsCaption(table, blastRadiusStatus);
+  const caption = prReviewMetricsCaption(table, blastRadiusStatus, changedContracts.length);
+  // P4-3g: the changed contracts' pinned group — its own tbody, never
+  // sorted (only Node rows sort), never capped. In the default order it
+  // sits between the changed rows and the affected rows. Under a user sort
+  // the Node rows are one interleaved block (P4-3d), so there is no
+  // "between": the group is pinned above that block, before the
+  // sorted-within-cap note, and stays put whatever the column.
+  const contractGroup = (
+    <MetricsContractGroup
+      contracts={changedContracts}
+      approximate={changedContractsApproximate}
+      onOpenType={onOpenType}
+    />
+  );
+  const hasContracts = changedContracts.length > 0;
+  const changedCount = sort === null && hasContracts ? leadingChangedRowCount(rows) : 0;
+  const leadingRows = rows.slice(0, changedCount);
+  const trailingRows = rows.slice(changedCount);
+  // Keyed rows keep their button across re-sorts and depth steps WITHIN one
+  // tbody. P4-3g review: with contracts present, a row that moves between the
+  // leading and trailing tbody (a sort toggle, or an async re-resolve that
+  // changes the contract count) is remounted, so its button is a new element.
+  // A sort can't happen while a modal is open, but an async re-resolve can;
+  // then `useModalLayer` finds the opener disconnected and focus falls back
+  // to `.code-map` (`MODAL_FOCUS_FALLBACK_ID`).
+  const renderRow = (row: PrReviewMetricRow) => (
+    <tr
+      key={row.id}
+      className={
+        row.hop === 'changed'
+          ? 'code-map__metrics-table-row code-map__metrics-table-row--changed'
+          : 'code-map__metrics-table-row'
+      }
+      // P4-3e: a click on any cell runs the row button's action; the
+      // row itself is no control and no tab stop.
+      onClick={(event) =>
+        activateMetricsRowFromCell(
+          event.currentTarget.querySelector<HTMLButtonElement>(`.${METRICS_ROW_BUTTON_CLASS}`),
+          event.target as Node,
+          !(window.getSelection()?.isCollapsed ?? true),
+          row.node,
+          onActivateNode,
+        )
+      }
+    >
+      <th scope="row" className="code-map__metrics-table-node" title={row.id}>
+        {/* P4-3e: the row's one control, as `HealthAuditClusterRow`'s
+            button — Enter, Space, the tab stop and the role come from
+            the platform. It hands over ITS OWN Node object. No
+            `aria-label`: the name is the cell's content, then the
+            visually hidden `HEALTH_ROW_AFFORDANCE`. Keyed rows keep
+            this element across re-sorts and depth steps, so closing
+            Node detail returns focus to it. */}
+        <button type="button" className={METRICS_ROW_BUTTON_CLASS} onClick={() => onActivateNode(row.node)}>
+          <code className="code-map__metrics-table-name">{row.name}</code>
+          {row.moduleLine !== null && <span className="code-map__metrics-table-module">{row.moduleLine}</span>}
+          {/* Same-name rows (two `handle`s in one file) differ here for
+              assistive tech, not only in the `title`. */}
+          <span className="visually-hidden">{`, ${row.file} line ${row.startLine}`}</span>
+          {row.coverageGap && (
+            <span
+              className="code-map__metrics-table-coverage-gap"
+              role="img"
+              aria-label="Coverage gap"
+              title="Coverage gap — no summary"
+            >
+              ⚠
+            </span>
+          )}
+          <span className="visually-hidden">{`, ${HEALTH_ROW_AFFORDANCE}`}</span>
+        </button>
+      </th>
+      <td className="code-map__metrics-table-cell">{String(row.hop)}</td>
+      <MetricSignalCell signal={row.complexity} columnMax={barMax.complexity} />
+      <MetricSignalCell signal={row.blastRadius} columnMax={barMax.blastRadius} />
+      <MetricTestsCell state={metricTestsState(row)} />
+      <td
+        className={
+          row.findings === null
+            ? 'code-map__metrics-table-cell code-map__metrics-table-cell--empty'
+            : 'code-map__metrics-table-cell'
+        }
+      >
+        {formatMetricFindingsCell(row.findings)}
+      </td>
+    </tr>
+  );
   return (
     // A scroll region, so it takes a focus stop for keyboard scrolling, like
     // `.code-map__health-grid`.
@@ -4375,6 +4589,7 @@ export function PrReviewMetricsTable({
             })}
           </tr>
         </thead>
+        {sort !== null && hasContracts && contractGroup}
         {/* P4-3d review: a sort on a capped table says it covers only the
             rows shown. Inert; its own tbody, so the rows' zebra keeps its
             parity. */}
@@ -4385,77 +4600,23 @@ export function PrReviewMetricsTable({
             </tr>
           </tbody>
         )}
-        <tbody>
-          {rows.map((row) => (
-            <tr
-              key={row.id}
-              className={
-                row.hop === 'changed'
-                  ? 'code-map__metrics-table-row code-map__metrics-table-row--changed'
-                  : 'code-map__metrics-table-row'
-              }
-              // P4-3e: a click on any cell runs the row button's action; the
-              // row itself is no control and no tab stop.
-              onClick={(event) =>
-                activateMetricsRowFromCell(
-                  event.currentTarget.querySelector<HTMLButtonElement>(`.${METRICS_ROW_BUTTON_CLASS}`),
-                  event.target as Node,
-                  !(window.getSelection()?.isCollapsed ?? true),
-                  row.node,
-                  onActivateNode,
-                )
-              }
-            >
-              <th scope="row" className="code-map__metrics-table-node" title={row.id}>
-                {/* P4-3e: the row's one control, as `HealthAuditClusterRow`'s
-                    button — Enter, Space, the tab stop and the role come from
-                    the platform. It hands over ITS OWN Node object. No
-                    `aria-label`: the name is the cell's content, then the
-                    visually hidden `HEALTH_ROW_AFFORDANCE`. Keyed rows keep
-                    this element across re-sorts and depth steps, so closing
-                    Node detail returns focus to it. */}
-                <button type="button" className={METRICS_ROW_BUTTON_CLASS} onClick={() => onActivateNode(row.node)}>
-                  <code className="code-map__metrics-table-name">{row.name}</code>
-                  {row.moduleLine !== null && <span className="code-map__metrics-table-module">{row.moduleLine}</span>}
-                  {/* Same-name rows (two `handle`s in one file) differ here for
-                      assistive tech, not only in the `title`. */}
-                  <span className="visually-hidden">{`, ${row.file} line ${row.startLine}`}</span>
-                  {row.coverageGap && (
-                    <span
-                      className="code-map__metrics-table-coverage-gap"
-                      role="img"
-                      aria-label="Coverage gap"
-                      title="Coverage gap — no summary"
-                    >
-                      ⚠
-                    </span>
-                  )}
-                  <span className="visually-hidden">{`, ${HEALTH_ROW_AFFORDANCE}`}</span>
-                </button>
-              </th>
-              <td className="code-map__metrics-table-cell">{String(row.hop)}</td>
-              <MetricSignalCell signal={row.complexity} columnMax={barMax.complexity} />
-              <MetricSignalCell signal={row.blastRadius} columnMax={barMax.blastRadius} />
-              <MetricTestsCell state={metricTestsState(row)} />
-              <td
-                className={
-                  row.findings === null
-                    ? 'code-map__metrics-table-cell code-map__metrics-table-cell--empty'
-                    : 'code-map__metrics-table-cell'
-                }
-              >
-                {formatMetricFindingsCell(row.findings)}
-              </td>
-            </tr>
-          ))}
-          {/* P4-3c: the affected rows' cap. Inert: no handler, no focus
-              stop — the only action is the depth stepper above. */}
-          {hiddenAffected !== null && (
-            <tr className="code-map__metrics-cap">
-              <td colSpan={PR_REVIEW_METRICS_COLUMN_COUNT}>{hiddenAffected}</td>
-            </tr>
-          )}
-        </tbody>
+        {/* P4-3g: in the default order, with contracts, the changed rows
+            get their own tbody so the contract group can sit after them. */}
+        {leadingRows.length > 0 && <tbody>{leadingRows.map(renderRow)}</tbody>}
+        {sort === null && hasContracts && contractGroup}
+        {/* P4-3g review: no empty tbody (a contract-only table). */}
+        {(trailingRows.length > 0 || hiddenAffected !== null) && (
+          <tbody>
+            {trailingRows.map(renderRow)}
+            {/* P4-3c: the affected rows' cap. Inert: no handler, no focus
+                stop — the only action is the depth stepper above. */}
+            {hiddenAffected !== null && (
+              <tr className="code-map__metrics-cap">
+                <td colSpan={PR_REVIEW_METRICS_COLUMN_COUNT}>{hiddenAffected}</td>
+              </tr>
+            )}
+          </tbody>
+        )}
       </table>
       {missing !== null && <p className="code-map__metrics-table-missing">{missing}</p>}
       {missingAffected !== null && (
@@ -4636,8 +4797,11 @@ function topLevelFileButtons(files: readonly TopLevelChangedFile[], onOpenFile: 
   ));
 }
 
-/** P4-2 phase 3c: a changed contract's name, as the button that opens its type detail. */
-function ChangedContractButton({ contract, onOpenType }: { contract: ChangedContract; onOpenType: (id: string) => void }) {
+/**
+ * P4-2 phase 3c: a changed contract's name, as the button that opens its
+ * type detail. P4-3g: exported — the metrics table's contract rows reuse it.
+ */
+export function ChangedContractButton({ contract, onOpenType }: { contract: ChangedContract; onOpenType: (id: string) => void }) {
   return (
     <button
       type="button"
@@ -10280,7 +10444,10 @@ export function CodeMap({
           `activateNode` — no mode switch, no Path Trace side effect, no
           viewport move, and no `focusedNodeIdRef` write (P0-2c's accepted
           degradation, above). `useModalLayer` returns focus to the row's
-          button on close, or to `.code-map` if the row has gone. */}
+          button on close, or to `.code-map` if the row has gone.
+          P4-3g: the gate also opens for changed contracts alone; a contract
+          row opens its type detail through `openType`, as the toolbar's
+          contract lines (`PrReviewDiffScopeNoticeRegion`) do. */}
       {prReviewMetricsTableProps !== null && (
         <>
           <MetricsTableDivider
@@ -10293,6 +10460,7 @@ export function CodeMap({
             sort={prReviewMetricSort}
             onSort={setPrReviewMetricSort}
             onActivateNode={openNodeDetail}
+            onOpenType={openType}
           />
         </>
       )}
