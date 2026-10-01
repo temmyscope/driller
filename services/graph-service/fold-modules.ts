@@ -123,10 +123,13 @@ export function foldModules<TNode extends { id: string; file: string; kind: stri
 export function scopeFoldedModules(
   foldedModules: readonly FoldedModule[],
   mapNodeIds: ReadonlySet<string>,
-  includedPaths: readonly string[],
+  // P4-4 phase 1a: or a file predicate (`buildScopedCodeMap`'s `keepFile`).
+  includedPaths: readonly string[] | ((file: string) => boolean),
 ): FoldedModule[] {
+  const keepFile =
+    typeof includedPaths === 'function' ? includedPaths : (file: string) => isFileInScope(file, includedPaths);
   return foldedModules
-    .filter((module) => isFileInScope(module.file, includedPaths))
+    .filter((module) => keepFile(module.file))
     .map((module) =>
       module.uses.every((use) => mapNodeIds.has(use.id))
         ? module

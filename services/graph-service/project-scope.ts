@@ -100,3 +100,22 @@ export function isScopeChangedRequest(data: unknown): data is GraphServiceScopeC
 export function isFileInScope(file: string, includedPaths: readonly string[]): boolean {
   return includedPaths.length === 0 || includedPaths.some((prefix) => file === prefix || file.startsWith(`${prefix}/`));
 }
+
+/**
+ * P4-4 (AD-13 "Section scope", founder decision 3): the allowlist entry that
+ * owns `file` — the longest entry `isFileInScope(file, [entry])` accepts, so
+ * with nested entries (`apps`, `apps/web`) the nearest one wins and every
+ * in-scope file belongs to exactly one section. Path-boundary aware like
+ * `isFileInScope` (`web` never owns `webapp/x.ts`). `undefined` when no entry
+ * contains `file` (always, for an empty allowlist). Pure — the caller
+ * normalizes `file` first.
+ */
+export function sectionOfFile(file: string, includedPaths: readonly string[]): string | undefined {
+  let owner: string | undefined;
+  for (const entry of includedPaths) {
+    if (isFileInScope(file, [entry]) && (owner === undefined || entry.length > owner.length)) {
+      owner = entry;
+    }
+  }
+  return owner;
+}

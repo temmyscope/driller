@@ -190,9 +190,12 @@ export function foldTypes<
 export function scopeFoldedTypes(
   foldedTypes: readonly FoldedType[],
   mapNodeKinds: ReadonlyMap<string, string>,
-  includedPaths: readonly string[],
+  // P4-4 phase 1a: or a file predicate (`buildScopedCodeMap`'s `keepFile`).
+  includedPaths: readonly string[] | ((file: string) => boolean),
 ): FoldedType[] {
-  const inScope = foldedTypes.filter((type) => isFileInScope(type.file, includedPaths));
+  const keepFile =
+    typeof includedPaths === 'function' ? includedPaths : (file: string) => isFileInScope(file, includedPaths);
+  const inScope = foldedTypes.filter((type) => keepFile(type.file));
   const typeIds = new Set(inScope.map((type) => type.id));
   const keepTypes = (ids: string[]) => ids.filter((id) => typeIds.has(id));
   return inScope.map((type) => {

@@ -349,8 +349,10 @@ export function classifyNode(
 export function annotateNodesWithSummaryState(
   nodes: CodeMapNode[],
   coverageGapFiles: ReadonlySet<string>,
+  // P4-4 phase 1a: injectable, like `classifyNode`'s, for `buildScopedCodeMap`'s tests.
+  getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
 ): CodeMapNode[] {
-  return nodes.map((node) => ({ ...node, ...classifyNode(node, coverageGapFiles) }));
+  return nodes.map((node) => ({ ...node, ...classifyNode(node, coverageGapFiles, getRecord) }));
 }
 
 /**

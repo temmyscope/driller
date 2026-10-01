@@ -8,8 +8,10 @@ import { describe, it } from 'node:test';
 
 import {
   applyScopeChanged,
+  isFileInScope,
   isScopeChangedRequest,
   resolveIncludedPathsOnIndexSuccess,
+  sectionOfFile,
   type ScopeState,
 } from './project-scope';
 
@@ -113,5 +115,58 @@ describe('isScopeChangedRequest', () => {
     assert.equal(isScopeChangedRequest({ type: 'graphService:index', path: A, includedPaths: [] }), false);
     assert.equal(isScopeChangedRequest(null), false);
     assert.equal(isScopeChangedRequest('graphService:scopeChanged'), false);
+  });
+});
+
+// P4-4 phase 1a (AD-13 "Section scope"): the nearest (longest) allowlist
+// entry owns a file; path boundaries are respected.
+describe('sectionOfFile', () => {
+  it('maps a file to the entry that contains it, on a path boundary', () => {
+    assert.equal(sectionOfFile('api/x.ts', ['web', 'api']), 'api');
+    assert.equal(sectionOfFile('web/a/b.ts', ['web', 'api']), 'web');
+    assert.equal(sectionOfFile('webapp/x.ts', ['web', 'api']), undefined);
+    // A file that IS the entry belongs to it, like `isFileInScope`.
+    assert.equal(sectionOfFile('web', ['web', 'api']), 'web');
+  });
+
+  it('nested entries: the longest containing entry wins, whatever the allowlist order', () => {
+    for (const allowlist of [['apps', 'apps/web'], ['apps/web', 'apps']]) {
+      assert.equal(sectionOfFile('apps/web/a.ts', allowlist), 'apps/web');
+      assert.equal(sectionOfFile('apps/b.ts', allowlist), 'apps');
+      // `apps/webapp` is under `apps`, not `apps/web`.
+      assert.equal(sectionOfFile('apps/webapp/c.ts', allowlist), 'apps');
+    }
+    assert.equal(sectionOfFile('a/b/c/d.ts', ['a', 'a/b/c', 'a/b']), 'a/b/c');
+  });
+
+  it('a file outside the allowlist, and any file under an empty allowlist, has no section', () => {
+    assert.equal(sectionOfFile('docs/a.md', ['web', 'api']), undefined);
+    assert.equal(sectionOfFile('web/a.ts', []), undefined);
+  });
+
+  it('each in-scope file is in exactly one section, so the per-section counts sum to the in-scope total', () => {
+    const allowlist = ['apps', 'apps/web', 'web', 'api'];
+    const files = [
+      'apps/b.ts',
+      'apps/web/a.ts',
+      'apps/web/deep/c.ts',
+      'apps/webapp/d.ts',
+      'web/a.ts',
+      'webapp/x.ts',
+      'api/s.ts',
+      'docs/a.md',
+      'apps',
+    ];
+    const counts = new Map<string, number>();
+    for (const file of files) {
+      const section = sectionOfFile(file, allowlist);
+      if (section !== undefined) {
+        assert.ok(isFileInScope(file, [section]), `${file} is inside its own section`);
+        counts.set(section, (counts.get(section) ?? 0) + 1);
+      }
+    }
+    assert.deepEqual(Object.fromEntries(counts), { apps: 3, 'apps/web': 2, web: 1, api: 1 });
+    const inScope = files.filter((file) => isFileInScope(file, allowlist)).length;
+    assert.equal([...counts.values()].reduce((sum, n) => sum + n, 0), inScope);
   });
 });

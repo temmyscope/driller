@@ -182,16 +182,19 @@ import { indexRepository, stopCbmDaemon } from './mcp-client';
 import { deriveLiveNode } from './live-node';
 import {
   applyScopeChanged,
-  isFileInScope,
   isScopeChangedRequest,
   resolveIncludedPathsOnIndexSuccess,
   type PendingScopeOverride,
 } from './project-scope';
-import { attachProjectRiskSignals } from './risk-signals';
-import { attachFoldedModuleLinks, scopeFoldedModules } from './fold-modules';
-import { attachTypeUses, capFoldedTypeUsedBy, scopeFoldedTypes, splitModuleTypeUses } from './fold-types';
+import { capFoldedTypeUsedBy } from './fold-types';
 import { fetchProductionCodeMap } from './production-code-map';
-import { attachSimilar } from './similar';
+import {
+  buildScopedCodeMap,
+  filterCodeMapToScope,
+  keepFileForScope,
+  type ActiveRawCodeMap,
+  type RawCodeMap,
+} from './scoped-code-map';
 import { toProjectRelativePosixPath } from './project-path';
 import { isTestPath } from './test-code';
 import { startMcpServer } from './mcp-server';
@@ -483,6 +486,61 @@ let activeFoldedModules: FoldedModule[] | undefined;
 // Nodes (`fold-types.ts`), scope-filtered like its Nodes. Same lifecycle as
 // `activeFoldedModules`. Read by `lookup_node` (a type id resolves as folded).
 let activeFoldedTypes: FoldedType[] | undefined;
+
+// P4-4 phase 1a: the raw fetch the current map was built from — the
+// `fetchProductionCodeMap` result, its LCOV report, the index's coverage-gap
+// files — and the indexing scope it was built with. Later P4-4 phases build
+// a section's map from it (`buildScopedCodeMap`) instead of re-fetching.
+// Same lifecycle as `activeCodeMapNodes`/`activeCodeMapEdges`, so it always
+// describes the map they hold:
+//  - set in the same synchronous statement as them, inside
+//    `startSummaryGenerationForProject` (a backend switch or model retry
+//    re-caches the same value, unchanged);
+//  - replaced by every Code Map fetch (`handleGetCodeMapRequest`), which is
+//    also when a new LCOV report or a saved scope change is picked up;
+//  - cleared with them when any index starts (`handleIndexRequest`) — a
+//    re-index of this project or a switch to another one.
+// A `scopeChanged` alone does not clear it: like the Nodes, it keeps
+// describing the last map until the next fetch (its `appliedScope` says
+// which scope that was).
+// Review round 1: stamped with the project root and the index generation its
+// fetch started under. A fetch that was still in flight when an index
+// started (a re-index, or a switch to another project) is never cached here,
+// and `getActiveRawCodeMap` returns `null` for any stamp that is not the
+// active project's current generation. (The Nodes/edges caches keep their
+// pre-existing behaviour: such a fetch still lands in them.)
+let activeRawCodeMap: ActiveRawCodeMap | undefined;
+
+// Review round 1 (P4-4 phase 1a): bumped when any index starts
+// (`handleIndexRequest`), the moment every cached map becomes the previous
+// generation's. Stamps `activeRawCodeMap`.
+let indexGeneration = 0;
+
+/** Whether `rawCodeMap` came from a fetch for the active project in the current index generation. */
+function isCurrentRawCodeMap(rawCodeMap: ActiveRawCodeMap): boolean {
+  return rawCodeMap.indexGeneration === indexGeneration && rawCodeMap.raw.projectRoot === activeProjectPath;
+}
+
+/**
+ * P4-4 phase 1a: the raw fetch behind the current map (see
+ * `activeRawCodeMap`), or `null` when there is none for the active project's
+ * current index generation. Read-only: the object and its `raw` and
+ * `appliedScope` are frozen (shallowly — the fetched Nodes, folded Modules
+ * and folded types inside are the same objects the live caches and replies
+ * share, so never mutate them). For tests and later P4-4 phases.
+ */
+export function getActiveRawCodeMap(): Readonly<ActiveRawCodeMap> | null {
+  return activeRawCodeMap !== undefined && isCurrentRawCodeMap(activeRawCodeMap) ? activeRawCodeMap : null;
+}
+
+/**
+ * Tests only: the stored `activeRawCodeMap` without `getActiveRawCodeMap`'s
+ * stamp check, so a test can see that it is cleared (and never set to a stale
+ * fetch) rather than only that the reader hides it.
+ */
+export function peekActiveRawCodeMapForTests(): Readonly<ActiveRawCodeMap> | undefined {
+  return activeRawCodeMap;
+}
 
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
@@ -934,7 +992,7 @@ function handleRetryModelRequest(): void {
         // (`activeGenerationRunId`/`activeJudgmentGenerationRunId`) clears
         // itself in its `finally`, so neither blocks this restart — while
         // still stopping a duplicate if one is somehow already running.
-        startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? []).catch(
+        startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap).catch(
           logFailure('summary generation'),
         );
         startJudgmentGenerationForProject(nodes).catch(logFailure('judgment generation'));
@@ -1166,6 +1224,11 @@ async function handleIndexRequest(
   // P4-2 phase 3a: same lifecycle as the two above.
   activeFoldedModules = undefined;
   activeFoldedTypes = undefined;
+  // P4-4 phase 1a: same lifecycle as the four above. Review round 1: and a
+  // new generation, so a fetch still in flight from before this point is
+  // never cached as the raw map.
+  activeRawCodeMap = undefined;
+  indexGeneration += 1;
   // Story 5.1 (Phase 2): reset alongside `activeCodeMapEdges` — same
   // never-serve-a-since-superseded-project's-coverage-summary reasoning.
   activeCoverageSummary = undefined;
@@ -1333,55 +1396,6 @@ async function handleIndexRequest(
  * the combined guard below only makes that existing invariant visible to the
  * type checker, it changes no observable behavior.
  */
-/**
- * Filters `nodes`/`edges` to only those under one of `includedPaths`'
- * project-root-relative POSIX subfolder prefixes (Bug fix, 2026-09-23) — see
- * `ProjectScopeConfig`'s own doc comment in ipc-contracts for why this is a
- * query-time filter over an already-fully-fetched Node/edge set, rather than
- * a narrower `index_repository` call (CBM has no such parameter). A no-op
- * (returns `nodes`/`edges` unchanged, same array references) when
- * `includedPaths` is empty — the pre-existing, unrestricted default every
- * project without a persisted scope setting gets.
- *
- * `node.file` is normalized for the match test only, via the same
- * `toProjectRelativePosixPath` every other consumer of a backend-returned
- * `file` field already normalizes through — never mutates the returned
- * node's own `file` field, so this works identically whether the caller has
- * already normalized `nodes` itself (`handleGetCodeMapRequest`, idempotent
- * on an already-POSIX-relative string) or hasn't (`computePathTraceResult`,
- * which never normalizes `file` at all since `traceCallPath` doesn't need
- * it).
- *
- * A prefix match respects path boundaries (`"web"` matches `"web/x.ts"` and
- * a Node whose file IS exactly `"web"`, never `"webapp/x.ts"`) — a plain
- * `String.startsWith` would false-positive on a sibling folder sharing a
- * name prefix.
- *
- * Edges are filtered to require BOTH endpoints survive the node filter —
- * same "no dangling edges to entities outside the fetched node set"
- * reasoning `mcp-client.ts`'s `CODE_MAP_EDGES_QUERY` comment already
- * establishes for its own label filtering (a dangling edge is harmless —
- * React Flow silently drops it — but `buildBidirectionalAdjacency`'s blast-
- * radius BFS has no reason to walk through a Node this filter just
- * excluded, and `traceCallPath` has no reason to trace through one either).
- */
-function filterCodeMapToScope<TNode extends { id: string; file: string }, TEdge extends { source: string; target: string }>(
-  projectRoot: string,
-  nodes: TNode[],
-  edges: TEdge[],
-  includedPaths: readonly string[],
-): { nodes: TNode[]; edges: TEdge[] } {
-  if (includedPaths.length === 0) {
-    return { nodes, edges };
-  }
-  const isIncludedFile = (file: string): boolean =>
-    isFileInScope(toProjectRelativePosixPath(projectRoot, file, 'indexing scope filter'), includedPaths);
-  const filteredNodes = nodes.filter((node) => isIncludedFile(node.file));
-  const includedIds = new Set(filteredNodes.map((node) => node.id));
-  const filteredEdges = edges.filter((edge) => includedIds.has(edge.source) && includedIds.has(edge.target));
-  return { nodes: filteredNodes, edges: filteredEdges };
-}
-
 async function handleGetCodeMapRequest(): Promise<void> {
   if (activeProject === undefined || activeProjectPath === undefined) {
     postCodeMapMessage({
@@ -1391,6 +1405,9 @@ async function handleGetCodeMapRequest(): Promise<void> {
     return;
   }
   const projectRoot = activeProjectPath;
+  // Review round 1 (P4-4 phase 1a): the generation this fetch starts under,
+  // stamped on the raw cache (see `activeRawCodeMap`).
+  const generation = indexGeneration;
   try {
     // P4-2 phase 1: `fetchProductionCodeMap` normalizes every Node's `file`
     // and drops test code (Nodes, edges touching them, test files' hotspot
@@ -1408,100 +1425,57 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // each Node carries the types it uses as `usesTypes`.
     // P4-2 phase 4: and attaches `similarTo` (Node detail's "Similar
     // implementations", and `lookup_node`) from the backend's `SIMILAR_TO`.
-    const {
-      nodes: normalizedNodesUnfiltered,
-      edges: productionEdges,
-      foldedModules: foldedModulesUnfiltered,
-      foldedTypes: foldedTypesUnfiltered,
-      similarPairs,
-    } = await fetchProductionCodeMap(
+    const fetched = await fetchProductionCodeMap(
       activeProject,
       projectRoot,
       'Code Map',
       { includeTestedBy: true, includeImplements: true, includeSimilar: true },
     );
-    // Bug fix (2026-09-23): filtered post-normalization (cheaper — avoids
-    // `filterCodeMapToScope`'s own internal normalize-for-match-test running
-    // twice) — see `filterCodeMapToScope`'s own doc comment.
     // P2-5: captured once, so the scope reported with the map is exactly the
-    // one this filter call used.
+    // one the pipeline's filter used.
+    // P4-4 phase 1a: this and the index's coverage-gap files are read right
+    // after the fetch, before the LCOV `await` — the same point the inline
+    // pipeline read them.
     const appliedScope = [...activeIncludedPaths];
-    const { nodes: scopedNodes, edges } = filterCodeMapToScope(
-      projectRoot,
-      normalizedNodesUnfiltered,
-      productionEdges,
-      appliedScope,
-    );
-    // P4-2 phase 3a: a folded Module is in scope exactly when its file is,
-    // and names only Nodes that survived the scope filter; the Nodes' own
-    // `fileTopLevel`/`calledAtLoadBy` are re-derived from that scoped set.
-    const scopedNodeIds = new Set(scopedNodes.map((node) => node.id));
-    // P4-2 phase 3b: the same for folded types — in scope when their file
-    // is, naming only scoped Nodes; `usesTypes` is re-derived from that set.
-    // A folded Module's top-level type uses keep only in-scope types.
-    const foldedTypes = scopeFoldedTypes(
-      foldedTypesUnfiltered,
-      new Map(scopedNodes.map((node) => [node.id, node.kind])),
-      appliedScope,
-    );
-    const foldedModules = splitModuleTypeUses(
-      scopeFoldedModules(foldedModulesUnfiltered, scopedNodeIds, appliedScope),
-      foldedTypes,
-    );
-    // P4-2 phase 4: `similarTo` is re-derived from the scoped set too, so a
-    // similar implementation is named only when it is on this (scoped) map.
-    const normalizedNodes = attachSimilar(
-      attachTypeUses(attachFoldedModuleLinks(scopedNodes, foldedModules), foldedTypes),
-      similarPairs,
-    );
-    const annotatedNodes = annotateNodesWithSummaryState(normalizedNodes, coverageGapFileSet);
-    // Story 2.1 (Phase 1): attach FR7's deterministic risk signals, computed
-    // live on every fetch — never persisted to `node-record-store.ts`
-    // (Boundaries & Constraints; unlike `summary` there's no expensive state
-    // here to protect from re-index). Adjacency for blast radius is built
-    // once here (review round, patch) and reused across every Node's BFS —
-    // `computeBlastRadius` used to be called per-Node, rebuilding it from
-    // scratch every time (O(N·(V+E)) instead of O(V+E)).
-    const blastRadiusAdjacency = buildBidirectionalAdjacency(normalizedNodes, edges);
+    const coverageGapFiles = coverageGapFileSet;
     // Story 2.1 (Phase 2): loaded once per fetch (not per-Node) — a
     // wholly independent data source from the backend-query-derived
-    // signals above (Intent), read fresh every fetch for the same
-    // never-persisted, always-recomputed reasoning as the rest of
-    // `riskSignals` (FR7 reproducibility). `undefined` when
-    // `coverage/lcov.info` doesn't exist or doesn't parse — never thrown,
-    // so it can never fail this fetch (Boundaries & Constraints).
+    // signals, read fresh every fetch for the same never-persisted,
+    // always-recomputed reasoning as the rest of `riskSignals` (FR7
+    // reproducibility). `undefined` when `coverage/lcov.info` doesn't exist
+    // or doesn't parse — never thrown, so it can never fail this fetch.
     // P4-3f review round 1: the report also carries the `FN:`/`FNDA:`
     // records and the listed files newer than it, which decide
     // `testCoverageHit` (the table's `covered`); `test-coverage-gap` still
     // reads its `DA:` lines alone.
+    // P4-4 phase 1a: loaded before the (now synchronous) pipeline rather
+    // than between its scope steps and its risk-signal step; nothing in the
+    // pipeline reads it earlier, so the result is the same.
     const coverage = await loadLcovCoverage(projectRoot);
-    // P1-1: severity for `blast-radius`/`hotspot` is project-relative, so
-    // `attachProjectRiskSignals` builds every Node's signals, rates them in
-    // one whole-project pass, and zips them back onto `annotatedNodes` before
-    // anything is posted or cached — the renderer and `lookup_node` (which
-    // carries these cached deterministic signals unchanged) therefore read
-    // the same `severity`. Signals are built off `normalizedNodes` (not
-    // `annotatedNodes`, whose declared type has lost the raw complexity/
-    // cognitive/hotspot fields); both are 1:1 in order off the same nodes.
-    const nodesWithRiskSignals: CodeMapNode[] = attachProjectRiskSignals(
-      annotatedNodes,
-      normalizedNodes,
-      blastRadiusAdjacency,
-      coverage,
-    );
-    // P2-5: how many Nodes the scope filter removed — reported with the map
-    // (and the scope that removed them) so an empty map can say the scope hid
-    // everything. Counted over the same set the map shows: `fetchCodeMap`
-    // returns only map-eligible Nodes (`CODE_MAP_NODES_QUERY`'s
-    // Function/Interface/Type/Module label filter), and every step after the
-    // scope filter maps 1:1, so `nodesWithRiskSignals.length ===
-    // normalizedNodes.length` and "this project's N Nodes" is never
-    // overcounted with non-eligible ones.
-    const hiddenByScope = normalizedNodesUnfiltered.length - normalizedNodes.length;
+    // P4-4 phase 1a: everything this map is built from, cached with it
+    // (`activeRawCodeMap`) so later phases can re-filter without re-fetching.
+    const raw: RawCodeMap = { projectRoot, fetched, coverage, coverageGapFiles };
+    // P4-4 phase 1a: the whole pipeline — scope filter, folded type/Module
+    // re-scoping, folded-link / type-use / similar re-attach, summary state,
+    // adjacency, project-relative severity and the LCOV flags — is
+    // `buildScopedCodeMap` (`scoped-code-map.ts`, where each step's
+    // reasoning now lives). Severity is relative to the in-scope set.
+    const {
+      nodes: nodesWithRiskSignals,
+      edges,
+      preSignalNodes: normalizedNodes,
+      foldedTypes,
+      foldedModules,
+      hiddenByScope,
+    } = buildScopedCodeMap(raw, keepFileForScope(appliedScope));
     postCodeMapMessage({
       type: 'graphService:codeMap',
       nodes: nodesWithRiskSignals,
       edges,
+      // P2-5: how many Nodes the scope filter removed — reported with the
+      // map (and the scope that removed them) so an empty map can say the
+      // scope hid everything. Test Nodes never reach the scope filter, so
+      // they are never counted here.
       hiddenByScope,
       appliedScope,
       // Capped per type for the reply only (`usedByTotal` stays the full
@@ -1522,20 +1496,25 @@ async function handleGetCodeMapRequest(): Promise<void> {
     // `normalizedNodes`'s fields (via `annotatedNodes`), so this is safe for
     // every existing consumer of `activeCodeMapNodes`.
     //
-    // Review finding (High — real race condition): `edges` is passed through
-    // here rather than cached separately right after the `fetchCodeMap` call
-    // above — `startSummaryGenerationForProject` now sets
-    // `activeCodeMapNodes`/`activeCodeMapEdges` together, in the same
+    // Review finding (High — real race condition): `edges` (and P4-4 phase
+    // 1a's `raw`) are passed through here rather than cached separately —
+    // `startSummaryGenerationForProject` sets `activeCodeMapNodes`/
+    // `activeCodeMapEdges`/`activeRawCodeMap` together, in the same
     // synchronous tick (its own doc comment). An earlier version cached
-    // `edges` right here, synchronously after `fetchCodeMap`, while
-    // `activeCodeMapNodes` was only (re)assigned later inside
-    // `startSummaryGenerationForProject` — with the real `await
-    // loadLcovCoverage(...)` in between, an `expandBlastRadius` request
-    // landing in that window computed against a mismatched nodes/edges pair
-    // (new edges, stale nodes) with no error, since neither the
-    // `activeProjectPath` nor the `activeSummaryGenerationId` guard changes
-    // on a plain Code Map refetch of the same project.
-    void startSummaryGenerationForProject(nodesWithRiskSignals, edges, foldedModules, foldedTypes);
+    // `edges` right after `fetchCodeMap`, while `activeCodeMapNodes` was only
+    // (re)assigned later inside `startSummaryGenerationForProject` — with the
+    // real `await loadLcovCoverage(...)` in between, an `expandBlastRadius`
+    // request landing in that window computed against a mismatched
+    // nodes/edges pair (new edges, stale nodes) with no error, since neither
+    // the `activeProjectPath` nor the `activeSummaryGenerationId` guard
+    // changes on a plain Code Map refetch of the same project.
+    // Frozen (shallowly) — read-only to every reader; see `getActiveRawCodeMap`.
+    const rawCodeMap: ActiveRawCodeMap = Object.freeze({
+      raw: Object.freeze(raw),
+      appliedScope: Object.freeze([...appliedScope]),
+      indexGeneration: generation,
+    });
+    void startSummaryGenerationForProject(nodesWithRiskSignals, edges, foldedModules, foldedTypes, rawCodeMap);
     // Story 2.2 Phase 2: judgment generation kicked off the same
     // fire-and-forget way, alongside the summary/staleness kick-offs — never
     // delays this response (AD-8). Same `nodesWithRiskSignals` set (not
@@ -2291,6 +2270,9 @@ async function startSummaryGenerationForProject(
   foldedModules: FoldedModule[],
   // P4-2 phase 3b: cached with them, the same way.
   foldedTypes: FoldedType[],
+  // P4-4 phase 1a: the raw fetch these were built from, cached with them the
+  // same way (`activeRawCodeMap`).
+  rawCodeMap: ActiveRawCodeMap | undefined,
 ): Promise<void> {
   const generationId = activeSummaryGenerationId;
   const projectRoot = activeProjectPath;
@@ -2303,6 +2285,9 @@ async function startSummaryGenerationForProject(
   activeCodeMapEdges = edges;
   activeFoldedModules = foldedModules;
   activeFoldedTypes = foldedTypes;
+  // Review round 1: never a fetch from before the latest index started (or
+  // for another project) — see `activeRawCodeMap`.
+  activeRawCodeMap = rawCodeMap !== undefined && isCurrentRawCodeMap(rawCodeMap) ? rawCodeMap : undefined;
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
@@ -2625,7 +2610,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
     // genuinely-blocked/pending Nodes (e.g. blocked on a missing key that
     // now exists) are retried.
     activeSummaryGenerationId += 1;
-    void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? []);
+    void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap);
     return;
   }
 
@@ -2665,7 +2650,7 @@ async function handleBackendSwitchedRequest(backendConfig: {
   }
 
   activeSummaryGenerationId += 1;
-  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? []);
+  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap);
 }
 
 process.parentPort?.on('message', (event) => {
