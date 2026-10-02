@@ -126,7 +126,10 @@ export function diffScopeSyncTimeFor(result: { status: DiffScopeResult['status']
     case 'not-a-git-repo':
     case 'no-base-ref-resolvable':
       return now;
+    // P4-4 phase 2a: `unknown-section` — the section left the allowlist, so
+    // nothing was synced.
     case 'error':
+    case 'unknown-section':
       return null;
     default: {
       const unknownStatus: never = status;

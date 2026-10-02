@@ -105,6 +105,7 @@ import type {
   TestedByTest,
   TopLevelChangedFile,
   TypeUse,
+  UnknownSectionResult,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
 import {
@@ -276,6 +277,62 @@ export function codeMapFailureMessage(result: Exclude<CodeMapResult, { status: '
   return result.status === 'unknown-section'
     ? `The section "${result.section}" is not in this project's included subfolders.`
     : result.message;
+}
+
+/**
+ * P4-4 phase 2a: settles one section-scoped operation's reply (Path Trace,
+ * diff scope or Blast Radius expansion) — the renderer's one rule for all
+ * three, on top of each operation's own request-id guard:
+ *  - a reply for a section other than the one on screen now (the section
+ *    changed while it was in flight) is dropped — it never applies, even if
+ *    nothing else bumped the request id;
+ *  - `unknown-section` (the section left the allowlist) calls
+ *    `unknownSection` — `CodeMap` resets the operation and hands the section
+ *    to `onUnknownSection`, the same fallback to `all` as the Code Map fetch;
+ *  - anything else is the operation's own result, for `apply`.
+ * `requestedSection` is the section the request was sent with, `null` for
+ * the whole scope. Hookless, so it's testable.
+ */
+export function settleSectionScopedReply<R extends { status: string }>(
+  result: R | UnknownSectionResult,
+  requestedSection: string | null,
+  currentSection: string | null,
+  handlers: { apply: (result: R) => void; unknownSection: (section: string) => void },
+): void {
+  if (requestedSection !== currentSection) {
+    return;
+  }
+  if (isUnknownSectionResult(result)) {
+    handlers.unknownSection(result.section);
+    return;
+  }
+  handlers.apply(result);
+}
+
+/**
+ * P4-4e review round 1: the Blast Radius expansion's state after an
+ * `unknown-section` reply. With a fallback (`onUnknownSection`, P4-4d) it is
+ * called and the state is left to the reload it triggers (`null`: no
+ * change). Without one, the expansion must not stay `loading` forever, and
+ * can't go back to `idle` (the auto-trigger would re-send the same unknown
+ * section), so it becomes the explicit error naming the section.
+ */
+export function blastRadiusStateOnUnknownSection(
+  section: string,
+  fallback: ((section: string) => void) | undefined,
+): BlastRadiusState | null {
+  if (fallback !== undefined) {
+    fallback(section);
+    return null;
+  }
+  return {
+    status: 'error',
+    message: codeMapFailureMessage({ status: 'unknown-section', section, knownSections: [] }),
+  };
+}
+
+function isUnknownSectionResult(result: { status: string }): result is UnknownSectionResult {
+  return result.status === 'unknown-section';
 }
 
 /**
@@ -4758,7 +4815,7 @@ export function contractDependents(
  * diff-scope request stores it (a resolved `nodeIds` becomes a `Set`, and
  * `topLevelFiles` is always present). Hookless, so it's testable.
  */
-export function diffScopeStateFromResult(result: DiffScopeResult): DiffScopeState {
+export function diffScopeStateFromResult(result: Exclude<DiffScopeResult, UnknownSectionResult>): DiffScopeState {
   switch (result.status) {
     case 'resolved':
       return {
@@ -5829,6 +5886,20 @@ export interface CodeMapProps {
    * has already reported it), so the button's pending state can end.
    */
   onReindex: () => Promise<boolean>;
+  /**
+   * P4-4 phase 2a: the section on screen (one allowlist entry), or `null` /
+   * omitted for the whole scope. Path Trace, diff scope and Blast Radius
+   * expansion are sent with it (`section ?? undefined`), and a reply for any
+   * other section is dropped (`settleSectionScopedReply`). P4-4d's Section
+   * bar supplies it; until then it is always the whole scope.
+   */
+  section?: string | null;
+  /**
+   * P4-4 phase 2a: called with the section when one of those operations
+   * replies `unknown-section` — the shell falls back to `all` (P4-4d), as
+   * for the Code Map fetch. The operation itself is reset to idle here.
+   */
+  onUnknownSection?: (section: string) => void;
 }
 
 /** P0-3: the `title` every Graph-Service-backed action carries while it's disabled for not being live. */
@@ -6654,13 +6725,13 @@ export function resolvePathTraceQuery(
   query: string,
   mapNodes: readonly Pick<CodeMapNode, 'id' | 'name'>[],
   foldedTypes: readonly FoldedType[],
-  traceResult: PathTraceResult,
+  traceResult: Exclude<PathTraceResult, UnknownSectionResult>,
 ): PathTraceState;
 export function resolvePathTraceQuery(
   query: string,
   mapNodes: readonly Pick<CodeMapNode, 'id' | 'name'>[],
   foldedTypes: readonly FoldedType[],
-  traceResult?: PathTraceResult,
+  traceResult?: Exclude<PathTraceResult, UnknownSectionResult>,
 ): PathTracePreCheck | PathTraceState {
   const q = query.trim().toLowerCase();
   const typeNotice = (types: FoldedType[]): PathTraceState => ({
@@ -7457,6 +7528,8 @@ export function CodeMap({
   onDiffScopeSynced,
   onOpenSettings,
   onReindex,
+  section = null,
+  onUnknownSection,
 }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   // P2-3: report every `fetchState` change, not just count changes — a Retry
@@ -7676,6 +7749,20 @@ export function CodeMap({
   // at call time) and `loadCodeMap`'s reset; a response is only applied if
   // it's still the latest.
   const pathTraceRequestIdRef = useRef(0);
+  // P4-4 phase 2a: the section on screen, read by Path Trace, diff scope and
+  // Blast Radius expansion when they send a request (so the effect that
+  // auto-triggers the expansion needs no new dependency) and again when the
+  // reply settles (`settleSectionScopedReply`): a reply for a section that
+  // is no longer on screen never applies. Synced in a layout effect, so it
+  // is current before any reply can settle after the render that changed it.
+  const sectionRef = useRef<string | null>(section);
+  useLayoutEffect(() => {
+    sectionRef.current = section;
+  }, [section]);
+  const onUnknownSectionRef = useRef(onUnknownSection);
+  useEffect(() => {
+    onUnknownSectionRef.current = onUnknownSection;
+  }, [onUnknownSection]);
   // P0-3: correlates a `refreshCodeMap` reply (see below) with the latest
   // refresh — and is bumped by `loadCodeMap` too, so a full reload started
   // after a refresh can never be overwritten by that refresh's late reply.
@@ -8232,23 +8319,36 @@ export function CodeMap({
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
+    // P4-4 phase 2a: the diff is scoped to the section on screen.
+    const requestedSection = sectionRef.current;
     window.driller
-      .computeDiffScope(projectPath, trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined)
-      .then((result: DiffScopeResult) => {
+      .computeDiffScope(projectPath, trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined, requestedSection ?? undefined)
+      .then((reply: DiffScopeResult) => {
         if (diffScopeRequestIdRef.current !== requestId) {
           return;
         }
-        // P3-10: every settle but `error` is a completed sync; an error
-        // keeps whatever time was held.
-        const syncedAt = diffScopeSyncTimeFor(result, Date.now());
-        if (syncedAt !== null) {
-          diffScopeSyncHeldForRef.current = projectPath;
-          onDiffScopeSyncedRef.current(projectPath, syncedAt);
-        }
-        setDiffScopeState(diffScopeStateFromResult(result));
+        settleSectionScopedReply(reply, requestedSection, sectionRef.current, {
+          apply: (result) => {
+            // P3-10: every settle but `error` is a completed sync; an error
+            // keeps whatever time was held.
+            const syncedAt = diffScopeSyncTimeFor(result, Date.now());
+            if (syncedAt !== null) {
+              diffScopeSyncHeldForRef.current = projectPath;
+              onDiffScopeSyncedRef.current(projectPath, syncedAt);
+            }
+            setDiffScopeState(diffScopeStateFromResult(result));
+          },
+          unknownSection: (gone) => {
+            // The section left the allowlist: no diff scope, no sync time;
+            // the shell falls back to `all`.
+            setDiffScopeState({ status: 'idle' });
+            clearDiffScopeSync();
+            onUnknownSectionRef.current?.(gone);
+          },
+        });
       })
       .catch((error: unknown) => {
-        if (diffScopeRequestIdRef.current !== requestId) {
+        if (diffScopeRequestIdRef.current !== requestId || requestedSection !== sectionRef.current) {
           return;
         }
         // `blastRadiusState` was already reset synchronously above, the
@@ -8259,7 +8359,7 @@ export function CodeMap({
           message: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [projectPath, baseRefInput, diffScopeState.status]);
+  }, [projectPath, baseRefInput, diffScopeState.status, clearDiffScopeSync]);
 
   const handleDiffScopeSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -8323,10 +8423,13 @@ export function CodeMap({
     }
     const requestId = ++blastRadiusRequestIdRef.current;
     const seedNodeIds = Array.from(diffScopeState.nodeIds);
+    // P4-4 phase 2a: hop distances over the section on screen only (read
+    // from the ref, so this effect's dependencies are unchanged).
+    const requestedSection = sectionRef.current;
     setBlastRadiusState({ status: 'loading' });
     window.driller
-      .expandBlastRadius(projectPath, seedNodeIds)
-      .then((result: BlastRadiusExpansionResult) => {
+      .expandBlastRadius(projectPath, seedNodeIds, requestedSection ?? undefined)
+      .then((reply: BlastRadiusExpansionResult) => {
         if (blastRadiusRequestIdRef.current !== requestId) {
           // Superseded by a later reset/trigger (a project switch, a
           // Retry/reload, or a fresh diff-scope resolution) — discard rather
@@ -8334,25 +8437,43 @@ export function CodeMap({
           // that may no longer even be on screen.
           return;
         }
-        if (result.status === 'resolved') {
-          const hopDistances = new Map(Object.entries(result.hopDistances));
-          // The stepper's own upper bound — "its own 'further'" (Always) —
-          // is the maximum hop distance actually present, not an arbitrary
-          // constant.
-          let maxDepth = 0;
-          for (const distance of hopDistances.values()) {
-            if (distance > maxDepth) {
-              maxDepth = distance;
+        settleSectionScopedReply(reply, requestedSection, sectionRef.current, {
+          apply: (result) => {
+            if (result.status === 'resolved') {
+              const hopDistances = new Map(Object.entries(result.hopDistances));
+              // The stepper's own upper bound — "its own 'further'" (Always) —
+              // is the maximum hop distance actually present, not an arbitrary
+              // constant.
+              let maxDepth = 0;
+              for (const distance of hopDistances.values()) {
+                if (distance > maxDepth) {
+                  maxDepth = distance;
+                }
+              }
+              setBlastRadiusState({ status: 'resolved', hopDistances, maxDepth });
+              setBlastRadiusDepth(initialBlastRadiusDepth(maxDepth));
+            } else {
+              setBlastRadiusState({ status: 'error', message: result.message });
             }
-          }
-          setBlastRadiusState({ status: 'resolved', hopDistances, maxDepth });
-          setBlastRadiusDepth(initialBlastRadiusDepth(maxDepth));
-        } else {
-          setBlastRadiusState({ status: 'error', message: result.message });
-        }
+          },
+          unknownSection: (gone) => {
+            // The section left the allowlist after the diff scope resolved in
+            // it. Only the shell's fallback to `all` runs here: that reload
+            // (`loadCodeMap`, P4-4d) resets the diff scope, this expansion
+            // and the table sort together at one reset point. Resetting the
+            // diff scope from this mode-keyed effect would add a reset point
+            // a mode toggle re-runs. Until then the expansion stays
+            // `loading`, which this effect never re-fires from. Review round
+            // 1: with no fallback wired, it becomes an explicit error instead.
+            const next = blastRadiusStateOnUnknownSection(gone, onUnknownSectionRef.current);
+            if (next !== null) {
+              setBlastRadiusState(next);
+            }
+          },
+        });
       })
       .catch((error: unknown) => {
-        if (blastRadiusRequestIdRef.current !== requestId) {
+        if (blastRadiusRequestIdRef.current !== requestId || requestedSection !== sectionRef.current) {
           return;
         }
         setBlastRadiusState({
@@ -9506,24 +9627,36 @@ export function CodeMap({
         return;
       }
       setPathTrace({ status: 'searching' });
+      // P4-4 phase 2a: the trace stays inside the section on screen.
+      const requestedSection = sectionRef.current;
       window.driller
-        .tracePath(query)
-        .then((result) => {
+        .tracePath(query, requestedSection ?? undefined)
+        .then((reply) => {
           if (pathTraceRequestIdRef.current !== requestId) {
             // Superseded by a Retry/reload (or another search) — discard
             // rather than let it clobber the map the user is now looking at.
             return;
           }
-          // P4-2 phase 3b: a "no-path-found" whose query a folded type's
-          // name contains becomes the "is a type" notice (current map's types).
-          const state = resolvePathTraceQuery(query, mapNodesForTrace, foldedTypesRef.current, result);
-          setPathTrace(state);
-          if (result.status === 'found') {
-            fitViewToPath(result.path);
-          }
+          settleSectionScopedReply(reply, requestedSection, sectionRef.current, {
+            apply: (result) => {
+              // P4-2 phase 3b: a "no-path-found" whose query a folded type's
+              // name contains becomes the "is a type" notice (current map's types).
+              const state = resolvePathTraceQuery(query, mapNodesForTrace, foldedTypesRef.current, result);
+              setPathTrace(state);
+              if (result.status === 'found') {
+                fitViewToPath(result.path);
+              }
+            },
+            unknownSection: (gone) => {
+              // The section left the allowlist: no trace; the shell falls
+              // back to `all`.
+              setPathTrace({ status: 'idle' });
+              onUnknownSectionRef.current?.(gone);
+            },
+          });
         })
         .catch((error: unknown) => {
-          if (pathTraceRequestIdRef.current !== requestId) {
+          if (pathTraceRequestIdRef.current !== requestId || requestedSection !== sectionRef.current) {
             return;
           }
           setPathTrace({

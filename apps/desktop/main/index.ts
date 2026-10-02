@@ -36,12 +36,9 @@ import {
   type EditorPreference,
   type GitDetectionResult,
   type GraphServiceCodeMapMessage,
-  type GraphServiceComputeDiffScopeRequest,
   type GraphServiceComputeDiffScopeResultMessage,
-  type GraphServiceExpandBlastRadiusRequest,
   type GraphServiceExpandBlastRadiusResultMessage,
   type GraphServiceGetCodeMapRequest,
-  type GraphServicePathTraceRequest,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRetryModelRequest,
@@ -88,6 +85,13 @@ import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import { buildBackendSwitchedRequest, buildIndexRequest } from './graph-service-requests';
+import {
+  buildComputeDiffScopeRequest,
+  buildExpandBlastRadiusRequest,
+  buildPathTraceRequest,
+  INVALID_OPERATION_SECTION_RESULT,
+  parseOperationSectionArg,
+} from './section-operations';
 import { relayKeyChange } from './key-change-relay';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
@@ -1155,7 +1159,11 @@ function requestPrBotIngestion(projectPath: string, bot: PrBotId): Promise<PrBot
  * subprocess's own error reply, it exiting mid-request, `postMessage` itself
  * throwing, or the request timing out) resolves to `{status: 'error', ...}`.
  */
-function requestComputeDiffScope(projectPath: string, baseRef: string | undefined): Promise<DiffScopeResult> {
+function requestComputeDiffScope(
+  projectPath: string,
+  baseRef: string | undefined,
+  section?: string,
+): Promise<DiffScopeResult> {
   if (pendingDiffScopeResolvers.has(projectPath)) {
     return Promise.resolve({
       status: 'error',
@@ -1187,12 +1195,8 @@ function requestComputeDiffScope(projectPath: string, baseRef: string | undefine
   void promise.finally(() => clearTimeout(timeoutTimer));
 
   try {
-    service.postMessage({
-      type: 'graphService:computeDiffScope',
-      projectPath,
-      requestId,
-      ...(baseRef !== undefined ? { baseRef } : {}),
-    } satisfies GraphServiceComputeDiffScopeRequest);
+    // P4-4 phase 2a: `section` only when given (section-operations.ts).
+    service.postMessage(buildComputeDiffScopeRequest(projectPath, requestId, baseRef, section));
   } catch (error) {
     // A synchronous throw here would otherwise leave this projectPath's
     // resolver set with nothing left to ever call it, leaking the request
@@ -1228,7 +1232,11 @@ function requestComputeDiffScope(projectPath: string, baseRef: string | undefine
  * subprocess's own error reply, it exiting mid-request, `postMessage` itself
  * throwing, or the request timing out) resolves to `{status: 'error', ...}`.
  */
-function requestExpandBlastRadius(projectPath: string, nodeIds: string[]): Promise<BlastRadiusExpansionResult> {
+function requestExpandBlastRadius(
+  projectPath: string,
+  nodeIds: string[],
+  section?: string,
+): Promise<BlastRadiusExpansionResult> {
   if (pendingBlastRadiusResolvers.has(projectPath)) {
     return Promise.resolve({
       status: 'error',
@@ -1260,12 +1268,8 @@ function requestExpandBlastRadius(projectPath: string, nodeIds: string[]): Promi
   void promise.finally(() => clearTimeout(timeoutTimer));
 
   try {
-    service.postMessage({
-      type: 'graphService:expandBlastRadius',
-      projectPath,
-      nodeIds,
-      requestId,
-    } satisfies GraphServiceExpandBlastRadiusRequest);
+    // P4-4 phase 2a: `section` only when given (section-operations.ts).
+    service.postMessage(buildExpandBlastRadiusRequest(projectPath, nodeIds, requestId, section));
   } catch (error) {
     // A synchronous throw here would otherwise leave this projectPath's
     // resolver set with nothing left to ever call it, leaking the request
@@ -1318,7 +1322,7 @@ function requestExpandBlastRadius(projectPath: string, nodeIds: string[]): Promi
  * yet, or Graph Service unavailable" -> "Trace refused" / "Explicit `error`
  * result with message" applies here exactly like the Code Map fetch.
  */
-function requestPathTrace(query: string): Promise<PathTraceResult> {
+function requestPathTrace(query: string, section?: string): Promise<PathTraceResult> {
   if (pendingPathTraceResolve) {
     return Promise.resolve({
       status: 'error',
@@ -1346,11 +1350,8 @@ function requestPathTrace(query: string): Promise<PathTraceResult> {
   void promise.finally(() => clearTimeout(timeoutTimer));
 
   try {
-    service.postMessage({
-      type: 'graphService:pathTrace',
-      query,
-      requestId: myToken,
-    } satisfies GraphServicePathTraceRequest);
+    // P4-4 phase 2a: `section` only when given (section-operations.ts).
+    service.postMessage(buildPathTraceRequest(query, myToken, section));
   } catch (error) {
     // A synchronous throw here would otherwise leave pendingPathTraceResolve
     // set with nothing left to ever call it, leaking the request forever —
@@ -2036,7 +2037,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     IpcChannels.diffScopeCompute,
-    (_event, projectPath: unknown, baseRefInput: unknown): Promise<DiffScopeResult> => {
+    (_event, projectPath: unknown, baseRefInput: unknown, sectionInput: unknown): Promise<DiffScopeResult> => {
       // Renderer-supplied values cross the contextBridge boundary untyped at
       // runtime (same precedent as `prBotRunIngestion`'s own guard above).
       if (typeof projectPath !== 'string' || projectPath.length === 0) {
@@ -2054,7 +2055,13 @@ function registerIpcHandlers(): void {
       }
       const trimmedBaseRef = typeof baseRefInput === 'string' ? baseRefInput.trim() : '';
       const baseRef = trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined;
-      return requestComputeDiffScope(projectPath, baseRef);
+      // P4-4 phase 2a: absent or a non-empty string; anything else is
+      // rejected here and never sent.
+      const section = parseOperationSectionArg(sectionInput);
+      if (!section.ok) {
+        return Promise.resolve(INVALID_OPERATION_SECTION_RESULT);
+      }
+      return requestComputeDiffScope(projectPath, baseRef, section.section);
     },
   );
 
@@ -2068,7 +2075,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     IpcChannels.blastRadiusExpand,
-    (_event, projectPath: unknown, nodeIdsInput: unknown): Promise<BlastRadiusExpansionResult> => {
+    (_event, projectPath: unknown, nodeIdsInput: unknown, sectionInput: unknown): Promise<BlastRadiusExpansionResult> => {
       // Renderer-supplied values cross the contextBridge boundary untyped at
       // runtime (same precedent as `diffScopeCompute`'s own guard above).
       if (typeof projectPath !== 'string' || projectPath.length === 0) {
@@ -2077,7 +2084,13 @@ function registerIpcHandlers(): void {
       if (!Array.isArray(nodeIdsInput) || !nodeIdsInput.every((nodeId) => typeof nodeId === 'string')) {
         return Promise.resolve({ status: 'error', message: 'Invalid Node IDs.' });
       }
-      return requestExpandBlastRadius(projectPath, nodeIdsInput);
+      // P4-4 phase 2a: absent or a non-empty string; anything else is
+      // rejected here and never sent.
+      const section = parseOperationSectionArg(sectionInput);
+      if (!section.ok) {
+        return Promise.resolve(INVALID_OPERATION_SECTION_RESULT);
+      }
+      return requestExpandBlastRadius(projectPath, nodeIdsInput, section.section);
     },
   );
 
@@ -2107,7 +2120,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     IpcChannels.pathTrace,
-    (_event, query: unknown): Promise<PathTraceResult> => {
+    (_event, query: unknown, sectionInput: unknown): Promise<PathTraceResult> => {
       // Renderer-supplied value crosses the contextBridge boundary untyped at
       // runtime (same precedent as `sourceReadRange`'s own guard above). The
       // trimmed value — not the raw one — is both what's validated and what
@@ -2125,7 +2138,13 @@ function registerIpcHandlers(): void {
       if (trimmedQuery.length === 0) {
         return Promise.resolve({ status: 'error', message: 'Invalid Path Trace query.' });
       }
-      return requestPathTrace(trimmedQuery);
+      // P4-4 phase 2a: absent or a non-empty string; anything else is
+      // rejected here and never sent.
+      const section = parseOperationSectionArg(sectionInput);
+      if (!section.ok) {
+        return Promise.resolve(INVALID_OPERATION_SECTION_RESULT);
+      }
+      return requestPathTrace(trimmedQuery, section.section);
     },
   );
 

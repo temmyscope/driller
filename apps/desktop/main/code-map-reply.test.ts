@@ -411,6 +411,23 @@ describe('toValidatedDiffScopeResult (P4-2 phase 3c)', () => {
   });
 });
 
+describe('toValidatedDiffScopeResult: unknown-section (P4-4 phase 2a)', () => {
+  type Result = Parameters<typeof toValidatedDiffScopeResult>[0];
+  it('passes a well-formed unknown-section result through', () => {
+    const unknown: Result = { status: 'unknown-section', section: 'docs', knownSections: ['web', 'api'] };
+    assert.deepEqual(toValidatedDiffScopeResult(unknown), { result: unknown, dropped: 0 });
+  });
+
+  it('drops malformed known sections, and is an explicit error without a string section', () => {
+    assert.deepEqual(
+      toValidatedDiffScopeResult({ status: 'unknown-section', section: 'docs', knownSections: ['web', 3] } as unknown as Result),
+      { result: { status: 'unknown-section', section: 'docs', knownSections: ['web'] }, dropped: 1 },
+    );
+    const { result } = toValidatedDiffScopeResult({ status: 'unknown-section', knownSections: [] } as unknown as Result);
+    assert.equal(result.status, 'error');
+  });
+});
+
 type UnknownSectionReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMapUnknownSection' }>;
 const unknownReply = (fields: Record<string, unknown>): UnknownSectionReply =>
   ({ type: 'graphService:codeMapUnknownSection', ...fields }) as unknown as UnknownSectionReply;

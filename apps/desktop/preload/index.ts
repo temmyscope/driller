@@ -193,8 +193,12 @@ const drillerApi: DrillerApi = {
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),
 
-  tracePath: (query: string): Promise<PathTraceResult> =>
-    ipcRenderer.invoke(IpcChannels.pathTrace, query),
+  // P4-4 phase 2a: like `getCodeMap`, the section is passed only when
+  // given, so an omitted one reaches main exactly as before (no argument).
+  tracePath: (query: string, section?: string): Promise<PathTraceResult> =>
+    section === undefined
+      ? ipcRenderer.invoke(IpcChannels.pathTrace, query)
+      : ipcRenderer.invoke(IpcChannels.pathTrace, query, section),
 
   // Review fix: `.catch` here is what actually makes `DrillerApi.
   // logDiagnosticEvent`'s documented "never rejects" contract hold at this
@@ -203,11 +207,15 @@ const drillerApi: DrillerApi = {
   logDiagnosticEvent: (entry: DiagnosticLogEntry): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.diagnosticLog, entry).catch(() => undefined),
 
-  computeDiffScope: (projectPath: string, baseRef?: string): Promise<DiffScopeResult> =>
-    ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef),
+  computeDiffScope: (projectPath: string, baseRef?: string, section?: string): Promise<DiffScopeResult> =>
+    section === undefined
+      ? ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef)
+      : ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef, section),
 
-  expandBlastRadius: (projectPath: string, nodeIds: string[]): Promise<BlastRadiusExpansionResult> =>
-    ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds),
+  expandBlastRadius: (projectPath: string, nodeIds: string[], section?: string): Promise<BlastRadiusExpansionResult> =>
+    section === undefined
+      ? ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds)
+      : ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds, section),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

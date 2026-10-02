@@ -5,11 +5,11 @@
  * maps (the nearest-entry rule) are built by the same lines.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 import {
   FOLDED_TYPE_IPC_MAX_USED_BY,
@@ -58,8 +58,21 @@ const fixtureRecords = (id: string): NodeRecord | undefined => FIXTURE_RECORDS[i
 let raw: RawCodeMap;
 let golden: Record<string, GoldenScope>;
 
+// P4-4e review round 1: no temp dirs left behind.
+const tempDirs: string[] = [];
+const tempDir = (prefix: string): string => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+};
+after(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 before(async () => {
-  const projectRoot = mkdtempSync(path.join(os.tmpdir(), 'driller-scoped-map-'));
+  const projectRoot = tempDir('driller-scoped-map-');
   const past = new Date(Date.now() - 60_000);
   for (const file of FIXTURE_SOURCE_FILES) {
     mkdirSync(path.join(projectRoot, path.dirname(file)), { recursive: true });
@@ -228,7 +241,7 @@ describe('P4-4 phase 1b: per-section severity and counts', () => {
         web.filter((b) => b !== a).map((b) => ({ source: a.id, target: b.id, kind: 'CALLS' as const })),
       ),
     ];
-    const projectRoot = mkdtempSync(path.join(os.tmpdir(), 'driller-section-severity-'));
+    const projectRoot = tempDir('driller-section-severity-');
     const fetched = await fetchProductionCodeMap('stub-project', projectRoot, 'Code Map', {
       fetch: async () => ({ nodes: [...api, ...web], edges }),
     });

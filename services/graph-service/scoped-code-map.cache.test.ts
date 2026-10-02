@@ -13,13 +13,24 @@
  * cached as it (the reader returns `null`), and the cached object is frozen.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
+import { rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 import { FIXTURE_LCOV, goldenStringify } from './scoped-code-map-fixture';
-import { fetchMap, getters, index, makeFixtureProject, onPost, posted, send, startIndexTs, waitFor } from './scoped-code-map-harness';
+import {
+  fetchMap,
+  getters,
+  index,
+  makeFixtureProject,
+  makeTempDir,
+  onPost,
+  posted,
+  removeHarnessTempDirs,
+  send,
+  startIndexTs,
+  waitFor,
+} from './scoped-code-map-harness';
 import { buildScopedCodeMap, keepFileForScope, type ActiveRawCodeMap } from './scoped-code-map';
 
 const PROJECT = makeFixtureProject();
@@ -61,6 +72,9 @@ function deferred(): { promise: Promise<void>; release: () => void } {
   });
   return { promise, release };
 }
+
+// P4-4e review round 1: no temp dirs left behind.
+after(removeHarnessTempDirs);
 
 before(async () => {
   // The first model download fails, so a later retry can succeed and
@@ -157,7 +171,7 @@ describe('P4-4 phase 1a: activeRawCodeMap', () => {
   it('is cleared by a switch to another project', { timeout: 20_000 }, async () => {
     await fetchMap();
     assert.ok(activeRaw());
-    const other = mkdtempSync(path.join(os.tmpdir(), 'driller-raw-cache-other-'));
+    const other = makeTempDir('driller-raw-cache-other-');
     await index(other);
     assert.equal(storedRaw(), undefined);
     assert.equal(activeRaw(), null);
@@ -184,7 +198,7 @@ describe('P4-4 phase 1a: activeRawCodeMap', () => {
       try {
         await waitFor(() => ((harness.__harnessFetchCount ?? 0) > fetchesBefore ? true : undefined), 'the fetch to start');
         harness.__harnessFetchGate = undefined;
-        const indexed = target === 'the same project' ? PROJECT : mkdtempSync(path.join(os.tmpdir(), 'driller-raw-race-'));
+        const indexed = target === 'the same project' ? PROJECT : makeTempDir('driller-raw-race-');
         await index(indexed);
       } finally {
         gate.release();

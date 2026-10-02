@@ -192,8 +192,9 @@ import {
   buildScopedCodeMap,
   countSectionNodes,
   filterCodeMapToScope,
+  filterToSection,
   keepFileForScope,
-  keepFileForSection,
+  resolveSectionFilter,
   type ActiveRawCodeMap,
   type RawCodeMap,
 } from './scoped-code-map';
@@ -542,6 +543,52 @@ export function getActiveRawCodeMap(): Readonly<ActiveRawCodeMap> | null {
  */
 export function peekActiveRawCodeMapForTests(): Readonly<ActiveRawCodeMap> | undefined {
   return activeRawCodeMap;
+}
+
+/** Tests only: the cached whole-scope edges diff scope and Blast Radius expansion read. */
+export function peekActiveCodeMapEdgesForTests(): readonly CodeMapEdge[] | undefined {
+  return activeCodeMapEdges;
+}
+
+/**
+ * P4-4e review round 1: what diff scope and Blast Radius expansion get when
+ * the requested section is in the live allowlist but not in the scope the
+ * cached map was built under (the allowlist changed and the refetch has not
+ * landed yet), or no current raw cache stamps the cached map at all.
+ */
+export const MAP_REFRESHING_RESULT = {
+  status: 'error',
+  message: 'The map is refreshing for the new scope — try again.',
+} as const;
+
+/**
+ * P4-4e review round 1: a section's file set over the whole-scope CACHES
+ * (diff scope, Blast Radius expansion). Two allowlists are involved:
+ *  - whether the section exists is decided by the live `activeIncludedPaths`
+ *    (`unknown-section` otherwise — the renderer then falls back to `all`);
+ *  - which files it owns (`sectionOfFile`, nearest entry) is decided by the
+ *    scope the caches were built under — the stamp-checked
+ *    `activeRawCodeMap.appliedScope`, set in the same tick as the cached
+ *    Nodes and edges — so the result always matches the map on screen.
+ * When the two disagree about the section (it is live but the caches were
+ * built without it), or no current raw cache exists, the result is the
+ * explicit `MAP_REFRESHING_RESULT`, never a silently different file set.
+ * (Not `unknown-section`: the section is real, so falling back to `all`
+ * would be wrong.) Path Trace and the Code Map fetch filter a fresh fetch
+ * with the live allowlist instead, so they don't need this.
+ */
+function resolveCachedSectionFilter(
+  section: string,
+): ReturnType<typeof resolveSectionFilter> | typeof MAP_REFRESHING_RESULT {
+  const live = resolveSectionFilter(section, activeIncludedPaths);
+  if (typeof live !== 'function') {
+    return live;
+  }
+  const cached = getActiveRawCodeMap();
+  if (cached === null || !cached.appliedScope.includes(section)) {
+    return MAP_REFRESHING_RESULT;
+  }
+  return resolveSectionFilter(section, cached.appliedScope);
 }
 
 // main passes `app.getPath('userData')` as this subprocess's first fork
@@ -913,14 +960,48 @@ function isPathTraceRequest(data: unknown): data is GraphServicePathTraceRequest
   if (typeof data !== 'object' || data === null) {
     return false;
   }
-  const { type, query, requestId } = data as { type?: unknown; query?: unknown; requestId?: unknown };
+  const { type, query, requestId, section } = data as {
+    type?: unknown;
+    query?: unknown;
+    requestId?: unknown;
+    section?: unknown;
+  };
   return (
     type === 'graphService:pathTrace' &&
     typeof query === 'string' &&
     query.trim().length > 0 &&
-    typeof requestId === 'number'
+    typeof requestId === 'number' &&
+    isOptionalSection(section)
   );
 }
+
+/**
+ * P4-4 phase 2a: a request's optional `section` — absent (the whole scope)
+ * or a string. Any string is accepted here; one that is not an allowlist
+ * entry gets the explicit `unknown-section` result (`resolveSectionFilter`).
+ */
+function isOptionalSection(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === 'string';
+}
+
+/**
+ * P4-4 phase 2a: true when `data` would pass `guard` but for a malformed
+ * (non-string) `section`. Main validates before sending, so this is
+ * defensive, like `isMalformedGetCodeMapRequest`: such a request is answered
+ * with an explicit `Invalid section.` error instead of being dropped (which
+ * would leave main's request pending until its backstop timeout).
+ */
+function isMalformedSectionRequest(data: unknown, guard: (value: unknown) => boolean): boolean {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    !isOptionalSection((data as { section?: unknown }).section) &&
+    guard({ ...data, section: undefined })
+  );
+}
+
+/** P4-4 phase 2a: the result a malformed `section` gets (`isMalformedSectionRequest`). */
+const INVALID_SECTION_RESULT = { status: 'error', message: 'Invalid section.' } as const;
 
 /**
  * True for a `graphService:regenerateNode` request (Story 1.8, Phase 4) —
@@ -1054,18 +1135,21 @@ function isComputeDiffScopeRequest(data: unknown): data is GraphServiceComputeDi
   if (typeof data !== 'object' || data === null) {
     return false;
   }
-  const { type, projectPath, baseRef, requestId } = data as {
+  const { type, projectPath, baseRef, requestId, section } = data as {
     type?: unknown;
     projectPath?: unknown;
     baseRef?: unknown;
     requestId?: unknown;
+    section?: unknown;
   };
   return (
     type === 'graphService:computeDiffScope' &&
     typeof projectPath === 'string' &&
     projectPath.length > 0 &&
     (baseRef === undefined || (typeof baseRef === 'string' && baseRef.length > 0)) &&
-    typeof requestId === 'number'
+    typeof requestId === 'number' &&
+    // P4-4 phase 2a.
+    isOptionalSection(section)
   );
 }
 
@@ -1082,11 +1166,12 @@ function isExpandBlastRadiusRequest(data: unknown): data is GraphServiceExpandBl
   if (typeof data !== 'object' || data === null) {
     return false;
   }
-  const { type, projectPath, nodeIds, requestId } = data as {
+  const { type, projectPath, nodeIds, requestId, section } = data as {
     type?: unknown;
     projectPath?: unknown;
     nodeIds?: unknown;
     requestId?: unknown;
+    section?: unknown;
   };
   return (
     type === 'graphService:expandBlastRadius' &&
@@ -1094,7 +1179,9 @@ function isExpandBlastRadiusRequest(data: unknown): data is GraphServiceExpandBl
     projectPath.length > 0 &&
     Array.isArray(nodeIds) &&
     nodeIds.every((nodeId) => typeof nodeId === 'string') &&
-    typeof requestId === 'number'
+    typeof requestId === 'number' &&
+    // P4-4 phase 2a.
+    isOptionalSection(section)
   );
 }
 
@@ -1428,11 +1515,14 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
   // allowlist at request time (exact match); anything else — including any
   // section while the allowlist is empty — is the explicit `unknown-section`
   // state, never an empty map. Checked before the fetch, so it costs none.
-  if (section !== undefined && !activeIncludedPaths.includes(section)) {
+  // P4-4 phase 2a: through `resolveSectionFilter`, shared with Path Trace,
+  // diff scope and Blast Radius expansion.
+  const requestFilter = section === undefined ? undefined : resolveSectionFilter(section, activeIncludedPaths);
+  if (requestFilter !== undefined && typeof requestFilter !== 'function') {
     postCodeMapMessage({
       type: 'graphService:codeMapUnknownSection',
-      section,
-      knownSections: [...activeIncludedPaths],
+      section: requestFilter.section,
+      knownSections: requestFilter.knownSections,
     });
     return;
   }
@@ -1508,7 +1598,10 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
     // P4-4 phase 1b: the Section bar's tab counts, over the whole-scope Nodes
     // (nearest-section rule, so they sum to the whole-scope count).
     const sections = countSectionNodes(projectRoot, normalizedNodes, appliedScope);
-    if (section === undefined) {
+    // P4-4 phase 2a: the section re-resolved against the scope this map was
+    // built with (`undefined` for the whole scope).
+    const sectionFilter = section === undefined ? undefined : resolveSectionFilter(section, appliedScope);
+    if (sectionFilter === undefined) {
       postCodeMapMessage({
         type: 'graphService:codeMap',
         nodes: nodesWithRiskSignals,
@@ -1527,21 +1620,21 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
         section: null,
         sections,
       });
-    } else if (!appliedScope.includes(section)) {
+    } else if (typeof sectionFilter !== 'function') {
       // P4-4 phase 1b: the allowlist changed during the fetch and dropped
       // this section. Still explicit, against the scope the map was built
       // with; the whole-scope caches below are refreshed as usual.
       postCodeMapMessage({
         type: 'graphService:codeMapUnknownSection',
-        section,
-        knownSections: [...appliedScope],
+        section: sectionFilter.section,
+        knownSections: sectionFilter.knownSections,
       });
     } else {
       // P4-4 phase 1b: the reply is a second run of the same pipeline over
       // this section's files alone (nearest-section rule), so its edges,
       // folded types/Modules and every severity cut are the section's own —
       // never filtered out of, or subtracted from, the whole-scope build.
-      const sectionMap = buildScopedCodeMap(raw, keepFileForSection(section, appliedScope));
+      const sectionMap = buildScopedCodeMap(raw, sectionFilter);
       postCodeMapMessage({
         type: 'graphService:codeMap',
         nodes: sectionMap.nodes,
@@ -1552,7 +1645,7 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
         appliedScope,
         foldedTypes: capFoldedTypeUsedBy(sectionMap.foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
         foldedModules: sectionMap.foldedModules,
-        section,
+        section: section ?? null,
         sections,
       });
     }
@@ -1644,9 +1737,18 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
  * behavior for a project scope this call would already have been able to
  * find.
  */
-export async function computePathTraceResult(query: string): Promise<PathTraceResult> {
+export async function computePathTraceResult(query: string, section?: string): Promise<PathTraceResult> {
   if (activeProject === undefined || activeProjectPath === undefined) {
     return { status: 'error', message: 'No project has finished indexing yet.' };
+  }
+  // P4-4 phase 2a (AD-13 "Section scope"): an unknown section is the
+  // explicit `unknown-section` result, decided before the fetch so it costs
+  // none (the same order as the Code Map fetch).
+  if (section !== undefined) {
+    const requestFilter = resolveSectionFilter(section, activeIncludedPaths);
+    if (typeof requestFilter !== 'function') {
+      return requestFilter;
+    }
   }
   try {
     const projectRoot = activeProjectPath;
@@ -1660,7 +1762,17 @@ export async function computePathTraceResult(query: string): Promise<PathTraceRe
     // Bug fix (2026-09-23): a Path Trace must never trace into/through a
     // Node this project's indexing-scope allowlist excludes — same filter
     // `handleGetCodeMapRequest` applies to the Code Map itself.
-    const { nodes, edges } = filterCodeMapToScope(projectRoot, productionNodes, productionEdges, activeIncludedPaths);
+    // P4-4 phase 2a: with a `section`, the fresh fetch is filtered to that
+    // section's files alone (nearest-section rule), so a trace never walks
+    // out of it; without one, the whole scope exactly as before. Resolved
+    // against the allowlist read after the fetch, as the whole-scope filter
+    // always was — a section the allowlist dropped meanwhile is
+    // `unknown-section`.
+    const keepFile = resolveSectionFilter(section, activeIncludedPaths);
+    if (typeof keepFile !== 'function') {
+      return keepFile;
+    }
+    const { nodes, edges } = filterCodeMapToScope(projectRoot, productionNodes, productionEdges, keepFile);
     // Defense in depth: main already sends a trimmed query (its own
     // `ipcMain.handle` validation), but this process trusts nothing crossing
     // its own boundary (same stance `isPathTraceRequest`'s own doc comment
@@ -1681,8 +1793,8 @@ export async function computePathTraceResult(query: string): Promise<PathTraceRe
  * `handleComputeDiffScopeRequest`/`handleExpandBlastRadiusRequest`'s own
  * thin-handler-over-compute-function shape.
  */
-async function handlePathTraceRequest(query: string, requestId: number): Promise<void> {
-  const result = await computePathTraceResult(query);
+async function handlePathTraceRequest(query: string, requestId: number, section?: string): Promise<void> {
+  const result = await computePathTraceResult(query, section);
   postPathTraceResultMessage({ type: 'graphService:pathTraceResult', requestId, result });
 }
 
@@ -2006,8 +2118,9 @@ async function handleComputeDiffScopeRequest(
   projectPath: string,
   baseRef: string | undefined,
   requestId: number,
+  section?: string,
 ): Promise<void> {
-  const result = await computeDiffScopeResult(projectPath, baseRef);
+  const result = await computeDiffScopeResult(projectPath, baseRef, section);
   postComputeDiffScopeResultMessage({ type: 'graphService:computeDiffScopeResult', projectPath, requestId, result });
 }
 
@@ -2043,6 +2156,7 @@ async function handleComputeDiffScopeRequest(
 export async function computeDiffScopeResult(
   projectPath: string,
   baseRef: string | undefined,
+  section?: string,
 ): Promise<DiffScopeResult> {
   if (activeDiffScopeComputationInFlight) {
     return { status: 'error', message: 'A diff-scope computation is already running.' };
@@ -2063,6 +2177,27 @@ export async function computeDiffScopeResult(
       // for a project that isn't (or is no longer) this process's active one
       // must never silently compute against the wrong project's Nodes.
       return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    // P4-4 phase 2a (AD-13 "Section scope"): with a `section`, the inputs —
+    // the whole-scope cached Nodes, folded types and folded Modules — are
+    // narrowed to that section's files (nearest-section rule) BEFORE any
+    // matching below, so the changed Nodes, changed contracts (and their
+    // dependents) and top-level-only files are all the section's own. Never
+    // the whole-scope result filtered afterwards. An unknown section is the
+    // explicit `unknown-section` result, before any git call.
+    let scopedNodes = nodes;
+    let scopedFoldedTypes = foldedTypes;
+    let scopedFoldedModules = foldedModules;
+    if (section !== undefined) {
+      // Review round 1: existence from the live allowlist, ownership from
+      // the scope the caches were built under.
+      const keepFile = resolveCachedSectionFilter(section);
+      if (typeof keepFile !== 'function') {
+        return keepFile;
+      }
+      scopedNodes = filterToSection(projectRoot, nodes, [], keepFile).nodes;
+      scopedFoldedTypes = foldedTypes.filter((type) => keepFile(type.file));
+      scopedFoldedModules = foldedModules.filter((module) => keepFile(module.file));
     }
     // Captured before the git subprocess calls below, for the supersession
     // check after they resolve — see `computeIngestionResult`'s own identical
@@ -2091,7 +2226,7 @@ export async function computeDiffScopeResult(
       };
     }
 
-    const nodeIds = findChangedNodeIds(nodes, diffScope.changedFiles);
+    const nodeIds = findChangedNodeIds(scopedNodes, diffScope.changedFiles);
     // P4-2 phase 3a: a changed Module is not a changed Node (it isn't in
     // `nodes`), so a file whose only change-able content is top-level code
     // is reported by name instead — never a silent "0 changed Nodes".
@@ -2102,18 +2237,18 @@ export async function computeDiffScopeResult(
     // Dependents are kept only among `nodes` (the map in scope), so the count
     // is what PR Review can highlight; `dependentIds` is capped for the wire.
     const { contracts: changedContracts, approximate } = findChangedContracts(
-      foldedTypes,
+      scopedFoldedTypes,
       diffScope.changedFiles,
       diffScope.changedLines,
-      { mapNodeIds: new Set(nodes.map((node) => node.id)) },
+      { mapNodeIds: new Set(scopedNodes.map((node) => node.id)) },
     );
     const contractOnlyFiles =
       diffScope.changedLines === undefined
         ? new Set<string>()
-        : findContractOnlyChangedFiles(foldedTypes, diffScope.changedLines);
+        : findContractOnlyChangedFiles(scopedFoldedTypes, diffScope.changedLines);
     const topLevelFiles = findTopLevelOnlyChangedFiles(
-      nodes,
-      foldedModules,
+      scopedNodes,
+      scopedFoldedModules,
       diffScope.changedFiles.filter((file) => !contractOnlyFiles.has(file)),
     );
     return {
@@ -2142,8 +2277,9 @@ async function handleExpandBlastRadiusRequest(
   projectPath: string,
   nodeIds: string[],
   requestId: number,
+  section?: string,
 ): Promise<void> {
-  const result = computeBlastRadiusExpansionResult(projectPath, nodeIds);
+  const result = computeBlastRadiusExpansionResult(projectPath, nodeIds, section);
   postExpandBlastRadiusResultMessage({
     type: 'graphService:expandBlastRadiusResult',
     projectPath,
@@ -2190,6 +2326,7 @@ async function handleExpandBlastRadiusRequest(
 export function computeBlastRadiusExpansionResult(
   projectPath: string,
   nodeIds: string[],
+  section?: string,
 ): BlastRadiusExpansionResult {
   if (activeBlastRadiusExpansionInFlight) {
     return { status: 'error', message: 'A blast radius expansion is already running.' };
@@ -2214,7 +2351,25 @@ export function computeBlastRadiusExpansionResult(
     // computation itself has no `await` today.
     const generationId = activeSummaryGenerationId;
 
-    const adjacency = buildBidirectionalAdjacency(nodes, edges);
+    // P4-4 phase 2a (AD-13 "Section scope"): with a `section`, the cached
+    // whole-scope Nodes and edges are narrowed to that section (edges with
+    // both ends in it) BEFORE the adjacency is built, so hop distances never
+    // cross a section — the same adjacency the section's own Code Map build
+    // walks. A seed outside the section is not in the adjacency, so it
+    // contributes nothing (`computeBlastRadiusHopDistances` skips it). An
+    // unknown section is the explicit `unknown-section` result.
+    let scopedNodes = nodes;
+    let scopedEdges = edges;
+    if (section !== undefined) {
+      // Review round 1: existence from the live allowlist, ownership from
+      // the scope the caches were built under.
+      const keepFile = resolveCachedSectionFilter(section);
+      if (typeof keepFile !== 'function') {
+        return keepFile;
+      }
+      ({ nodes: scopedNodes, edges: scopedEdges } = filterToSection(projectRoot, nodes, edges, keepFile));
+    }
+    const adjacency = buildBidirectionalAdjacency(scopedNodes, scopedEdges);
     const hopDistancesById = computeBlastRadiusHopDistances(adjacency, nodeIds);
 
     if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
@@ -2743,7 +2898,12 @@ process.parentPort?.on('message', (event) => {
     // Fire-and-forget from the message handler's perspective, same as every
     // other branch here — `handlePathTraceRequest` posts its own
     // `graphService:pathTraceResult` reply asynchronously and never throws.
-    void handlePathTraceRequest(event.data.query, event.data.requestId);
+    void handlePathTraceRequest(event.data.query, event.data.requestId, event.data.section);
+    return;
+  }
+  if (!isShuttingDown && isMalformedSectionRequest(event.data, isPathTraceRequest)) {
+    const { requestId } = event.data as GraphServicePathTraceRequest;
+    postPathTraceResultMessage({ type: 'graphService:pathTraceResult', requestId, result: INVALID_SECTION_RESULT });
     return;
   }
   if (!isShuttingDown && isRetryModelRequest(event.data)) {
@@ -2771,7 +2931,22 @@ process.parentPort?.on('message', (event) => {
     // other branch here — `handleComputeDiffScopeRequest` posts its own
     // `graphService:computeDiffScopeResult` reply asynchronously and never
     // throws (its own top-level try/catch guarantees that).
-    void handleComputeDiffScopeRequest(event.data.projectPath, event.data.baseRef, event.data.requestId);
+    void handleComputeDiffScopeRequest(
+      event.data.projectPath,
+      event.data.baseRef,
+      event.data.requestId,
+      event.data.section,
+    );
+    return;
+  }
+  if (!isShuttingDown && isMalformedSectionRequest(event.data, isComputeDiffScopeRequest)) {
+    const { projectPath, requestId } = event.data as GraphServiceComputeDiffScopeRequest;
+    postComputeDiffScopeResultMessage({
+      type: 'graphService:computeDiffScopeResult',
+      projectPath,
+      requestId,
+      result: INVALID_SECTION_RESULT,
+    });
     return;
   }
   if (!isShuttingDown && isExpandBlastRadiusRequest(event.data)) {
@@ -2779,7 +2954,22 @@ process.parentPort?.on('message', (event) => {
     // other branch here — `handleExpandBlastRadiusRequest` posts its own
     // `graphService:expandBlastRadiusResult` reply asynchronously and never
     // throws (its own top-level try/catch guarantees that).
-    void handleExpandBlastRadiusRequest(event.data.projectPath, event.data.nodeIds, event.data.requestId);
+    void handleExpandBlastRadiusRequest(
+      event.data.projectPath,
+      event.data.nodeIds,
+      event.data.requestId,
+      event.data.section,
+    );
+    return;
+  }
+  if (!isShuttingDown && isMalformedSectionRequest(event.data, isExpandBlastRadiusRequest)) {
+    const { projectPath, requestId } = event.data as GraphServiceExpandBlastRadiusRequest;
+    postExpandBlastRadiusResultMessage({
+      type: 'graphService:expandBlastRadiusResult',
+      projectPath,
+      requestId,
+      result: INVALID_SECTION_RESULT,
+    });
     return;
   }
   if (!isShuttingDown && isIndexRequest(event.data)) {

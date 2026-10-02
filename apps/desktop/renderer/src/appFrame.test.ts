@@ -310,6 +310,8 @@ describe('diffScopeSyncTimeFor (P3-10)', () => {
     [{ status: 'not-a-git-repo' }, NOW],
     [{ status: 'no-base-ref-resolvable' }, NOW],
     [{ status: 'error', message: 'boom' }, null],
+    // P4-4 phase 2a: the section left the allowlist — nothing was synced.
+    [{ status: 'unknown-section', section: 'docs', knownSections: ['web'] }, null],
   ];
   for (const [result, expected] of cases) {
     it(`${result.status}${result.status === 'resolved' ? ` (${result.nodeIds.length} Nodes)` : ''} → ${expected === null ? 'no sync' : 'synced now'}`, () => {
@@ -324,6 +326,7 @@ describe('diffScopeSyncTimeFor (P3-10)', () => {
       'not-a-git-repo': true,
       'no-base-ref-resolvable': true,
       error: true,
+      'unknown-section': true,
     };
     assert.deepEqual(new Set(cases.map(([r]) => r.status)), new Set(Object.keys(statuses)));
   });

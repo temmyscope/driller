@@ -23,6 +23,7 @@ import {
   type FoldedModule,
   type FoldedType,
   type SectionNodeCount,
+  type UnknownSectionResult,
 } from '@driller/graph-contracts';
 import type { CodeMapEdge, CodeMapNode } from '@driller/ipc-contracts';
 
@@ -62,6 +63,47 @@ export function keepFileForScope(includedPaths: readonly string[]): KeepFile {
  */
 export function keepFileForSection(section: string, includedPaths: readonly string[]): KeepFile {
   return (file) => sectionOfFile(file, includedPaths) === section;
+}
+
+/**
+ * P4-4 phase 2a (AD-13 "Section scope"): the one place a request's optional
+ * `section` is checked against the allowlist and turned into a file set.
+ *  - omitted → the whole scope (`keepFileForScope`, so an empty allowlist
+ *    stays the identity-recognised unrestricted `KEEP_ALL_FILES`);
+ *  - an exact allowlist entry → `keepFileForSection` (nearest-section rule);
+ *  - anything else (including any section while the allowlist is empty) →
+ *    the explicit `UnknownSectionResult`, with the allowlist as
+ *    `knownSections`.
+ * Used by the Code Map fetch, Path Trace, diff scope and Blast Radius
+ * expansion, so all four validate a section the same way.
+ */
+export function resolveSectionFilter(
+  section: string | undefined,
+  includedPaths: readonly string[],
+): KeepFile | UnknownSectionResult {
+  if (section === undefined) {
+    return keepFileForScope(includedPaths);
+  }
+  if (!includedPaths.includes(section)) {
+    return { status: 'unknown-section', section, knownSections: [...includedPaths] };
+  }
+  return keepFileForSection(section, includedPaths);
+}
+
+/**
+ * P4-4 phase 2a: narrows already-built whole-scope Nodes and edges (the
+ * caches diff scope and Blast Radius expansion read) to one section's file
+ * set, BEFORE anything is computed from them: Nodes whose file `keepFile`
+ * keeps, and only the edges whose both endpoints survive — exactly
+ * `filterCodeMapToScope`'s rule (it does the work; `keepFile` here is never
+ * `KEEP_ALL_FILES`, so it always filters). Since a section is a subset of
+ * the whole scope, this equals the section build's own Nodes and edges.
+ */
+export function filterToSection<
+  TNode extends { id: string; file: string },
+  TEdge extends { source: string; target: string },
+>(projectRoot: string, nodes: TNode[], edges: TEdge[], keepFile: KeepFile): { nodes: TNode[]; edges: TEdge[] } {
+  return filterCodeMapToScope(projectRoot, nodes, edges, keepFile);
 }
 
 /**

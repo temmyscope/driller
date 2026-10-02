@@ -22,14 +22,14 @@
  * registered before `production-code-map.ts` first loads.
  */
 import assert from 'node:assert/strict';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 import type { CodeMapEdge } from '@driller/graph-contracts';
 
 import { isFileInScope } from './project-scope';
 import { buildScopedCodeMap, keepFileForSection } from './scoped-code-map';
 import { goldenStringify } from './scoped-code-map-fixture';
-import { getters, makeFixtureProject, posted, send, startIndexTs, waitFor, type Posted } from './scoped-code-map-harness';
+import { getters, makeFixtureProject, posted, removeHarnessTempDirs, send, startIndexTs, waitFor, type Posted } from './scoped-code-map-harness';
 
 const PROJECT = makeFixtureProject();
 const harness = globalThis as { __harnessFetchCount?: number; __harnessFetchGate?: Promise<void> };
@@ -73,6 +73,9 @@ function cacheSnapshot(): string {
   const { getNodes, getFolded, getFoldedTypes } = getters();
   return goldenStringify({ nodes: getNodes(), folded: getFolded(), foldedTypes: getFoldedTypes() });
 }
+
+// P4-4e review round 1: no temp dirs left behind.
+after(removeHarnessTempDirs);
 
 before(async () => {
   indexModule = await startIndexTs(PROJECT);

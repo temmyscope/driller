@@ -22,7 +22,7 @@
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { register } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -168,9 +168,34 @@ export async function index(projectPath: string, wait = true): Promise<void> {
   }
 }
 
+const tempDirs: string[] = [];
+
+/**
+ * P4-4e review round 1: a temp dir under the OS temp dir, removed by
+ * `removeHarnessTempDirs` (each harness test file calls it in `after`).
+ */
+export function makeTempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+/**
+ * Removes every dir `makeTempDir` made (the fixture projects and the userData
+ * dir), after flushing the Node record store's debounced write — which would
+ * otherwise re-create the userData dir once it fires.
+ */
+export async function removeHarnessTempDirs(): Promise<void> {
+  const { flushNodeRecordStore } = await import('./node-record-store');
+  await flushNodeRecordStore();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /** A temp project holding the fixture's source files (older than its LCOV report) and `coverage/lcov.info`. */
 export function makeFixtureProject(): string {
-  const project = mkdtempSync(path.join(os.tmpdir(), 'driller-scoped-harness-'));
+  const project = makeTempDir('driller-scoped-harness-');
   const past = new Date(Date.now() - 60_000);
   for (const file of FIXTURE_SOURCE_FILES) {
     mkdirSync(path.join(project, path.dirname(file)), { recursive: true });
@@ -189,7 +214,7 @@ export function makeFixtureProject(): string {
 export async function startIndexTs(project: string): Promise<typeof import('./index')> {
   register(HOOKS, import.meta.url);
   (process as unknown as { parentPort: typeof port }).parentPort = port;
-  process.argv[2] = mkdtempSync(path.join(os.tmpdir(), 'driller-scoped-harness-userdata-'));
+  process.argv[2] = makeTempDir('driller-scoped-harness-userdata-');
   const indexModule = await import('./index');
   await index(project);
   return indexModule;

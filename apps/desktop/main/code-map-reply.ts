@@ -50,6 +50,7 @@ import type {
   SectionNodeCount,
   SimilarImplementation,
   TopLevelChangedFile,
+  UnknownSectionResult,
 } from '@driller/ipc-contracts';
 
 type CodeMapReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMap' }>;
@@ -131,11 +132,22 @@ export function isSectionNodeCount(value: unknown): value is SectionNodeCount {
 export function toUnknownSectionResult(
   message: UnknownSectionReply,
 ): { result: UnknownSectionCodeMapResult; dropped: number } | null {
-  const rawSection: unknown = message.section;
+  return parseUnknownSection(message.section, message.knownSections);
+}
+
+/**
+ * The `{status: 'unknown-section'}` fields off an untyped reply: `null` when
+ * `section` is not a string; `knownSections` keeps only its strings (a
+ * non-array becomes `[]`), counting what it dropped. Shared by the Code Map
+ * reply and (P4-4 phase 2a) the diff-scope reply.
+ */
+function parseUnknownSection(
+  rawSection: unknown,
+  rawKnown: unknown,
+): { result: UnknownSectionResult; dropped: number } | null {
   if (!isString(rawSection)) {
     return null;
   }
-  const rawKnown: unknown = message.knownSections;
   const known = Array.isArray(rawKnown) ? rawKnown.filter(isString) : [];
   const dropped = Array.isArray(rawKnown) ? rawKnown.length - known.length : 1;
   return { result: { status: 'unknown-section', section: rawSection, knownSections: known }, dropped };
@@ -321,6 +333,13 @@ export function toValidatedDiffScopeResult(result: DiffScopeResult): { result: D
   }
   if (result.status === 'error') {
     return isString(result.message) ? { result, dropped: 0 } : { result: MALFORMED_DIFF_SCOPE, dropped: 1 };
+  }
+  // P4-4 phase 2a: an unknown-section reply is passed through, validated
+  // like the Code Map's own. (Read off a widened view: `isRecord` narrows
+  // the `UnknownSectionResult` interface out of `result`'s type.)
+  const untyped = result as Record<string, unknown>;
+  if (untyped.status === 'unknown-section') {
+    return parseUnknownSection(untyped.section, untyped.knownSections) ?? { result: MALFORMED_DIFF_SCOPE, dropped: 1 };
   }
   if (result.status !== 'resolved') {
     const known = ['no-changes', 'not-a-git-repo', 'no-base-ref-resolvable'] as const;

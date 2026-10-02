@@ -92,7 +92,13 @@ export type PathTraceResult =
     }
   | { status: 'ambiguous'; candidates: { id: string; name: string }[] }
   | { status: 'no-path-found' }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string }
+  /**
+   * P4-4 phase 2a (AD-13 "Section scope"): the request's `section` is not in
+   * the project's current allowlist. Only a request WITH a `section` can
+   * get it; `traceCallPath` itself never returns it.
+   */
+  | UnknownSectionResult;
 
 /**
  * Resolves `query` against `nodes`' `id`/`name` (exact `id` match first, then
@@ -1618,7 +1624,9 @@ export type DiffScopeResult =
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }
   | { status: 'no-base-ref-resolvable' }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string }
+  /** P4-4 phase 2a: see `PathTraceResult`'s own `UnknownSectionResult` member. */
+  | UnknownSectionResult;
 
 /**
  * Story 3.2 (Phase 1): multi-Node blast radius hop distances (FR12).
@@ -1642,7 +1650,9 @@ export type DiffScopeResult =
  */
 export type BlastRadiusExpansionResult =
   | { status: 'resolved'; hopDistances: Record<string, number> }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string }
+  /** P4-4 phase 2a: see `PathTraceResult`'s own `UnknownSectionResult` member. */
+  | UnknownSectionResult;
 
 /**
  * P4-4 phase 1b (AD-13 "Section scope"): the explicit result state for a

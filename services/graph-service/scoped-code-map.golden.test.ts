@@ -32,11 +32,11 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 import { mergeNodeRecord } from './node-record-store';
 import { FIXTURE_RECORDS, FIXTURE_SCOPES, FIXTURE_TRACE_QUERIES, goldenStringify } from './scoped-code-map-fixture';
-import { fetchMap, getters, makeFixtureProject, send, startIndexTs, trace } from './scoped-code-map-harness';
+import { fetchMap, getters, makeFixtureProject, removeHarnessTempDirs, send, startIndexTs, trace } from './scoped-code-map-harness';
 
 const GOLDEN_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'scoped-code-map.golden.json');
 const UPDATE_GOLDEN = process.env.DRILLER_UPDATE_GOLDEN === '1';
@@ -65,6 +65,9 @@ async function snapshotScope(scope: readonly string[]): Promise<Record<string, u
     traces,
   };
 }
+
+// P4-4e review round 1: no temp dirs left behind.
+after(removeHarnessTempDirs);
 
 before(async () => {
   await startIndexTs(PROJECT);

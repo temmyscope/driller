@@ -861,6 +861,12 @@ export interface GraphServicePathTraceRequest {
   type: 'graphService:pathTrace';
   query: string;
   requestId: number;
+  /**
+   * P4-4 phase 2a (AD-13 "Section scope"): one allowlist entry, exactly as
+   * the Section bar shows it; absent = the whole scope (today's behaviour).
+   * A value not in the allowlist gets `UnknownSectionResult`.
+   */
+  section?: string;
 }
 
 /**
@@ -1158,6 +1164,12 @@ export interface GraphServiceComputeDiffScopeRequest {
   projectPath: string;
   baseRef?: string;
   requestId: number;
+  /**
+   * P4-4 phase 2a (AD-13 "Section scope"): one allowlist entry, exactly as
+   * the Section bar shows it; absent = the whole scope (today's behaviour).
+   * A value not in the allowlist gets `UnknownSectionResult`.
+   */
+  section?: string;
 }
 
 /**
@@ -1218,6 +1230,12 @@ export interface GraphServiceExpandBlastRadiusRequest {
   projectPath: string;
   nodeIds: string[];
   requestId: number;
+  /**
+   * P4-4 phase 2a (AD-13 "Section scope"): one allowlist entry, exactly as
+   * the Section bar shows it; absent = the whole scope (today's behaviour).
+   * A value not in the allowlist gets `UnknownSectionResult`.
+   */
+  section?: string;
 }
 
 /**
@@ -1510,8 +1528,11 @@ export interface DrillerApi {
    * `packages/graph-contracts`'s `traceCallPath` via the Graph Service.
    * Callable directly (e.g. from the DevTools console); no search UI or
    * route-highlighting consumer exists yet (Phase 2).
+   *
+   * P4-4 phase 2a: `section` (optional) limits the trace to one section's
+   * files (nearest-section rule); omitted = the whole scope.
    */
-  tracePath: (query: string) => Promise<PathTraceResult>;
+  tracePath: (query: string, section?: string) => Promise<PathTraceResult>;
   /**
    * Fire-and-forget: appends one entry to driller's local-only diagnostic
    * log (Story 1.9, Phase 4, AD-21). Never rejects — a log-write failure is
@@ -1529,8 +1550,11 @@ export interface DrillerApi {
    * own validation. No renderer entry point calls this yet this phase (Never:
    * "no UI trigger, mode switcher... this phase") — reachable only by calling
    * this directly, e.g. from the DevTools console.
+   *
+   * P4-4 phase 2a: `section` (optional) limits the changed Nodes, contracts
+   * and top-level files to one section; omitted = the whole scope.
    */
-  computeDiffScope: (projectPath: string, baseRef?: string) => Promise<DiffScopeResult>;
+  computeDiffScope: (projectPath: string, baseRef?: string, section?: string) => Promise<DiffScopeResult>;
   /**
    * Computes combined blast radius hop distances from `nodeIds` for
    * `projectPath` (Story 3.2, Phase 1, FR12, AD-13) — a full IPC/graph-
@@ -1544,6 +1568,9 @@ export interface DrillerApi {
    * No renderer entry point calls this yet this phase (Never: "no UI
    * changes in this phase") — reachable only by calling this directly, e.g.
    * from the DevTools console.
+   *
+   * P4-4 phase 2a: `section` (optional) walks only that section's Nodes and
+   * edges; a seed outside it contributes nothing. Omitted = the whole scope.
    */
-  expandBlastRadius: (projectPath: string, nodeIds: string[]) => Promise<BlastRadiusExpansionResult>;
+  expandBlastRadius: (projectPath: string, nodeIds: string[], section?: string) => Promise<BlastRadiusExpansionResult>;
 }
