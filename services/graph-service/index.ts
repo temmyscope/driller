@@ -122,10 +122,6 @@ import path from 'node:path';
 import {
   buildBidirectionalAdjacency,
   computeBlastRadiusHopDistances,
-  findChangedNodeIds,
-  findChangedContracts,
-  findContractOnlyChangedFiles,
-  findTopLevelOnlyChangedFiles,
   FOLDED_TYPE_IPC_MAX_USED_BY,
   traceCallPath,
   type BlastRadiusExpansionResult,
@@ -175,7 +171,7 @@ import type {} from 'electron';
 import { backendSwitchKind, nextBackendConfig, type BackendConfigState } from './backend-switch';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
-import { computeDiffScope } from './git-diff-scope';
+import { computeDiffScope, resolveGitToplevel } from './git-diff-scope';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { loadLcovCoverage } from './lcov';
@@ -190,7 +186,13 @@ import {
 import { capFoldedTypeUsedBy } from './fold-types';
 import { fetchProductionCodeMap } from './production-code-map';
 import {
+  attachCrossSectionCalls,
   buildScopedCodeMap,
+  countChangedInOtherSections,
+  narrowDiffInputs,
+  summarizeDiffChanges,
+  type DiffMatchInputs,
+  countCrossSectionEdges,
   countSectionNodes,
   filterCodeMapToScope,
   filterToSection,
@@ -639,9 +641,27 @@ export function getSectionCodeMap(
     return memoized;
   }
   const { nodes, foldedModules, foldedTypes } = buildScopedCodeMap(source.raw, keepFile);
+  // P4-4 phase 3a: each section Node's callees in other sections, from the
+  // same raw cache's whole-scope Nodes and edges (the scope filter the
+  // whole-scope build runs, before the section's own filter dropped them) —
+  // so `lookup_node` with a `section` names them exactly as the renderer's
+  // section map does.
+  const wholeScope = filterCodeMapToScope(
+    source.raw.projectRoot,
+    source.raw.fetched.nodes,
+    source.raw.fetched.edges,
+    keepFileForScope(source.appliedScope),
+  );
   const build: SectionCodeMapLookup = Object.freeze({
     status: 'section',
-    nodes,
+    nodes: attachCrossSectionCalls(
+      source.raw.projectRoot,
+      nodes,
+      wholeScope.nodes,
+      wholeScope.edges,
+      section,
+      source.appliedScope,
+    ),
     foldedModules,
     foldedTypes,
     appliedScope: source.appliedScope,
@@ -1703,9 +1723,17 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
       // folded types/Modules and every severity cut are the section's own —
       // never filtered out of, or subtracted from, the whole-scope build.
       const sectionMap = buildScopedCodeMap(raw, sectionFilter);
+      // A string here: `sectionFilter` is only a predicate when `section` was given.
+      const sectionName = section as string;
+      // P4-4 phase 3a: what the section's both-endpoints filter dropped,
+      // counted over the whole-scope build's Nodes and edges (before that
+      // filter), never as "whole scope minus section": the edges joining
+      // this section to each other section, and each section Node's callees
+      // in another section. Absent when there are none.
+      const crossSectionEdges = countCrossSectionEdges(projectRoot, normalizedNodes, edges, sectionName, appliedScope);
       postCodeMapMessage({
         type: 'graphService:codeMap',
-        nodes: sectionMap.nodes,
+        nodes: attachCrossSectionCalls(projectRoot, sectionMap.nodes, normalizedNodes, edges, sectionName, appliedScope),
         edges: sectionMap.edges,
         // P2-5's meaning is kept: the Nodes the allowlist removed. Other
         // sections' Nodes are not counted.
@@ -1715,6 +1743,7 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
         foldedModules: sectionMap.foldedModules,
         section: section ?? null,
         sections,
+        ...(crossSectionEdges.length > 0 ? { crossSectionEdges } : {}),
       });
     }
     // Review round (patch): passes `nodesWithRiskSignals`, not
@@ -2193,6 +2222,49 @@ async function handleComputeDiffScopeRequest(
 }
 
 /**
+ * P4-4 phase 3a (founder decision 2026-10-03): each section folder's git
+ * top-level directory (`resolveGitToplevel`), for "is this section in the
+ * same repository". One lookup per section per index generation and project
+ * root: the cache is replaced as soon as either changes (any index start
+ * bumps the generation). A lookup that fails is cached as `undefined` too.
+ */
+let gitToplevelCache:
+  | { generation: number; projectRoot: string; bySection: Map<string, Promise<string | undefined>> }
+  | undefined;
+
+async function sectionGitToplevels(
+  projectRoot: string,
+  sections: readonly string[],
+): Promise<Map<string, string | undefined>> {
+  if (
+    gitToplevelCache === undefined ||
+    gitToplevelCache.generation !== indexGeneration ||
+    gitToplevelCache.projectRoot !== projectRoot
+  ) {
+    gitToplevelCache = { generation: indexGeneration, projectRoot, bySection: new Map() };
+  }
+  const { bySection } = gitToplevelCache;
+  const entries = await Promise.all(
+    [...new Set(sections)].map(async (section): Promise<[string, string | undefined]> => {
+      let lookup = bySection.get(section);
+      if (lookup === undefined) {
+        lookup = resolveGitToplevel(path.join(projectRoot, ...section.split('/')));
+        bySection.set(section, lookup);
+      }
+      return [section, await lookup];
+    }),
+  );
+  return new Map(entries);
+}
+
+/** Tests only: the git top-level cache's sections, and the generation it is for. */
+export function peekGitToplevelCacheForTests(): { generation: number; sections: string[] } | undefined {
+  return gitToplevelCache === undefined
+    ? undefined
+    : { generation: gitToplevelCache.generation, sections: [...gitToplevelCache.bySection.keys()] };
+}
+
+/**
  * Computes the diff-scoped `DiffScopeResult` for `projectPath` against
  * `baseRef` — branches on `git-diff-scope.ts`'s `computeDiffScope` result:
  * every non-`'resolved'` state (`'no-changes'`/`'not-a-git-repo'`/
@@ -2253,9 +2325,11 @@ export async function computeDiffScopeResult(
     // dependents) and top-level-only files are all the section's own. Never
     // the whole-scope result filtered afterwards. An unknown section is the
     // explicit `unknown-section` result, before any git call.
-    let scopedNodes = nodes;
-    let scopedFoldedTypes = foldedTypes;
-    let scopedFoldedModules = foldedModules;
+    const wholeScope: DiffMatchInputs<CodeMapNode> = { nodes, foldedTypes, foldedModules };
+    let scoped = wholeScope;
+    // P4-4 phase 3a: the scope the caches were built under (which decides
+    // section ownership), for `changedInOtherSections`; only with a section.
+    let ownershipScope: readonly string[] | undefined;
     if (section !== undefined) {
       // Review round 1: existence from the live allowlist, ownership from
       // the scope the caches were built under.
@@ -2263,9 +2337,10 @@ export async function computeDiffScopeResult(
       if (typeof keepFile !== 'function') {
         return keepFile;
       }
-      scopedNodes = filterToSection(projectRoot, nodes, [], keepFile).nodes;
-      scopedFoldedTypes = foldedTypes.filter((type) => keepFile(type.file));
-      scopedFoldedModules = foldedModules.filter((module) => keepFile(module.file));
+      // Non-null: `resolveCachedSectionFilter` only returns a predicate when
+      // a current raw cache exists.
+      ownershipScope = (getActiveRawCodeMap() as ActiveRawCodeMap).appliedScope;
+      scoped = narrowDiffInputs(projectRoot, wholeScope, keepFile);
     }
     // Captured before the git subprocess calls below, for the supersession
     // check after they resolve — see `computeIngestionResult`'s own identical
@@ -2279,6 +2354,16 @@ export async function computeDiffScopeResult(
     const diffScope = await computeDiffScope(projectRoot, baseRef);
     if (diffScope.status !== 'resolved') {
       return diffScope;
+    }
+    // P4-4 phase 3a (founder decision 2026-10-03): with a section, which
+    // other sections share its git repository (`git rev-parse
+    // --show-toplevel` per section folder, cached per index generation). A
+    // section in another repository — or in none — is not part of this diff.
+    let sameRepo: ((other: string) => boolean) | undefined;
+    if (section !== undefined && ownershipScope !== undefined) {
+      const toplevels = await sectionGitToplevels(projectRoot, ownershipScope);
+      const own = toplevels.get(section);
+      sameRepo = (other) => own !== undefined && toplevels.get(other) === own;
     }
 
     // Review finding (Blind Hunter): `nodes` was captured before the
@@ -2294,7 +2379,6 @@ export async function computeDiffScopeResult(
       };
     }
 
-    const nodeIds = findChangedNodeIds(scopedNodes, diffScope.changedFiles);
     // P4-2 phase 3a: a changed Module is not a changed Node (it isn't in
     // `nodes`), so a file whose only change-able content is top-level code
     // is reported by name instead — never a silent "0 changed Nodes".
@@ -2304,21 +2388,19 @@ export async function computeDiffScopeResult(
     // contract change, not a "top-level code" change.
     // Dependents are kept only among `nodes` (the map in scope), so the count
     // is what PR Review can highlight; `dependentIds` is capped for the wire.
-    const { contracts: changedContracts, approximate } = findChangedContracts(
-      scopedFoldedTypes,
-      diffScope.changedFiles,
-      diffScope.changedLines,
-      { mapNodeIds: new Set(scopedNodes.map((node) => node.id)) },
-    );
-    const contractOnlyFiles =
-      diffScope.changedLines === undefined
-        ? new Set<string>()
-        : findContractOnlyChangedFiles(scopedFoldedTypes, diffScope.changedLines);
-    const topLevelFiles = findTopLevelOnlyChangedFiles(
-      scopedNodes,
-      scopedFoldedModules,
-      diffScope.changedFiles.filter((file) => !contractOnlyFiles.has(file)),
-    );
+    // P4-4 phase 3a: these steps now live in `summarizeDiffChanges`
+    // (`scoped-code-map.ts`), unchanged, so `changedInOtherSections` reuses them.
+    const { nodeIds, changedContracts, approximate, topLevelFiles } = summarizeDiffChanges(scoped, diffScope);
+    // P4-4 phase 3a: with a section, what the diff changed in each OTHER
+    // section of the same repository — each section's own counts, from the
+    // same finders over the whole-scope caches narrowed to it (never the
+    // section's result subtracted from the whole), ownership by the caches'
+    // own scope. Absent when there are none, and never computed without a
+    // section.
+    const changedInOtherSections =
+      section === undefined || ownershipScope === undefined || sameRepo === undefined
+        ? []
+        : countChangedInOtherSections(projectRoot, wholeScope, diffScope, section, ownershipScope, sameRepo);
     return {
       status: 'resolved',
       resolvedBaseRef: diffScope.resolvedBaseRef,
@@ -2326,6 +2408,7 @@ export async function computeDiffScopeResult(
       ...(topLevelFiles.length > 0 ? { topLevelFiles } : {}),
       ...(changedContracts.length > 0 ? { changedContracts } : {}),
       ...(changedContracts.length > 0 && approximate ? { changedContractsApproximate: true as const } : {}),
+      ...(changedInOtherSections.length > 0 ? { changedInOtherSections } : {}),
     };
   } catch (error) {
     return { status: 'error', message: error instanceof Error ? error.message : String(error) };

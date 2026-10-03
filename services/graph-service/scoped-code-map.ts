@@ -20,9 +20,20 @@
  */
 import {
   buildBidirectionalAdjacency,
+  CROSS_SECTION_CALLS_MAX,
+  findChangedContracts,
+  findChangedNodeIds,
+  findContractOnlyChangedFiles,
+  findTopLevelOnlyChangedFiles,
+  type ChangedContract,
+  type ChangedLinesByFile,
+  type CrossSectionCall,
+  type CrossSectionEdgeCount,
   type FoldedModule,
   type FoldedType,
+  type SectionChangeCount,
   type SectionNodeCount,
+  type TopLevelChangedFile,
   type UnknownSectionResult,
 } from '@driller/graph-contracts';
 import type { CodeMapEdge, CodeMapNode } from '@driller/ipc-contracts';
@@ -126,6 +137,232 @@ export function countSectionNodes(
     }
   }
   return [...counts].map(([path, nodeCount]) => ({ path, nodeCount }));
+}
+
+/**
+ * P4-4 phase 3a: each Node id's section under the nearest-section rule
+ * (`sectionOfFile` over `includedPaths`). A Node outside the allowlist has
+ * no entry, so it is never counted as "another section": scope hides it,
+ * not the section.
+ */
+function sectionsById(
+  projectRoot: string,
+  nodes: readonly { id: string; file: string }[],
+  includedPaths: readonly string[],
+): Map<string, string> {
+  const owners = new Map<string, string>();
+  for (const node of nodes) {
+    const owner = sectionOfFile(toProjectRelativePosixPath(projectRoot, node.file, 'cross-section count'), includedPaths);
+    if (owner !== undefined) {
+      owners.set(node.id, owner);
+    }
+  }
+  return owners;
+}
+
+/** Section entries sorted by `total` (highest first), then section. */
+function sortBySizeThenSection<T extends { section: string }>(entries: T[], total: (entry: T) => number): T[] {
+  return entries.sort(
+    (a, b) => total(b) - total(a) || (a.section < b.section ? -1 : a.section > b.section ? 1 : 0),
+  );
+}
+
+/**
+ * P4-4 phase 3a: the whole-scope edges a section's map drops because their
+ * other end is in another section — one entry per other section, counting
+ * every edge (any `CodeMapEdgeKind`) with exactly one end in `section` and
+ * the other in that section, split by direction (founder decision
+ * 2026-10-03): `outgoing` = `section` → other, `incoming` = other →
+ * `section`. Counted over `nodes`/`edges` as they are BEFORE the section's
+ * both-endpoints filter (the whole-scope build's), never as "whole scope
+ * minus section".
+ *
+ * An end that is no Node in `nodes` (a dangling edge), or whose file is in
+ * no allowlist entry, has no section, so the edge is never counted. That is
+ * consistent with the unrestricted map's dangling-edge pass-through
+ * (`KEEP_ALL_FILES`): a section exists only with a non-empty allowlist,
+ * whose whole-scope filter has already dropped dangling edges.
+ * Sorted by `outgoing + incoming` (highest first), then section; `[]` when
+ * there is none.
+ */
+export function countCrossSectionEdges(
+  projectRoot: string,
+  nodes: readonly { id: string; file: string }[],
+  edges: readonly { source: string; target: string }[],
+  section: string,
+  includedPaths: readonly string[],
+): CrossSectionEdgeCount[] {
+  const owners = sectionsById(projectRoot, nodes, includedPaths);
+  const counts = new Map<string, CrossSectionEdgeCount>();
+  const entryFor = (other: string): CrossSectionEdgeCount => {
+    let entry = counts.get(other);
+    if (entry === undefined) {
+      entry = { section: other, outgoing: 0, incoming: 0 };
+      counts.set(other, entry);
+    }
+    return entry;
+  };
+  for (const edge of edges) {
+    const from = owners.get(edge.source);
+    const to = owners.get(edge.target);
+    if (from === undefined || to === undefined || from === to) {
+      continue;
+    }
+    if (from === section) {
+      entryFor(to).outgoing += 1;
+    } else if (to === section) {
+      entryFor(from).incoming += 1;
+    }
+  }
+  return sortBySizeThenSection([...counts.values()], (entry) => entry.outgoing + entry.incoming);
+}
+
+/**
+ * P4-4 phase 3a: `sectionNodes` (a section build's Nodes) with each Node's
+ * `crossSectionCalls` — its outgoing whole-scope `CALLS` edges whose callee
+ * is in another allowlist section — and `crossSectionCallsTotal`. One entry
+ * per callee (a repeated edge never doubles a row), sorted by section, then
+ * name, then id, capped at `CROSS_SECTION_CALLS_MAX`. A Node with none is
+ * returned as the same object, with neither field. Incoming callers are not
+ * counted (Ask First).
+ */
+export function attachCrossSectionCalls<TNode extends { id: string }>(
+  projectRoot: string,
+  sectionNodes: TNode[],
+  wholeScopeNodes: readonly { id: string; name: string; file: string }[],
+  wholeScopeEdges: readonly { source: string; target: string; kind: string }[],
+  section: string,
+  includedPaths: readonly string[],
+): (TNode & { crossSectionCalls?: CrossSectionCall[]; crossSectionCallsTotal?: number })[] {
+  const owners = sectionsById(projectRoot, wholeScopeNodes, includedPaths);
+  const names = new Map(wholeScopeNodes.map((node) => [node.id, node.name]));
+  const callees = new Map<string, Map<string, CrossSectionCall>>();
+  for (const edge of wholeScopeEdges) {
+    if (edge.kind !== 'CALLS' || owners.get(edge.source) !== section) {
+      continue;
+    }
+    const calleeSection = owners.get(edge.target);
+    const name = names.get(edge.target);
+    if (calleeSection === undefined || calleeSection === section || name === undefined) {
+      continue;
+    }
+    const byId = callees.get(edge.source) ?? new Map<string, CrossSectionCall>();
+    byId.set(edge.target, { id: edge.target, name, section: calleeSection });
+    callees.set(edge.source, byId);
+  }
+  const compare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  return sectionNodes.map((node) => {
+    const byId = callees.get(node.id);
+    if (byId === undefined) {
+      return node;
+    }
+    const all = [...byId.values()].sort(
+      (a, b) => compare(a.section, b.section) || compare(a.name, b.name) || compare(a.id, b.id),
+    );
+    return { ...node, crossSectionCalls: all.slice(0, CROSS_SECTION_CALLS_MAX), crossSectionCallsTotal: all.length };
+  });
+}
+
+/** P4-4 phase 3a: one resolved diff, as `summarizeDiffChanges` reads it (`git-diff-scope.ts`'s resolved result). */
+export interface ResolvedDiff {
+  changedFiles: string[];
+  changedLines?: ChangedLinesByFile;
+}
+
+/** The whole-scope caches a diff is matched against. */
+export interface DiffMatchInputs<TNode extends { id: string; file: string }> {
+  nodes: readonly TNode[];
+  foldedTypes: readonly FoldedType[];
+  foldedModules: readonly FoldedModule[];
+}
+
+/**
+ * P4-4 phase 3a: what one diff changed among `nodes` / `foldedTypes` /
+ * `foldedModules` — moved here from `index.ts`'s `computeDiffScopeResult`
+ * unchanged, so a section's own result and the per-section counts of
+ * `changedInOtherSections` come from the same finders:
+ *  - `nodeIds`: `findChangedNodeIds`;
+ *  - `changedContracts` / `approximate`: `findChangedContracts`, dependents
+ *    kept among `nodes`;
+ *  - `topLevelFiles`: `findTopLevelOnlyChangedFiles`, leaving out a file
+ *    whose every change lies inside a type (`findContractOnlyChangedFiles`).
+ */
+export function summarizeDiffChanges(
+  inputs: DiffMatchInputs<{ id: string; file: string }>,
+  diff: ResolvedDiff,
+): { nodeIds: string[]; changedContracts: ChangedContract[]; approximate: boolean; topLevelFiles: TopLevelChangedFile[] } {
+  const nodes = [...inputs.nodes];
+  const nodeIds = findChangedNodeIds(nodes, diff.changedFiles);
+  const { contracts: changedContracts, approximate } = findChangedContracts(
+    inputs.foldedTypes,
+    diff.changedFiles,
+    diff.changedLines,
+    { mapNodeIds: new Set(nodes.map((node) => node.id)) },
+  );
+  const contractOnlyFiles =
+    diff.changedLines === undefined ? new Set<string>() : findContractOnlyChangedFiles(inputs.foldedTypes, diff.changedLines);
+  const topLevelFiles = findTopLevelOnlyChangedFiles(
+    nodes,
+    inputs.foldedModules,
+    diff.changedFiles.filter((file) => !contractOnlyFiles.has(file)),
+  );
+  return { nodeIds, changedContracts, approximate, topLevelFiles };
+}
+
+/**
+ * P4-4 phase 3a: `inputs` narrowed to one section's files (`keepFile`) —
+ * Nodes through `filterToSection`, folded types and Modules by their
+ * `file`, exactly as `computeDiffScopeResult` narrows them for a section.
+ */
+export function narrowDiffInputs<TNode extends { id: string; file: string }>(
+  projectRoot: string,
+  inputs: DiffMatchInputs<TNode>,
+  keepFile: KeepFile,
+): DiffMatchInputs<TNode> {
+  return {
+    nodes: filterToSection(projectRoot, [...inputs.nodes], [], keepFile).nodes,
+    foldedTypes: inputs.foldedTypes.filter((type) => keepFile(type.file)),
+    foldedModules: inputs.foldedModules.filter((module) => keepFile(module.file)),
+  };
+}
+
+/**
+ * P4-4 phase 3a (founder decision 2026-10-03): what one diff changed in
+ * each OTHER section of `includedPaths` that `sameRepo` says shares the
+ * requested section's git repository — per section, the counts its own
+ * diff-scope result would hold (`summarizeDiffChanges` over the whole-scope
+ * `inputs` narrowed to that section, never "whole scope minus section"):
+ * changed Nodes, changed contracts and top-level-only files. The current
+ * section, a section `sameRepo` rejects (another repository, or none) and
+ * anything outside the allowlist are never counted. One entry per section
+ * with any count above 0, sorted by the sum (highest first), then section;
+ * `[]` when there is none.
+ */
+export function countChangedInOtherSections(
+  projectRoot: string,
+  inputs: DiffMatchInputs<{ id: string; file: string }>,
+  diff: ResolvedDiff,
+  section: string,
+  includedPaths: readonly string[],
+  sameRepo: (otherSection: string) => boolean,
+): SectionChangeCount[] {
+  const entries: SectionChangeCount[] = [];
+  for (const other of new Set(includedPaths)) {
+    if (other === section || !sameRepo(other)) {
+      continue;
+    }
+    const changes = summarizeDiffChanges(narrowDiffInputs(projectRoot, inputs, keepFileForSection(other, includedPaths)), diff);
+    const entry: SectionChangeCount = {
+      section: other,
+      changedNodes: changes.nodeIds.length,
+      changedContracts: changes.changedContracts.length,
+      topLevelFiles: changes.topLevelFiles.length,
+    };
+    if (entry.changedNodes + entry.changedContracts + entry.topLevelFiles > 0) {
+      entries.push(entry);
+    }
+  }
+  return sortBySizeThenSection(entries, (entry) => entry.changedNodes + entry.changedContracts + entry.topLevelFiles);
 }
 
 /**

@@ -38,20 +38,34 @@
  * `toUnknownSectionResult`. Whether a reply is for the request being
  * settled is checked before either (`code-map-requests.ts`'s
  * `routeCodeMapReply`).
+ *
+ * P4-4 phase 3a: the cross-section counts, per element, the same way:
+ * `crossSectionEdges` (`isCrossSectionEdgeCount`) and each Node's
+ * `crossSectionCalls` (`sanitizeNodeCrossSectionCalls`) on a Code Map
+ * reply, `changedInOtherSections` (`isSectionChangeCount`) on a diff-scope
+ * reply. Malformed elements
+ * are dropped and counted (logged once per reply by the caller), a field
+ * with nothing left is removed rather than sent as `[]`, and a whole-scope
+ * reply (`section: null`) never carries `crossSectionEdges` (nor, review
+ * round 1, any Node's `crossSectionCalls`).
  */
 import type {
   ChangedContract,
   CodeMapNode,
   CodeMapResult,
+  CrossSectionCall,
+  CrossSectionEdgeCount,
   DiffScopeResult,
   FoldedModule,
   FoldedType,
   GraphServiceCodeMapMessage,
+  SectionChangeCount,
   SectionNodeCount,
   SimilarImplementation,
   TopLevelChangedFile,
   UnknownSectionResult,
 } from '@driller/ipc-contracts';
+import { CROSS_SECTION_CALLS_MAX } from '@driller/ipc-contracts';
 
 type CodeMapReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMap' }>;
 type UnknownSectionReply = Extract<GraphServiceCodeMapMessage, { type: 'graphService:codeMapUnknownSection' }>;
@@ -295,6 +309,126 @@ export function sanitizeNodeTestCoverageAvailable(node: CodeMapNode): { node: Co
   };
 }
 
+/** A count field: a non-negative integer. */
+const isCount = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0;
+
+/**
+ * P4-4 phase 3a (founder decision 2026-10-03): whether `value` is a
+ * well-formed `CrossSectionEdgeCount`: a non-empty string `section` and
+ * non-negative integer `outgoing` / `incoming`, at least one above 0 (an
+ * entry exists only for a section with an edge).
+ */
+export function isCrossSectionEdgeCount(value: unknown): value is CrossSectionEdgeCount {
+  return (
+    isRecord(value) &&
+    isString(value.section) &&
+    value.section.length > 0 &&
+    isCount(value.outgoing) &&
+    isCount(value.incoming) &&
+    value.outgoing + value.incoming >= 1
+  );
+}
+
+/**
+ * P4-4 phase 3a (founder decision 2026-10-03): whether `value` is a
+ * well-formed `SectionChangeCount`: a non-empty string `section` and
+ * non-negative integer `changedNodes` / `changedContracts` / `topLevelFiles`,
+ * at least one above 0.
+ */
+export function isSectionChangeCount(value: unknown): value is SectionChangeCount {
+  return (
+    isRecord(value) &&
+    isString(value.section) &&
+    value.section.length > 0 &&
+    isCount(value.changedNodes) &&
+    isCount(value.changedContracts) &&
+    isCount(value.topLevelFiles) &&
+    value.changedNodes + value.changedContracts + value.topLevelFiles >= 1
+  );
+}
+
+/** P4-4 phase 3a: whether `value` is a well-formed `CrossSectionCall`: non-empty string `id`/`name`/`section`. */
+export function isCrossSectionCall(value: unknown): value is CrossSectionCall {
+  return (
+    isRecord(value) &&
+    isString(value.id) &&
+    value.id.length > 0 &&
+    isString(value.name) &&
+    value.name.length > 0 &&
+    isString(value.section) &&
+    value.section.length > 0
+  );
+}
+
+/**
+ * P4-4 phase 3a: an optional per-section count list's well-formed elements,
+ * the first entry per section only (a repeated section would double a
+ * line). `undefined` when nothing survives (the field is then left out,
+ * never `[]`); `dropped` counts what was removed (a non-array counts 1).
+ */
+function keepSectionCounts<T extends { section: string }>(
+  raw: unknown,
+  isValid: (value: unknown) => value is T,
+): { kept: T[] | undefined; dropped: number } {
+  const valid = keepValid(raw, isValid);
+  const seen = new Set<string>();
+  const kept = valid.kept.filter((entry) => !seen.has(entry.section) && seen.add(entry.section) !== undefined);
+  return { kept: kept.length > 0 ? kept : undefined, dropped: valid.dropped + (valid.kept.length - kept.length) };
+}
+
+/**
+ * P4-4 phase 3a: a Node with its `crossSectionCalls` validated per element,
+ * for a reply about `section` (`null`: the whole scope). The same rules as
+ * `sanitizeNodeSimilarTo`, plus the section's own:
+ *  - on a whole-scope reply both fields are removed (counted as 1): a
+ *    no-section Node never carries them, like the reply's `crossSectionEdges`;
+ *  - malformed elements, repeated ids and (review round 1) calls whose
+ *    `section` is the reply's own section are dropped and counted;
+ *  - with none left both fields are removed; a lone `crossSectionCallsTotal`
+ *    is removed and counted;
+ *  - a surviving list keeps a `crossSectionCallsTotal` that is an integer at
+ *    least its length, else gets its length (counted);
+ *  - (review round 1) a list longer than `CROSS_SECTION_CALLS_MAX` is cut to
+ *    the cap, keeping the total; each cut entry is counted.
+ * Returns the same Node when nothing needed changing (or both are absent).
+ */
+export function sanitizeNodeCrossSectionCalls(
+  node: CodeMapNode,
+  section: string | null,
+): { node: CodeMapNode; dropped: number } {
+  const raw: unknown = node.crossSectionCalls;
+  const rawTotal: unknown = node.crossSectionCallsTotal;
+  if (raw === undefined && rawTotal === undefined) {
+    return { node, dropped: 0 };
+  }
+  const { crossSectionCalls: _calls, crossSectionCallsTotal: _total, ...rest } = node;
+  if (section === null) {
+    return { node: rest, dropped: 1 };
+  }
+  const valid = keepValid(raw, isCrossSectionCall);
+  const seen = new Set<string>();
+  const kept = valid.kept.filter(
+    (entry) => entry.section !== section && !seen.has(entry.id) && seen.add(entry.id) !== undefined,
+  );
+  const dropped = valid.dropped + (valid.kept.length - kept.length);
+  if (kept.length === 0) {
+    return { node: rest, dropped: dropped + (raw === undefined ? 1 : 0) };
+  }
+  const totalOk = Number.isInteger(rawTotal) && (rawTotal as number) >= kept.length;
+  const overCap = Math.max(0, kept.length - CROSS_SECTION_CALLS_MAX);
+  if (dropped === 0 && totalOk && overCap === 0) {
+    return { node, dropped: 0 };
+  }
+  return {
+    node: {
+      ...rest,
+      crossSectionCalls: kept.slice(0, CROSS_SECTION_CALLS_MAX),
+      crossSectionCallsTotal: totalOk ? (rawTotal as number) : kept.length,
+    },
+    dropped: dropped + (totalOk ? 0 : 1) + overCap,
+  };
+}
+
 /** P4-2 phase 3c: a well-formed `TopLevelChangedFile`: string `file`, a valid line range. */
 export function isTopLevelChangedFile(value: unknown): value is TopLevelChangedFile {
   return isRecord(value) && isString(value.file) && isLineRange(value.startLine, value.endLine);
@@ -355,6 +489,8 @@ export function toValidatedDiffScopeResult(result: DiffScopeResult): { result: D
   const topLevel = keepValid(raw.topLevelFiles, isTopLevelChangedFile);
   const contracts = keepValid(raw.changedContracts, isChangedContract);
   const approximate = raw.changedContractsApproximate === true && contracts.kept.length > 0;
+  // P4-4 phase 3a: the changed Nodes in other sections (section requests only).
+  const elsewhere = keepSectionCounts(raw.changedInOtherSections, isSectionChangeCount);
   return {
     result: {
       status: 'resolved',
@@ -363,8 +499,9 @@ export function toValidatedDiffScopeResult(result: DiffScopeResult): { result: D
       ...(topLevel.kept.length > 0 ? { topLevelFiles: topLevel.kept } : {}),
       ...(contracts.kept.length > 0 ? { changedContracts: contracts.kept } : {}),
       ...(approximate ? { changedContractsApproximate: true as const } : {}),
+      ...(elsewhere.kept !== undefined ? { changedInOtherSections: elsewhere.kept } : {}),
     },
-    dropped: raw.nodeIds.length - nodeIds.length + topLevel.dropped + contracts.dropped,
+    dropped: raw.nodeIds.length - nodeIds.length + topLevel.dropped + contracts.dropped + elsewhere.dropped,
   };
 }
 
@@ -389,6 +526,13 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   droppedTestCoverageAvailable: number;
   /** P4-4 phase 1b: how many `sections` elements were malformed and dropped. */
   droppedSections: number;
+  /**
+   * P4-4 phase 3a: how many cross-section count elements (`crossSectionEdges`,
+   * and every Node's `crossSectionCalls` / `crossSectionCallsTotal`) were
+   * malformed and dropped — including a `crossSectionEdges` on a whole-scope
+   * reply, which never carries one.
+   */
+  droppedCrossSection: number;
 } {
   const replaced: ReplacedCodeMapField[] = [];
   const rawHidden: unknown = message.hiddenByScope;
@@ -439,6 +583,13 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   } else {
     replaced.push('sections');
   }
+  // P4-4 phase 3a: only a section reply may carry `crossSectionEdges`.
+  const rawCrossEdges: unknown = (message as { crossSectionEdges?: unknown }).crossSectionEdges;
+  const crossEdges =
+    section === null
+      ? { kept: undefined, dropped: rawCrossEdges === undefined ? 0 : 1 }
+      : keepSectionCounts(rawCrossEdges, isCrossSectionEdgeCount);
+  let droppedCrossSection = crossEdges.dropped;
   let droppedSimilarTo = 0;
   let droppedTestCoverageAvailable = 0;
   const nodes = Array.isArray(message.nodes)
@@ -450,7 +601,9 @@ export function toOkCodeMapResult(message: CodeMapReply): {
         droppedSimilarTo += sanitized.dropped;
         const flagged = sanitizeNodeTestCoverageAvailable(sanitized.node);
         droppedTestCoverageAvailable += flagged.dropped;
-        return flagged.node;
+        const crossChecked = sanitizeNodeCrossSectionCalls(flagged.node, section);
+        droppedCrossSection += crossChecked.dropped;
+        return crossChecked.node;
       })
     : message.nodes;
   return {
@@ -464,6 +617,7 @@ export function toOkCodeMapResult(message: CodeMapReply): {
       foldedModules,
       section,
       sections,
+      ...(crossEdges.kept !== undefined ? { crossSectionEdges: crossEdges.kept } : {}),
     },
     replaced,
     droppedFoldedTypes,
@@ -471,5 +625,6 @@ export function toOkCodeMapResult(message: CodeMapReply): {
     droppedSimilarTo,
     droppedTestCoverageAvailable,
     droppedSections,
+    droppedCrossSection,
   };
 }

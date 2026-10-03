@@ -262,7 +262,8 @@ export function routeCodeMapReply(
   // P2-5: the scope fields are validated here, at the process boundary.
   // P4-2 phase 3b/3c: and each folded type / Module; P4-2 phase 4: each
   // Node's "Similar implementations"; P4-3 phase 5: each Node's
-  // test-coverage flags; P4-4 phase 1b: `section` and `sections`.
+  // test-coverage flags; P4-4 phase 1b: `section` and `sections`; P4-4
+  // phase 3a: the cross-section counts.
   const {
     result,
     replaced,
@@ -271,6 +272,7 @@ export function routeCodeMapReply(
     droppedSimilarTo,
     droppedTestCoverageAvailable,
     droppedSections,
+    droppedCrossSection,
   } = toOkCodeMapResult(message);
   if (replaced.length > 0) {
     warn(`Code Map reply had malformed ${joinNaturally(replaced)}; replaced with the empty default.`);
@@ -281,6 +283,8 @@ export function routeCodeMapReply(
     [droppedSimilarTo, 'malformed similar implementation'],
     [droppedTestCoverageAvailable, 'malformed test-coverage flag'],
     [droppedSections, 'malformed section count'],
+    // P4-4 phase 3a.
+    [droppedCrossSection, 'malformed cross-section count'],
   ];
   for (const [count, what] of drops) {
     if (count > 0) {

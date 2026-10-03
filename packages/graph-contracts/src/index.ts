@@ -1302,6 +1302,67 @@ export interface CodeMapNode {
    * say "covered".
    */
   testCoverageHit?: true;
+  /**
+   * P4-4 phase 3a (section maps only): this Node's outgoing `CALLS` edges
+   * whose callee is in another section of the allowlist (nearest-section
+   * rule) — real whole-scope edges the section's both-endpoints filter
+   * dropped, never inferred. Sorted by section, then name, then id; one entry
+   * per callee; capped at `CROSS_SECTION_CALLS_MAX`. Absent when there is
+   * none, and always absent on a whole-scope map (no `section`). A callee
+   * outside the allowlist is never listed: scope hides it, not the section.
+   */
+  crossSectionCalls?: CrossSectionCall[];
+  /** P4-4 phase 3a: how many cross-section callees exist before the cap. Present exactly when `crossSectionCalls` is; never below its length. */
+  crossSectionCallsTotal?: number;
+}
+
+/**
+ * P4-4 phase 3a: one callee of a section Node that lives in another section
+ * (`CodeMapNode.crossSectionCalls`). `id` is a Code Map Node id in the
+ * whole scope (resolvable via `lookup_node` without a section, or with
+ * `section` set to `section`); `section` is the allowlist entry that owns it.
+ */
+export interface CrossSectionCall {
+  id: string;
+  name: string;
+  section: string;
+}
+
+/** P4-4 phase 3a: the most `CodeMapNode.crossSectionCalls` entries carried per Node; `crossSectionCallsTotal` is the full count. */
+export const CROSS_SECTION_CALLS_MAX = 20;
+
+/**
+ * P4-4 phase 3a: the whole-scope Code Map edges (`CALLS`/`IMPORTS`/`USAGE`)
+ * that join the requested section to one other section — counted before the
+ * section's both-endpoints filter drops them, never as "whole scope minus
+ * section". Founder decision (2026-10-03): split by direction. `outgoing`
+ * counts edges from the requested section into `section`, `incoming` edges
+ * from `section` into the requested one. Both are non-negative integers, and
+ * an entry exists only when at least one is above 0.
+ */
+export interface CrossSectionEdgeCount {
+  section: string;
+  outgoing: number;
+  incoming: number;
+}
+
+/**
+ * P4-4 phase 3a: what a diff changed in one OTHER section of the same git
+ * repository as the requested section (`DiffScopeResult.changedInOtherSections`)
+ * — founder decision (2026-10-03). Each count is what that section's own
+ * diff-scope result would hold, computed by the same finders over the
+ * whole-scope caches, never as "whole scope minus section":
+ *  - `changedNodes`: its changed Code Map Nodes (`nodeIds`);
+ *  - `changedContracts`: its changed folded types (`changedContracts`);
+ *  - `topLevelFiles`: its changed files with only folded top-level code
+ *    (`topLevelFiles`).
+ * Non-negative integers; an entry exists only when at least one is above 0.
+ */
+export interface SectionChangeCount {
+  section: string;
+  changedNodes: number;
+  changedContracts: number;
+  topLevelFiles: number;
 }
 
 /**
@@ -1631,6 +1692,17 @@ export type DiffScopeResult =
        * (`ChangedContractsResult.approximate`). Absent otherwise.
        */
       changedContractsApproximate?: true;
+      /**
+       * P4-4 phase 3a (section requests only): what the diff changed in each
+       * OTHER allowlist section in the same git repository as the requested
+       * one (see `SectionChangeCount`) — ownership by the nearest-section
+       * rule, the current section excluded. A section in another repository
+       * is never listed (it is not part of this diff), and nothing outside the
+       * allowlist is counted. Sorted by the sum of the three counts (highest
+       * first), then section. Absent when there are none, and always absent
+       * without a `section`.
+       */
+      changedInOtherSections?: SectionChangeCount[];
     }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }

@@ -254,6 +254,15 @@ describe('routeCodeMapReply (review round 1)', () => {
     assert.deepEqual(warnings, ['Code Map reply had 1 malformed section count; dropped.']);
   });
 
+  it('ok with cross-section counts (P4-4 phase 3a): kept when well-formed, malformed ones dropped and logged once', { timeout: 5_000 }, async () => {
+    const { requester, route, warnings } = routed();
+    const api = requester.request('api');
+    const edges = [{ section: 'web', outgoing: 9, incoming: 3 }];
+    route(okReply('api', { crossSectionEdges: [...edges, { section: 'docs', outgoing: 0, incoming: 0 }, null] }));
+    assert.deepEqual(await api, { ...okFor('api'), crossSectionEdges: edges });
+    assert.deepEqual(warnings, ['Code Map reply had 2 malformed cross-section counts; dropped.']);
+  });
+
   it('error: settles with its message (echoed, or with no echo at all)', { timeout: 5_000 }, async () => {
     const { requester, route } = routed();
     const api = requester.request('api');

@@ -5,12 +5,16 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
+import { CROSS_SECTION_CALLS_MAX, type GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
 
 import {
+  isCrossSectionCall,
+  isCrossSectionEdgeCount,
+  isSectionChangeCount,
   isSectionNodeCount,
   isSimilarImplementation,
   joinNaturally,
+  sanitizeNodeCrossSectionCalls,
   sanitizeNodeSimilarTo,
   sanitizeNodeTestCoverageAvailable,
   toOkCodeMapResult,
@@ -43,6 +47,7 @@ describe('toOkCodeMapResult', () => {
       droppedSimilarTo: 0,
       droppedTestCoverageAvailable: 0,
       droppedSections: 0,
+      droppedCrossSection: 0,
     });
   });
 
@@ -495,5 +500,165 @@ describe('section and sections (P4-4 phase 1b)', () => {
       dropped: 1,
     });
     assert.equal(toUnknownSectionResult(unknownReply({ section: 4, knownSections: [] })), null);
+  });
+});
+
+describe('cross-section counts (P4-4 phase 3a)', () => {
+  const base = { hiddenByScope: 0, appliedScope: ['web', 'api'], foldedTypes: [] };
+  const EDGE = { section: 'web', outgoing: 9, incoming: 3 };
+  const CALL = { id: 'web.render', name: 'render', section: 'web' };
+  const node = (fields: Record<string, unknown> = {}): CodeMapNodeLike => ({
+    id: 'api.handleOrder',
+    name: 'handleOrder',
+    file: 'api/order.ts',
+    startLine: 1,
+    endLine: 2,
+    kind: 'Function',
+    summaryStatus: 'pending',
+    riskSignals: [],
+    ...fields,
+  });
+  type CodeMapNodeLike = Parameters<typeof sanitizeNodeCrossSectionCalls>[0];
+
+  it('element validators', () => {
+    assert.equal(isCrossSectionEdgeCount(EDGE), true);
+    assert.equal(isCrossSectionEdgeCount({ section: 'web', outgoing: 0, incoming: 2 }), true, 'one direction may be 0');
+    for (const bad of [
+      null,
+      'web',
+      { section: '', outgoing: 1, incoming: 0 },
+      { section: 'web', outgoing: 0, incoming: 0 },
+      { section: 'web', outgoing: 1.5, incoming: 0 },
+      { section: 'web', outgoing: -1, incoming: 3 },
+      { section: 'web', outgoing: 1, incoming: 1.5 },
+      { section: 'web', outgoing: 2, incoming: -1 },
+      { section: 'web', outgoing: 1, incoming: '1' },
+      { section: 3, outgoing: 1, incoming: 0 },
+      { section: 'web', outgoing: 1 },
+      { section: 'web', count: 12 },
+    ]) {
+      assert.equal(isCrossSectionEdgeCount(bad), false, JSON.stringify(bad));
+    }
+    const CHANGE = { section: 'api', changedNodes: 3, changedContracts: 0, topLevelFiles: 0 };
+    assert.equal(isSectionChangeCount(CHANGE), true);
+    assert.equal(isSectionChangeCount({ ...CHANGE, changedNodes: 0, topLevelFiles: 1 }), true);
+    for (const bad of [
+      { ...CHANGE, changedNodes: 0 },
+      { ...CHANGE, changedContracts: -1 },
+      { ...CHANGE, topLevelFiles: 0.5 },
+      { ...CHANGE, section: '' },
+      { section: 'api', changedNodes: 3 },
+      { section: 'api', count: 3 },
+    ]) {
+      assert.equal(isSectionChangeCount(bad), false, JSON.stringify(bad));
+    }
+    assert.equal(isCrossSectionCall(CALL), true);
+    for (const bad of [null, { ...CALL, id: '' }, { ...CALL, name: 7 }, { ...CALL, section: '' }, { id: 'x', name: 'x' }]) {
+      assert.equal(isCrossSectionCall(bad), false, JSON.stringify(bad));
+    }
+  });
+
+  it('a section reply keeps well-formed crossSectionEdges, dropping (and counting) malformed and repeated entries', () => {
+    const ok = toOkCodeMapResult(reply({ ...base, section: 'api', crossSectionEdges: [EDGE] }));
+    assert.deepEqual(ok.result.status === 'ok' && ok.result.crossSectionEdges, [EDGE]);
+    assert.equal(ok.droppedCrossSection, 0);
+    const mixed = toOkCodeMapResult(
+      reply({ ...base, section: 'api', crossSectionEdges: [EDGE, { section: 'docs', outgoing: -1, incoming: 2 }, null, { section: 'web', outgoing: 1, incoming: 0 }] }),
+    );
+    assert.deepEqual(mixed.result.crossSectionEdges, [EDGE]);
+    assert.equal(mixed.droppedCrossSection, 3);
+  });
+
+  it('nothing left, a non-array, or a whole-scope reply: the field is absent (never []), and the drop is counted', () => {
+    for (const [section, raw, dropped] of [
+      ['api', [{ section: 'web', outgoing: 0, incoming: 0 }], 1],
+      ['api', 'web', 1],
+      ['api', [], 0],
+      [null, [EDGE], 1],
+    ] as const) {
+      const { result, droppedCrossSection } = toOkCodeMapResult(reply({ ...base, section, crossSectionEdges: raw }));
+      assert.ok(!('crossSectionEdges' in result), JSON.stringify(raw));
+      assert.equal(droppedCrossSection, dropped, JSON.stringify(raw));
+    }
+    const { result } = toOkCodeMapResult(reply({ ...base, section: null }));
+    assert.deepEqual(Object.keys(result), ['status', 'nodes', 'edges', 'hiddenByScope', 'appliedScope', 'foldedTypes', 'foldedModules', 'section', 'sections']);
+  });
+
+  it("a Node's crossSectionCalls: well-formed passes as the same object; malformed elements and a bad total are fixed and counted", () => {
+    const ok = node({ crossSectionCalls: [CALL], crossSectionCallsTotal: 25 });
+    assert.deepEqual(sanitizeNodeCrossSectionCalls(ok, 'api'), { node: ok, dropped: 0 });
+    const plain = node();
+    assert.deepEqual(sanitizeNodeCrossSectionCalls(plain, 'api'), { node: plain, dropped: 0 });
+
+    const mixed = sanitizeNodeCrossSectionCalls(node({ crossSectionCalls: [CALL, { ...CALL, section: 4 }, CALL], crossSectionCallsTotal: 3 }), 'api');
+    assert.deepEqual(mixed.node.crossSectionCalls, [CALL]);
+    assert.equal(mixed.node.crossSectionCallsTotal, 3);
+    assert.equal(mixed.dropped, 2);
+
+    const badTotal = sanitizeNodeCrossSectionCalls(node({ crossSectionCalls: [CALL], crossSectionCallsTotal: 0 }), 'api');
+    assert.equal(badTotal.node.crossSectionCallsTotal, 1);
+    assert.equal(badTotal.dropped, 1);
+
+    for (const fields of [{ crossSectionCalls: [null] , crossSectionCallsTotal: 1 }, { crossSectionCalls: 'web' }, { crossSectionCallsTotal: 4 }]) {
+      const { node: cleaned, dropped } = sanitizeNodeCrossSectionCalls(node(fields), 'api');
+      assert.ok(!('crossSectionCalls' in cleaned) && !('crossSectionCallsTotal' in cleaned), JSON.stringify(fields));
+      assert.equal(dropped, 1, JSON.stringify(fields));
+    }
+  });
+
+  it('review round 1: a whole-scope reply strips every Node\'s crossSectionCalls (counted)', () => {
+    const withCalls = node({ crossSectionCalls: [CALL], crossSectionCallsTotal: 1 });
+    assert.deepEqual(sanitizeNodeCrossSectionCalls(withCalls, null), { node: node(), dropped: 1 });
+    const { result, droppedCrossSection } = toOkCodeMapResult(reply({ ...base, section: null, nodes: [withCalls, node()] }));
+    assert.ok(result.nodes.every((n) => !('crossSectionCalls' in n) && !('crossSectionCallsTotal' in n)));
+    assert.equal(droppedCrossSection, 1);
+  });
+
+  it("review round 1: a call into the reply's own section is dropped (counted)", () => {
+    const own = { id: 'api.other', name: 'other', section: 'api' };
+    const { node: cleaned, dropped } = sanitizeNodeCrossSectionCalls(node({ crossSectionCalls: [own, CALL], crossSectionCallsTotal: 2 }), 'api');
+    assert.deepEqual(cleaned.crossSectionCalls, [CALL]);
+    assert.equal(cleaned.crossSectionCallsTotal, 2);
+    assert.equal(dropped, 1);
+    const only = sanitizeNodeCrossSectionCalls(node({ crossSectionCalls: [own], crossSectionCallsTotal: 1 }), 'api');
+    assert.ok(!('crossSectionCalls' in only.node) && !('crossSectionCallsTotal' in only.node));
+  });
+
+  it('review round 1: a list over CROSS_SECTION_CALLS_MAX is cut to the cap, keeping the total', () => {
+    const calls = Array.from({ length: CROSS_SECTION_CALLS_MAX + 5 }, (_, i) => ({ id: `web.f${i}`, name: `f${i}`, section: 'web' }));
+    const { node: cut, dropped } = sanitizeNodeCrossSectionCalls(node({ crossSectionCalls: calls, crossSectionCallsTotal: 30 }), 'api');
+    assert.deepEqual(cut.crossSectionCalls, calls.slice(0, CROSS_SECTION_CALLS_MAX));
+    assert.equal(cut.crossSectionCallsTotal, 30);
+    assert.equal(dropped, 5);
+    const noTotal = sanitizeNodeCrossSectionCalls(node({ crossSectionCalls: calls }), 'api');
+    assert.equal(noTotal.node.crossSectionCalls?.length, CROSS_SECTION_CALLS_MAX);
+    assert.equal(noTotal.node.crossSectionCallsTotal, calls.length, 'the total is the full surviving count');
+  });
+
+  it('toOkCodeMapResult sanitizes every Node and sums the drops with crossSectionEdges', () => {
+    const { result, droppedCrossSection } = toOkCodeMapResult(
+      reply({ ...base, section: 'api', crossSectionEdges: [EDGE, null], nodes: [node({ crossSectionCalls: [CALL, {}], crossSectionCallsTotal: 2 })] }),
+    );
+    assert.deepEqual(result.nodes[0]?.crossSectionCalls, [CALL]);
+    assert.equal(droppedCrossSection, 2);
+  });
+
+  it('a diff-scope result keeps well-formed changedInOtherSections; nothing left is absent; drops are counted', () => {
+    type Result = Parameters<typeof toValidatedDiffScopeResult>[0];
+    const resolved = (fields: Record<string, unknown>) =>
+      ({ status: 'resolved', resolvedBaseRef: 'abc', nodeIds: ['n'], ...fields }) as unknown as Result;
+    const elsewhere = [{ section: 'api', changedNodes: 3, changedContracts: 1, topLevelFiles: 0 }];
+    assert.deepEqual(toValidatedDiffScopeResult(resolved({ changedInOtherSections: elsewhere })), {
+      result: resolved({ changedInOtherSections: elsewhere }),
+      dropped: 0,
+    });
+    assert.deepEqual(
+      toValidatedDiffScopeResult(resolved({ changedInOtherSections: [...elsewhere, { section: 'web' }, { section: 'api', changedNodes: 1, changedContracts: 0, topLevelFiles: 0 }] })),
+      { result: resolved({ changedInOtherSections: elsewhere }), dropped: 2 },
+    );
+    for (const raw of [[{ section: 'web', changedNodes: 0, changedContracts: 0, topLevelFiles: 0 }], [{ section: 'web', count: 2 }], 'api', []]) {
+      const { result } = toValidatedDiffScopeResult(resolved({ changedInOtherSections: raw }));
+      assert.ok(!('changedInOtherSections' in result), JSON.stringify(raw));
+    }
   });
 });

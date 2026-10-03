@@ -238,9 +238,9 @@ describe('P4-4 phase 2b: MCP without section is unchanged', () => {
     }
   });
 
-  it('the version is 1.7.0, and the descriptions state the section rules', () => {
+  it('the version is 1.8.0 (P4-4g), and the descriptions state the section rules', () => {
     assert.ok(mcp);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.7.0');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.8.0');
     const tools = registerTools();
     for (const name of ['lookup_node', 'trace_path', 'expand_blast_radius', 'compute_diff_scope']) {
       const description = tools.get(name)?.config.description ?? '';
@@ -253,6 +253,13 @@ describe('P4-4 phase 2b: MCP without section is unchanged', () => {
     assert.match(tools.get('lookup_node')!.config.description!, /not-in-section/);
     assert.match(tools.get('trace_path')!.config.description!, /it never crosses into another section/);
     assert.match(tools.get('expand_blast_radius')!.config.description!, /walked over that section's Nodes and the edges between them alone/);
+    // P4-4 phase 3a: the cross-section fields.
+    assert.match(tools.get('lookup_node')!.config.description!, /'crossSectionCalls'.*capped at 20 with 'crossSectionCallsTotal'/);
+    assert.match(tools.get('lookup_node')!.config.description!, /always absent without 'section'/);
+    assert.match(tools.get('compute_diff_scope')!.config.description!, /'changedInOtherSections' counts them: \[\{section, changedNodes, changedContracts, topLevelFiles\}\]/);
+    assert.match(tools.get('compute_diff_scope')!.config.description!, /always absent without 'section'/);
+    assert.doesNotMatch(tools.get('compute_diff_scope')!.config.description!, /changes in other sections are not reported/);
+    assert.match(tools.get('compute_diff_scope')!.config.description!, /SAME git repository/);
   });
 });
 

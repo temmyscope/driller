@@ -76,10 +76,23 @@ const MOVED_GRAPH_SHAPES = [
  * `TestedBy.tests`; `SIMILAR_TO_MIN_JACCARD`/`SIMILAR_TO_MAX_ENTRIES` bound
  * `CodeMapNode.similarTo` (P4-2 phase 4).
  */
-const CONTRACT_CONSTANTS = ['TESTED_BY_MAX_TESTS', 'SIMILAR_TO_MIN_JACCARD', 'SIMILAR_TO_MAX_ENTRIES'] as const;
+const CONTRACT_CONSTANTS = [
+  'TESTED_BY_MAX_TESTS',
+  'SIMILAR_TO_MIN_JACCARD',
+  'SIMILAR_TO_MAX_ENTRIES',
+  // P4-4 phase 3a: bounds `CodeMapNode.crossSectionCalls`.
+  'CROSS_SECTION_CALLS_MAX',
+] as const;
 
 /** P4-4 phase 1b (AD-13 "Section scope"): the section result state and the per-section Node count. */
-const SECTION_SCOPE_SHAPES = ['UnknownSectionResult', 'SectionNodeCount'] as const;
+const SECTION_SCOPE_SHAPES = [
+  'UnknownSectionResult',
+  'SectionNodeCount',
+  // P4-4 phase 3a: the cross-section counts.
+  'CrossSectionEdgeCount',
+  'CrossSectionCall',
+  'SectionChangeCount',
+] as const;
 
 const CONTRACT_HOME_NAMES: readonly string[] = [
   ...OPERATION_RESULT_TYPES,

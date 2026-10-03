@@ -65,6 +65,7 @@ import type { CodeMapNode, McpServerStatusMessage } from '@driller/ipc-contracts
 import {
   BLAST_RADIUS_DEFAULT_HOPS,
   CHANGED_CONTRACT_MAX_DEPENDENT_IDS,
+  CROSS_SECTION_CALLS_MAX,
   FOLDED_TYPE_LOOKUP_MAX_USED_BY,
   SIMILAR_TO_MAX_ENTRIES,
   SIMILAR_TO_MIN_JACCARD,
@@ -392,7 +393,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.7.0';
+export const MCP_SERVER_VERSION = '1.8.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -434,6 +435,7 @@ export function registerLookupNodeTool(
         "'testCoverageHit': true, when present, means the function was entered at least once by tests (LCOV): a function record (FN/FNDA) starting in this Node's range has a call count above 0, and the file is not newer than the report. It is the only coverage claim made about the Node itself; line hits alone never set it, because loading a module hits a declaration's own line even when no test calls it. An absent 'testCoverageHit' is NOT evidence the Node is untested: the report may lack function records, be older than the file, or not list it. An absent 'testCoverageAvailable' means there is no LCOV data for the file at all (no coverage/lcov.info, an unparseable one, or a report that doesn't list the file). " +
         "With 'section', the Node is the one the human sees in that section: every deterministic signal's severity and the blast-radius count are computed over that section alone (its own severity cut, and only Nodes and edges inside it); the 'llm-judgment' and 'ingested' signals and the summary come from driller's stored records and are the same with or without a section; and the section-scoped links ('similarTo', 'usesTypes', 'fileTopLevel', 'fileTopLevelTypes', 'calledAtLoadBy', and a folded type's 'usedBy' and type links, or a folded Module's 'uses') name only ids inside the section; 'testedBy' and the test-coverage flags are the same as without a section. " +
         "An id that exists in the whole scope but belongs to another section (a folded Module or type by its file) returns {status: 'not-in-section', nodeId, section, nodeSection}, never not-found; 'nodeSection' is the section that holds it. " +
+        `With 'section', 'crossSectionCalls', when present, lists this Node's callees in other sections of the allowlist ({id, name, section}): its real outgoing CALLS edges whose target another section holds (the calls the section's own edges leave out), one entry per callee, sorted by section, then name, capped at ${CROSS_SECTION_CALLS_MAX} with 'crossSectionCallsTotal' giving the full count; look one up with that 'section', or without one. A callee outside the allowlist is never listed, callers in other sections are not listed, and both fields are absent when there is none and always absent without 'section'. ` +
         SECTION_RULE_DESCRIPTION,
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
@@ -514,7 +516,7 @@ export function registerComputeDiffScopeTool(server: Pick<McpServer, 'registerTo
         "'changedContractsApproximate: true' means approximate: couldn't read line ranges for some changed file, so " +
         "every type in it was counted (may over-report, never hides a contract). " +
         "'topLevelFiles' leaves out a file whose every change lies inside a type. " +
-        "With 'section', the changed Nodes, changed contracts (and their dependents) and top-level-only files are only that section's own, matched against its Nodes alone; changes in other sections are not reported. " +
+        "With 'section', the changed Nodes, changed contracts (and their dependents) and top-level-only files are only that section's own, matched against its Nodes alone; changed Nodes in other sections are never in 'nodeIds'. Instead, a resolved result's optional 'changedInOtherSections' counts them: [{section, changedNodes, changedContracts, topLevelFiles}], one entry per other allowlist section in the SAME git repository as 'section' with at least one change, each count being what that section's own result would hold (its changed Nodes, changed contracts and top-level-only files, by the same nearest-section rule); sorted by the sum of the three (highest first), then by section. A section in another git repository (or in none) is never listed: it is not part of this diff. It is absent when there are none and always absent without 'section'; nothing outside the allowlist is counted. " +
         SECTION_RULE_DESCRIPTION,
       inputSchema: z.object({
         projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
@@ -637,6 +639,14 @@ export function startMcpServer(
   // call without `section` is byte-for-byte what 1.6.0 returned. (The P4-4f
   // spec, written before P4-3f took 1.6.0, says 1.5.0 → 1.6.0; the intent —
   // one additive minor bump — is kept.)
+  // P4-4 phase 3a (1.8.0): with a `section`, `lookup_node`'s Node gains
+  // `crossSectionCalls` / `crossSectionCallsTotal` and `compute_diff_scope`'s
+  // resolved result gains `changedInOtherSections` — additive, absent when
+  // empty, and never present on a call without `section` (still
+  // byte-for-byte 1.6.0's result). Founder decisions (2026-10-03), still
+  // 1.8.0 since nothing has been released since: `changedInOtherSections`
+  // entries are {section, changedNodes, changedContracts, topLevelFiles},
+  // same-repository sections only.
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
   registerLookupNodeTool(

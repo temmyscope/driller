@@ -18,7 +18,9 @@
  *  - `__harnessFetchGate`: a promise `fetchCodeMap` awaits first
  *    (`__harnessFetchCount` counts calls);
  *  - `__harnessModel`: a factory for `ensureLocalModel`'s promise (never
- *    settles when unset).
+ *    settles when unset);
+ *  - `__harnessFixtureOverride` (P4-4g review round 1): a raw fetch result
+ *    `fetchCodeMap` returns instead of the fixture while set.
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -49,7 +51,7 @@ export async function fetchCodeMap() {
   globalThis.__harnessFetchCount = (globalThis.__harnessFetchCount ?? 0) + 1;
   const gate = globalThis.__harnessFetchGate;
   if (gate) await gate;
-  return structuredClone(FIXTURE);
+  return structuredClone(globalThis.__harnessFixtureOverride ?? FIXTURE);
 }
 `);
 const MODEL_MANAGER_STUB = toDataUrl(

@@ -46,6 +46,9 @@
  * establishes for `PrBotIngestionResult`).
  */
 
+import { stat } from 'node:fs/promises';
+import path from 'node:path';
+
 import type { ChangedLineRange, ChangedLinesByFile } from '@driller/graph-contracts';
 
 import { resolveDefaultBranch } from './git-base-ref';
@@ -104,6 +107,34 @@ async function isInsideGitWorkTree(projectRoot: string): Promise<boolean> {
     timeoutMs: GIT_SUBPROCESS_TIMEOUT_MS,
   });
   return 'stdout' in result && result.stdout.trim() === 'true';
+}
+
+/**
+ * P4-4 phase 3a (founder decision 2026-10-03): the top-level directory of the
+ * git working tree that holds `dir` (`git rev-parse --show-toplevel`, run in
+ * `dir`, with the same short timeout as every other git call here), or
+ * `undefined` when `dir` is in no git repository, doesn't exist, or the call
+ * fails. Never throws. A path that is a file is looked up from its folder.
+ * Used to tell whether two indexing-scope sections are in the same repository.
+ */
+export async function resolveGitToplevel(dir: string): Promise<string | undefined> {
+  let cwd = dir;
+  try {
+    if (!(await stat(dir)).isDirectory()) {
+      cwd = path.dirname(dir);
+    }
+  } catch {
+    return undefined;
+  }
+  const result = await runSafeSubprocess('git', ['rev-parse', '--show-toplevel'], {
+    cwd,
+    timeoutMs: GIT_SUBPROCESS_TIMEOUT_MS,
+  });
+  if (!('stdout' in result)) {
+    return undefined;
+  }
+  const toplevel = result.stdout.trim();
+  return toplevel.length > 0 ? toplevel : undefined;
 }
 
 /** Turns a non-`stdout` `SubprocessResult` into safe, user-facing error text. */

@@ -26,6 +26,7 @@ import type {
   BlastRadiusExpansionResult,
   CodeMapEdge,
   CodeMapNode,
+  CrossSectionEdgeCount,
   DiffScopeResult,
   FoldedModule,
   FoldedType,
@@ -79,6 +80,9 @@ export type {
   CoverageSummaryResult,
   UnknownSectionResult,
   SectionNodeCount,
+  CrossSectionEdgeCount,
+  CrossSectionCall,
+  SectionChangeCount,
 } from '@driller/graph-contracts';
 
 /**
@@ -89,6 +93,7 @@ export type {
  */
 export {
   BLAST_RADIUS_DEFAULT_HOPS,
+  CROSS_SECTION_CALLS_MAX,
   FOLDED_TYPE_IPC_MAX_USED_BY,
   SIMILAR_TO_MAX_ENTRIES,
   SIMILAR_TO_MIN_JACCARD,
@@ -402,6 +407,17 @@ export type CodeMapResult =
        * bar's tab labels.
        */
       sections: SectionNodeCount[];
+      /**
+       * P4-4 phase 3a (section maps only): one entry per other allowlist
+       * section with at least one whole-scope edge (`CALLS`/`IMPORTS`/
+       * `USAGE`) between it and `section`, split by direction (`outgoing`:
+       * this section → that one; `incoming`: that one → this) — the edges this
+       * map's both-endpoints filter dropped, counted before the filter, never
+       * by subtracting. Sorted by `outgoing + incoming` (highest first), then
+       * section. Absent when there are none, and always absent when `section`
+       * is `null`.
+       */
+      crossSectionEdges?: CrossSectionEdgeCount[];
     }
   /** P4-4 phase 1b: the requested `section` is not in the allowlist. */
   | UnknownSectionResult
@@ -478,6 +494,8 @@ export type GraphServiceCodeMapMessage =
       section: string | null;
       /** P4-4 phase 1b: see `CodeMapResult.sections`. */
       sections: SectionNodeCount[];
+      /** P4-4 phase 3a: see `CodeMapResult.crossSectionEdges`. */
+      crossSectionEdges?: CrossSectionEdgeCount[];
     }
   /** P4-4 phase 1b: see `UnknownSectionResult`; `section` echoes the request. */
   | { type: 'graphService:codeMapUnknownSection'; section: string; knownSections: string[] }
