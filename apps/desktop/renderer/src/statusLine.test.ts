@@ -113,7 +113,7 @@ describe('formatCoverage', () => {
 
 describe('status line and footer agree (FIX-3)', () => {
   it('cites the same map count the footer shows', () => {
-    const map = { status: 'ready', nodes: 1014, edges: 2371 } as const;
+    const map = { status: 'ready', nodes: 1014, edges: 2371, appliedScope: [], sections: [], section: null } as const;
     const footer = deriveFooterBar({
       currentProjectPath: PROJECT,
       isOpening: false,

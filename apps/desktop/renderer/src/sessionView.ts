@@ -10,7 +10,14 @@
  * structural data as if it were current — anything other than `indexed` means
  * the map shows the last completed index.
  */
-import type { CodeMapEdge, CodeMapNode, FoldedModule, FoldedType, GraphServiceStatusMessage } from '@driller/ipc-contracts';
+import type {
+  CodeMapEdge,
+  CodeMapNode,
+  FoldedModule,
+  FoldedType,
+  GraphServiceStatusMessage,
+  SectionNodeCount,
+} from '@driller/ipc-contracts';
 
 // ---------------------------------------------------------------------------
 // View derivation
@@ -225,6 +232,10 @@ export type CodeMapFetchReply =
       foldedTypes: FoldedType[];
       /** P4-2 phase 3c: `CodeMapResult.foldedModules`; absent means none. */
       foldedModules?: FoldedModule[];
+      /** P4-4 phase 1c: `CodeMapResult.section`; absent means the whole scope. */
+      section?: string | null;
+      /** P4-4 phase 1c: `CodeMapResult.sections`; absent means none. */
+      sections?: SectionNodeCount[];
     }
   | { kind: 'failed'; message: string };
 
@@ -248,6 +259,9 @@ export type RefreshOutcome =
       foldedTypes: FoldedType[];
       /** P4-2 phase 3c: carried through from the reply, when it has one. */
       foldedModules?: FoldedModule[];
+      /** P4-4 phase 1c: both carried through from the reply, when it has them. */
+      section?: string | null;
+      sections?: SectionNodeCount[];
       nodeDetail: NodeDetailRefresh;
     }
   /** The refresh failed but a completed map is on screen: keep it, and say the refresh failed. */
@@ -293,6 +307,8 @@ export function resolveRefreshOutcome({
     appliedScope: reply.appliedScope,
     foldedTypes: reply.foldedTypes,
     ...(reply.foldedModules !== undefined ? { foldedModules: reply.foldedModules } : {}),
+    ...(reply.section !== undefined ? { section: reply.section } : {}),
+    ...(reply.sections !== undefined ? { sections: reply.sections } : {}),
     nodeDetail,
   };
 }

@@ -105,6 +105,7 @@ import type {
   TestedByTest,
   TopLevelChangedFile,
   TypeUse,
+  SectionNodeCount,
   UnknownSectionResult,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
@@ -139,6 +140,16 @@ export type FetchState =
        * modules" canvas toggle. Absent means none (e.g. the dev fixture).
        */
       foldedModules?: readonly FoldedModule[];
+      /**
+       * P4-4 phase 1c: the section this map is for (`CodeMapResult.section`),
+       * `null` for the whole scope. Absent means the whole scope (the dev fixture).
+       */
+      section?: string | null;
+      /**
+       * P4-4 phase 1c: the Section bar's tabs (`CodeMapResult.sections`) —
+       * whole-scope counts per section, even in a section's reply. Absent means none.
+       */
+      sections?: readonly SectionNodeCount[];
     }
   | { status: 'error'; message: string };
 
@@ -270,8 +281,9 @@ export type DiffScopeNoticeStatus = 'no-changes' | 'not-a-git-repo' | 'no-base-r
 
 /**
  * P4-4 phase 1b: the error-state sentence for a Code Map fetch that did not
- * return a map. `unknown-section` is only possible once a section is
- * requested (P4-4d's Section bar); until then it is shown as an error.
+ * return a map. P4-4d: an `unknown-section` reply goes to the shell's
+ * fallback (`handOffUnknownSection`) instead; this sentence is only for a
+ * `CodeMap` rendered without one.
  */
 export function codeMapFailureMessage(result: Exclude<CodeMapResult, { status: 'ok' }>): string {
   return result.status === 'unknown-section'
@@ -303,7 +315,10 @@ export function settleSectionScopedReply<R extends { status: string }>(
     return;
   }
   if (isUnknownSectionResult(result)) {
-    handlers.unknownSection(result.section);
+    // P4-4d review round 1: the section the request was sent with, not the
+    // reply's echo (only a whole-scope request, which can't be unknown,
+    // falls back to the echo).
+    handlers.unknownSection(requestedSection ?? result.section);
     return;
   }
   handlers.apply(result);
@@ -329,6 +344,65 @@ export function blastRadiusStateOnUnknownSection(
     status: 'error',
     message: codeMapFailureMessage({ status: 'unknown-section', section, knownSections: [] }),
   };
+}
+
+/**
+ * P4-4 phase 1c: a Code Map fetch (load or refresh) that replied
+ * `unknown-section` — the selected section left the allowlist — is handed to
+ * the shell's fallback (`onUnknownSection`: back to `all`, announced as
+ * status text), which reloads the map through the section change. Returns
+ * whether it was handed off; without a fallback it is not, and the caller
+ * shows its usual error state.
+ *
+ * P4-4d review round 1: the fallback is given `requestedSection`, the
+ * section captured when the request was sent, never the reply's echoed
+ * string. A whole-scope request (`null`) can't be unknown, so it is never
+ * handed off.
+ */
+export function handOffUnknownSection(
+  result: CodeMapResult,
+  requestedSection: string | null,
+  fallback: ((section: string) => void) | undefined,
+): boolean {
+  if (result.status !== 'unknown-section' || fallback === undefined || requestedSection === null) {
+    return false;
+  }
+  fallback(requestedSection);
+  return true;
+}
+
+/**
+ * P4-4 phase 1c: the Node a successful `regenerateNode` patches in. In `all`
+ * the reply is used as is. The reply is the whole-scope cached Node, so in a
+ * section (`section !== null`) every structural field it carries —
+ * `riskSignals` (severities cut over the whole scope), and the cross-section
+ * links the section reply dropped (`fileTopLevel`, `fileTopLevelTypes`,
+ * `usesTypes`, `calledAtLoadBy`, `similarTo`/`similarToTotal`, `testedBy`,
+ * the test-coverage flags) — would overwrite the section's own.
+ *
+ * P4-4d review round 1: so in a section the on-screen Node is kept and only
+ * what regeneration changes is taken from the reply: `summaryStatus`,
+ * `summary` and `stale` (an absent optional field in the reply is absent in
+ * the result, never left over from the old summary).
+ */
+export function regeneratedNodeForMap(
+  onScreen: CodeMapNode,
+  regenerated: CodeMapNode,
+  section: string | null,
+): CodeMapNode {
+  if (section === null) {
+    return regenerated;
+  }
+  const next: CodeMapNode = { ...onScreen, summaryStatus: regenerated.summaryStatus };
+  delete next.summary;
+  delete next.stale;
+  if (regenerated.summary !== undefined) {
+    next.summary = regenerated.summary;
+  }
+  if (regenerated.stale !== undefined) {
+    next.stale = regenerated.stale;
+  }
+  return next;
 }
 
 function isUnknownSectionResult(result: { status: string }): result is UnknownSectionResult {
@@ -805,6 +879,10 @@ export interface InitialFitDecisionInput {
   projectPath: string | null;
   /** The project the last first-fit was applied for (`null` before any). */
   fittedProjectPath: string | null;
+  /** P4-4 phase 1c: the section this map is for (`null` = `all`). */
+  section: string | null;
+  /** P4-4 phase 1c: the section the last first-fit was applied for. */
+  fittedSection: string | null;
   /** Laid-out Nodes of the ready map (0 while loading, errored or empty). */
   nodesCount: number;
   /** The measured map size (`measuredViewportSize`: own ResizeObserver, else React Flow's store). */
@@ -813,8 +891,9 @@ export interface InitialFitDecisionInput {
 
 /**
  * FIX-3: the first-view effect's gate, as a pure decision. Armed while this
- * canvas mount is `pending` or the project differs from the one last fitted
- * (a project change re-arms it); an armed fit `wait`s until the instance, a
+ * canvas mount is `pending` or the project — or, P4-4 phase 1c, the section —
+ * differs from the one last fitted (a project or section change re-arms it,
+ * so the viewport fits the new Node set); an armed fit `wait`s until the instance, a
  * non-empty laid-out map and a usable size all exist, then `fit`s once.
  * Otherwise `done`: the one-shot fit is spent, so a refresh, scope change or
  * resize keeps the user's own pan/zoom.
@@ -824,10 +903,12 @@ export function initialFitDecision({
   instanceReady,
   projectPath,
   fittedProjectPath,
+  section,
+  fittedSection,
   nodesCount,
   size,
 }: InitialFitDecisionInput): InitialFitDecision {
-  if (!pending && projectPath === fittedProjectPath) {
+  if (!pending && projectPath === fittedProjectPath && section === fittedSection) {
     return 'done';
   }
   const sized = isFiniteNumber(size.width) && isFiniteNumber(size.height) && size.width > 0 && size.height > 0;
@@ -838,18 +919,20 @@ export function initialFitDecision({
 export interface InitialFitState {
   pending: boolean;
   fittedProjectPath: string | null;
+  /** P4-4 phase 1c: the section of the last first-fit. */
+  fittedSection: string | null;
 }
 
-export const INITIAL_FIT_STATE: InitialFitState = { pending: false, fittedProjectPath: null };
+export const INITIAL_FIT_STATE: InitialFitState = { pending: false, fittedProjectPath: null, fittedSection: null };
 
 /** FIX-3: a canvas mount (`onInit`) owes a first fit. */
 export function armInitialFit(state: InitialFitState): InitialFitState {
   return { ...state, pending: true };
 }
 
-/** FIX-3: the first fit landed for `projectPath` — spent until the next mount or project. */
-export function completeInitialFit(projectPath: string | null): InitialFitState {
-  return { pending: false, fittedProjectPath: projectPath };
+/** FIX-3: the first fit landed for `projectPath` (and, P4-4 phase 1c, `section`) — spent until the next mount, project or section. */
+export function completeInitialFit(projectPath: string | null, section: string | null): InitialFitState {
+  return { pending: false, fittedProjectPath: projectPath, fittedSection: section };
 }
 
 export interface InitialViewportParams {
@@ -7396,10 +7479,21 @@ export function RefreshErrorNotice({
  * Service reports how many Nodes its scope filter removed
  * (`hiddenByScope`), so "the scope hid everything" (most likely a typo like
  * `wbe`) is told apart from "the project genuinely has none".
+ *
+ * P4-4 phase 1c: a section's empty map is its own case, decided first. A
+ * section reply's `hiddenByScope` is the whole-scope count (Nodes the
+ * allowlist removed), not this section's, so it can never say "the scope hid
+ * everything" here.
  */
-export type EmptyMapCase = { kind: 'scope-hid-everything'; hiddenCount: number } | { kind: 'no-map-eligible-nodes' };
+export type EmptyMapCase =
+  | { kind: 'empty-section'; section: string }
+  | { kind: 'scope-hid-everything'; hiddenCount: number }
+  | { kind: 'no-map-eligible-nodes' };
 
-export function chooseEmptyMapCase(hiddenByScope: number): EmptyMapCase {
+export function chooseEmptyMapCase(hiddenByScope: number, section: string | null = null): EmptyMapCase {
+  if (section !== null) {
+    return { kind: 'empty-section', section };
+  }
   return hiddenByScope > 0 ? { kind: 'scope-hid-everything', hiddenCount: hiddenByScope } : { kind: 'no-map-eligible-nodes' };
 }
 
@@ -7468,6 +7562,7 @@ export function reindexButtonState({
 export function EmptyMapNotice({
   hiddenByScope,
   appliedScope,
+  section = null,
   graphServiceAvailable,
   reindexPending,
   onOpenSettings,
@@ -7475,12 +7570,24 @@ export function EmptyMapNotice({
 }: {
   hiddenByScope: number;
   appliedScope: readonly string[];
+  /** P4-4 phase 1c: the section this empty map is for (`null` = `all`). */
+  section?: string | null;
   graphServiceAvailable: boolean;
   reindexPending: boolean;
   onOpenSettings: () => void;
   onReindex: () => void;
 }) {
-  const emptyCase = chooseEmptyMapCase(hiddenByScope);
+  const emptyCase = chooseEmptyMapCase(hiddenByScope, section);
+  if (emptyCase.kind === 'empty-section') {
+    // P4-4 phase 1c: names the section, with no action — the Section bar
+    // above it is how to leave it, and neither the scope editor nor a
+    // re-index is what an empty section asks for.
+    return (
+      <ActionableNotice tone="info">
+        No map Nodes in <code>{emptyCase.section}</code>
+      </ActionableNotice>
+    );
+  }
   if (emptyCase.kind === 'scope-hid-everything') {
     return (
       <ActionableNotice
@@ -8021,8 +8128,14 @@ export function CodeMap({
         });
       return;
     }
+    // P4-4 phase 1c: the map of the section on screen (`sectionRef`, synced
+    // in a layout effect, so it is already the new section when the
+    // section-keyed effect below calls this). Fast switching queues one
+    // request per switch in main; only the latest one's reply applies (the
+    // shared `refreshRequestIdRef` check below).
+    const requestedSection = sectionRef.current;
     window.driller
-      .getCodeMap()
+      .getCodeMap(requestedSection ?? undefined)
       .then((result) => {
         if (requestId !== refreshRequestIdRef.current) {
           return;
@@ -8036,12 +8149,18 @@ export function CodeMap({
             appliedScope: result.appliedScope,
             foldedTypes: result.foldedTypes,
             foldedModules: result.foldedModules,
+            section: result.section,
+            sections: result.sections,
           });
-        } else {
-          // P4-4 phase 1b: no section is requested yet, so an unknown-section
-          // reply is shown as the error state until P4-4d's Section bar.
-          setFetchState({ status: 'error', message: codeMapFailureMessage(result) });
+          return;
         }
+        // P4-4 phase 1c: the section left the allowlist — the shell falls
+        // back to `all` (status text, never this error state), and the
+        // section change reloads. The map stays `loading` until then.
+        if (handOffUnknownSection(result, requestedSection, onUnknownSectionRef.current)) {
+          return;
+        }
+        setFetchState({ status: 'error', message: codeMapFailureMessage(result) });
       })
       .catch((error: unknown) => {
         if (requestId !== refreshRequestIdRef.current) {
@@ -8056,9 +8175,13 @@ export function CodeMap({
       });
   }, [fixtureNodeCount, clearDiffScopeSync]);
 
+  // P4-4 phase 1c: `section` is a dependency so that a switch reloads the
+  // map through this same full reset — history, Node and type detail, Path
+  // Trace, the diff scope and base ref (and their sync), Blast Radius — and
+  // the canvas remounts for the new Node set (its first fit re-arms).
   useEffect(() => {
     loadCodeMap();
-  }, [loadCodeMap]);
+  }, [loadCodeMap, section]);
 
   /**
    * P0-3: refetch the map after a new `indexed` for the same project
@@ -8126,6 +8249,8 @@ export function CodeMap({
             appliedScope: outcome.appliedScope,
             foldedTypes: outcome.foldedTypes,
             ...(outcome.foldedModules !== undefined ? { foldedModules: outcome.foldedModules } : {}),
+            ...(outcome.section !== undefined ? { section: outcome.section } : {}),
+            ...(outcome.sections !== undefined ? { sections: outcome.sections } : {}),
           });
           // P4-2 phase 3b: an open type detail and an "is a type" notice
           // follow their types to the fresh map, or close/clear when gone.
@@ -8141,9 +8266,18 @@ export function CodeMap({
           return;
       }
     };
+    const requestedSection = sectionRef.current;
     window.driller
-      .getCodeMap()
+      .getCodeMap(requestedSection ?? undefined)
       .then((result) => {
+        // P4-4 phase 1c: a refresh (new index, e.g. after a scope change) can
+        // find the section gone — the same fallback to `all` as a load.
+        if (
+          requestId === refreshRequestIdRef.current &&
+          handOffUnknownSection(result, requestedSection, onUnknownSectionRef.current)
+        ) {
+          return;
+        }
         settle(
           result.status === 'ok'
             ? {
@@ -8154,6 +8288,8 @@ export function CodeMap({
                 appliedScope: result.appliedScope,
                 foldedTypes: result.foldedTypes,
                 foldedModules: result.foldedModules,
+                section: result.section,
+                sections: result.sections,
               }
             : { kind: 'failed', message: codeMapFailureMessage(result) },
         );
@@ -8630,8 +8766,13 @@ export function CodeMap({
               // patch above.
               return previous;
             }
+            // P4-4 phase 1c: the reply is the whole-scope Node; in a section
+            // the on-screen Node's own severities are kept
+            // (`regeneratedNodeForMap`), keyed on the section of the map
+            // being patched.
+            const mapSection = previous.section ?? null;
             const nodes = previous.nodes.map((candidate) =>
-              candidate.id === result.node.id ? result.node : candidate,
+              candidate.id === result.node.id ? regeneratedNodeForMap(candidate, result.node, mapSection) : candidate,
             );
             return { ...previous, nodes };
           });
@@ -8646,7 +8787,13 @@ export function CodeMap({
           return;
         }
         if (result.status === 'ok') {
-          updateNodeDetail({ status: 'open', node: result.node });
+          // P4-4 phase 1c: the panel keeps the section's severities too. The
+          // open panel's Node is from the map on screen, whose section is
+          // the one in `sectionRef` once its load landed.
+          updateNodeDetail({
+            status: 'open',
+            node: regeneratedNodeForMap(current.node, result.node, sectionRef.current),
+          });
           setRegenerateState({ kind: 'idle' });
         } else {
           setRegenerateState({ kind: 'error', message: result.message });
@@ -9427,6 +9574,11 @@ export function CodeMap({
   // a programmatic `setViewport` (its pan-zoom handler skips only `internal`
   // events), but the LOD pass must not depend on that to leave the pre-fit
   // zoom. Instant, like the `fitView` it replaces.
+  // P4-4 phase 1c: keyed on the section of the map ON SCREEN (its reply's
+  // `section`), not the prop — in the render where the prop has changed, the
+  // previous section's Nodes are still laid out, and fitting those would
+  // spend the fit the new section's Nodes are owed.
+  const shownSection = fetchState.status === 'ready' ? (fetchState.section ?? null) : null;
   useLayoutEffect(() => {
     const instance = reactFlowInstanceRef.current;
     const size = measuredViewportSize();
@@ -9435,6 +9587,8 @@ export function CodeMap({
       instanceReady: instance !== null,
       projectPath,
       fittedProjectPath: initialFitRef.current.fittedProjectPath,
+      section: shownSection,
+      fittedSection: initialFitRef.current.fittedSection,
       nodesCount: lodInputNodes.length,
       size,
     });
@@ -9462,13 +9616,13 @@ export function CodeMap({
     if (next === null) {
       return undefined;
     }
-    initialFitRef.current = completeInitialFit(projectPath);
+    initialFitRef.current = completeInitialFit(projectPath, shownSection);
     const nextViewport = { x: next.x, y: next.y, zoom: next.zoom };
     void instance.setViewport(nextViewport);
     setViewport(nextViewport);
     setAwaitingFirstFit(false);
     return undefined;
-  }, [canvasInitCount, initialFitRetry, lodInputNodes, containerSize, measuredViewportSize, projectPath]);
+  }, [canvasInitCount, initialFitRetry, lodInputNodes, containerSize, measuredViewportSize, projectPath, shownSection]);
 
   /**
    * Story 1.9 (Phase 2): fits the viewport to show every Node in a `found`
@@ -10171,6 +10325,7 @@ export function CodeMap({
           <EmptyMapNotice
             hiddenByScope={fetchState.hiddenByScope}
             appliedScope={fetchState.appliedScope}
+            section={fetchState.section ?? null}
             graphServiceAvailable={graphServiceAvailable}
             reindexPending={reindexPending}
             onOpenSettings={onOpenSettings}

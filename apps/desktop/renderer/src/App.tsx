@@ -15,17 +15,22 @@ import { formatElapsedMs, hasCoverageGap, statusLineText } from './statusLine';
 import {
   INITIAL_FRAME_MAP_STATE,
   INITIAL_FRAME_SYNC_STATE,
+  INITIAL_SECTION_SHELL_STATE,
   applyDiffScopeSyncToFrame,
   applyMapReportToFrame,
   applyProjectClosedToFrame,
   applyProjectClosedToFrameSync,
   applyProjectOpenedToFrame,
   applyProjectOpenedToFrameSync,
+  applyMapReportToSectionShell,
+  applySectionActivated,
+  applyUnknownSection,
   deriveFooterBar,
   deriveTitle,
   footerAvailability,
   footerBarRightTitle,
   frameMapFor,
+  frameSectionBarFor,
   frameSyncFor,
   mapNodesForStatusLine,
   nextSyncAgeTickMs,
@@ -37,6 +42,7 @@ import { CodeMap, type CodeMapMode } from './CodeMap';
 import { createMenuOpenFolderHandler } from './menuOpenFolder';
 import { openModalLayers } from './modalStack';
 import { ModeSwitcher } from './ModeSwitcher';
+import { SECTION_PANEL_ID, SectionBar, selectedSectionTabId, showSectionBar } from './SectionBar';
 import { Settings } from './Settings';
 import {
   INITIAL_SESSION_MAP_STATE,
@@ -191,6 +197,13 @@ export function App() {
   // fixed `'codeMap'` — see `applyOpenResult`'s own comment for the two
   // outcomes.
   const [mode, setMode] = useState<Mode>('codeMap');
+  // P4-4 phase 1c: the selected section (`null` = `all`) — shell state like
+  // `mode`, kept across a mode switch — plus the text of its one
+  // `role="status"` announcement. Every transition is a pure function in
+  // appFrame.ts. Reset with `mode` when a different project opens and on
+  // Close; never persisted (that is P4-4i).
+  const [sectionShell, setSectionShell] = useState(INITIAL_SECTION_SHELL_STATE);
+  const section = sectionShell.section;
   // P0-3: the map's lifetime — `loadedProjectPath` (set when an `indexed`
   // for the current project passes the correlation filter below, cleared only
   // on Close or a project switch) and `dataVersion` (bumped once per NEW
@@ -221,6 +234,12 @@ export function App() {
   const [frameMap, setFrameMap] = useState<FrameMapState>(INITIAL_FRAME_MAP_STATE);
   const handleMapState = useCallback((reportPath: string | null, state: MapFooterState) => {
     setFrameMap((current) => applyMapReportToFrame(current, currentProjectPathRef.current, reportPath, state));
+    // P4-4d review round 1: the open project's map reports also settle a
+    // pending section switch's announcement, and drop a section whose bar
+    // the reply hides (`applyMapReportToSectionShell`).
+    if (reportPath !== null && reportPath === currentProjectPathRef.current) {
+      setSectionShell((current) => applyMapReportToSectionShell(current, state));
+    }
   }, []);
   // P3-10: when the open project's diff scope last synced, reported by
   // `CodeMap`'s `onDiffScopeSynced` — same drop-other-projects and
@@ -441,6 +460,7 @@ export function App() {
                   (project) => normalizePathForComparisonLocal(project.path) === normalizedNewPath,
                 );
           setMode(wasAlreadyInRecentProjects ? 'codeMap' : 'healthAudit');
+          setSectionShell(INITIAL_SECTION_SHELL_STATE);
         }
         // P2-3: the previous project's map state never labels this one (a
         // no-op when the same project is re-selected).
@@ -627,6 +647,7 @@ export function App() {
     // P2-2: with no project open the (disabled) switcher shows Code Map, not
     // the closed project's mode; the first-open rule picks again on open.
     setMode('codeMap');
+    setSectionShell(INITIAL_SECTION_SHELL_STATE);
     focusOpenFolderAfterCloseRef.current = true;
   }, [commitSessionMap]);
 
@@ -837,6 +858,24 @@ export function App() {
   });
   const footerBarRightTooltip = footerBarRightTitle({ currentProjectPath, mode, lastSyncedAt });
 
+  // P4-4 phase 1c: the Section bar is drawn from the last ready map's reply
+  // (its applied scope and per-section counts), never the persisted setting.
+  const sectionBarSource = frameSectionBarFor(frameMap, currentProjectPath);
+  const sectionBarShown = showMap && sectionBarSource !== null && showSectionBar(sectionBarSource.appliedScope);
+  // P4-4d review round 1: while the bar is shown, the map region is the
+  // tabpanel the tabs control, labelled by the selected tab.
+  const sectionPanelLabelledBy = sectionBarShown ? selectedSectionTabId(sectionBarSource.sections, section) : undefined;
+  const handleSectionChange = useCallback((next: string | null) => {
+    setSectionShell((current) => applySectionActivated(current, next));
+  }, []);
+  // P4-4 phase 1c: a reply said the selected section left the allowlist —
+  // back to `all`, announced as status text (never an error notice); the
+  // section change reloads the map. Wired to `CodeMap`'s fetch, Path Trace,
+  // diff scope and Blast Radius expansion alike.
+  const handleUnknownSection = useCallback((gone: string) => {
+    setSectionShell((current) => applyUnknownSection(current, gone));
+  }, []);
+
   return (
     // P2-3: one frame on both screens — titlebar, a body (the landing column
     // or the map), the existing status footers, then the footer bar. Only the
@@ -875,6 +914,25 @@ export function App() {
           <span aria-hidden="true">⚙</span>
         </button>
       </header>
+
+      {/* P4-4 phase 1c: the Section bar — only with a ready map whose applied
+          scope has 2 or more entries. */}
+      {sectionBarShown && (
+        // P4-4d review round 1: a switch is only offered while the session
+        // is live — otherwise it would throw away the last completed map.
+        <SectionBar
+          sections={sectionBarSource.sections}
+          section={section}
+          enabled={graphServiceLive}
+          onChange={handleSectionChange}
+        />
+      )}
+      {/* P4-4 phase 1c: the one region that announces a section switch (or
+          the fallback to `all`) — always mounted, since a live region only
+          reliably announces a change it already existed for. */}
+      <p className="visually-hidden" role="status">
+        {sectionShell.announcement}
+      </p>
 
       {!showMap && (
         <div className="app__body">
@@ -956,7 +1014,13 @@ export function App() {
             {notice?.kind === 'error' && <ActionableNotice tone="error">{notice.message}</ActionableNotice>}
           </div>
 
-          <section className="app__map" aria-label="Code Map">
+          <section
+            className="app__map"
+            id={SECTION_PANEL_ID}
+            role={sectionBarShown ? 'tabpanel' : undefined}
+            aria-labelledby={sectionPanelLabelledBy}
+            aria-label={sectionPanelLabelledBy === undefined ? 'Code Map' : undefined}
+          >
             {/* `projectPath` (review finding, Medium) lets CodeMap reject a
                 stale `graphService:summaryProgress` message for a project the
                 user has since navigated away from — reliably non-null here:
@@ -974,6 +1038,8 @@ export function App() {
               onDiffScopeSynced={handleDiffScopeSynced}
               onOpenSettings={handleOpenSettingsForScope}
               onReindex={restartGraphServiceForRetry}
+              section={section}
+              onUnknownSection={handleUnknownSection}
             />
           </section>
         </div>

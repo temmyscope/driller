@@ -53,6 +53,10 @@ describe('settleSectionScopedReply', () => {
   it('hands an unknown-section reply to the fallback, never to apply', () => {
     assert.deepEqual(settle(UNKNOWN, 'docs', 'docs'), [{ kind: 'unknown', section: 'docs' }]);
   });
+
+  it('P4-4d review round 1: hands over the requested section, never the reply echo', () => {
+    assert.deepEqual(settle({ ...UNKNOWN, section: 'echo' } as PathTraceResult, 'docs', 'docs'), [{ kind: 'unknown', section: 'docs' }]);
+  });
 });
 
 describe('CodeMap source: the section reaches all three operations', () => {

@@ -277,6 +277,8 @@ describe('initialFitDecision (FIX-3)', () => {
     instanceReady: true,
     projectPath: '/repo/app',
     fittedProjectPath: null,
+    section: null,
+    fittedSection: null,
     nodesCount: 1014,
     size: VIEW,
   };
@@ -293,18 +295,27 @@ describe('initialFitDecision (FIX-3)', () => {
   });
 
   it('is done once the fit is spent, for the same project', () => {
-    const spent = completeInitialFit('/repo/app');
+    const spent = completeInitialFit('/repo/app', null);
     assert.equal(initialFitDecision({ ...ready, ...spent }), 'done');
   });
 
   it('re-arms on a project change, and on a new canvas mount', () => {
-    const spent = completeInitialFit('/repo/app');
+    const spent = completeInitialFit('/repo/app', null);
     assert.equal(initialFitDecision({ ...ready, ...spent, projectPath: '/repo/other' }), 'fit');
     assert.equal(initialFitDecision({ ...ready, ...armInitialFit(spent) }), 'fit');
   });
 
   it('starts unarmed until a canvas mounts', () => {
     assert.equal(initialFitDecision({ ...ready, ...INITIAL_FIT_STATE, projectPath: null }), 'done');
-    assert.deepEqual(armInitialFit(INITIAL_FIT_STATE), { pending: true, fittedProjectPath: null });
+    assert.deepEqual(armInitialFit(INITIAL_FIT_STATE), { pending: true, fittedProjectPath: null, fittedSection: null });
+  });
+
+  it('P4-4 phase 1c: re-arms when the map on screen is for another section, and is spent per section', () => {
+    const spentAll = completeInitialFit('/repo/app', null);
+    assert.equal(initialFitDecision({ ...ready, ...spentAll, section: 'api' }), 'fit');
+    const spentApi = completeInitialFit('/repo/app', 'api');
+    assert.equal(initialFitDecision({ ...ready, ...spentApi, section: 'api' }), 'done');
+    assert.equal(initialFitDecision({ ...ready, ...spentApi, section: null }), 'fit');
+    assert.equal(initialFitDecision({ ...ready, ...spentApi, section: 'web' }), 'fit');
   });
 });

@@ -348,6 +348,78 @@ code,
   outline-offset: 2px;
 }
 
+/*
+ * P4-4 phase 1c: the Section bar (DESIGN.md `section-tab` /
+ * `section-tab-active`) — a tab row under the header, quieter than the mode
+ * switcher: meta size, `--text-mute`, no border, no fill. The active tab is
+ * an underline in `--text` plus `aria-selected` (never colour alone, never
+ * `--accent`: a section is not a change); keyboard focus keeps the accent
+ * focus ring.
+ */
+.section-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+  padding: 0.25rem 1.5rem;
+  background: var(--panel-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+/* P4-4d review round 1: one row at any width — the tabs scroll sideways
+   rather than wrap or clip, so a long path is always shown whole. */
+.section-bar__tabs {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.25rem;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.section-bar__tab {
+  flex-shrink: 0;
+  white-space: nowrap;
+  padding: 4px 10px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-mute);
+  font-family: inherit;
+  font-size: 9.5px;
+  cursor: pointer;
+}
+
+.section-bar__tab:not([aria-disabled='true']):hover {
+  color: var(--text);
+}
+
+.section-bar__tab[aria-selected='true'] {
+  color: var(--text);
+  border-bottom-color: var(--text);
+  font-weight: 600;
+}
+
+.section-bar__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* P4-4d review round 1: not live — muted, no pointer affordance, still focusable. */
+.section-bar__tab[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.section-bar__hint {
+  flex-shrink: 0;
+  color: var(--text-mute);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
 /* P2-2: disabled until a project is open — muted, no pointer affordance.
    Driven by `aria-disabled` (the radios stay focusable so the hint is heard). */
 .mode-switcher__option:has(input[aria-disabled='true']) {

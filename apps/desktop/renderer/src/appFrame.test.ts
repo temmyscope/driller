@@ -26,6 +26,7 @@ import {
   footerBarRightTitle,
   formatSyncAge,
   frameMapFor,
+  frameSectionBarFor,
   frameSyncFor,
   mapNodesForStatusLine,
   mapFooterState,
@@ -42,7 +43,7 @@ const PROJECT = '/Users/dev/code/my-app';
 const OTHER = '/Users/dev/code/other';
 const AT = '2026-09-25T00:00:00.000Z';
 
-const READY: MapFooterState = { status: 'ready', nodes: 229, edges: 359 };
+const READY: MapFooterState = { status: 'ready', nodes: 229, edges: 359, appliedScope: [], sections: [], section: null };
 
 const NO_PROJECT: FooterBarInput = {
   currentProjectPath: null,
@@ -80,10 +81,13 @@ describe('projectFolderName', () => {
 
 describe('mapFooterState', () => {
   it('ready: the full Node and edge totals', () => {
-    assert.deepEqual(mapFooterState({ status: 'ready', nodes: [1, 2, 3], edges: [1, 2] }), {
+    assert.deepEqual(mapFooterState({ status: 'ready', nodes: [1, 2, 3], edges: [1, 2], appliedScope: [] }), {
       status: 'ready',
       nodes: 3,
       edges: 2,
+      appliedScope: [],
+      sections: [],
+      section: null,
     });
   });
 
@@ -97,7 +101,7 @@ describe('mapFooterState', () => {
 });
 
 describe('frame map-state transitions', () => {
-  const withMap: FrameMapState = { projectPath: PROJECT, map: READY };
+  const withMap: FrameMapState = { projectPath: PROJECT, map: READY, sectionBar: { appliedScope: [], sections: [] } };
 
   it('takes a report for the current project', () => {
     assert.deepEqual(applyMapReportToFrame(INITIAL_FRAME_MAP_STATE, PROJECT, PROJECT, READY), withMap);
@@ -229,7 +233,7 @@ describe('deriveFooterBar', () => {
   });
 
   it('Close project: back to no project open', () => {
-    const closed = applyProjectClosedToFrame({ projectPath: PROJECT, map: READY });
+    const closed = applyProjectClosedToFrame({ projectPath: PROJECT, map: READY, sectionBar: null });
     assert.deepEqual(
       deriveFooterBar({ ...NO_PROJECT, availability: 'live', map: frameMapFor(closed, null) }),
       { left: 'no project open', right: '' },
@@ -238,7 +242,7 @@ describe('deriveFooterBar', () => {
   });
 
   it('Reopening the same repo: a fresh ready report shows counts again', () => {
-    const closed = applyProjectClosedToFrame({ projectPath: PROJECT, map: READY });
+    const closed = applyProjectClosedToFrame({ projectPath: PROJECT, map: READY, sectionBar: null });
     const reopened = applyMapReportToFrame(
       applyMapReportToFrame(closed, PROJECT, PROJECT, { status: 'loading' }),
       PROJECT,
@@ -510,12 +514,63 @@ describe('footerBarRightTitle (P3-10)', () => {
 
 describe('mapNodesForStatusLine (FIX-3)', () => {
   it("is the ready map's Node count", () => {
-    assert.equal(mapNodesForStatusLine({ status: 'ready', nodes: 1014, edges: 2371 }), 1014);
+    assert.equal(mapNodesForStatusLine({ ...READY, nodes: 1014, edges: 2371 }), 1014);
   });
 
   it('is null while no map is loaded', () => {
     assert.equal(mapNodesForStatusLine(null), null);
     assert.equal(mapNodesForStatusLine({ status: 'loading' }), null);
     assert.equal(mapNodesForStatusLine({ status: 'error' }), null);
+  });
+});
+
+describe('P4-4 phase 1c: the Section bar source', () => {
+  const SECTIONS = [
+    { path: 'web', nodeCount: 792 },
+    { path: 'api', nodeCount: 412 },
+  ];
+  // A section reply: 412 Nodes on screen, but `sections` stays whole-scope.
+  const API_READY: MapFooterState = {
+    status: 'ready',
+    nodes: 412,
+    edges: 900,
+    appliedScope: ['web', 'api'],
+    sections: SECTIONS,
+    section: 'api',
+  };
+
+  it('mapFooterState carries the reply scope, sections and section', () => {
+    assert.deepEqual(
+      mapFooterState({ status: 'ready', nodes: [1], edges: [], appliedScope: ['web', 'api'], sections: SECTIONS, section: 'api' }),
+      { status: 'ready', nodes: 1, edges: 0, appliedScope: ['web', 'api'], sections: SECTIONS, section: 'api' },
+    );
+  });
+
+  it('a ready report sets the bar source; a later loading or error report keeps it', () => {
+    const ready = applyMapReportToFrame(INITIAL_FRAME_MAP_STATE, PROJECT, PROJECT, API_READY);
+    assert.deepEqual(frameSectionBarFor(ready, PROJECT), { appliedScope: ['web', 'api'], sections: SECTIONS });
+    const loading = applyMapReportToFrame(ready, PROJECT, PROJECT, { status: 'loading' });
+    assert.equal(loading.sectionBar, ready.sectionBar);
+    const errored = applyMapReportToFrame(loading, PROJECT, PROJECT, { status: 'error' });
+    assert.equal(errored.sectionBar, ready.sectionBar);
+    assert.equal(frameSectionBarFor(ready, OTHER), null);
+    assert.equal(frameSectionBarFor(ready, null), null);
+  });
+
+  it('a project switch or Close drops the bar source', () => {
+    const ready = applyMapReportToFrame(INITIAL_FRAME_MAP_STATE, PROJECT, PROJECT, API_READY);
+    assert.equal(applyProjectOpenedToFrame(ready, OTHER).sectionBar, null);
+    assert.equal(applyProjectClosedToFrame(ready).sectionBar, null);
+  });
+
+  it('a report with a different section, sections or scope is not deduped away', () => {
+    const ready = applyMapReportToFrame(INITIAL_FRAME_MAP_STATE, PROJECT, PROJECT, API_READY);
+    const fewer = applyMapReportToFrame(ready, PROJECT, PROJECT, { ...API_READY, appliedScope: ['api'], sections: [SECTIONS[1]!] });
+    assert.notEqual(fewer, ready);
+    assert.deepEqual(fewer.sectionBar?.appliedScope, ['api']);
+    const recount = applyMapReportToFrame(ready, PROJECT, PROJECT, { ...API_READY, sections: [SECTIONS[0]!, { path: 'api', nodeCount: 413 }] });
+    assert.notEqual(recount, ready);
+    assert.notEqual(applyMapReportToFrame(ready, PROJECT, PROJECT, { ...API_READY, section: 'web' }), ready);
+    assert.equal(applyMapReportToFrame(ready, PROJECT, PROJECT, { ...API_READY, sections: [...SECTIONS] }), ready);
   });
 });

@@ -8,33 +8,54 @@
  * (EXPERIENCE.md: "never specify data the product cannot produce"). That is
  * why there is no git branch in the titlebar — nothing supplies it.
  */
-import type { DiffScopeResult, GraphServiceStatusMessage } from '@driller/ipc-contracts';
+import type { DiffScopeResult, GraphServiceStatusMessage, SectionNodeCount } from '@driller/ipc-contracts';
 
 import type { CodeMapMode } from './CodeMap';
-import { formatMapCounts } from './format';
+import { formatCount, formatMapCounts } from './format';
 import { deriveSessionView, isStatusForCurrentProject, type SessionAvailability } from './sessionView';
 
 // ---------------------------------------------------------------------------
 // The map's state, as reported by `CodeMap` (`onMapState`)
 // ---------------------------------------------------------------------------
 
-/** What the footer needs of `CodeMap`'s fetch: whether a map is on screen, and its totals. */
+/**
+ * What the footer needs of `CodeMap`'s fetch: whether a map is on screen, and
+ * its totals. P4-4 phase 1c: a ready map also carries what the Section bar
+ * needs of its reply — the scope the Graph Service applied and the
+ * whole-scope Node count per section (`[]` for none).
+ */
 export type MapFooterState =
   | { status: 'loading' }
   | { status: 'error' }
-  | { status: 'ready'; nodes: number; edges: number };
+  | {
+      status: 'ready';
+      nodes: number;
+      edges: number;
+      appliedScope: readonly string[];
+      sections: readonly SectionNodeCount[];
+      /** P4-4d review round 1: the section the reply is for (`null` = `all`). */
+      section: string | null;
+    };
 
 /**
  * `CodeMap`'s `FetchState` reduced to the footer's view of it — the ready
  * map's full Node and edge totals. Structurally typed so this module needn't
  * import `CodeMap`'s runtime. A failed *refresh* keeps `fetchState` `ready`
  * (the last completed map stays mounted), so it keeps its counts here too.
+ * An absent `sections` (the dev fixture) is none.
  */
 export function mapFooterState(
   fetchState:
     | { status: 'loading' }
     | { status: 'error' }
-    | { status: 'ready'; nodes: readonly unknown[]; edges: readonly unknown[] },
+    | {
+        status: 'ready';
+        nodes: readonly unknown[];
+        edges: readonly unknown[];
+        appliedScope: readonly string[];
+        sections?: readonly SectionNodeCount[];
+        section?: string | null;
+      },
 ): MapFooterState {
   switch (fetchState.status) {
     case 'loading':
@@ -42,24 +63,63 @@ export function mapFooterState(
     case 'error':
       return { status: 'error' };
     case 'ready':
-      return { status: 'ready', nodes: fetchState.nodes.length, edges: fetchState.edges.length };
+      return {
+        status: 'ready',
+        nodes: fetchState.nodes.length,
+        edges: fetchState.edges.length,
+        appliedScope: fetchState.appliedScope,
+        sections: fetchState.sections ?? [],
+        section: fetchState.section ?? null,
+      };
   }
 }
 
-function sameMapFooterState(a: MapFooterState, b: MapFooterState): boolean {
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function sameSections(a: readonly SectionNodeCount[], b: readonly SectionNodeCount[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((entry, index) => entry.path === b[index]?.path && entry.nodeCount === b[index]?.nodeCount)
+  );
+}
+
+export function sameMapFooterState(a: MapFooterState, b: MapFooterState): boolean {
   if (a.status !== b.status) {
     return false;
   }
-  return a.status !== 'ready' || (b.status === 'ready' && a.nodes === b.nodes && a.edges === b.edges);
+  return (
+    a.status !== 'ready' ||
+    (b.status === 'ready' &&
+      a.nodes === b.nodes &&
+      a.edges === b.edges &&
+      a.section === b.section &&
+      sameStrings(a.appliedScope, b.appliedScope) &&
+      sameSections(a.sections, b.sections))
+  );
+}
+
+/** P4-4 phase 1c: what the Section bar is drawn from — the last ready map's reply. */
+export interface SectionBarSource {
+  appliedScope: readonly string[];
+  sections: readonly SectionNodeCount[];
 }
 
 /** App's copy of the last map report, tagged with the project it describes. */
 export interface FrameMapState {
   projectPath: string | null;
   map: MapFooterState | null;
+  /**
+   * P4-4 phase 1c: the last READY report's scope and sections, for the
+   * Section bar. Kept through a later loading or error report for the same
+   * project, so a section switch (which reloads the map) never makes the bar
+   * — and the focus on it — disappear mid-switch.
+   */
+  sectionBar: SectionBarSource | null;
 }
 
-export const INITIAL_FRAME_MAP_STATE: FrameMapState = { projectPath: null, map: null };
+export const INITIAL_FRAME_MAP_STATE: FrameMapState = { projectPath: null, map: null, sectionBar: null };
 
 /**
  * A report from `CodeMap`. Ignored unless it is about the project currently
@@ -78,7 +138,13 @@ export function applyMapReportToFrame(
   if (state.projectPath === reportPath && state.map !== null && sameMapFooterState(state.map, map)) {
     return state;
   }
-  return { projectPath: reportPath, map };
+  const sectionBar =
+    map.status === 'ready'
+      ? { appliedScope: map.appliedScope, sections: map.sections }
+      : state.projectPath === reportPath
+        ? state.sectionBar
+        : null;
+  return { projectPath: reportPath, map, sectionBar };
 }
 
 /** Opening a different project drops the previous project's map state; re-opening the same one keeps it. */
@@ -94,6 +160,107 @@ export function applyProjectClosedToFrame(state: FrameMapState): FrameMapState {
 /** The map state for the open project, or `null` if what's held belongs to another. */
 export function frameMapFor(state: FrameMapState, currentProjectPath: string | null): MapFooterState | null {
   return currentProjectPath !== null && state.projectPath === currentProjectPath ? state.map : null;
+}
+
+/** P4-4 phase 1c: the Section bar's source for the open project, or `null`. */
+export function frameSectionBarFor(state: FrameMapState, currentProjectPath: string | null): SectionBarSource | null {
+  return currentProjectPath !== null && state.projectPath === currentProjectPath ? state.sectionBar : null;
+}
+
+// ---------------------------------------------------------------------------
+// P4-4 phase 1c: the selected section, and its one announcement
+// ---------------------------------------------------------------------------
+
+/**
+ * App's section shell state: the selected allowlist entry (`null` = `all`),
+ * the text of the one `role="status"` region that announces a switch, and
+ * whether a switch is still waiting for its reply.
+ */
+export interface SectionShellState {
+  section: string | null;
+  announcement: string;
+  /** P4-4d review round 1: a switch was announced as loading and its reply hasn't landed. */
+  pending: boolean;
+}
+
+export const INITIAL_SECTION_SHELL_STATE: SectionShellState = { section: null, announcement: '', pending: false };
+
+function sectionName(section: string | null): string {
+  return section === null ? 'all sections' : `section ${section}`;
+}
+
+/** "Loading section api…" / "Loading all sections…" — said on activation. */
+export function sectionLoadingAnnouncement(section: string | null): string {
+  return `Loading ${sectionName(section)}…`;
+}
+
+/**
+ * "Showing section api — 412 Nodes" / "Showing all sections — 1,204 Nodes" —
+ * said when the switch's reply lands, with that reply's own Node count.
+ */
+export function sectionAnnouncement(section: string | null, nodes: number): string {
+  return `Showing ${sectionName(section)} — ${formatCount(nodes, 'Node', 'Nodes')}`;
+}
+
+/** The failed switch's status text; the map's own error notice carries the reason and Retry. */
+export function sectionFailedAnnouncement(section: string | null): string {
+  return `Couldn’t load ${sectionName(section)}`;
+}
+
+/** The fallback's status text — never an error notice. */
+export function unknownSectionAnnouncement(section: string): string {
+  return `${section} is no longer in the indexing scope — showing all sections`;
+}
+
+/**
+ * A tab was activated. Activating the section already selected changes
+ * nothing (no refetch, no announcement); any other switches and says it is
+ * loading — the result is announced from the reply (`applyMapReportToSectionShell`).
+ */
+export function applySectionActivated(state: SectionShellState, next: string | null): SectionShellState {
+  if (next === state.section) {
+    return state;
+  }
+  return { section: next, announcement: sectionLoadingAnnouncement(next), pending: true };
+}
+
+/**
+ * A map report for the open project.
+ * - A ready reply whose applied scope has fewer than 2 distinct entries,
+ *   with a section selected: back to `all`, silently — the bar is hidden and
+ *   the section's content is the whole scope, so nothing on screen changes,
+ *   and a section the user can no longer see must not stay selected.
+ * - While a switch is pending: its ready reply (keyed on the reply's own
+ *   section) announces what is shown, with that reply's Node count; an error
+ *   announces the failure. Anything else (a loading report, or a ready one
+ *   for another section) changes nothing.
+ */
+export function applyMapReportToSectionShell(state: SectionShellState, map: MapFooterState): SectionShellState {
+  if (map.status === 'ready' && state.section !== null && new Set(map.appliedScope).size < 2) {
+    return { section: null, announcement: '', pending: false };
+  }
+  if (!state.pending) {
+    return state;
+  }
+  if (map.status === 'ready' && map.section === state.section) {
+    return { ...state, announcement: sectionAnnouncement(map.section, map.nodes), pending: false };
+  }
+  if (map.status === 'error') {
+    return { ...state, announcement: sectionFailedAnnouncement(state.section), pending: false };
+  }
+  return state;
+}
+
+/**
+ * A reply said `section` is no longer in the allowlist: fall back to `all`
+ * and say so. Ignored unless it is the section still selected — a late
+ * report about a section the user already left must not undo their choice.
+ */
+export function applyUnknownSection(state: SectionShellState, section: string): SectionShellState {
+  if (state.section !== section) {
+    return state;
+  }
+  return { section: null, announcement: unknownSectionAnnouncement(section), pending: false };
 }
 
 // ---------------------------------------------------------------------------
