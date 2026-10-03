@@ -1552,7 +1552,18 @@ export type NodeLookupResult =
       referencedByTypes: string[];
     }
   | { status: 'not-found' }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string }
+  /**
+   * P4-4 phase 2b (AD-13 "Section scope"): a lookup WITH a `section` (MCP
+   * only) for an id that exists in the whole scope — a map Node, or a folded
+   * Module or type, judged by its `file` — but belongs to another section
+   * under the nearest-entry rule. `nodeSection` is that owning section.
+   * Never collapsed into `'not-found'`, and never returned without a
+   * `section`.
+   */
+  | { status: 'not-in-section'; nodeId: string; section: string; nodeSection: string }
+  /** P4-4 phase 2b: see `PathTraceResult`'s own `UnknownSectionResult` member. */
+  | UnknownSectionResult;
 
 /**
  * Coverage-check retrieval's explicit result-state union (Story 5.1, Phase 2,

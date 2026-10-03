@@ -56,7 +56,9 @@ const MODEL_MANAGER_STUB = toDataUrl(
   'export function ensureLocalModel() { const make = globalThis.__harnessModel; return make ? make() : new Promise(() => {}); }',
 );
 const MCP_SERVER_STUB = toDataUrl(
-  'export function startMcpServer(getNodes, _post, _derive, getFolded, getFoldedTypes) { globalThis.__harnessGetters = { getNodes, getFolded, getFoldedTypes }; return async () => {}; }',
+  // P4-4 phase 2b: also keeps the live derivation and the section-build
+  // getter (`undefined` on a baseline that has none).
+  'export function startMcpServer(getNodes, _post, derive, getFolded, getFoldedTypes, getSectionCodeMap) { globalThis.__harnessGetters = { getNodes, getFolded, getFoldedTypes, derive, getSectionCodeMap }; return async () => {}; }',
 );
 
 const HOOKS = toDataUrl(`
@@ -149,7 +151,15 @@ export async function trace(query: string): Promise<unknown> {
 }
 
 /** The live cache getters `index.ts` handed the (stubbed) agent surface. */
-export function getters(): { getNodes: () => unknown; getFolded: () => unknown; getFoldedTypes: () => unknown } {
+export function getters(): {
+  getNodes: () => unknown;
+  getFolded: () => unknown;
+  getFoldedTypes: () => unknown;
+  /** P4-4 phase 2b: `index.ts`'s live `deriveLiveNode` closure. */
+  derive: (node: unknown) => unknown;
+  /** P4-4 phase 2b: `index.ts`'s memoized `getSectionCodeMap`. */
+  getSectionCodeMap: (section: string) => unknown;
+} {
   const captured = (globalThis as { __harnessGetters?: ReturnType<typeof getters> }).__harnessGetters;
   assert.ok(captured);
   return captured;

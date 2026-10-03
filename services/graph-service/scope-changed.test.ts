@@ -225,6 +225,12 @@ async function index(projectPath: string, includedPaths?: string[]): Promise<voi
 
 const ALL = ['web/a.ts', 'app/b.ts', 'docs/c.ts', 'webapp/d.ts'];
 
+/**
+ * P4-4 phase 2b: the section-build getter for `registerLookupNodeTool`. Every
+ * lookup in this file is made without a `section`, so it must never be read.
+ */
+const NO_SECTION_LOOKUP = (): never => assert.fail('a lookup_node call without section must never read the section build');
+
 /** P4-2 phase 3a: the live `activeCodeMapNodes` / `activeFoldedModules` getters the stubbed `startMcpServer` captured. */
 function capturedGetters(): { getNodes: () => unknown; getFolded: () => unknown; getFoldedTypes: () => unknown } {
   const captured = globalThis as {
@@ -452,6 +458,7 @@ describe('graphService:scopeChanged through index.ts', () => {
           referencedByTypes: [],
         },
       ],
+      NO_SECTION_LOOKUP,
     );
     assert.ok(handler);
     const result = JSON.parse((await handler({ nodeId: 'mod:web/a' })).content[0]!.text);
@@ -605,6 +612,7 @@ describe('graphService:scopeChanged through index.ts', () => {
       (node) => node,
       getFolded as Parameters<typeof registerLookupNodeTool>[3],
       getFoldedTypes as Parameters<typeof registerLookupNodeTool>[4],
+      NO_SECTION_LOOKUP,
     );
     assert.ok(handler);
     const viaTool = JSON.parse((await handler({ nodeId: 'T2' })).content[0]!.text);
@@ -657,6 +665,7 @@ describe('graphService:scopeChanged through index.ts', () => {
       (node) => node,
       getFolded as Parameters<typeof registerLookupNodeTool>[3],
       getFoldedTypes as Parameters<typeof registerLookupNodeTool>[4],
+      NO_SECTION_LOOKUP,
     );
     assert.ok(handler);
     const viaTool = JSON.parse((await handler({ nodeId: 'w' })).content[0]!.text);
@@ -742,7 +751,8 @@ describe('graphService:scopeChanged through index.ts', () => {
       const { getNodes, getFolded, getFoldedTypes } = capturedGetters();
       const { MCP_SERVER_VERSION, registerLookupNodeTool } = await import('./mcp-server');
       const { deriveLiveNode } = await import('./live-node');
-      assert.equal(MCP_SERVER_VERSION, '1.6.0');
+      // P4-4 phase 2b: bumped again for the optional `section`.
+      assert.equal(MCP_SERVER_VERSION, '1.7.0');
       let handler: ((args: { nodeId: string }) => Promise<{ content: { text: string }[] }>) | undefined;
       let description = '';
       registerLookupNodeTool(
@@ -756,6 +766,7 @@ describe('graphService:scopeChanged through index.ts', () => {
         (node) => deriveLiveNode(node, { getRecord: () => undefined, coverageGapFiles: new Set() }),
         getFolded as Parameters<typeof registerLookupNodeTool>[3],
         getFoldedTypes as Parameters<typeof registerLookupNodeTool>[4],
+        NO_SECTION_LOOKUP,
       );
       assert.ok(handler);
       for (const id of ['w', 'a', 'd', 'x']) {

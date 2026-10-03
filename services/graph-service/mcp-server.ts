@@ -72,6 +72,7 @@ import {
   type FoldedModule,
   type FoldedType,
   type NodeLookupResult,
+  type UnknownSectionResult,
 } from '@driller/graph-contracts';
 import {
   computeBlastRadiusExpansionResult,
@@ -79,6 +80,7 @@ import {
   computePathTraceResult,
   getCoverageSummaryResult,
 } from './index';
+import { sectionOfFile } from './project-scope';
 
 /**
  * A distinctive, uncommon port (confirmed with the human) outside typical
@@ -204,6 +206,71 @@ export function lookupNode(
 }
 
 /**
+ * P4-4 phase 2b: one section's build, as `lookup_node` reads it —
+ * `index.ts`'s `getSectionCodeMap(section)`, the memoized
+ * `buildScopedCodeMap(activeRawCodeMap.raw, sectionPredicate)` (the same
+ * build the renderer gets for that section). `appliedScope` is the scope the
+ * raw cache was built under, which decides which section owns a file.
+ */
+export interface SectionCodeMapLookup {
+  readonly status: 'section';
+  readonly nodes: CodeMapNode[];
+  readonly foldedModules: FoldedModule[];
+  readonly foldedTypes: FoldedType[];
+  readonly appliedScope: readonly string[];
+}
+
+/** P4-4 phase 2b: what `getSectionCodeMap(section)` answers. */
+export type SectionCodeMapResult = SectionCodeMapLookup | UnknownSectionResult | { status: 'error'; message: string };
+
+/**
+ * P4-4 phase 2b (AD-13 "Section scope"): Node lookup WITH a `section`. The
+ * id is looked up in the section's own build (`lookupNode` over its Nodes,
+ * folded Modules and folded types, so a Node's severities, blast-radius
+ * counts and section-scoped links are the section's — never the whole-scope
+ * cached Node's). An id the section build doesn't hold but the whole scope
+ * does (a map Node, or a folded Module or type, by its `file`) is the
+ * explicit `not-in-section`, naming the section that owns it under the
+ * nearest-entry rule; never `not-found`. An unknown section, the
+ * map-refreshing error and "no project indexed" come from `sectionMap`
+ * as-is.
+ */
+export function lookupNodeInSection(
+  nodeId: string,
+  section: string,
+  sectionMap: SectionCodeMapResult,
+  deriveLive: (cached: CodeMapNode) => CodeMapNode,
+  wholeScope: {
+    nodes: readonly CodeMapNode[] | undefined;
+    foldedModules: readonly FoldedModule[];
+    foldedTypes: readonly FoldedType[];
+  },
+): NodeLookupResult {
+  if (sectionMap.status !== 'section') {
+    return sectionMap;
+  }
+  const inSection = lookupNode(nodeId, sectionMap.nodes, deriveLive, sectionMap.foldedModules, sectionMap.foldedTypes);
+  if (inSection.status !== 'not-found') {
+    return inSection;
+  }
+  const file =
+    wholeScope.nodes?.find((node) => node.id === nodeId)?.file ??
+    wholeScope.foldedModules.find((module) => module.moduleIds.includes(nodeId))?.file ??
+    wholeScope.foldedTypes.find((type) => type.id === nodeId)?.file;
+  const nodeSection = file === undefined ? undefined : sectionOfFile(file, sectionMap.appliedScope);
+  // An id whose file no section owns is in no section of this scope at all:
+  // `not-found`, as the whole-scope lookup would say. Review round 1: so is
+  // one whose owner IS the requested section (the build lacks it, so it is
+  // no Node there) — never a self-contradicting `not-in-section`. (Both are
+  // unreachable while the whole-scope caches and the section build come
+  // from the same fetch.)
+  if (nodeSection === undefined || nodeSection === section) {
+    return inSection;
+  }
+  return { status: 'not-in-section', nodeId, section, nodeSection };
+}
+
+/**
  * True when `req` must be rejected outright for carrying (or possibly
  * carrying) a body over `MAX_REQUEST_BODY_BYTES`.
  *
@@ -265,6 +332,26 @@ function jsonToolResult(result: unknown): { content: [{ type: 'text'; text: stri
 }
 
 /**
+ * P4-4 phase 2b (AD-13 "Section scope"): the optional `section` input shared
+ * by `lookup_node`, `trace_path`, `expand_blast_radius` and
+ * `compute_diff_scope`. Omitted, each tool is exactly what it was before
+ * (1.6.0). `''` is rejected as invalid input (`min(1)`: the SDK answers
+ * with an `isError` tool result, "Input validation error: …", before the
+ * handler runs) — the same rule main applies to an IPC `section: ''`
+ * (malformed), never `unknown-section`, which is for a well-formed name that
+ * isn't an allowlist entry.
+ */
+export const SECTION_INPUT_DESCRIPTION =
+  "An indexing-scope allowlist entry, exactly as the human's Section bar shows it. Omit for the whole scope (identical to the unsectioned result).";
+
+const sectionInput = (): z.ZodOptional<z.ZodString> =>
+  z.string().min(1, 'section must not be empty; omit it for the whole scope.').optional().describe(SECTION_INPUT_DESCRIPTION);
+
+/** P4-4 phase 2b: the shared description sentence on how a `section` is resolved. */
+const SECTION_RULE_DESCRIPTION =
+  "With 'section', a file belongs to the nearest (longest) allowlist entry that contains it, so with nested entries such as 'apps' and 'apps/web', the 'apps' section never holds apps/web/**; a 'section' that is not in the current allowlist returns {status: 'unknown-section', section, knownSections}, and while the map is still refreshing for a changed allowlist the result is an explicit error saying so. ";
+
+/**
  * Registers the `trace_path` tool (Story 5.1, Phase 2) on `server` —
  * extracted (FIX-2) so a test can capture and invoke the exact registered
  * handler without binding the listener. The handler serializes
@@ -287,26 +374,35 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
         '`depths` maps each reached Node id to its hop distance from the entry (entry = 0). ' +
         'Returns the exact same PathTraceResult the human-facing UI renders for the identical query: an explicit result state (found/ambiguous/no-path-found/error), never collapsed into a generic success/failure. ' +
         "A Module id (a file's top-level code) is folded into its file and has no Code Map Node, so it never resolves as an entry and its calls are not traced; use lookup_node on it to see what that top-level code calls or uses. " +
-        "Type and Interface Nodes are folded off the Code Map too, so a type's id or name never resolves as an entry: a type-only query returns no-path-found here. The human-facing UI shows this same result, adding only an 'is a type — open its detail' hint on top of it; agents should use lookup_node with the type's id to see who uses it.",
+        "Type and Interface Nodes are folded off the Code Map too, so a type's id or name never resolves as an entry: a type-only query returns no-path-found here. The human-facing UI shows this same result, adding only an 'is a type — open its detail' hint on top of it; agents should use lookup_node with the type's id to see who uses it. " +
+        "With 'section', the trace runs over that section's Nodes and the CALLS edges between them alone: it never crosses into another section, and an entry outside the section is never resolved (the same result the human gets in that section). " +
+        SECTION_RULE_DESCRIPTION,
       inputSchema: z.object({
         query: z
           .string()
           .min(1, 'query must not be empty.')
           .describe('The Path Trace query — matched against Node id first, then name, then a name substring.'),
+        section: sectionInput(),
       }),
     },
-    async ({ query }) => jsonToolResult(await computePathTraceResult(query)),
+    // P4-4 phase 2b: `section` is passed through as given — `undefined` when
+    // omitted, which is exactly the pre-section call.
+    async ({ query, section }) => jsonToolResult(await computePathTraceResult(query, section)),
   );
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.6.0';
+export const MCP_SERVER_VERSION = '1.7.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
  * the same pattern as `registerTracePathTool`) so a test can capture and
  * invoke the exact registered handler, folded-Module argument included,
  * without binding the listener. Each getter is read at call time.
+ *
+ * P4-4 phase 2b: `getSectionCodeMap` is called only for a lookup WITH a
+ * `section` — a call without one never touches the section memo, and is
+ * byte-for-byte the pre-section lookup.
  */
 export function registerLookupNodeTool(
   server: Pick<McpServer, 'registerTool'>,
@@ -315,6 +411,8 @@ export function registerLookupNodeTool(
   getActiveFoldedModules: () => FoldedModule[] | undefined,
   // P4-2 phase 3b: the live `activeFoldedTypes`, read at call time too.
   getActiveFoldedTypes: () => FoldedType[] | undefined,
+  // P4-4 phase 2b: `index.ts`'s memoized `getSectionCodeMap`.
+  getSectionCodeMap: (section: string) => SectionCodeMapResult,
 ): void {
   server.registerTool(
     'lookup_node',
@@ -333,21 +431,116 @@ export function registerLookupNodeTool(
         "'fileTopLevelTypes', when present on a Node, lists the folded types its file's top-level code uses. " +
         `'similarTo', when present, lists other production Functions in other files that the index's own SIMILAR_TO edge marks as near-duplicates of this one ({id, name, file, score}, score being the backend's jaccard token overlap, at least ${SIMILAR_TO_MIN_JACCARD}), highest score first, capped at ${SIMILAR_TO_MAX_ENTRIES} with 'similarToTotal' giving the full count; each id is a Code Map Node id. Similarity is structural (token overlap), not a claim they behave the same; same-file pairs and test code are never listed, and nothing is inferred beyond SIMILAR_TO. An absent 'similarTo' means no such pair was found (or the index has no SIMILAR_TO edges). ` +
         "'testCoverageAvailable': true, when present, means the project's coverage/lcov.info has line data for this Node's file; it says nothing about a percentage, and nothing about whether this Node ran. " +
-        "'testCoverageHit': true, when present, means the function was entered at least once by tests (LCOV): a function record (FN/FNDA) starting in this Node's range has a call count above 0, and the file is not newer than the report. It is the only coverage claim made about the Node itself; line hits alone never set it, because loading a module hits a declaration's own line even when no test calls it. An absent 'testCoverageHit' is NOT evidence the Node is untested: the report may lack function records, be older than the file, or not list it. An absent 'testCoverageAvailable' means there is no LCOV data for the file at all (no coverage/lcov.info, an unparseable one, or a report that doesn't list the file).",
+        "'testCoverageHit': true, when present, means the function was entered at least once by tests (LCOV): a function record (FN/FNDA) starting in this Node's range has a call count above 0, and the file is not newer than the report. It is the only coverage claim made about the Node itself; line hits alone never set it, because loading a module hits a declaration's own line even when no test calls it. An absent 'testCoverageHit' is NOT evidence the Node is untested: the report may lack function records, be older than the file, or not list it. An absent 'testCoverageAvailable' means there is no LCOV data for the file at all (no coverage/lcov.info, an unparseable one, or a report that doesn't list the file). " +
+        "With 'section', the Node is the one the human sees in that section: every deterministic signal's severity and the blast-radius count are computed over that section alone (its own severity cut, and only Nodes and edges inside it); the 'llm-judgment' and 'ingested' signals and the summary come from driller's stored records and are the same with or without a section; and the section-scoped links ('similarTo', 'usesTypes', 'fileTopLevel', 'fileTopLevelTypes', 'calledAtLoadBy', and a folded type's 'usedBy' and type links, or a folded Module's 'uses') name only ids inside the section; 'testedBy' and the test-coverage flags are the same as without a section. " +
+        "An id that exists in the whole scope but belongs to another section (a folded Module or type by its file) returns {status: 'not-in-section', nodeId, section, nodeSection}, never not-found; 'nodeSection' is the section that holds it. " +
+        SECTION_RULE_DESCRIPTION,
       inputSchema: z.object({
         nodeId: z.string().describe("The Node's stable id (qualified name), as shown in the Code Map."),
+        section: sectionInput(),
       }),
     },
-    async ({ nodeId }) =>
+    async ({ nodeId, section }) =>
       jsonToolResult(
-        lookupNode(
-          nodeId,
-          getActiveCodeMapNodes(),
-          deriveLiveNode,
-          getActiveFoldedModules() ?? [],
-          getActiveFoldedTypes() ?? [],
-        ),
+        section === undefined
+          ? lookupNode(
+              nodeId,
+              getActiveCodeMapNodes(),
+              deriveLiveNode,
+              getActiveFoldedModules() ?? [],
+              getActiveFoldedTypes() ?? [],
+            )
+          : lookupNodeInSection(nodeId, section, getSectionCodeMap(section), deriveLiveNode, {
+              nodes: getActiveCodeMapNodes(),
+              foldedModules: getActiveFoldedModules() ?? [],
+              foldedTypes: getActiveFoldedTypes() ?? [],
+            }),
       ),
+  );
+}
+
+/**
+ * Registers the `expand_blast_radius` tool (Story 5.1, Phase 2) on `server` —
+ * extracted (P4-4 phase 2b, the `registerTracePathTool` pattern) so a test
+ * can capture and invoke the exact registered handler without binding the
+ * listener.
+ */
+export function registerExpandBlastRadiusTool(server: Pick<McpServer, 'registerTool'>): void {
+  server.registerTool(
+    'expand_blast_radius',
+    {
+      title: 'Expand blast radius from a Node set',
+      description:
+        "Compute hop-distance blast radius expansion from a seed set of Node ids through driller's Code Map. Returns the exact same BlastRadiusExpansionResult the human-facing UI would get for the identical seed set — an explicit result state (resolved/error), never collapsed into a generic success/failure. " +
+        "Hop distances are per direction and unbounded: each Node's distance is the smaller of its forward (seed reaches it) and backward (it reaches a seed) distance from the nearest seed, never a path that mixes directions, so Nodes that only share a caller or callee with a seed are not returned. Seeds are excluded. " +
+        `Filtering to distances 1..${BLAST_RADIUS_DEFAULT_HOPS} for a single seed gives exactly the Node set that seed's 'blast-radius' signal counts. ` +
+        "A Module id (a file's top-level code) is folded into its file and has no Code Map Node: as a seed it reaches nothing, and Module edges are never walked. " +
+        "Type and Interface ids are folded off the Code Map the same way: as seeds they reach nothing, and type (USAGE) edges are never walked. " +
+        "With 'section', hop distances are walked over that section's Nodes and the edges between them alone (the same graph its blast-radius counts use): nothing outside the section is returned, and a seed outside it reaches nothing. " +
+        SECTION_RULE_DESCRIPTION,
+      inputSchema: z.object({
+        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
+        nodeIds: z
+          .array(z.string())
+          .max(1000, 'nodeIds must not exceed 1000 entries.')
+          .describe('The seed Node ids to expand blast radius from. May be empty.'),
+        section: sectionInput(),
+      }),
+    },
+    // P4-4 phase 2b: `section` passed through (`undefined` when omitted — the pre-section call).
+    async ({ projectPath, nodeIds, section }) =>
+      jsonToolResult(computeBlastRadiusExpansionResult(projectPath, nodeIds, section)),
+  );
+}
+
+/**
+ * Registers the `compute_diff_scope` tool (Story 5.1, Phase 2) on `server` —
+ * extracted (P4-4 phase 2b) like `registerExpandBlastRadiusTool`.
+ */
+export function registerComputeDiffScopeTool(server: Pick<McpServer, 'registerTool'>): void {
+  server.registerTool(
+    'compute_diff_scope',
+    {
+      title: 'Compute the diff-scoped Node set',
+      description:
+        "Compute the diff-scoped Node set for a project against a base ref (or an auto-resolved default branch). Returns the exact same DiffScopeResult the human-facing UI would get for the identical request — an explicit result state (resolved/no-changes/not-a-git-repo/no-base-ref-resolvable/error), never collapsed into a generic success/failure. " +
+        "A resolved result's optional 'topLevelFiles' lists changed files whose only content on the map is folded top-level code (no Code Map Node), so a top-level-only change is named rather than reported as zero changed Nodes. " +
+        "A resolved result's optional 'changedContracts' lists the folded Types/Interfaces whose own lines the diff " +
+        "changed (types are not Code Map Nodes, so a type-only change would otherwise read as zero changed Nodes), " +
+        "most dependents first: each is {id, name, kind: 'Type' | 'Interface', file, dependentCount, dependentIds}. " +
+        "'dependentIds' are the in-scope Code Map Nodes with a real USAGE edge into the type (sorted, unique, at most " +
+        `${CHANGED_CONTRACT_MAX_DEPENDENT_IDS}); 'dependentCount' is always their full number. ` +
+        "Dependents are affected, not changed: they are not in 'nodeIds'. " +
+        "'changedContractsApproximate: true' means approximate: couldn't read line ranges for some changed file, so " +
+        "every type in it was counted (may over-report, never hides a contract). " +
+        "'topLevelFiles' leaves out a file whose every change lies inside a type. " +
+        "With 'section', the changed Nodes, changed contracts (and their dependents) and top-level-only files are only that section's own, matched against its Nodes alone; changes in other sections are not reported. " +
+        SECTION_RULE_DESCRIPTION,
+      inputSchema: z.object({
+        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
+        baseRef: z
+          .string()
+          .optional()
+          .describe('The branch/commit to diff against. Omit to auto-resolve a default branch.'),
+        section: sectionInput(),
+      }),
+    },
+    async ({ projectPath, baseRef, section }) => {
+      // Review finding (Low): mirrors the renderer's own established base-ref
+      // normalization (Story 3.1, Phase 2) — a trimmed-empty string means
+      // "omit," triggering auto-resolution, exactly like the tool's own
+      // description promises. Without this, `baseRef: ''` would pass through
+      // as `''` rather than `undefined`, diverging from that documented
+      // behavior.
+      const trimmedBaseRef = baseRef?.trim();
+      const result = await computeDiffScopeResult(
+        projectPath,
+        trimmedBaseRef && trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined,
+        // P4-4 phase 2b: `undefined` when omitted — the pre-section call.
+        section,
+      );
+      return jsonToolResult(result);
+    },
   );
 }
 
@@ -411,6 +604,9 @@ export function startMcpServer(
   getActiveFoldedModules: () => FoldedModule[] | undefined,
   // P4-2 phase 3b: the live `activeFoldedTypes`, a getter for the same reason.
   getActiveFoldedTypes: () => FoldedType[] | undefined,
+  // P4-4 phase 2b: `index.ts`'s memoized section build, for `lookup_node`
+  // with a `section` only.
+  getSectionCodeMap: (section: string) => SectionCodeMapResult,
 ): () => Promise<void> {
   // Phase 1 shipped '1.0.0' as the documented v1 contract covering
   // `lookup_node` alone. Phase 2 bumps the MINOR version (semver:
@@ -434,9 +630,23 @@ export function startMcpServer(
   // `similarToTotal` — additive, absent when not applicable.
   // P4-3 phase 5 (1.6.0): `lookup_node`'s Node gains `testCoverageAvailable`
   // and `testCoverageHit` — additive, `true` or absent (never `false`).
+  // P4-4 phase 2b (1.7.0): `lookup_node`, `trace_path`, `expand_blast_radius`
+  // and `compute_diff_scope` gain an optional `section` (AD-13 "Section
+  // scope"); `lookup_node` gains the `not-in-section` and `unknown-section`
+  // states and the others `unknown-section`, all reachable only with it. A
+  // call without `section` is byte-for-byte what 1.6.0 returned. (The P4-4f
+  // spec, written before P4-3f took 1.6.0, says 1.5.0 → 1.6.0; the intent —
+  // one additive minor bump — is kept.)
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
-  registerLookupNodeTool(server, getActiveCodeMapNodes, deriveLiveNode, getActiveFoldedModules, getActiveFoldedTypes);
+  registerLookupNodeTool(
+    server,
+    getActiveCodeMapNodes,
+    deriveLiveNode,
+    getActiveFoldedModules,
+    getActiveFoldedTypes,
+    getSectionCodeMap,
+  );
 
   // Story 5.1 (Phase 2): the remaining four operations. Each handler calls
   // straight into its already-exported, already-reviewed compute function
@@ -450,66 +660,9 @@ export function startMcpServer(
 
   registerTracePathTool(server);
 
-  server.registerTool(
-    'expand_blast_radius',
-    {
-      title: 'Expand blast radius from a Node set',
-      description:
-        "Compute hop-distance blast radius expansion from a seed set of Node ids through driller's Code Map. Returns the exact same BlastRadiusExpansionResult the human-facing UI would get for the identical seed set — an explicit result state (resolved/error), never collapsed into a generic success/failure. " +
-        "Hop distances are per direction and unbounded: each Node's distance is the smaller of its forward (seed reaches it) and backward (it reaches a seed) distance from the nearest seed, never a path that mixes directions, so Nodes that only share a caller or callee with a seed are not returned. Seeds are excluded. " +
-        `Filtering to distances 1..${BLAST_RADIUS_DEFAULT_HOPS} for a single seed gives exactly the Node set that seed's 'blast-radius' signal counts. ` +
-        "A Module id (a file's top-level code) is folded into its file and has no Code Map Node: as a seed it reaches nothing, and Module edges are never walked. " +
-        "Type and Interface ids are folded off the Code Map the same way: as seeds they reach nothing, and type (USAGE) edges are never walked.",
-      inputSchema: z.object({
-        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
-        nodeIds: z
-          .array(z.string())
-          .max(1000, 'nodeIds must not exceed 1000 entries.')
-          .describe('The seed Node ids to expand blast radius from. May be empty.'),
-      }),
-    },
-    async ({ projectPath, nodeIds }) => jsonToolResult(computeBlastRadiusExpansionResult(projectPath, nodeIds)),
-  );
+  registerExpandBlastRadiusTool(server);
 
-  server.registerTool(
-    'compute_diff_scope',
-    {
-      title: 'Compute the diff-scoped Node set',
-      description:
-        "Compute the diff-scoped Node set for a project against a base ref (or an auto-resolved default branch). Returns the exact same DiffScopeResult the human-facing UI would get for the identical request — an explicit result state (resolved/no-changes/not-a-git-repo/no-base-ref-resolvable/error), never collapsed into a generic success/failure. " +
-        "A resolved result's optional 'topLevelFiles' lists changed files whose only content on the map is folded top-level code (no Code Map Node), so a top-level-only change is named rather than reported as zero changed Nodes. " +
-        "A resolved result's optional 'changedContracts' lists the folded Types/Interfaces whose own lines the diff " +
-        "changed (types are not Code Map Nodes, so a type-only change would otherwise read as zero changed Nodes), " +
-        "most dependents first: each is {id, name, kind: 'Type' | 'Interface', file, dependentCount, dependentIds}. " +
-        "'dependentIds' are the in-scope Code Map Nodes with a real USAGE edge into the type (sorted, unique, at most " +
-        `${CHANGED_CONTRACT_MAX_DEPENDENT_IDS}); 'dependentCount' is always their full number. ` +
-        "Dependents are affected, not changed: they are not in 'nodeIds'. " +
-        "'changedContractsApproximate: true' means approximate: couldn't read line ranges for some changed file, so " +
-        "every type in it was counted (may over-report, never hides a contract). " +
-        "'topLevelFiles' leaves out a file whose every change lies inside a type.",
-      inputSchema: z.object({
-        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
-        baseRef: z
-          .string()
-          .optional()
-          .describe('The branch/commit to diff against. Omit to auto-resolve a default branch.'),
-      }),
-    },
-    async ({ projectPath, baseRef }) => {
-      // Review finding (Low): mirrors the renderer's own established base-ref
-      // normalization (Story 3.1, Phase 2) — a trimmed-empty string means
-      // "omit," triggering auto-resolution, exactly like the tool's own
-      // description promises. Without this, `baseRef: ''` would pass through
-      // as `''` rather than `undefined`, diverging from that documented
-      // behavior.
-      const trimmedBaseRef = baseRef?.trim();
-      const result = await computeDiffScopeResult(
-        projectPath,
-        trimmedBaseRef && trimmedBaseRef.length > 0 ? trimmedBaseRef : undefined,
-      );
-      return jsonToolResult(result);
-    },
-  );
+  registerComputeDiffScopeTool(server);
 
   server.registerTool(
     'get_coverage_summary',

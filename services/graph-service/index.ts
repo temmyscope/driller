@@ -135,6 +135,7 @@ import {
   type FoldedType,
   type IndexCoverageSummary,
   type PathTraceResult,
+  type UnknownSectionResult,
 } from '@driller/graph-contracts';
 import type {
   CloudBackend,
@@ -200,7 +201,7 @@ import {
 } from './scoped-code-map';
 import { toProjectRelativePosixPath } from './project-path';
 import { isTestPath } from './test-code';
-import { startMcpServer } from './mcp-server';
+import { startMcpServer, type SectionCodeMapLookup } from './mcp-server';
 import { QODO_SOURCE_TOOL, runQodoIngestion } from './qodo-adapter';
 import {
   flushNodeRecordStore,
@@ -591,6 +592,69 @@ function resolveCachedSectionFilter(
   return resolveSectionFilter(section, cached.appliedScope);
 }
 
+/**
+ * P4-4 phase 2b: the memo behind `getSectionCodeMap` — one section build per
+ * section, valid only for the raw cache it was built from (`source`, by
+ * identity). Dropped in the same tick `activeRawCodeMap` is replaced or
+ * cleared (`handleIndexRequest`, `startSummaryGenerationForProject`); the
+ * identity check in `getSectionCodeMap` is defense in depth on top of that.
+ * Only `lookup_node` WITH a `section` ever reads or fills it.
+ */
+let sectionCodeMapMemo: { source: ActiveRawCodeMap; builds: Map<string, SectionCodeMapLookup> } | undefined;
+
+/**
+ * P4-4 phase 2b: the section build `lookup_node` answers a `section` lookup
+ * from — `buildScopedCodeMap(activeRawCodeMap.raw, sectionPredicate)`, the
+ * same build `handleGetCodeMapRequest` sends the renderer for that section,
+ * so its Nodes, folded Modules / types and every severity cut are the
+ * section's own (never the whole-scope cache filtered afterwards).
+ *
+ * The section is resolved with the P4-4e machinery
+ * (`resolveCachedSectionFilter`): existence against the live allowlist
+ * (`unknown-section` otherwise), ownership against the scope the raw cache
+ * was built under, and the explicit `MAP_REFRESHING_RESULT` when the two
+ * disagree or no current raw cache exists. Memoized per section and raw-cache
+ * identity (`sectionCodeMapMemo`). `appliedScope` is the raw cache's, so the
+ * caller can name the section that owns an id found only in the whole scope.
+ */
+export function getSectionCodeMap(
+  section: string,
+): SectionCodeMapLookup | UnknownSectionResult | { status: 'error'; message: string } {
+  if (activeCodeMapNodes === undefined) {
+    // The same guard (and message) as the whole-scope `lookupNode`.
+    return { status: 'error', message: 'No project has finished indexing yet.' };
+  }
+  const keepFile = resolveCachedSectionFilter(section);
+  if (typeof keepFile !== 'function') {
+    return keepFile;
+  }
+  // Non-null: `resolveCachedSectionFilter` only returns a predicate when a
+  // current raw cache exists.
+  const source = getActiveRawCodeMap() as ActiveRawCodeMap;
+  if (sectionCodeMapMemo === undefined || sectionCodeMapMemo.source !== source) {
+    sectionCodeMapMemo = { source, builds: new Map() };
+  }
+  const memoized = sectionCodeMapMemo.builds.get(section);
+  if (memoized !== undefined) {
+    return memoized;
+  }
+  const { nodes, foldedModules, foldedTypes } = buildScopedCodeMap(source.raw, keepFile);
+  const build: SectionCodeMapLookup = Object.freeze({
+    status: 'section',
+    nodes,
+    foldedModules,
+    foldedTypes,
+    appliedScope: source.appliedScope,
+  });
+  sectionCodeMapMemo.builds.set(section, build);
+  return build;
+}
+
+/** Tests only: the section-build memo, to see that it is dropped (not only bypassed) and never filled by a no-section call. */
+export function peekSectionCodeMapMemoForTests(): ReadonlyMap<string, SectionCodeMapLookup> | undefined {
+  return sectionCodeMapMemo?.builds;
+}
+
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
 // Node's own `child_process.fork` argv convention, which `utilityProcess.
@@ -638,6 +702,8 @@ try {
     (node) => deriveLiveNode(node, { getRecord: getNodeRecord, coverageGapFiles: coverageGapFileSet }),
     () => activeFoldedModules,
     () => activeFoldedTypes,
+    // P4-4 phase 2b: `lookup_node` with a `section` (memoized section build).
+    getSectionCodeMap,
   );
 } catch (error) {
   console.error('[graph-service] failed to start the Agent-Facing Query Surface (mcp-server.ts):', error);
@@ -1333,6 +1399,8 @@ async function handleIndexRequest(
   // new generation, so a fetch still in flight from before this point is
   // never cached as the raw map.
   activeRawCodeMap = undefined;
+  // P4-4 phase 2b: the section builds go with the raw cache they came from.
+  sectionCodeMapMemo = undefined;
   indexGeneration += 1;
   // Story 5.1 (Phase 2): reset alongside `activeCodeMapEdges` — same
   // never-serve-a-since-superseded-project's-coverage-summary reasoning.
@@ -2515,7 +2583,14 @@ async function startSummaryGenerationForProject(
   activeFoldedTypes = foldedTypes;
   // Review round 1: never a fetch from before the latest index started (or
   // for another project) — see `activeRawCodeMap`.
-  activeRawCodeMap = rawCodeMap !== undefined && isCurrentRawCodeMap(rawCodeMap) ? rawCodeMap : undefined;
+  const nextRawCodeMap = rawCodeMap !== undefined && isCurrentRawCodeMap(rawCodeMap) ? rawCodeMap : undefined;
+  // P4-4 phase 2b: a replaced (or cleared) raw cache drops the section
+  // builds made from it, in this same tick. A re-kick that re-caches the
+  // same object (backend switch, model retry) keeps them: same raw, same builds.
+  if (nextRawCodeMap !== activeRawCodeMap) {
+    sectionCodeMapMemo = undefined;
+  }
+  activeRawCodeMap = nextRawCodeMap;
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
