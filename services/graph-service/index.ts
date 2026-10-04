@@ -123,8 +123,10 @@ import {
   buildBidirectionalAdjacency,
   computeBlastRadiusHopDistances,
   FOLDED_TYPE_IPC_MAX_USED_BY,
+  listEntryCandidates,
   traceCallPath,
   type BlastRadiusExpansionResult,
+  type EntryCandidatesResult,
   type CoverageSummaryResult,
   type DiffScopeResult,
   type FoldedModule,
@@ -148,6 +150,8 @@ import type {
   GraphServiceExpandBlastRadiusResultMessage,
   GraphServiceGetCodeMapRequest,
   GraphServiceIndexRequest,
+  GraphServiceListEntryCandidatesRequest,
+  GraphServiceListEntryCandidatesResultMessage,
   GraphServicePathTraceRequest,
   GraphServicePathTraceResultMessage,
   GraphServiceRegenerateNodeRequest,
@@ -191,6 +195,7 @@ import { fetchProductionCodeMap } from './production-code-map';
 import {
   attachCrossSectionCalls,
   buildScopedCodeMap,
+  buildSectionCallGraph,
   countChangedInOtherSections,
   narrowDiffInputs,
   summarizeDiffChanges,
@@ -678,6 +683,153 @@ export function peekSectionCodeMapMemoForTests(): ReadonlyMap<string, SectionCod
   return sectionCodeMapMemo?.builds;
 }
 
+/**
+ * P4-7c: the whole-scope entry-candidate listing for the cached map
+ * (`activeCodeMapNodes`/`activeCodeMapEdges`), computed at most once per map:
+ *  - reset to `undefined` alongside them in `handleIndexRequest`;
+ *  - reset in `startSummaryGenerationForProject` whenever it caches a
+ *    different Nodes or edges array (every Code Map fetch). A re-kick that
+ *    re-caches the same arrays (backend switch, model retry) keeps it.
+ * Only `computeEntryCandidatesResult` fills it, lazily, on the first request
+ * for that map — never on the fetch path.
+ */
+let activeEntryCandidates: EntryCandidatesResult | undefined;
+
+/**
+ * P4-7c (AD-13 "(f) per section"): the per-section listings, valid only for
+ * the raw cache their section call graphs were built from (`source`, by
+ * identity) — the `sectionCodeMapMemo` lifecycle exactly: dropped in the same
+ * tick `activeRawCodeMap` is replaced or cleared, with the identity check in
+ * `computeEntryCandidatesResult` as defense in depth.
+ */
+let entryCandidatesSectionMemo: { source: ActiveRawCodeMap; results: Map<string, EntryCandidatesResult> } | undefined;
+
+/**
+ * Tests only: the ranking `computeEntryCandidatesResult` runs —
+ * `listEntryCandidates` unless a test swaps it (to count calls, to throw, or
+ * to start a re-index mid-compute). Never reassigned outside tests.
+ */
+let entryCandidatesLister: typeof listEntryCandidates = listEntryCandidates;
+
+/** Tests only: swap the ranking (`undefined` restores `listEntryCandidates`). */
+export function setEntryCandidatesListerForTests(lister: typeof listEntryCandidates | undefined): void {
+  entryCandidatesLister = lister ?? listEntryCandidates;
+}
+
+/** Tests only: the two memos, to see that they are filled once and dropped (not only bypassed). */
+export function peekEntryCandidatesMemoForTests(): {
+  whole: EntryCandidatesResult | undefined;
+  sections: ReadonlyMap<string, EntryCandidatesResult> | undefined;
+} {
+  return { whole: activeEntryCandidates, sections: entryCandidatesSectionMemo?.results };
+}
+
+/**
+ * P4-7c (AD-13 (f), FR-15): the ranked candidate entry points of the active
+ * project's map — the ONE compute path both the `entryCandidates:list` IPC
+ * channel (through `handleListEntryCandidatesRequest`) and the
+ * `list_entry_candidates` MCP tool call, so their answers cannot drift.
+ *
+ * Reads only cached state, never a fresh fetch:
+ *  - without `section`, the cached whole-scope `activeCodeMapNodes`/
+ *    `activeCodeMapEdges` — the scoped, test-free, folded map
+ *    `computeBlastRadiusExpansionResult` reads;
+ *  - with `section`, the section's own Nodes and edges, built from the raw
+ *    cache (`buildSectionCallGraph`, the section Code Map build's own first
+ *    steps, so `calledAtLoadBy` is re-scoped to the section) — never the
+ *    whole-scope result filtered. The section is resolved with the P4-4e
+ *    machinery (`resolveCachedSectionFilter`): `unknown-section` against the
+ *    live allowlist, ownership by the raw cache's `appliedScope`, and
+ *    `MAP_REFRESHING_RESULT` while the refetch hasn't landed.
+ *
+ * Off the interaction path: the listing is computed lazily, on the first
+ * request for a given map (or map + section), and memoized
+ * (`activeEntryCandidates`, `entryCandidatesSectionMemo`); a repeat call
+ * does no walk. A Code Map fetch, a Blast Radius expansion or a Path Trace
+ * never computes it. It is one synchronous pass (~ms on a real project,
+ * ~0.1–0.55 s on the 50k-Node synthetic worst case, P4-7b), so the Graph
+ * Service handles other requests before and after it, never during.
+ *
+ * Guards mirror `computeBlastRadiusExpansionResult` (same messages): no
+ * indexed map, another project, and a generation change during the compute
+ * (results discarded, never memoized). Never throws. Review round 1: and,
+ * with or without a section, `MAP_REFRESHING_RESULT` while no current raw
+ * cache stamps the cached map (a stale fetch landed after an index started).
+ */
+export function computeEntryCandidatesResult(projectPath: string, section?: string): EntryCandidatesResult {
+  try {
+    const nodes = activeCodeMapNodes;
+    const edges = activeCodeMapEdges;
+    const projectRoot = activeProjectPath;
+    if (!nodes || !edges || !projectRoot) {
+      return { status: 'error', message: 'No project has finished indexing yet.' };
+    }
+    if (projectRoot !== projectPath) {
+      // Mirrors `computeBlastRadiusExpansionResult`'s own stale-project guard.
+      return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    // P4-7c review round 1: the cached Nodes/edges must be stamped by a
+    // current raw cache (this project, this index generation). A fetch that
+    // was still in flight when an index started still lands in
+    // `activeCodeMapNodes`/`activeCodeMapEdges` (never in the raw cache), so
+    // without this check a switch to another project (or a re-index) could
+    // list — and memoize — the previous map's candidates under the new
+    // project. (Blast Radius expansion has the same inherited race; recorded
+    // in deferred-work.md, not fixed here.)
+    if (getActiveRawCodeMap() === null) {
+      return MAP_REFRESHING_RESULT;
+    }
+    const generationId = activeSummaryGenerationId;
+
+    let result: EntryCandidatesResult;
+    let memoize: (computed: EntryCandidatesResult) => void;
+    if (section === undefined) {
+      if (activeEntryCandidates !== undefined) {
+        return activeEntryCandidates;
+      }
+      result = entryCandidatesLister(nodes, edges);
+      memoize = (computed) => {
+        activeEntryCandidates = computed;
+      };
+    } else {
+      const keepFile = resolveCachedSectionFilter(section);
+      if (typeof keepFile !== 'function') {
+        return keepFile;
+      }
+      // Non-null: `resolveCachedSectionFilter` only returns a predicate when
+      // a current raw cache exists.
+      const source = getActiveRawCodeMap() as ActiveRawCodeMap;
+      if (entryCandidatesSectionMemo === undefined || entryCandidatesSectionMemo.source !== source) {
+        entryCandidatesSectionMemo = { source, results: new Map() };
+      }
+      const memo = entryCandidatesSectionMemo;
+      const memoized = memo.results.get(section);
+      if (memoized !== undefined) {
+        return memoized;
+      }
+      const graph = buildSectionCallGraph(source.raw, keepFile);
+      result = entryCandidatesLister(graph.nodes, graph.edges);
+      memoize = (computed) => {
+        memo.results.set(section, computed);
+      };
+    }
+
+    // The compute is synchronous today; kept for structural parity with
+    // `computeBlastRadiusExpansionResult`, so a later async or chunked
+    // listing can't silently answer for a superseded map.
+    if (activeSummaryGenerationId !== generationId || activeProjectPath !== projectRoot) {
+      return {
+        status: 'error',
+        message: 'The project changed while the entry candidates were being listed; discarding its results.',
+      };
+    }
+    memoize(result);
+    return result;
+  } catch (error) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 // main passes `app.getPath('userData')` as this subprocess's first fork
 // argument (apps/desktop/main/index.ts's `spawnGraphService`) — mirrors
 // Node's own `child_process.fork` argv convention, which `utilityProcess.
@@ -808,6 +960,11 @@ function postComputeDiffScopeResultMessage(message: GraphServiceComputeDiffScope
  * `postComputeDiffScopeResultMessage`.
  */
 function postExpandBlastRadiusResultMessage(message: GraphServiceExpandBlastRadiusResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/** P4-7c: posts a `graphService:listEntryCandidatesResult` reply — own `type`, same convention as `postExpandBlastRadiusResultMessage`. */
+function postListEntryCandidatesResultMessage(message: GraphServiceListEntryCandidatesResultMessage): void {
   process.parentPort?.postMessage(message);
 }
 
@@ -1275,6 +1432,25 @@ function isExpandBlastRadiusRequest(data: unknown): data is GraphServiceExpandBl
 }
 
 /**
+ * P4-7c: true for a `graphService:listEntryCandidates` request — the same
+ * untrusted-shape treatment as `isExpandBlastRadiusRequest`: a non-empty
+ * `projectPath`, a numeric `requestId` and an optional non-empty `section`.
+ */
+function isListEntryCandidatesRequest(data: unknown): data is GraphServiceListEntryCandidatesRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, projectPath, requestId, section } = data as Record<string, unknown>;
+  return (
+    type === 'graphService:listEntryCandidates' &&
+    typeof projectPath === 'string' &&
+    projectPath.length > 0 &&
+    typeof requestId === 'number' &&
+    isOptionalSection(section)
+  );
+}
+
+/**
  * P4-4 phase 3b: true for a `graphService:diffScopeCarry` request — the same
  * untrusted-shape treatment as the other guards here: a non-empty
  * `projectPath` and `baseRef`, a numeric `requestId`, and each section `null`
@@ -1501,6 +1677,9 @@ async function handleIndexRequest(
   activeRawCodeMap = undefined;
   // P4-4 phase 2b: the section builds go with the raw cache they came from.
   sectionCodeMapMemo = undefined;
+  // P4-7c: the entry-candidate listings go with the map they were listed from.
+  activeEntryCandidates = undefined;
+  entryCandidatesSectionMemo = undefined;
   indexGeneration += 1;
   // Story 5.1 (Phase 2): reset alongside `activeCodeMapEdges` — same
   // never-serve-a-since-superseded-project's-coverage-summary reasoning.
@@ -2520,6 +2699,23 @@ async function handleExpandBlastRadiusRequest(
 }
 
 /**
+ * Handles a `graphService:listEntryCandidates` request (P4-7c): posts exactly
+ * one `graphService:listEntryCandidatesResult`, echoing `projectPath` and
+ * `requestId`, with `computeEntryCandidatesResult`'s result (which never
+ * throws) — the same call the `list_entry_candidates` MCP tool makes.
+ */
+function handleListEntryCandidatesRequest(projectPath: string, requestId: number, section?: string): void {
+  postListEntryCandidatesResultMessage({
+    type: 'graphService:listEntryCandidatesResult',
+    projectPath,
+    requestId,
+    // Review round 1: echoed, so main can check it against its request.
+    section: section ?? null,
+    result: computeEntryCandidatesResult(projectPath, section),
+  });
+}
+
+/**
  * Computes the `BlastRadiusExpansionResult` for `projectPath` against
  * `nodeIds` — against the cached `activeCodeMapNodes`/`activeCodeMapEdges`
  * (the same Code Map state `computeDiffScopeResult` reads its own
@@ -2738,6 +2934,11 @@ async function startSummaryGenerationForProject(
   const gapFiles = coverageGapFileSet;
   const backendConfig = activeBackendConfig;
 
+  // P4-7c: a different map (any fresh fetch) drops the whole-scope listing
+  // memoized from the previous one; a re-kick over the same arrays keeps it.
+  if (nodes !== activeCodeMapNodes || edges !== activeCodeMapEdges) {
+    activeEntryCandidates = undefined;
+  }
   // Set together, same synchronous tick, no `await` between them — see this
   // function's own doc comment for the race condition this atomicity fixes.
   activeCodeMapNodes = nodes;
@@ -2752,6 +2953,8 @@ async function startSummaryGenerationForProject(
   // same object (backend switch, model retry) keeps them: same raw, same builds.
   if (nextRawCodeMap !== activeRawCodeMap) {
     sectionCodeMapMemo = undefined;
+    // P4-7c: the section listings go with it, the same way.
+    entryCandidatesSectionMemo = undefined;
   }
   activeRawCodeMap = nextRawCodeMap;
 
@@ -3211,6 +3414,22 @@ process.parentPort?.on('message', (event) => {
       type: 'graphService:expandBlastRadiusResult',
       projectPath,
       requestId,
+      result: INVALID_SECTION_RESULT,
+    });
+    return;
+  }
+  if (!isShuttingDown && isListEntryCandidatesRequest(event.data)) {
+    // P4-7c: answered synchronously from the memo (or one lazy listing).
+    handleListEntryCandidatesRequest(event.data.projectPath, event.data.requestId, event.data.section);
+    return;
+  }
+  if (!isShuttingDown && isMalformedSectionRequest(event.data, isListEntryCandidatesRequest)) {
+    const { projectPath, requestId } = event.data as GraphServiceListEntryCandidatesRequest;
+    postListEntryCandidatesResultMessage({
+      type: 'graphService:listEntryCandidatesResult',
+      projectPath,
+      requestId,
+      section: null,
       result: INVALID_SECTION_RESULT,
     });
     return;

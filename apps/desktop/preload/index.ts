@@ -13,6 +13,7 @@ import {
   type BackendConfig,
   type ClearCloudApiKeyResult,
   type BlastRadiusExpansionResult,
+  type EntryCandidatesResult,
   type CloudBackend,
   type CodeMapResult,
   type DiagnosticLogEntry,
@@ -232,6 +233,12 @@ const drillerApi: DrillerApi = {
     section === undefined
       ? ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds)
       : ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds, section),
+
+  // P4-7c: like `expandBlastRadius`, the section is passed only when given.
+  listEntryCandidates: (projectPath: string, section?: string): Promise<EntryCandidatesResult> =>
+    section === undefined
+      ? ipcRenderer.invoke(IpcChannels.entryCandidatesList, projectPath)
+      : ipcRenderer.invoke(IpcChannels.entryCandidatesList, projectPath, section),
 };
 
 contextBridge.exposeInMainWorld('driller', drillerApi);

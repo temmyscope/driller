@@ -35,12 +35,14 @@ import {
   type DiffScopeCarryResult,
   type DiffScopeResult,
   type EditorPreference,
+  type EntryCandidatesResult,
   type GitDetectionResult,
   type GraphServiceCodeMapMessage,
   type GraphServiceComputeDiffScopeResultMessage,
   type GraphServiceDiffScopeCarryResultMessage,
   type GraphServiceExpandBlastRadiusResultMessage,
   type GraphServiceGetCodeMapRequest,
+  type GraphServiceListEntryCandidatesResultMessage,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRetryModelRequest,
@@ -86,7 +88,14 @@ import {
 import { appendDiagnosticLogEntry } from './diagnostic-log';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
-import { buildBackendSwitchedRequest, buildIndexRequest } from './graph-service-requests';
+import {
+  buildBackendSwitchedRequest,
+  buildIndexRequest,
+  createEntryCandidatesRelay,
+  isListEntryCandidatesResultMessage,
+  parseListEntryCandidatesArgs,
+  type ParsedListEntryCandidatesArgs,
+} from './graph-service-requests';
 import {
   buildComputeDiffScopeRequest,
   buildExpandBlastRadiusRequest,
@@ -289,6 +298,27 @@ const diffScopeCarryRelay = createDiffScopeCarryRelay({
   setTimer: (callback, ms) => setTimeout(callback, ms),
   clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 });
+
+// P4-7c: main's relay for `entryCandidates:list` — the pending map, the
+// timeout and the settle-on-exit (`graph-service-requests.ts`, unit-tested
+// there). Several requests may overlap (each has its own id).
+const entryCandidatesRelay = createEntryCandidatesRelay({
+  service: () => (graphService && !isGraphServiceShuttingDown ? graphService : null),
+  currentProjectPath: () => currentProjectPath,
+  setTimer: (callback, ms) => setTimeout(callback, ms),
+  clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+});
+
+/**
+ * P4-7c: relays an entry-candidates listing to the Graph Service and resolves
+ * with its reply — never rejects (`createEntryCandidatesRelay`'s failure
+ * paths, the same ones `requestExpandBlastRadius` has).
+ */
+function requestListEntryCandidates(
+  args: Extract<ParsedListEntryCandidatesArgs, { ok: true }>,
+): Promise<EntryCandidatesResult> {
+  return entryCandidatesRelay.request(args);
+}
 
 // Story 3.2 (Phase 1): correlates each in-flight `blastRadius:expand`
 // request to its eventual Graph Service reply — mirrors
@@ -810,6 +840,7 @@ function spawnGraphService(): void {
         | GraphServiceComputeDiffScopeResultMessage
         | GraphServiceExpandBlastRadiusResultMessage
         | GraphServiceDiffScopeCarryResultMessage
+        | GraphServiceListEntryCandidatesResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -852,6 +883,11 @@ function spawnGraphService(): void {
       // P4-4 phase 3b: validated at the process boundary.
       if (isDiffScopeCarryResultMessage(message)) {
         diffScopeCarryRelay.settleReply(message.requestId, message.result);
+        return;
+      }
+      // P4-7c: validated at the process boundary by the relay.
+      if (isListEntryCandidatesResultMessage(message)) {
+        entryCandidatesRelay.settleReply(message.requestId, message.result, message.section);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -921,6 +957,8 @@ function spawnGraphService(): void {
     settleAllPendingBlastRadiusRequests('Graph Service exited before the blast radius could be expanded.');
     // P4-4 phase 3b: the same for a pending base-ref carry check.
     diffScopeCarryRelay.settleAll('Graph Service exited before the base ref could be checked.');
+    // P4-7c: the same for a pending entry-candidates listing.
+    entryCandidatesRelay.settleAll('Graph Service exited before the entry candidates could be listed.');
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -2149,6 +2187,21 @@ function registerIpcHandlers(): void {
         return Promise.resolve(INVALID_OPERATION_SECTION_RESULT);
       }
       return requestExpandBlastRadius(projectPath, nodeIdsInput, section.section);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // P4-7c (AD-13 (f), FR-15): the ranked entry candidates — the same Graph
+  // Service compute function the `list_entry_candidates` MCP tool calls. A
+  // non-string (or empty) `projectPath` or a malformed `section` is answered
+  // with an explicit `error` here and nothing is sent.
+  // ---------------------------------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannels.entryCandidatesList,
+    (_event, projectPath: unknown, sectionInput: unknown): Promise<EntryCandidatesResult> => {
+      const args = parseListEntryCandidatesArgs(projectPath, sectionInput);
+      return args.ok ? requestListEntryCandidates(args) : Promise.resolve(args.result);
     },
   );
 

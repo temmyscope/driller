@@ -28,6 +28,7 @@ import type {
   CodeMapNode,
   CrossSectionEdgeCount,
   DiffScopeResult,
+  EntryCandidatesResult,
   FoldedModule,
   FoldedType,
   IndexCoverageSummary,
@@ -1273,6 +1274,47 @@ export interface GraphServiceExpandBlastRadiusResultMessage {
   result: BlastRadiusExpansionResult;
 }
 
+// ---------------------------------------------------------------------------
+// P4-7c: list entry candidates (AD-13 (f), FR-3/FR-4/FR-15).
+//
+// The `graphService:expandBlastRadius` request/response pair's shape, with
+// no `nodeIds`: the Graph Service lists candidates from its own cached
+// active map (never a request-supplied Node set). `EntryCandidatesResult` is
+// declared once in `@driller/graph-contracts` and re-exported above.
+// ---------------------------------------------------------------------------
+
+/**
+ * Message main sends to ask the Graph Service subprocess for the ranked
+ * entry candidates of `projectPath`'s active map. `projectPath` and
+ * `requestId` correlate the reply, as for
+ * `GraphServiceExpandBlastRadiusRequest`.
+ */
+export interface GraphServiceListEntryCandidatesRequest {
+  type: 'graphService:listEntryCandidates';
+  projectPath: string;
+  requestId: number;
+  /**
+   * AD-13 "(f) per section" (founder decision 2026-10-04): one allowlist
+   * entry, exactly as the Section bar shows it; absent = the whole scope.
+   * A value not in the allowlist gets `UnknownSectionResult`.
+   */
+  section?: string;
+}
+
+/**
+ * The Graph Service's reply to a `GraphServiceListEntryCandidatesRequest`;
+ * `projectPath` and `requestId` echo the request's. P4-7c review round 1:
+ * `section` echoes the request's section (`null` for the whole scope, or for
+ * a malformed one), which main checks against the request it settles.
+ */
+export interface GraphServiceListEntryCandidatesResultMessage {
+  type: 'graphService:listEntryCandidatesResult';
+  projectPath: string;
+  requestId: number;
+  section: string | null;
+  result: EntryCandidatesResult;
+}
+
 /**
  * P4-4 phase 3b (founder decision 2026-10-04): whether PR Review's base ref
  * carries over a section switch, so the diff scope is re-run in the new
@@ -1354,6 +1396,8 @@ export const IpcChannels = {
   diffScopeCompute: 'diffScope:compute',
   diffScopeCarry: 'diffScope:carry',
   blastRadiusExpand: 'blastRadius:expand',
+  // P4-7c: AD-13 (f), shared with the `list_entry_candidates` MCP tool.
+  entryCandidatesList: 'entryCandidates:list',
   menuOpenFolder: 'menu:openFolder',
 } as const;
 
@@ -1650,6 +1694,17 @@ export interface DrillerApi {
    * edges; a seed outside it contributes nothing. Omitted = the whole scope.
    */
   expandBlastRadius: (projectPath: string, nodeIds: string[], section?: string) => Promise<BlastRadiusExpansionResult>;
+  /**
+   * P4-7c (AD-13 (f), FR-15): the ranked candidate entry points of
+   * `projectPath`'s active map — a heuristic over indexed code (Nodes with
+   * no CALLS or USAGE caller in it, ranked by forward reach). The same
+   * Graph Service compute function the `list_entry_candidates` MCP tool
+   * calls, so both answers are identical. `projectPath` must be the open
+   * project. `section` (optional) lists the candidates of that section's
+   * own Nodes and edges; omitted = the whole scope. Never rejects: every
+   * failure is an explicit `error` result.
+   */
+  listEntryCandidates: (projectPath: string, section?: string) => Promise<EntryCandidatesResult>;
   /**
    * P4-4 phase 3b (founder decision 2026-10-04): may PR Review's `baseRef`
    * carry from `fromSection` to `toSection` (`null` = `all`)? See

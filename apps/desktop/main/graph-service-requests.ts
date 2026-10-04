@@ -1,6 +1,7 @@
 /**
  * P2-10: the two main → Graph Service requests that make up AD-4's one
- * sanctioned key hop, built here as pure, injectable functions so the "no
+ * sanctioned key hop (and, since P4-7c, the `entryCandidates:list` relay at
+ * the end of this file), built here as pure, injectable functions so the "no
  * key under Local" and "no blank or undecryptable key" rules are testable
  * without Electron.
  *
@@ -13,9 +14,14 @@
 
 import type {
   CloudBackend,
+  EntryCandidatesResult,
   GraphServiceBackendSwitchedRequest,
   GraphServiceIndexRequest,
+  GraphServiceListEntryCandidatesRequest,
+  GraphServiceListEntryCandidatesResultMessage,
 } from '@driller/ipc-contracts';
+
+import { INVALID_OPERATION_SECTION_RESULT, parseOperationSectionArg } from './section-operations';
 
 /** Returns the stored key, or `undefined` when none is stored. May throw. */
 export type DecryptCloudKey = () => string | undefined;
@@ -85,4 +91,205 @@ export function buildBackendSwitchedRequest(
     activeBackend: deps.activeBackend,
     ...cloudKeyField(deps.activeBackend, deps.decrypt),
   };
+}
+
+// ---------------------------------------------------------------------------
+// P4-7c: `entryCandidates:list` (AD-13 (f), FR-15) — main's relay to the
+// Graph Service, as a seam with its dependencies passed in (the
+// `diff-scope-carry-relay.ts` pattern) so every path is unit-tested without
+// Electron. `index.ts` owns one instance and only delegates to it.
+// ---------------------------------------------------------------------------
+
+/** The listing is one synchronous pass over cached data in the Graph Service; sized like Blast Radius expansion's backstop. */
+export const ENTRY_CANDIDATES_REQUEST_TIMEOUT_MS = 30 * 1000 + 10_000;
+
+/** The validated `entryCandidates:list` arguments, or the reply a malformed call gets (nothing is sent then). */
+export type ParsedListEntryCandidatesArgs =
+  | { ok: true; projectPath: string; section?: string }
+  | { ok: false; result: EntryCandidatesResult };
+
+/**
+ * The renderer's untyped `entryCandidates:list` arguments: `projectPath` a
+ * non-empty string (anything else is an explicit `error`, never a throw), and
+ * `section` absent or a non-empty string (`parseOperationSectionArg`).
+ */
+export function parseListEntryCandidatesArgs(projectPath: unknown, section: unknown): ParsedListEntryCandidatesArgs {
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return { ok: false, result: { status: 'error', message: 'Invalid project path.' } };
+  }
+  const parsedSection = parseOperationSectionArg(section);
+  if (!parsedSection.ok) {
+    return { ok: false, result: INVALID_OPERATION_SECTION_RESULT };
+  }
+  return parsedSection.section === undefined
+    ? { ok: true, projectPath }
+    : { ok: true, projectPath, section: parsedSection.section };
+}
+
+/** The `graphService:listEntryCandidates` request (`section` only when given). */
+export function buildListEntryCandidatesRequest(
+  projectPath: string,
+  requestId: number,
+  section?: string,
+): GraphServiceListEntryCandidatesRequest {
+  return {
+    type: 'graphService:listEntryCandidates',
+    projectPath,
+    requestId,
+    ...(section === undefined ? {} : { section }),
+  };
+}
+
+const ENTRY_CANDIDATES_STATUSES = new Set(['found', 'none', 'error', 'unknown-section']);
+
+/**
+ * The Graph Service's reply, checked at the process boundary: a result whose
+ * `status` is not one of `EntryCandidatesResult`'s (or an `error` without a
+ * message) becomes an explicit `error`; a well-formed one passes through
+ * unchanged, so the renderer gets exactly what the MCP tool returns.
+ */
+export function toValidatedEntryCandidatesResult(result: unknown): EntryCandidatesResult {
+  const status = (result as { status?: unknown } | null)?.status;
+  const malformed: EntryCandidatesResult = { status: 'error', message: 'Malformed entry-candidates reply.' };
+  if (typeof status !== 'string' || !ENTRY_CANDIDATES_STATUSES.has(status)) {
+    return malformed;
+  }
+  if (status === 'error' && typeof (result as { message?: unknown }).message !== 'string') {
+    return malformed;
+  }
+  if (
+    status === 'found' &&
+    (!Array.isArray((result as { candidates?: unknown }).candidates) ||
+      typeof (result as { totalQualifying?: unknown }).totalQualifying !== 'number')
+  ) {
+    return malformed;
+  }
+  if (status === 'unknown-section') {
+    const { section, knownSections } = result as { section?: unknown; knownSections?: unknown };
+    if (
+      typeof section !== 'string' ||
+      !Array.isArray(knownSections) ||
+      !knownSections.every((known) => typeof known === 'string')
+    ) {
+      return malformed;
+    }
+  }
+  return result as EntryCandidatesResult;
+}
+
+export interface EntryCandidatesRelayDeps {
+  /** The live Graph Service, or `null` when none is running or it is shutting down. */
+  service: () => { postMessage: (message: GraphServiceListEntryCandidatesRequest) => void } | null;
+  currentProjectPath: () => string | null;
+  setTimer: (callback: () => void, ms: number) => unknown;
+  clearTimer: (timer: unknown) => void;
+  timeoutMs?: number;
+}
+
+export interface EntryCandidatesRelay {
+  /** `requestListEntryCandidates`: never rejects; every failure is an explicit `error`. */
+  request: (args: Extract<ParsedListEntryCandidatesArgs, { ok: true }>) => Promise<EntryCandidatesResult>;
+  /**
+   * A `graphService:listEntryCandidatesResult` reply: validated, then settles
+   * its request (if still pending). Review round 1: `section` is the reply's
+   * echo — it must be the request's section (`null` for the whole scope),
+   * else the request settles with an explicit mismatch error.
+   */
+  settleReply: (requestId: number, result: unknown, section: unknown) => void;
+  /** The Graph Service exited: every pending request settles with `message`. */
+  settleAll: (message: string) => void;
+  pendingCount: () => number;
+}
+
+/**
+ * Each request has its own id, so several may overlap (a section switch
+ * while the previous listing is in flight); a reply for an id no longer
+ * pending (timed out, settled) is ignored. The failure paths match
+ * `blastRadius:expand`'s: no service (or one shutting down), another
+ * project, a `postMessage` throw, the timeout and the service exiting all
+ * resolve to `{status: 'error'}`.
+ */
+export function createEntryCandidatesRelay(deps: EntryCandidatesRelayDeps): EntryCandidatesRelay {
+  const pending = new Map<
+    number,
+    { resolve: (result: EntryCandidatesResult) => void; timer: unknown; section: string | null }
+  >();
+  let nextRequestId = 0;
+
+  const settle = (requestId: number, result: EntryCandidatesResult): void => {
+    const entry = pending.get(requestId);
+    if (entry === undefined) {
+      return;
+    }
+    pending.delete(requestId);
+    deps.clearTimer(entry.timer);
+    entry.resolve(result);
+  };
+
+  return {
+    request(args) {
+      const service = deps.service();
+      if (service === null) {
+        return Promise.resolve({ status: 'error', message: 'Graph Service is not running.' });
+      }
+      if (args.projectPath !== deps.currentProjectPath()) {
+        return Promise.resolve({
+          status: 'error',
+          message: 'The requested project is not the currently open project.',
+        });
+      }
+      const requestId = ++nextRequestId;
+      const promise = new Promise<EntryCandidatesResult>((resolve) => {
+        const timer = deps.setTimer(
+          () =>
+            settle(requestId, {
+              status: 'error',
+              message: 'Timed out waiting for the Graph Service to list the entry candidates.',
+            }),
+          deps.timeoutMs ?? ENTRY_CANDIDATES_REQUEST_TIMEOUT_MS,
+        );
+        pending.set(requestId, { resolve, timer, section: args.section ?? null });
+      });
+      try {
+        service.postMessage(buildListEntryCandidatesRequest(args.projectPath, requestId, args.section));
+      } catch (error) {
+        settle(requestId, {
+          status: 'error',
+          message: `Failed to send the entry-candidates request to the Graph Service: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        });
+      }
+      return promise;
+    },
+    settleReply(requestId, result, section) {
+      const entry = pending.get(requestId);
+      if (entry === undefined) {
+        return;
+      }
+      if (section !== entry.section) {
+        settle(requestId, { status: 'error', message: 'Mismatched entry-candidates reply.' });
+        return;
+      }
+      settle(requestId, toValidatedEntryCandidatesResult(result));
+    },
+    settleAll(message) {
+      for (const requestId of [...pending.keys()]) {
+        settle(requestId, { status: 'error', message });
+      }
+    },
+    pendingCount: () => pending.size,
+  };
+}
+
+/** True for a `graphService:listEntryCandidatesResult` reply (its `result` is validated by `settleReply`). */
+export function isListEntryCandidatesResultMessage(
+  message: unknown,
+): message is GraphServiceListEntryCandidatesResultMessage {
+  return (
+    typeof message === 'object' &&
+    message !== null &&
+    (message as { type?: unknown }).type === 'graphService:listEntryCandidatesResult' &&
+    typeof (message as { requestId?: unknown }).requestId === 'number'
+  );
 }

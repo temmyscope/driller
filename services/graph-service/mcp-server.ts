@@ -66,6 +66,9 @@ import {
   BLAST_RADIUS_DEFAULT_HOPS,
   CHANGED_CONTRACT_MAX_DEPENDENT_IDS,
   CROSS_SECTION_CALLS_MAX,
+  ENTRY_CANDIDATE_LOADED_BY_MAX,
+  ENTRY_CANDIDATE_MAX,
+  ENTRY_CANDIDATE_MIN_REACH,
   FOLDED_TYPE_LOOKUP_MAX_USED_BY,
   SIMILAR_TO_MAX_ENTRIES,
   SIMILAR_TO_MIN_JACCARD,
@@ -78,6 +81,7 @@ import {
 import {
   computeBlastRadiusExpansionResult,
   computeDiffScopeResult,
+  computeEntryCandidatesResult,
   computePathTraceResult,
   getCoverageSummaryResult,
 } from './index';
@@ -322,7 +326,7 @@ function writeRequestTooLarge(res: http.ServerResponse): void {
 
 /**
  * Shared response shape for every `registerTool` handler below (review
- * finding, Low): all five tools JSON-stringify their explicit result state
+ * finding, Low): all six tools JSON-stringify their explicit result state
  * into a single text content block — extracted once now that there are 5
  * near-identical call sites instead of 1 (this phase's own AD-13
  * no-duplication stance, applied to the response-wrapping code too, not
@@ -393,7 +397,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.8.0';
+export const MCP_SERVER_VERSION = '1.9.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -496,6 +500,45 @@ export function registerExpandBlastRadiusTool(server: Pick<McpServer, 'registerT
 }
 
 /**
+ * P4-7c: the `list_entry_candidates` tool's description — exported so a test
+ * pins what it promises (a heuristic over indexed code, what `none` means,
+ * the reason kinds, and which callers count).
+ */
+export const LIST_ENTRY_CANDIDATES_DESCRIPTION =
+  "List candidate entry points of the project's Code Map: where to start reading. This is a heuristic over indexed code, never a claim that a Node is the program's entry point: a candidate is a Code Map Node with no caller among the Code Map's in-scope Nodes (indexed code within the indexing scope), ranked by how many Nodes it reaches. " +
+  "A caller is another Code Map Node with a CALLS or USAGE edge into it: USAGE counts as a caller (so a component rendered through JSX is not a candidate), IMPORTS does not, and a self-call is ignored. Load-time calls from a file's top level (main(), app.whenReady().then(createWindow), ipcMain.handle(channel, handler)) do NOT count as callers, because that is how programs start: they are named in the reason instead. " +
+  `'reach' is the number of distinct Nodes the candidate reaches forward over CALLS and USAGE edges, itself excluded. Nodes reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} are dropped. ` +
+  `Returns an explicit result state: {status: 'found', candidates, totalQualifying}, candidates ordered by reach (highest first) then id, at most ${ENTRY_CANDIDATE_MAX}, with 'totalQualifying' counting every qualifying Node before that cap; {status: 'none'} when no Node qualifies (for example fully cyclic code, or every root reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} Nodes), which means no qualifying Node, NOT that the code has no entry point; or {status: 'error', message}. ` +
+  "Each candidate is {id, name, file, startLine, endLine, reach, reason}. Reason kinds: 'no-callers' (no Code Map Node calls or uses it in indexed code); when files' top-level code calls or uses it at load time, the reason also carries 'loadedBy' " +
+  `(those files, sorted, at most ${ENTRY_CANDIDATE_LOADED_BY_MAX}) and 'loadedByTotal' (how many there are). ` +
+  "Test code is never a candidate and never counted in reach. The result is the exact same EntryCandidatesResult the human-facing UI gets for the identical request. " +
+  "With 'section', candidates and reach are computed from that section's own Nodes and the edges between them, never by filtering the whole-scope result: a Node whose only callers are in another section is a candidate in its own section, and 'loadedBy' names only files inside the section. " +
+  SECTION_RULE_DESCRIPTION;
+
+/**
+ * Registers the `list_entry_candidates` tool (P4-7c, AD-13 (f)) on `server`
+ * — the `registerExpandBlastRadiusTool` pattern. The handler serializes
+ * `computeEntryCandidatesResult`, the same function the `entryCandidates:list`
+ * IPC channel's Graph Service handler calls, so the two answers are
+ * identical (FR-15).
+ */
+export function registerListEntryCandidatesTool(server: Pick<McpServer, 'registerTool'>): void {
+  server.registerTool(
+    'list_entry_candidates',
+    {
+      title: 'List candidate entry points',
+      description: LIST_ENTRY_CANDIDATES_DESCRIPTION,
+      inputSchema: z.object({
+        projectPath: z.string().describe('The absolute path of the project to query — must match the currently indexed project.'),
+        section: sectionInput(),
+      }),
+    },
+    // `section` passed through (`undefined` when omitted — the whole scope).
+    async ({ projectPath, section }) => jsonToolResult(computeEntryCandidatesResult(projectPath, section)),
+  );
+}
+
+/**
  * Registers the `compute_diff_scope` tool (Story 5.1, Phase 2) on `server` —
  * extracted (P4-4 phase 2b) like `registerExpandBlastRadiusTool`.
  */
@@ -547,9 +590,9 @@ export function registerComputeDiffScopeTool(server: Pick<McpServer, 'registerTo
 }
 
 /**
- * Builds the `McpServer`, registers all five tools (`lookup_node` plus
+ * Builds the `McpServer`, registers all six tools (`lookup_node` plus
  * Phase 2's `trace_path`/`expand_blast_radius`/`compute_diff_scope`/
- * `get_coverage_summary`), and starts the `127.0.0.1`-bound HTTP listener —
+ * `get_coverage_summary`, and P4-7c's `list_entry_candidates`), and starts the `127.0.0.1`-bound HTTP listener —
  * called once at subprocess boot (`index.ts`), never gated on a project
  * being indexed first (Always).
  *
@@ -647,6 +690,8 @@ export function startMcpServer(
   // 1.8.0 since nothing has been released since: `changedInOtherSections`
   // entries are {section, changedNodes, changedContracts, topLevelFiles},
   // same-repository sections only.
+  // P4-7c (1.9.0): the new `list_entry_candidates` tool (AD-13 (f)), with
+  // the same optional `section`. Additive: no existing tool changes.
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
   registerLookupNodeTool(
@@ -671,6 +716,9 @@ export function startMcpServer(
   registerTracePathTool(server);
 
   registerExpandBlastRadiusTool(server);
+
+  // P4-7c: the sixth tool, shared with the renderer's `entryCandidates:list`.
+  registerListEntryCandidatesTool(server);
 
   registerComputeDiffScopeTool(server);
 

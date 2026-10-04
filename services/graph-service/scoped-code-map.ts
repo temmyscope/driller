@@ -468,6 +468,47 @@ export function filterCodeMapToScope<
 }
 
 /**
+ * Steps 1–4a of the pipeline (see this module's doc comment), shared by
+ * `buildScopedCodeMap` and `buildSectionCallGraph` (P4-7c review round 1) so
+ * the two can never drift:
+ *  1. `filterCodeMapToScope` — Nodes in the file set, and the edges between them;
+ *  2–3. a folded type / Module is kept exactly when its file is, and names
+ *     only kept Nodes (and kept types); a folded Module's top-level type uses
+ *     keep only kept types;
+ *  4a. each Node's folded-Module links (`fileTopLevel`, `calledAtLoadBy`,
+ *     `fileTopLevelTypes`) re-derived from the scoped Modules.
+ */
+function scopeRawCodeMap(raw: RawCodeMap, keepFile: KeepFile) {
+  const { nodes: fetchedNodes, edges: fetchedEdges, foldedModules: fetchedModules, foldedTypes: fetchedTypes } = raw.fetched;
+  const { nodes: scopedNodes, edges } = filterCodeMapToScope(raw.projectRoot, fetchedNodes, fetchedEdges, keepFile);
+  const scopedNodeIds = new Set(scopedNodes.map((node) => node.id));
+  const foldedTypes = scopeFoldedTypes(fetchedTypes, new Map(scopedNodes.map((node) => [node.id, node.kind])), keepFile);
+  const foldedModules = splitModuleTypeUses(scopeFoldedModules(fetchedModules, scopedNodeIds, keepFile), foldedTypes);
+  return { linkedNodes: attachFoldedModuleLinks(scopedNodes, foldedModules), edges, foldedTypes, foldedModules };
+}
+
+/**
+ * P4-7c (AD-13 "(f) per section", founder decision 2026-10-04): the Nodes
+ * and edges entry candidates are listed from in one section — exactly
+ * `buildScopedCodeMap(raw, keepFile)`'s steps 1–4a (`scopeRawCodeMap`, the
+ * same code), nothing else: the section's own Nodes and the edges between
+ * them (never the whole-scope result filtered), each Node's `calledAtLoadBy`
+ * re-scoped to the section exactly as the section's Code Map reply has it —
+ * a file of another section whose top-level code calls a Node never appears
+ * in it, so never in a candidate's `reason.loadedBy`. Type uses, similar
+ * implementations, summary state and signals are skipped:
+ * `listEntryCandidates` reads only ids, names, locations, `calledAtLoadBy`
+ * and edges. Pure.
+ */
+export function buildSectionCallGraph(
+  raw: RawCodeMap,
+  keepFile: KeepFile,
+): { nodes: ProductionCodeMapResult['nodes']; edges: CodeMapEdge[] } {
+  const { linkedNodes, edges } = scopeRawCodeMap(raw, keepFile);
+  return { nodes: linkedNodes, edges };
+}
+
+/**
  * The Code Map for the files `keepFile` keeps, built from `raw` by the
  * pipeline in this module's doc comment. Pure apart from reading Node
  * records through `getRecord` (summary state, record-backed signals).
@@ -477,22 +518,13 @@ export function buildScopedCodeMap(
   keepFile: KeepFile,
   getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
 ): ScopedCodeMap {
-  const { nodes: fetchedNodes, edges: fetchedEdges, foldedModules: fetchedModules, foldedTypes: fetchedTypes, similarPairs } =
-    raw.fetched;
-  // 1. Nodes in the file set, and the edges between them.
-  const { nodes: scopedNodes, edges } = filterCodeMapToScope(raw.projectRoot, fetchedNodes, fetchedEdges, keepFile);
-  // 2–3. A folded type / Module is kept exactly when its file is, and names
-  // only kept Nodes (and kept types). A folded Module's top-level type uses
-  // keep only kept types.
-  const scopedNodeIds = new Set(scopedNodes.map((node) => node.id));
-  const foldedTypes = scopeFoldedTypes(fetchedTypes, new Map(scopedNodes.map((node) => [node.id, node.kind])), keepFile);
-  const foldedModules = splitModuleTypeUses(scopeFoldedModules(fetchedModules, scopedNodeIds, keepFile), foldedTypes);
-  // 4. Each Node's folded links, type uses and similar implementations are
-  // re-derived from the scoped set.
-  const preSignalNodes = attachSimilar(
-    attachTypeUses(attachFoldedModuleLinks(scopedNodes, foldedModules), foldedTypes),
-    similarPairs,
-  );
+  const { nodes: fetchedNodes, similarPairs } = raw.fetched;
+  // 1–4a. The scope filter, folded type / Module scoping and folded-Module
+  // links (`scopeRawCodeMap`, shared with `buildSectionCallGraph`).
+  const { linkedNodes, edges, foldedTypes, foldedModules } = scopeRawCodeMap(raw, keepFile);
+  // 4. Each Node's type uses and similar implementations are re-derived
+  // from the scoped set.
+  const preSignalNodes = attachSimilar(attachTypeUses(linkedNodes, foldedTypes), similarPairs);
   // 5. Summary state from the record store and the index's coverage gaps.
   const annotatedNodes = annotateNodesWithSummaryState(preSignalNodes, raw.coverageGapFiles, getRecord);
   // 6. Blast-radius adjacency over this file set's edges, built once.
