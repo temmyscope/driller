@@ -1789,6 +1789,71 @@ code,
   pointer-events: auto;
 }
 
+/* P4-7e: Revealed's drill. A ref card ("↺ name shown above") and a stub
+   card ("+N more callees") are small, dashed and never map-Node cards; the
+   glyph and text carry the meaning (never colour alone). The ref connector
+   is faint and dashed, apart from every real edge kind, and its label says
+   "shown above". */
+.code-map__reveal-ref,
+.code-map__reveal-stub {
+  max-width: 200px;
+  padding: 0.3rem 0.6rem;
+  border: 1px dashed var(--border-control);
+  border-radius: 0;
+  background: var(--panel);
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.code-map__reveal-stub {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.code-map__reveal-ref:hover,
+.code-map__reveal-stub:hover {
+  border-color: var(--accent);
+}
+
+.code-map__reveal-ref:focus-visible,
+.code-map__reveal-stub:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.code-map__edge--reveal-ref {
+  stroke-dasharray: 3 4;
+  opacity: 0.5;
+  /* Review round 1: decoration, never clicked through to a Node. */
+  pointer-events: none;
+  cursor: default;
+}
+
+.code-map__node-affordance--drill[aria-expanded='true'] {
+  border-style: dashed;
+}
+
+/* Review round 1: the note can't make the card taller than an ordinary one
+   — it takes one line (no wider than the card: `width: 0; min-width: 100%`,
+   ellipsis, the full text in `title`), and the summary gives up its second
+   line on that card. */
+.code-map__node-cross-section-note {
+  width: 0;
+  min-width: 100%;
+  margin: 0.1rem 0 0;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.code-map__node--cross-section-note .code-map__node-summary {
+  -webkit-line-clamp: 1;
+}
+
 /* P4-2 phase 3c: a folded Type/Interface/Module card drawn back by "Show
    types & modules" (`CodeMapFoldedCard`): a dashed, dimmed card so it never
    reads as a map Node; its kind label says "folded" in text too. */

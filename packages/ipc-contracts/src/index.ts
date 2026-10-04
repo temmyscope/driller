@@ -103,6 +103,15 @@ export {
   TESTED_BY_MAX_TESTS,
 } from '@driller/graph-contracts';
 
+/**
+ * P4-7e: re-exported so the renderer's drill (`revealView.ts`) walks the very
+ * adjacency a candidate's reach counts — `CALLS` and `USAGE` only, never
+ * `IMPORTS` — with no second implementation and no Graph Service call per
+ * expand (Option C was rejected).
+ */
+export { entryReachAdjacency } from '@driller/graph-contracts';
+export type { BidirectionalAdjacency } from '@driller/graph-contracts';
+
 // ---------------------------------------------------------------------------
 // Recent Projects (AD-5: persisted via electron-store under userData)
 // ---------------------------------------------------------------------------

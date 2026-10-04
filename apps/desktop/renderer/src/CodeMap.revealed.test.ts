@@ -35,6 +35,7 @@ import {
   revealedPopulation,
   revealNoticeFor,
   revealKey,
+  revealStateOf,
   type RevealState,
 } from './revealView';
 import { renderTree, textOf, type RenderedElement } from './testRender';
@@ -55,6 +56,17 @@ function node(id: string): CodeMapNode {
     summary: 'Does a thing.',
     riskSignals: [],
   };
+}
+
+/** P4-7e: a state from P4-7d's `{candidates, revealed}` shape — each revealed id becomes a `node` entry (reach 0 unless a candidate). */
+function stateFrom(input: {
+  candidates: EntryCandidate[];
+  revealed: ReadonlyMap<string, { depth: number; parentId: string | null }>;
+}): RevealState {
+  return revealStateOf(
+    input.candidates,
+    [...input.revealed].map(([id, entry]) => ({ kind: 'node' as const, id, depth: entry.depth, parentId: entry.parentId, reach: 0 })),
+  );
 }
 
 const edge = (source: string, target: string): CodeMapEdge => ({ source, target, kind: 'CALLS' });
@@ -181,7 +193,7 @@ describe('Full map is byte-identical (positionOf omitted)', () => {
     );
     assert.match(
       codeMapSrc,
-      /toFlowEdges\(\(revealCanvas === null \? population : revealCanvas\.population\)\.canvasEdges\)/,
+      /revealCanvas === null\s*\? toFlowEdges\(population\.canvasEdges\)\s*:/,
     );
     assert.match(
       codeMapSrc,
@@ -303,14 +315,14 @@ describe('Revealed lays out exactly the revealed ids', () => {
   });
 
   it('a deeper reveal draws its edges and positions by column', () => {
-    const state: RevealState = {
+    const state: RevealState = stateFrom({
       candidates: [HANDLE_REQUEST],
       revealed: new Map([
         ['handleRequest', { depth: 0, parentId: null }],
         ['serviceB', { depth: 1, parentId: 'handleRequest' }],
         ['serviceA', { depth: 1, parentId: 'handleRequest' }],
       ]),
-    };
+    });
     const drawn = revealedPopulation(canvasPopulation(FETCH, { nodes: [], edges: [] }, false), state);
     const positions = layeredLayout(state);
     const flowNodes = layoutNodes(
@@ -334,10 +346,10 @@ describe('Revealed lays out exactly the revealed ids', () => {
     assert.deepEqual(drawn.canvasEdges, [edge('handleRequest', 'serviceA'), edge('handleRequest', 'serviceB')]);
   });
 
-  it('the Revealed branch passes the drawn population, positionOf and candidates', () => {
+  it('the Revealed branch passes the drawn population, positionOf, candidates and (P4-7e) the drill', () => {
     assert.match(
       codeMapSrc,
-      /: layoutNodes\(\s*revealCanvas\.population\.mapNodes,[\s\S]*?revealCanvas\.population\.foldedNodes,\s*activateFoldedNode,\s*contractDependentsById,\s*revealCanvas\.positionOf,\s*revealCanvas\.candidates,\s*\)/,
+      /: layoutNodes\(\s*revealCanvas\.population\.mapNodes,[\s\S]*?revealCanvas\.population\.foldedNodes,\s*activateFoldedNode,\s*contractDependentsById,\s*revealCanvas\.positionOf,\s*revealCanvas\.candidates,\s*revealCanvas\.reveal,\s*\)/,
     );
     // Numbers keep reading the full map.
     assert.match(codeMapSrc, /const callEdges = useMemo\(\(\) => callEdgesOf\(population\.riskEdges\), \[population\]\);/);

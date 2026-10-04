@@ -153,8 +153,24 @@ import {
   revealRefitOnListing,
   revealStatusText,
   revealViewRequestForToggle,
+  applyRevealTransition,
+  collapseNode,
+  expandNode,
+  expandStub,
+  REVEAL_LAYER_CAP,
+  revealAuxCards,
+  revealCrossSectionNote,
+  revealDrillButtonText,
+  revealDrillControls,
+  revealDrillGraphFor,
+  revealRefText,
+  revealStubText,
+  type RevealDrillGraph,
   type HeldReveal,
+  type RevealAuxCard,
+  type RevealDrillControl,
   type RevealNotice,
+  type RevealState,
   type RevealViewMode,
   type RevealViewRequest,
   type SavedFullViewport,
@@ -1222,8 +1238,39 @@ type CodeMapFlowNode = FlowNode<
      * the "◎ candidate" badge, its reason line and the aria suffix.
      */
     candidate?: EntryCandidate;
+    /**
+     * P4-7e: set only on a revealed Node's card in Revealed — its
+     * "▸ Expand callees (N)" / "▾ Collapse" button (none at N = 0) and what
+     * pressing it does.
+     */
+    drill?: RevealDrillControl;
+    onDrill?: (node: CodeMapNode, action: RevealDrillControl['kind']) => void;
+    /** P4-7e: Revealed in a section only — "↗ Calls N Nodes in other sections (not shown in this section)" (`revealCrossSectionNote`). */
+    crossSectionNote?: string;
   },
   'codeMapNode'
+>;
+
+/**
+ * P4-7e: a Revealed ref card — "↺ `<name>` shown above" for a callee already
+ * revealed elsewhere. Render-only, like a folded card: never a `CodeMapNode`,
+ * never counted. Activating it navigates to the target.
+ */
+type CodeMapRevealRefFlowNode = FlowNode<
+  {
+    ref: Extract<RevealAuxCard, { kind: 'ref' }>;
+    onActivate: (ref: Extract<RevealAuxCard, { kind: 'ref' }>) => void;
+  },
+  'codeMapRevealRef'
+>;
+
+/** P4-7e: a Revealed stub card — "+N more callees"; activating it reveals the next `REVEAL_LAYER_CAP`. Render-only. */
+type CodeMapRevealStubFlowNode = FlowNode<
+  {
+    stub: Extract<RevealAuxCard, { kind: 'more' }>;
+    onActivate: (stub: Extract<RevealAuxCard, { kind: 'more' }>) => void;
+  },
+  'codeMapRevealStub'
 >;
 
 /**
@@ -1241,8 +1288,8 @@ type CodeMapFoldedFlowNode = FlowNode<
   'codeMapFolded'
 >;
 
-/** A card on the canvas: a map Node's, or a folded kind's. */
-type CodeMapCardFlowNode = CodeMapFlowNode | CodeMapFoldedFlowNode;
+/** A card on the canvas: a map Node's, a folded kind's, or (P4-7e, Revealed) a ref or stub. */
+type CodeMapCardFlowNode = CodeMapFlowNode | CodeMapFoldedFlowNode | CodeMapRevealRefFlowNode | CodeMapRevealStubFlowNode;
 
 /** P4-2 phase 3c: a canvas card's map Node — `undefined` for a folded card (not a map Node) or none. */
 const mapNodeOf = (flowNode: CodeMapCardFlowNode | undefined): CodeMapNode | undefined =>
@@ -1851,6 +1898,10 @@ export function layoutNodes(
   // P4-7d: Revealed's entry candidates by id — a candidate's card gets
   // `data.candidate` (badge, reason, aria suffix). Omitted, no card has it.
   candidates?: ReadonlyMap<string, EntryCandidate>,
+  // P4-7e: Revealed's drill — each revealed Node's control, the ref and stub
+  // cards (render-only, placed by `positionOf` like the folded cards), and
+  // the cross-section note. Omitted (Full map), no card gets any of it.
+  reveal?: LayoutRevealExtras,
 ): CodeMapCardFlowNode[] {
   const gridSize = canvasGridSize(nodes.length, foldedNodes.length);
   const place = positionOf ?? ((_id: string, index: number) => layoutPosition(index, gridSize));
@@ -1877,6 +1928,7 @@ export function layoutNodes(
         isChanged: changedNodeIds.has(node.id),
         ...(affectedByContracts !== undefined ? { affectedByContracts } : {}),
         ...(candidate !== undefined ? { candidate } : {}),
+        ...(reveal !== undefined ? revealCardData(reveal, node) : {}),
       },
     };
   });
@@ -1888,7 +1940,39 @@ export function layoutNodes(
       data: { folded, onActivate: onActivateFolded, isChanged: changedNodeIds.has(folded.id) },
     });
   });
+  reveal?.auxCards.forEach((aux, index) => {
+    const position = place(aux.id, nodes.length + foldedNodes.length + index);
+    cards.push(
+      aux.kind === 'ref'
+        ? { id: aux.id, type: 'codeMapRevealRef', position, data: { ref: aux, onActivate: reveal.onActivateRef } }
+        : { id: aux.id, type: 'codeMapRevealStub', position, data: { stub: aux, onActivate: reveal.onActivateStub } },
+    );
+  });
   return cards;
+}
+
+/** P4-7e: what `layoutNodes` needs for Revealed's drill. */
+export interface LayoutRevealExtras {
+  controls: ReadonlyMap<string, RevealDrillControl>;
+  onDrill: (node: CodeMapNode, action: RevealDrillControl['kind']) => void;
+  auxCards: readonly RevealAuxCard[];
+  onActivateRef: (ref: Extract<RevealAuxCard, { kind: 'ref' }>) => void;
+  onActivateStub: (stub: Extract<RevealAuxCard, { kind: 'more' }>) => void;
+}
+
+/** P4-7e: a revealed Node card's drill data — its control (if any), the handler, and the cross-section note (if any). */
+function revealCardData(
+  reveal: LayoutRevealExtras,
+  node: CodeMapNode,
+): { drill?: RevealDrillControl; onDrill: LayoutRevealExtras['onDrill']; crossSectionNote?: string } {
+  const drill = reveal.controls.get(node.id);
+  // Review round 1: only on an expanded card — beside the callees it shows.
+  const crossSectionNote = drill?.kind === 'collapse' ? revealCrossSectionNote(node) : null;
+  return {
+    ...(drill !== undefined ? { drill } : {}),
+    onDrill: reveal.onDrill,
+    ...(crossSectionNote !== null ? { crossSectionNote } : {}),
+  };
 }
 
 /**
@@ -2091,6 +2175,11 @@ export function activateCanvasCard(flowNode: CodeMapAnyFlowNode, expandCluster: 
     expandCluster(flowNode.data.cluster);
   } else if (flowNode.type === 'codeMapFolded') {
     flowNode.data.onActivate(flowNode.data.folded);
+  } else if (flowNode.type === 'codeMapRevealRef') {
+    // P4-7e: a ref navigates to its target; a stub reveals the next callees.
+    flowNode.data.onActivate(flowNode.data.ref);
+  } else if (flowNode.type === 'codeMapRevealStub') {
+    flowNode.data.onActivate(flowNode.data.stub);
   } else {
     flowNode.data.onActivate(flowNode.data.node);
   }
@@ -2183,6 +2272,35 @@ function toFlowEdges(edges: readonly CodeMapEdge[]): FlowEdge[] {
     label: edge.kind,
     className: `code-map__edge code-map__edge--${edge.kind.toLowerCase()}`,
   }));
+}
+
+/**
+ * P4-7e: the faint parent → ref connector of each drawn ref card, labelled
+ * "shown above" and styled apart from every real edge kind. It joins a Node
+ * to the small card that stands for a callee already shown — never two
+ * Nodes, so it is never mistaken for (or counted as) a fabricated edge.
+ */
+export function revealRefConnectorEdges(auxCards: readonly RevealAuxCard[]): FlowEdge[] {
+  return auxCards
+    .filter((card): card is Extract<RevealAuxCard, { kind: 'ref' }> => card.kind === 'ref')
+    .map((card) => ({
+      id: `${REVEAL_CONNECTOR_ID_PREFIX}${card.id}`,
+      source: card.parentId,
+      target: card.id,
+      label: 'shown above',
+      className: 'code-map__edge code-map__edge--reveal-ref',
+      // Review round 1: decoration, not an edge to follow.
+      selectable: false,
+      focusable: false,
+    }));
+}
+
+/** P4-7e: every ref connector's id starts with this; no real edge's does (`toFlowEdges` ids start with a Node id). */
+const REVEAL_CONNECTOR_ID_PREFIX = 'reveal-connector:';
+
+/** P4-7e review round 1: whether a canvas edge is a ref connector — `handleEdgeClick` ignores those. */
+export function isRevealConnectorEdgeId(id: string): boolean {
+  return id.startsWith(REVEAL_CONNECTOR_ID_PREFIX);
 }
 
 /**
@@ -2991,6 +3109,95 @@ export function RevealListingNotice({
   );
 }
 
+/**
+ * P4-7e: a revealed Node's "▸ Expand callees (N)" / "▾ Collapse" button —
+ * a glyph plus text, `aria-expanded`, and an accessible name naming the
+ * Node. Stops propagation on mousedown, click and keydown, like the
+ * neighbour pills, so it never opens Node detail too. Hookless.
+ */
+export function RevealDrillButton({
+  node,
+  drill,
+  onDrill,
+}: {
+  node: CodeMapNode;
+  drill: RevealDrillControl;
+  onDrill: (node: CodeMapNode, action: RevealDrillControl['kind']) => void;
+}) {
+  const label =
+    drill.kind === 'expand'
+      ? `Expand ${drill.count} callee${drill.count === 1 ? '' : 's'} of ${node.name}`
+      : `Collapse the callees of ${node.name}`;
+  return (
+    <button
+      type="button"
+      className="code-map__node-affordance code-map__node-affordance--drill"
+      aria-expanded={drill.kind === 'collapse'}
+      aria-label={label}
+      onMouseDown={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.stopPropagation();
+        onDrill(node, drill.kind);
+      }}
+    >
+      {revealDrillButtonText(drill)}
+    </button>
+  );
+}
+
+/**
+ * P4-7e: a ref card — "↺ `<name>` shown above" for a callee already revealed
+ * elsewhere (a cycle, or fan-in). Render-only; activating it (click, Enter,
+ * Space) navigates to the target. Hookless.
+ */
+export function CodeMapRevealRefCard({ data }: Pick<NodeProps<CodeMapRevealRefFlowNode>, 'data'>) {
+  const { ref, onActivate } = data;
+  return (
+    <div
+      className="code-map__reveal-ref"
+      title={revealRefText(ref.targetName)}
+      tabIndex={0}
+      role="button"
+      aria-label={`${ref.targetName} is shown above, go to it`}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onActivate(ref);
+        }
+      }}
+    >
+      <Handle type="target" position={Position.Left} />
+      <span aria-hidden="true">↺</span> <code>{ref.targetName}</code> shown above
+    </div>
+  );
+}
+
+/**
+ * P4-7e: a stub card — "+N more callees"; activating it (click, Enter, Space)
+ * reveals the next `REVEAL_LAYER_CAP`. Render-only. Hookless.
+ */
+export function CodeMapRevealStubCard({ data }: Pick<NodeProps<CodeMapRevealStubFlowNode>, 'data'>) {
+  const { stub, onActivate } = data;
+  const next = Math.min(stub.hiddenCount, REVEAL_LAYER_CAP);
+  return (
+    <div
+      className="code-map__reveal-stub"
+      tabIndex={0}
+      role="button"
+      aria-label={`${revealStubText(stub.hiddenCount)} of ${stub.parentName}, show the next ${next}`}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onActivate(stub);
+        }
+      }}
+    >
+      {revealStubText(stub.hiddenCount)}
+    </div>
+  );
+}
+
 export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data'>) {
   const {
     node,
@@ -3007,11 +3214,16 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
     isChanged,
     affectedByContracts,
     candidate,
+    drill,
+    onDrill,
+    crossSectionNote,
   } = data;
   const summaryStatus = node.summaryStatus;
   return (
     <div
-      className={`code-map__node${isChanged ? ' code-map__node--changed' : ''}`}
+      className={`code-map__node${isChanged ? ' code-map__node--changed' : ''}${
+        crossSectionNote !== undefined ? ' code-map__node--cross-section-note' : ''
+      }`}
       title={`${node.file}:${node.startLine}-${node.endLine}`}
       tabIndex={0}
       role="button"
@@ -3032,6 +3244,14 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
           "candidate", never colour alone, and its reason, qualified "in
           indexed code". */}
       {candidate !== undefined && <CandidateReasonLine candidate={candidate} />}
+      {/* P4-7e (founder decision 2026-10-04, proposed): in a section, the
+          drill follows that section's own edges only, so a callee in another
+          section is never revealed — this says so, with P4-4g's count. */}
+      {crossSectionNote !== undefined && (
+        <p className="code-map__node-cross-section-note" title={crossSectionNote}>
+          {crossSectionNote}
+        </p>
+      )}
       {/* Story 3.1 (Phase 2): PR Review Mode's changed-Node treatment —
           never color-only (Accessibility Floor): this visible "Changed"
           text label carries the meaning on its own; `code-map__node--changed`
@@ -3144,6 +3364,12 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
           Flow's own node-drag/selection handling is what the mousedown stop
           guards against. */}
       <div className="code-map__node-affordances">
+        {/* P4-7e: Revealed's expand/collapse — the same three
+            `stopPropagation` handlers as the pills below, so pressing it
+            never also opens Node detail. No button at N = 0. */}
+        {drill !== undefined && onDrill !== undefined && (
+          <RevealDrillButton node={node} drill={drill} onDrill={onDrill} />
+        )}
         {/* P2-4: each pill draws a 1-hop neighbour trace (origin + every
             neighbour in that direction + the edges between them) rather
             than jumping to the first neighbour only. */}
@@ -6130,7 +6356,13 @@ export function CodeMapFoldedCard({ data }: Pick<NodeProps<CodeMapFoldedFlowNode
   );
 }
 
-const nodeTypes = { codeMapNode: CodeMapNodeCard, codeMapCluster: CodeMapClusterCard, codeMapFolded: CodeMapFoldedCard };
+const nodeTypes = {
+  codeMapNode: CodeMapNodeCard,
+  codeMapCluster: CodeMapClusterCard,
+  codeMapFolded: CodeMapFoldedCard,
+  codeMapRevealRef: CodeMapRevealRefCard,
+  codeMapRevealStub: CodeMapRevealStubCard,
+};
 
 /**
  * Dev-only frame-timing/selection-latency instrumentation (Code Map's
@@ -8528,6 +8760,11 @@ export function CodeMap({
   const [revealHeld, setRevealHeld] = useState<HeldReveal | null>(null);
   const revealHeldRef = useRef<HeldReveal | null>(null);
   revealHeldRef.current = revealHeld;
+  // P4-7e: the drill graph of the map on screen (`revealDrillGraphFor`: the
+  // candidates' own CALLS+USAGE adjacency and the lazy reach, one per map
+  // fetch), and that fetch's Nodes for a listing reply's refresh rebase.
+  const revealDrillGraphRef = useRef<RevealDrillGraph | null>(null);
+  const revealMapNodesRef = useRef<readonly CodeMapNode[]>([]);
   // P4-7d: drops an out-of-order listing reply (with the section check in
   // `revealListingReplyOutcome`).
   const revealListingRequests = useRef(createLatestRequestGuard()).current;
@@ -10046,20 +10283,90 @@ export function CodeMap({
   const currentRevealKey =
     projectPath !== null && revealMapStamp !== null ? revealKey(projectPath, revealSection) : null;
   revealMapRef.current = { key: currentRevealKey, mapStamp: revealMapStamp };
+  revealMapNodesRef.current = fetchState.status === 'ready' ? fetchState.nodes : [];
+  // P4-7e: built only while Revealed is drawn — Full never pays for it.
+  const revealDrillGraph =
+    revealDrawn && fetchState.status === 'ready'
+      ? revealDrillGraphFor(revealDrillGraphRef.current, fetchState.nodes, fetchState.edges)
+      : null;
+  if (revealDrillGraph !== null) {
+    revealDrillGraphRef.current = revealDrillGraph;
+  }
+  // P4-7e: one drill step — expand, collapse or a stub — applied to the held
+  // state for the map on screen (`applyRevealTransition`), renderer-local:
+  // no Graph Service call, no IPC (AD-14). Never touches what any number
+  // reads (`population.riskNodes`/`riskEdges`, adjacency, Path Trace).
+  const applyRevealDrill = useCallback((transition: (state: RevealState, graph: RevealDrillGraph) => RevealState) => {
+    const graph = revealDrillGraphRef.current;
+    const { key, mapStamp } = revealMapRef.current;
+    if (graph === null || graph.edges !== mapStamp) {
+      return;
+    }
+    const applied = applyRevealTransition(revealHeldRef.current, key, (state) => transition(state, graph));
+    if (applied === null) {
+      return;
+    }
+    // P4-7f seam: push the reveal history entry ({before, after}) and the
+    // announcement here — `applied.before`/`applied.after` are immutable.
+    revealHeldRef.current = applied.held;
+    setRevealHeld(applied.held);
+  }, []);
+  const onRevealDrill = useCallback(
+    (node: CodeMapNode, action: RevealDrillControl['kind']) =>
+      applyRevealDrill((state, graph) =>
+        action === 'expand'
+          ? expandNode(state, graph.adjacency, graph.reachById, node.id)
+          : collapseNode(state, node.id),
+      ),
+    [applyRevealDrill],
+  );
+  const onActivateRevealStub = useCallback(
+    (stub: Extract<RevealAuxCard, { kind: 'more' }>) =>
+      applyRevealDrill((state, graph) => expandStub(state, graph.adjacency, graph.reachById, stub.parentId)),
+    [applyRevealDrill],
+  );
+  // A ref card goes to the Node it stands for (drawn, so no switch to Full).
+  const onActivateRevealRef = useCallback(
+    (ref: Extract<RevealAuxCard, { kind: 'ref' }>) => navigateToNode(ref.targetId),
+    [navigateToNode],
+  );
   const revealCanvas = useMemo(() => {
     if (!revealDrawn || fetchState.status !== 'ready') {
+      return null;
+    }
+    if (revealDrillGraph === null) {
+      // Never while Revealed is drawn on a ready map (built just above).
       return null;
     }
     const state = drawnRevealState(revealHeld, currentRevealKey);
     const positions = layeredLayout(state);
     const drawn = revealedPopulation(population, state);
+    const nameById = new Map(drawn.mapNodes.map((node) => [node.id, node.name]));
+    const auxCards = revealAuxCards(state, (id) => nameById.get(id), revealDrillGraph.adjacency);
     return {
       population: drawn,
       positionOf: (id: string, index: number) =>
         positions.get(id) ?? layoutPosition(index, canvasGridSize(drawn.mapNodes.length, drawn.foldedNodes.length)),
       candidates: candidatesById(state),
+      reveal: {
+        controls: revealDrillControls(state, revealDrillGraph.adjacency),
+        onDrill: onRevealDrill,
+        auxCards,
+        onActivateRef: onActivateRevealRef,
+        onActivateStub: onActivateRevealStub,
+      },
     };
-  }, [revealDrawn, fetchState.status, revealHeld, currentRevealKey, population]);
+  }, [
+    revealDrawn,
+    fetchState.status,
+    revealHeld,
+    currentRevealKey,
+    population,
+    revealDrillGraph,
+    onRevealDrill,
+    onActivateRevealRef,
+    onActivateRevealStub,
+  ]);
   // Review round 1: a ready listing that draws nothing here is the `stale`
   // notice — never an empty canvas without one.
   const revealNotice = revealDrawn
@@ -10108,6 +10415,7 @@ export function CodeMap({
               contractDependentsById,
               revealCanvas.positionOf,
               revealCanvas.candidates,
+              revealCanvas.reveal,
             )
         : [],
     [
@@ -10128,8 +10436,16 @@ export function CodeMap({
       contractDependentsById,
     ],
   );
+  // P4-7e: in Revealed, the real edges among revealed Nodes plus each ref
+  // card's faint "shown above" connector — no other edge is drawn.
   const flowEdges = useMemo(
-    () => toFlowEdges((revealCanvas === null ? population : revealCanvas.population).canvasEdges),
+    () =>
+      revealCanvas === null
+        ? toFlowEdges(population.canvasEdges)
+        : [
+            ...toFlowEdges(revealCanvas.population.canvasEdges),
+            ...revealRefConnectorEdges(revealCanvas.reveal.auxCards),
+          ],
     [population, revealCanvas],
   );
   // FIX-2: the map's real `CALLS` edges, for the `'found'` trace highlight.
@@ -10159,6 +10475,7 @@ export function CodeMap({
     }
     const key = currentRevealKey;
     const mapStamp = revealMapStamp;
+    const mapNodes = revealMapNodesRef.current;
     const requestedSection = revealSection;
     const requestId = revealListingRequests.begin();
     const started = startRevealListing(revealHeldRef.current, key, mapStamp);
@@ -10173,6 +10490,11 @@ export function CodeMap({
         key,
         mapStamp,
         result,
+        // P4-7e: a refresh keeps what was drilled, pruned to the new map.
+        drillGraph:
+          started.listing.status === 'loading' && started.listing.previous !== null
+            ? revealDrillGraphFor(revealDrillGraphRef.current, mapNodes, mapStamp)
+            : null,
       });
       if (outcome.kind === 'ignore') {
         return;
@@ -10584,6 +10906,12 @@ export function CodeMap({
 
   const handleEdgeClick: EdgeMouseHandler<FlowEdge> = useCallback(
     (_event, edge) => {
+      // P4-7e review round 1: a ref connector joins a Node to a render-only
+      // ref card — never a Node pair, so it never navigates (and no ref card
+      // id ever enters history). Connectors are also non-interactive.
+      if (isRevealConnectorEdgeId(edge.id)) {
+        return;
+      }
       // P3-11: a synthetic cluster edge's rendered endpoints include a
       // cluster id, which must never reach `navigateToNode` — resolve on the
       // real Node pair it stands in for. `navigateToNode` → `centerOnNode`
