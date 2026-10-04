@@ -1271,6 +1271,47 @@ export interface GraphServiceExpandBlastRadiusResultMessage {
   result: BlastRadiusExpansionResult;
 }
 
+/**
+ * P4-4 phase 3b (founder decision 2026-10-04): whether PR Review's base ref
+ * carries over a section switch, so the diff scope is re-run in the new
+ * section:
+ *  - `same-repository`: both sections' folders are in the same git
+ *    repository (`git rev-parse --show-toplevel`);
+ *  - `ref-exists`: the target section is in another repository, and the base
+ *    ref resolves to a commit there (`git rev-parse --verify`);
+ *  - `not-carried`: neither, or a repository or section couldn't be
+ *    determined — the base ref is cleared and the diff reset to idle;
+ *  - `error`: the request itself failed (treated like `not-carried`).
+ * Never computed from the diff itself; read-only git calls only.
+ */
+export type DiffScopeCarryResult =
+  | { status: 'same-repository' }
+  | { status: 'ref-exists' }
+  | { status: 'not-carried' }
+  | { status: 'error'; message: string };
+
+/**
+ * P4-4 phase 3b: main → Graph Service — may `baseRef` carry from section
+ * `fromSection` to `toSection` (`null` = `all`, the project root)?
+ * `requestId` correlates the reply, as for the diff-scope request.
+ */
+export interface GraphServiceDiffScopeCarryRequest {
+  type: 'graphService:diffScopeCarry';
+  projectPath: string;
+  requestId: number;
+  fromSection: string | null;
+  toSection: string | null;
+  baseRef: string;
+}
+
+/** P4-4 phase 3b: the reply to `GraphServiceDiffScopeCarryRequest`, echoing `projectPath` and `requestId`. */
+export interface GraphServiceDiffScopeCarryResultMessage {
+  type: 'graphService:diffScopeCarryResult';
+  projectPath: string;
+  requestId: number;
+  result: DiffScopeCarryResult;
+}
+
 // ---------------------------------------------------------------------------
 // IPC channel names — namespaced `<domain>:<action>`
 // ---------------------------------------------------------------------------
@@ -1307,6 +1348,7 @@ export const IpcChannels = {
   pathTrace: 'path:trace',
   diagnosticLog: 'diagnostic:log',
   diffScopeCompute: 'diffScope:compute',
+  diffScopeCarry: 'diffScope:carry',
   blastRadiusExpand: 'blastRadius:expand',
   menuOpenFolder: 'menu:openFolder',
 } as const;
@@ -1591,4 +1633,15 @@ export interface DrillerApi {
    * edges; a seed outside it contributes nothing. Omitted = the whole scope.
    */
   expandBlastRadius: (projectPath: string, nodeIds: string[], section?: string) => Promise<BlastRadiusExpansionResult>;
+  /**
+   * P4-4 phase 3b (founder decision 2026-10-04): may PR Review's `baseRef`
+   * carry from `fromSection` to `toSection` (`null` = `all`)? See
+   * `DiffScopeCarryResult`. Read-only; never rejects.
+   */
+  checkDiffScopeCarry: (
+    projectPath: string,
+    fromSection: string | null,
+    toSection: string | null,
+    baseRef: string,
+  ) => Promise<DiffScopeCarryResult>;
 }

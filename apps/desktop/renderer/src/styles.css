@@ -172,6 +172,25 @@ code,
   border-top: 1px solid var(--border);
 }
 
+/* P4-4 phase 3b: the footer's cross-section line ("9 edges into web/, 3 from
+   web/ — not shown in this section"), above the footer bar. Always mounted
+   (a live region); collapsed to nothing when empty. */
+.app__cross-section-line {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 4px 14px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: var(--panel-alt);
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.app__cross-section-line:empty {
+  padding: 0;
+  border-top: 0;
+}
+
 .app__footerbar-left {
   min-width: 0;
   overflow: hidden;
@@ -3550,6 +3569,32 @@ code,
   margin-top: 4px;
 }
 
+/* P4-4 phase 3b: Node detail's "Calls into other sections" rows. */
+.code-map__node-detail-cross-section {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  font-size: var(--detail-fine-size);
+  line-height: var(--detail-fine-leading);
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+/* P4-4 phase 3b: PR Review's "changed elsewhere" line, under the change
+   count — the count line's quiet status styling, informational (no notice
+   icon). */
+.code-map__changed-elsewhere {
+  margin: 0;
+  padding: 0.3rem 0.6rem;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-top: 0;
+  background: var(--panel-alt);
+  color: var(--text-mute);
+  font-size: 11px;
+  text-align: center;
+  overflow-wrap: break-word;
+}
+
 /* P4-2 phase 3a: the card's "↑at load" cue — shaped like a caller pill but
    dashed and not interactive: the caller is folded top-level code. */
 .code-map__node-load-caller {
@@ -3998,5 +4043,14 @@ code,
 .code-map__metrics-table-missing {
   margin: 0;
   padding: 0.35rem 0.6rem;
+  color: var(--text-mute);
+}
+
+/* P4-4 review round 1: why a cross-section switch is unavailable — the
+   Section bar's hint, beside the aria-disabled switch buttons. */
+.code-map__switch-hint {
+  display: block;
+  margin: 2px 0 0;
+  font-size: var(--detail-fine-size);
   color: var(--text-mute);
 }

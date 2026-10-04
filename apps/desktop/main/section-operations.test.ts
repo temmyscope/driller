@@ -10,10 +10,13 @@ import { describe, it } from 'node:test';
 
 import {
   buildComputeDiffScopeRequest,
+  buildDiffScopeCarryRequest,
   buildExpandBlastRadiusRequest,
   buildPathTraceRequest,
   INVALID_OPERATION_SECTION_RESULT,
+  parseDiffScopeCarryArgs,
   parseOperationSectionArg,
+  toValidatedDiffScopeCarryResult,
 } from './section-operations';
 
 describe('parseOperationSectionArg', () => {
@@ -77,5 +80,57 @@ describe('the Graph Service requests', () => {
       requestId: 3,
       section: 'apps/web',
     });
+  });
+});
+
+describe('P4-4h: the diff-scope carry check (founder decision 2026-10-04)', () => {
+  it('valid arguments: sections null (all) or non-empty strings; the base ref trimmed', () => {
+    assert.deepEqual(parseDiffScopeCarryArgs('/p', 'web', null, ' origin/main '), {
+      ok: true,
+      projectPath: '/p',
+      fromSection: 'web',
+      toSection: null,
+      baseRef: 'origin/main',
+    });
+  });
+
+  it('anything malformed is answered without sending', () => {
+    assert.deepEqual(parseDiffScopeCarryArgs('', 'web', 'api', 'main'), {
+      ok: false,
+      result: { status: 'error', message: 'Invalid project path.' },
+    });
+    for (const section of ['', 42, undefined, ['api']]) {
+      assert.deepEqual(parseDiffScopeCarryArgs('/p', section, 'api', 'main'), { ok: false, result: INVALID_OPERATION_SECTION_RESULT });
+      assert.deepEqual(parseDiffScopeCarryArgs('/p', 'web', section, 'main'), { ok: false, result: INVALID_OPERATION_SECTION_RESULT });
+    }
+    for (const baseRef of ['', '  ', null, 7]) {
+      assert.deepEqual(parseDiffScopeCarryArgs('/p', 'web', 'api', baseRef), {
+        ok: false,
+        result: { status: 'error', message: 'Invalid base ref.' },
+      });
+    }
+  });
+
+  it('the Graph Service request', () => {
+    const args = parseDiffScopeCarryArgs('/p', null, 'api', 'main');
+    assert.ok(args.ok);
+    assert.deepEqual(buildDiffScopeCarryRequest(args, 9), {
+      type: 'graphService:diffScopeCarry',
+      projectPath: '/p',
+      requestId: 9,
+      fromSection: null,
+      toSection: 'api',
+      baseRef: 'main',
+    });
+  });
+
+  it('the reply is validated: known statuses pass, anything else is an error', () => {
+    for (const status of ['same-repository', 'ref-exists', 'not-carried'] as const) {
+      assert.deepEqual(toValidatedDiffScopeCarryResult({ status, extra: 1 }), { status });
+    }
+    assert.deepEqual(toValidatedDiffScopeCarryResult({ status: 'error', message: 'x' }), { status: 'error', message: 'x' });
+    for (const bad of [null, 'same-repository', { status: 'maybe' }, { status: 'error' }]) {
+      assert.deepEqual(toValidatedDiffScopeCarryResult(bad), { status: 'error', message: 'Malformed diff-scope carry reply.' });
+    }
   });
 });

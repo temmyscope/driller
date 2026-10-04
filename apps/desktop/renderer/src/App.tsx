@@ -33,8 +33,12 @@ import {
   frameSectionBarFor,
   frameSyncFor,
   mapNodesForStatusLine,
+  nextFooterCrossSectionLine,
   nextSyncAgeTickMs,
+  pendingFocusForSwitch,
+  pendingFocusNodeIdFor,
   type FrameMapState,
+  type PendingSectionFocus,
   type FrameSyncState,
   type MapFooterState,
 } from './appFrame';
@@ -204,6 +208,11 @@ export function App() {
   // Close; never persisted (that is P4-4i).
   const [sectionShell, setSectionShell] = useState(INITIAL_SECTION_SHELL_STATE);
   const section = sectionShell.section;
+  // P4-4 phase 3b: Node detail's cross-section switch asks for its callee to
+  // be selected once the new section's map is ready — handed to `CodeMap` as
+  // the one-shot `pendingFocusNodeId` while that section is selected, and
+  // cleared when `CodeMap` consumes it, on any other switch, open or Close.
+  const [pendingSectionFocus, setPendingSectionFocus] = useState<PendingSectionFocus | null>(null);
   // P0-3: the map's lifetime — `loadedProjectPath` (set when an `indexed`
   // for the current project passes the correlation filter below, cleared only
   // on Close or a project switch) and `dataVersion` (bumped once per NEW
@@ -461,6 +470,7 @@ export function App() {
                 );
           setMode(wasAlreadyInRecentProjects ? 'codeMap' : 'healthAudit');
           setSectionShell(INITIAL_SECTION_SHELL_STATE);
+          setPendingSectionFocus(null);
         }
         // P2-3: the previous project's map state never labels this one (a
         // no-op when the same project is re-selected).
@@ -648,6 +658,7 @@ export function App() {
     // the closed project's mode; the first-open rule picks again on open.
     setMode('codeMap');
     setSectionShell(INITIAL_SECTION_SHELL_STATE);
+    setPendingSectionFocus(null);
     focusOpenFolderAfterCloseRef.current = true;
   }, [commitSessionMap]);
 
@@ -867,13 +878,40 @@ export function App() {
   const sectionPanelLabelledBy = sectionBarShown ? selectedSectionTabId(sectionBarSource.sections, section) : undefined;
   const handleSectionChange = useCallback((next: string | null) => {
     setSectionShell((current) => applySectionActivated(current, next));
+    setPendingSectionFocus(null);
   }, []);
+  // P4-4 phase 3b: a switch asked for by `CodeMap` — PR Review's "changed
+  // elsewhere" line, or Node detail's "Calls into other sections" with the
+  // callee to select. The Section bar's own switch path: the same section
+  // shell transition (full reset in `CodeMap`, the loading and result
+  // announcements), plus the pending focus.
+  const handleSwitchSection = useCallback((next: string, focusNodeId?: string) => {
+    setSectionShell((current) => applySectionActivated(current, next));
+    setPendingSectionFocus(pendingFocusForSwitch(next, focusNodeId));
+  }, []);
+  const handlePendingFocusConsumed = useCallback(() => {
+    setPendingSectionFocus(null);
+  }, []);
+  // P4-4 phase 3b: the footer's cross-section line — only for the ready
+  // section map on screen (never `all`), from its reply's own counts.
+  // Review round 1: held through a pending switch or a reload
+  // (`nextFooterCrossSectionLine`), so it is announced only when its text
+  // really changes — the "adjust state while rendering" pattern.
+  const [crossSectionLine, setCrossSectionLine] = useState<string | null>(null);
+  const nextCrossSectionLine = showMap
+    ? nextFooterCrossSectionLine(crossSectionLine, frameMapFor(frameMap, currentProjectPath), sectionShell.pending)
+    : null;
+  if (nextCrossSectionLine !== crossSectionLine) {
+    setCrossSectionLine(nextCrossSectionLine);
+  }
   // P4-4 phase 1c: a reply said the selected section left the allowlist —
   // back to `all`, announced as status text (never an error notice); the
   // section change reloads the map. Wired to `CodeMap`'s fetch, Path Trace,
   // diff scope and Blast Radius expansion alike.
   const handleUnknownSection = useCallback((gone: string) => {
     setSectionShell((current) => applyUnknownSection(current, gone));
+    // Review round 1: a pending cross-section focus goes with the section.
+    setPendingSectionFocus(null);
   }, []);
 
   return (
@@ -1040,6 +1078,9 @@ export function App() {
               onReindex={restartGraphServiceForRetry}
               section={section}
               onUnknownSection={handleUnknownSection}
+              onSwitchSection={handleSwitchSection}
+              pendingFocusNodeId={pendingFocusNodeIdFor(pendingSectionFocus, section)}
+              onPendingFocusConsumed={handlePendingFocusConsumed}
             />
           </section>
         </div>
@@ -1160,6 +1201,13 @@ export function App() {
           announced by `session-notice` and the status footers above, and
           re-announcing counts on every refresh would be noise — and so
           would the PR Review sync age re-rendering as it ages (P3-10). */}
+      {/* P4-4 phase 3b: the edges a section map drops, per other section and
+          direction — text only (the Section bar is right there). Always
+          mounted so it is announced politely when its text changes; empty
+          (and collapsed by CSS) with no line. */}
+      <p className="app__cross-section-line" role="status">
+        {nextCrossSectionLine}
+      </p>
       <footer className="app__footerbar" aria-label="Status line">
         <span className="app__footerbar-left">{footerBar.left}</span>
         <span className="app__footerbar-right" title={footerBarRightTooltip}>

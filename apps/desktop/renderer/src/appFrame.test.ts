@@ -19,18 +19,23 @@ import {
   applyProjectClosedToFrameSync,
   applyProjectOpenedToFrame,
   applyProjectOpenedToFrameSync,
+  crossSectionEdgesLine,
   deriveFooterBar,
   deriveTitle,
   diffScopeSyncTimeFor,
   footerAvailability,
   footerBarRightTitle,
+  footerCrossSectionLine,
   formatSyncAge,
+  nextFooterCrossSectionLine,
   frameMapFor,
   frameSectionBarFor,
   frameSyncFor,
   mapNodesForStatusLine,
   mapFooterState,
   nextSyncAgeTickMs,
+  pendingFocusForSwitch,
+  pendingFocusNodeIdFor,
   SYNC_AGE_MAX_TICK_MS,
   projectFolderName,
   type FooterBarInput,
@@ -572,5 +577,121 @@ describe('P4-4 phase 1c: the Section bar source', () => {
     assert.notEqual(recount, ready);
     assert.notEqual(applyMapReportToFrame(ready, PROJECT, PROJECT, { ...API_READY, section: 'web' }), ready);
     assert.equal(applyMapReportToFrame(ready, PROJECT, PROJECT, { ...API_READY, sections: [...SECTIONS] }), ready);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-4 phase 3b: the footer's cross-section line
+// ---------------------------------------------------------------------------
+
+describe('crossSectionEdgesLine', () => {
+  const SUFFIX = ' — not shown in this section';
+
+  it('splits by direction: "9 edges into web/, 3 from web/"', () => {
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 9, incoming: 3 }]), `9 edges into web/, 3 edges from web/${SUFFIX}`);
+  });
+
+  it('leaves a 0 direction out', () => {
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 12, incoming: 0 }]), `12 edges into web/${SUFFIX}`);
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 0, incoming: 3 }]), `3 edges from web/${SUFFIX}`);
+  });
+
+  it('every count carries its own singular or plural noun', () => {
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 1, incoming: 0 }]), `1 edge into web/${SUFFIX}`);
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 0, incoming: 1 }]), `1 edge from web/${SUFFIX}`);
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 1, incoming: 3 }]), `1 edge into web/, 3 edges from web/${SUFFIX}`);
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 2, incoming: 1 }]), `2 edges into web/, 1 edge from web/${SUFFIX}`);
+  });
+
+  it('joins several sections with " · " in the reply\'s order, every count the field\'s own', () => {
+    assert.equal(
+      crossSectionEdgesLine([
+        { section: 'web', outgoing: 1_204, incoming: 3 },
+        { section: 'docs', outgoing: 3, incoming: 0 },
+        { section: 'apps/cli', outgoing: 0, incoming: 2 },
+      ]),
+      `1,204 edges into web/, 3 edges from web/ · 3 edges into docs/ · 2 edges from apps/cli/${SUFFIX}`,
+    );
+  });
+
+  it('is null for an absent or empty field, or one with no count above 0', () => {
+    assert.equal(crossSectionEdgesLine(undefined), null);
+    assert.equal(crossSectionEdgesLine([]), null);
+    assert.equal(crossSectionEdgesLine([{ section: 'web', outgoing: 0, incoming: 0 }]), null);
+  });
+});
+
+describe('footerCrossSectionLine', () => {
+  const EDGES = [{ section: 'web', outgoing: 9, incoming: 3 }];
+  const API: MapFooterState = { ...READY, appliedScope: ['api', 'web'], section: 'api', crossSectionEdges: EDGES };
+
+  it('a ready section map with crossSectionEdges shows the line', () => {
+    assert.equal(footerCrossSectionLine(API), '9 edges into web/, 3 edges from web/ — not shown in this section');
+  });
+
+  it('no line in all, while loading, on error, before a report, or without the field', () => {
+    assert.equal(footerCrossSectionLine({ ...API, section: null }), null);
+    assert.equal(footerCrossSectionLine({ status: 'loading' }), null);
+    assert.equal(footerCrossSectionLine({ status: 'error' }), null);
+    assert.equal(footerCrossSectionLine(null), null);
+    assert.equal(footerCrossSectionLine({ ...READY, appliedScope: ['api', 'web'], section: 'api' }), null);
+  });
+
+  it('the report keeps a non-empty field only, and a change to it is a new report', () => {
+    const fetch = { status: 'ready' as const, nodes: [], edges: [], appliedScope: ['api', 'web'], section: 'api' };
+    const withEdges = mapFooterState({ ...fetch, crossSectionEdges: EDGES });
+    assert.deepEqual(withEdges.status === 'ready' ? withEdges.crossSectionEdges : null, EDGES);
+    const empty = mapFooterState({ ...fetch, crossSectionEdges: [] });
+    assert.equal(empty.status === 'ready' && 'crossSectionEdges' in empty, false);
+
+    const first = applyMapReportToFrame(INITIAL_FRAME_MAP_STATE, PROJECT, PROJECT, API);
+    assert.equal(applyMapReportToFrame(first, PROJECT, PROJECT, { ...API, crossSectionEdges: [...EDGES] }), first);
+    const changed = applyMapReportToFrame(first, PROJECT, PROJECT, {
+      ...API,
+      crossSectionEdges: [{ section: 'web', outgoing: 3, incoming: 9 }],
+    });
+    assert.notEqual(changed, first);
+    assert.equal(footerCrossSectionLine(frameMapFor(changed, PROJECT)), '3 edges into web/, 9 edges from web/ — not shown in this section');
+  });
+});
+
+describe('nextFooterCrossSectionLine (review round 1)', () => {
+  const API: MapFooterState = {
+    ...READY,
+    appliedScope: ['api', 'web'],
+    section: 'api',
+    crossSectionEdges: [{ section: 'web', outgoing: 9, incoming: 3 }],
+  };
+  const LINE = '9 edges into web/, 3 edges from web/ — not shown in this section';
+
+  it('follows the ready map when no switch is pending', () => {
+    assert.equal(nextFooterCrossSectionLine(null, API, false), LINE);
+    assert.equal(nextFooterCrossSectionLine(LINE, { ...API, section: null }, false), null);
+    assert.equal(nextFooterCrossSectionLine(LINE, { status: 'error' }, false), null);
+  });
+
+  it('keeps the previous text while a switch is pending, even when a ready map lands', () => {
+    assert.equal(nextFooterCrossSectionLine('old', API, true), 'old');
+    assert.equal(nextFooterCrossSectionLine(null, API, true), null);
+  });
+
+  it('keeps it through a reload, so the same counts change no text (nothing re-announced)', () => {
+    assert.equal(nextFooterCrossSectionLine(LINE, { status: 'loading' }, false), LINE);
+    assert.equal(nextFooterCrossSectionLine(LINE, API, false), LINE);
+  });
+});
+
+describe('the pending cross-section focus', () => {
+  it('a switch with a Node keeps it for that section; without one, none', () => {
+    assert.deepEqual(pendingFocusForSwitch('web', 'web/r.ts#render'), { section: 'web', nodeId: 'web/r.ts#render' });
+    assert.equal(pendingFocusForSwitch('web'), null);
+  });
+
+  it('is handed to CodeMap only while its section is selected', () => {
+    const pending = pendingFocusForSwitch('web', 'web/r.ts#render');
+    assert.equal(pendingFocusNodeIdFor(pending, 'web'), 'web/r.ts#render');
+    assert.equal(pendingFocusNodeIdFor(pending, 'api'), null);
+    assert.equal(pendingFocusNodeIdFor(pending, null), null);
+    assert.equal(pendingFocusNodeIdFor(null, 'web'), null);
   });
 });

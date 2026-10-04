@@ -137,6 +137,43 @@ export async function resolveGitToplevel(dir: string): Promise<string | undefine
   return toplevel.length > 0 ? toplevel : undefined;
 }
 
+/**
+ * P4-4 phase 3b (founder decision 2026-10-04): whether PR Review's base ref
+ * `ref` carries from the folder `fromDir` to `toDir` on a section switch:
+ * `same-repository` when both folders resolve to the same git top-level;
+ * else `ref-exists` when `toDir`'s repository resolves `ref` to a commit
+ * (`git rev-parse --verify --quiet <ref>^{commit}`, run there); else
+ * `not-carried` — including a folder in no repository, a ref that looks like
+ * an option (leading `-`), or any failed call. Same short git timeout as
+ * every other call here. Never throws.
+ */
+export async function decideDiffScopeCarry(
+  fromDir: string,
+  toDir: string,
+  ref: string,
+): Promise<'same-repository' | 'ref-exists' | 'not-carried'> {
+  try {
+    const [from, to] = await Promise.all([resolveGitToplevel(fromDir), resolveGitToplevel(toDir)]);
+    if (to === undefined) {
+      return 'not-carried';
+    }
+    if (from !== undefined && from === to) {
+      return 'same-repository';
+    }
+    const trimmed = ref.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('-')) {
+      return 'not-carried';
+    }
+    const verified = await runSafeSubprocess('git', ['rev-parse', '--verify', '--quiet', `${trimmed}^{commit}`], {
+      cwd: to,
+      timeoutMs: GIT_SUBPROCESS_TIMEOUT_MS,
+    });
+    return 'stdout' in verified && verified.stdout.trim().length > 0 ? 'ref-exists' : 'not-carried';
+  } catch {
+    return 'not-carried';
+  }
+}
+
 /** Turns a non-`stdout` `SubprocessResult` into safe, user-facing error text. */
 function describeSubprocessFailure(result: Exclude<SubprocessResult, { stdout: string; stderr: string }>): string {
   if ('notFound' in result) {

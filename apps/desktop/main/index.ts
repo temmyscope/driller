@@ -32,11 +32,13 @@ import {
   type BlastRadiusExpansionResult,
   type CodeMapResult,
   type DiagnosticLogEntry,
+  type DiffScopeCarryResult,
   type DiffScopeResult,
   type EditorPreference,
   type GitDetectionResult,
   type GraphServiceCodeMapMessage,
   type GraphServiceComputeDiffScopeResultMessage,
+  type GraphServiceDiffScopeCarryResultMessage,
   type GraphServiceExpandBlastRadiusResultMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServicePathTraceResultMessage,
@@ -90,8 +92,10 @@ import {
   buildExpandBlastRadiusRequest,
   buildPathTraceRequest,
   INVALID_OPERATION_SECTION_RESULT,
+  parseDiffScopeCarryArgs,
   parseOperationSectionArg,
 } from './section-operations';
+import { createDiffScopeCarryRelay, isDiffScopeCarryResultMessage } from './diff-scope-carry-relay';
 import { relayKeyChange } from './key-change-relay';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
@@ -270,6 +274,16 @@ let nextDiffScopeRequestId = 0;
 // hang is still caught promptly rather than leaving the caller waiting
 // minutes for what should be a sub-second local operation.
 const DIFF_SCOPE_REQUEST_TIMEOUT_MS = 60 * 1000 + 10_000;
+
+// P4-4 phase 3b (founder decision 2026-10-04): the `diffScope:carry` relay —
+// pending checks keyed by request id, a timeout, settle on exit
+// (`diff-scope-carry-relay.ts`, unit-tested there).
+const diffScopeCarryRelay = createDiffScopeCarryRelay({
+  service: () => (graphService && !isGraphServiceShuttingDown ? graphService : null),
+  currentProjectPath: () => currentProjectPath,
+  setTimer: (callback, ms) => setTimeout(callback, ms),
+  clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+});
 
 // Story 3.2 (Phase 1): correlates each in-flight `blastRadius:expand`
 // request to its eventual Graph Service reply — mirrors
@@ -790,6 +804,7 @@ function spawnGraphService(): void {
         | GraphServiceRunIngestionResultMessage
         | GraphServiceComputeDiffScopeResultMessage
         | GraphServiceExpandBlastRadiusResultMessage
+        | GraphServiceDiffScopeCarryResultMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -827,6 +842,11 @@ function spawnGraphService(): void {
       }
       if (isExpandBlastRadiusResultMessage(message)) {
         settlePendingBlastRadiusRequest(message.projectPath, message.result, message.requestId);
+        return;
+      }
+      // P4-4 phase 3b: validated at the process boundary.
+      if (isDiffScopeCarryResultMessage(message)) {
+        diffScopeCarryRelay.settleReply(message.requestId, message.result);
         return;
       }
       if (isModelStatusMessage(message)) {
@@ -894,6 +914,8 @@ function spawnGraphService(): void {
     // `graphService:expandBlastRadiusResult` reply those promises are
     // waiting on.
     settleAllPendingBlastRadiusRequests('Graph Service exited before the blast radius could be expanded.');
+    // P4-4 phase 3b: the same for a pending base-ref carry check.
+    diffScopeCarryRelay.settleAll('Graph Service exited before the base ref could be checked.');
     if (code === 0 || isGraphServiceShuttingDown) {
       // A deliberate shutdown (app quit, or teardownGraphService's 2s kill
       // fallback) can exit with a non-zero/null code too — that's not an
@@ -2062,6 +2084,24 @@ function registerIpcHandlers(): void {
         return Promise.resolve(INVALID_OPERATION_SECTION_RESULT);
       }
       return requestComputeDiffScope(projectPath, baseRef, section.section);
+    },
+  );
+
+  // P4-4 phase 3b (founder decision 2026-10-04): may PR Review's base ref
+  // carry over a section switch? Arguments validated here
+  // (`parseDiffScopeCarryArgs`); a malformed call is answered without
+  // sending anything.
+  ipcMain.handle(
+    IpcChannels.diffScopeCarry,
+    (
+      _event,
+      projectPath: unknown,
+      fromSection: unknown,
+      toSection: unknown,
+      baseRef: unknown,
+    ): Promise<DiffScopeCarryResult> => {
+      const args = parseDiffScopeCarryArgs(projectPath, fromSection, toSection, baseRef);
+      return args.ok ? diffScopeCarryRelay.request(args) : Promise.resolve(args.result);
     },
   );
 

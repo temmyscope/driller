@@ -106,6 +106,10 @@ import type {
   TopLevelChangedFile,
   TypeUse,
   SectionNodeCount,
+  SectionChangeCount,
+  CrossSectionCall,
+  CrossSectionEdgeCount,
+  DiffScopeCarryResult,
   UnknownSectionResult,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
@@ -121,6 +125,7 @@ import { diffScopeSyncTimeFor, mapFooterState, type MapFooterState } from './app
 import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
+import { SECTION_SWITCH_UNAVAILABLE_HINT, selectedSectionTabId } from './SectionBar';
 
 export type FetchState =
   | { status: 'loading' }
@@ -150,6 +155,11 @@ export type FetchState =
        * whole-scope counts per section, even in a section's reply. Absent means none.
        */
       sections?: readonly SectionNodeCount[];
+      /**
+       * P4-4 phase 3b: the reply's `crossSectionEdges` (P4-4g) — read only by
+       * the footer line (`mapFooterState`). Absent means none.
+       */
+      crossSectionEdges?: readonly CrossSectionEdgeCount[];
     }
   | { status: 'error'; message: string };
 
@@ -265,6 +275,12 @@ export type DiffScopeState =
       changedContracts: readonly ChangedContract[];
       /** P4-2 phase 3c: `DiffScopeResult`'s `changedContractsApproximate`, `false` when absent. */
       changedContractsApproximate?: boolean;
+      /**
+       * P4-4 phase 3b: `DiffScopeResult`'s `changedInOtherSections` (P4-4g) —
+       * what the diff changed in other sections of the same repository.
+       * Absent (or `[]`) for none.
+       */
+      changedInOtherSections?: readonly SectionChangeCount[];
     }
   | { status: 'no-changes' }
   | { status: 'not-a-git-repo' }
@@ -3405,6 +3421,12 @@ export interface PrReviewView {
    */
   changedContractsApproximate: boolean;
   /**
+   * P4-4 phase 3b: what the resolved diff changed in other sections of the
+   * same repository, for the "changed elsewhere" line. Same gating as
+   * `topLevelFiles`, and only for a section map — never in `all`.
+   */
+  changedInOtherSections: readonly SectionChangeCount[];
+  /**
    * P4-3a: the changed-Node metrics table below the canvas, or `null` for
    * none. Non-null only in PR Review Mode, with a showable map, for a
    * resolved diff scope with at least one row — never an empty table.
@@ -3418,6 +3440,7 @@ export interface PrReviewView {
 }
 
 const NO_TOP_LEVEL_FILES: readonly TopLevelChangedFile[] = [];
+const NO_SECTION_CHANGES: readonly SectionChangeCount[] = [];
 const NO_CHANGED_CONTRACTS: readonly ChangedContract[] = [];
 
 /**
@@ -3470,11 +3493,13 @@ export function resolvePrReviewView(
       : null;
   const changedContracts = resolved?.changedContracts ?? NO_CHANGED_CONTRACTS;
   const changedContractsApproximate = resolved?.changedContractsApproximate === true;
+  const inSection = fetchState.status === 'ready' && (fetchState.section ?? null) !== null;
   return {
     noticeStatus,
     topLevelFiles: resolved?.topLevelFiles ?? NO_TOP_LEVEL_FILES,
     changedContracts,
     changedContractsApproximate,
+    changedInOtherSections: (inSection ? resolved?.changedInOtherSections : undefined) ?? NO_SECTION_CHANGES,
     // P4-3g: the contracts come from the same resolved scope only — a
     // non-resolved state's leftover data never opens the table.
     metricsTable:
@@ -3865,7 +3890,9 @@ export function CodeMapCanvasFrame({
   children: ReactNode;
 }) {
   return (
-    <div className="code-map__canvas" ref={canvasRef} style={{ height: CODE_MAP_CANVAS_HEIGHT }}>
+    // Review round 1: `tabIndex={-1}` — the fallback focus target after a
+    // cross-section switch whose card never renders (`cardFocusStep`).
+    <div className="code-map__canvas" ref={canvasRef} style={{ height: CODE_MAP_CANVAS_HEIGHT }} tabIndex={-1}>
       {children}
     </div>
   );
@@ -4826,6 +4853,141 @@ export function formatDiffScopeChangeCount(nodeCount: number, topLevelFileCount:
   return parts.join(' · ');
 }
 
+/** P4-4 phase 3b: one other section's "changed elsewhere" entry — its counts, its section, and the line both make. */
+export interface ChangedElsewhereEntry {
+  section: string;
+  /** "3 changed Nodes", "1 contract changed · top-level code changed in 2 files" — zero counts left out. */
+  counts: string;
+  /** "api/: 3 changed Nodes" — the section first, then its counts (review round 1). */
+  text: string;
+}
+
+/**
+ * P4-4 phase 3b: PR Review's "changed elsewhere" line, from a resolved
+ * section diff's `changedInOtherSections` (P4-4g; founder decision
+ * 2026-10-03: changed Nodes, changed contracts and top-level-only files, for
+ * other sections in the same git repository only). One entry per section,
+ * in the field's order, section first: "api/: 1 changed Node · 1 contract
+ * changed · top-level code changed in 1 file" — each with its own "Switch to
+ * api". A 0 count is left out, and an entry with none is dropped. Every
+ * number is the field's own. `null` for an absent or empty list.
+ */
+export function changedElsewhereLine(
+  changedInOtherSections: readonly SectionChangeCount[] | undefined,
+): ChangedElsewhereEntry[] | null {
+  const entries: ChangedElsewhereEntry[] = [];
+  for (const entry of changedInOtherSections ?? []) {
+    const parts: string[] = [];
+    if (entry.changedNodes > 0) {
+      parts.push(formatCount(entry.changedNodes, 'changed Node', 'changed Nodes'));
+    }
+    if (entry.changedContracts > 0) {
+      parts.push(`${formatCount(entry.changedContracts, 'contract', 'contracts')} changed`);
+    }
+    if (entry.topLevelFiles > 0) {
+      parts.push(`top-level code changed in ${formatCount(entry.topLevelFiles, 'file', 'files')}`);
+    }
+    if (parts.length > 0) {
+      const counts = parts.join(' · ');
+      entries.push({ section: entry.section, counts, text: `${entry.section}/: ${counts}` });
+    }
+  }
+  return entries.length > 0 ? entries : null;
+}
+
+/**
+ * P4-4 review round 1: a cross-section switch button's availability props.
+ * Never natively `disabled` while the session isn't live: `aria-disabled`
+ * keeps it focusable and describes it by the Section bar's hint
+ * (`SECTION_SWITCH_UNAVAILABLE_HINT`), and activating it does nothing — the
+ * Section bar's own precedent.
+ */
+export function sectionSwitchButtonProps(
+  graphServiceAvailable: boolean,
+  hintId: string,
+  onActivate: () => void,
+): {
+  className: string;
+  'aria-disabled'?: true;
+  'aria-describedby'?: string;
+  onClick: () => void;
+} {
+  return graphServiceAvailable
+    ? { className: 'code-map__link-button', onClick: onActivate }
+    : {
+        className: `code-map__link-button ${SERVICE_UNAVAILABLE_CLASS}`,
+        'aria-disabled': true,
+        'aria-describedby': hintId,
+        onClick: () => {},
+      };
+}
+
+/** P4-4 review round 1: the ids of the two switch surfaces' unavailable hints. */
+export const CHANGED_ELSEWHERE_HINT_ID = 'code-map-changed-elsewhere-hint';
+export const CROSS_SECTION_CALLS_HINT_ID = 'code-map-cross-section-calls-hint';
+
+/**
+ * P4-4 phase 3b: the "changed elsewhere" line under PR Review's change count
+ * — "api/: 3 changed Nodes — Switch to api", one row per other section.
+ * Informational: no ✓/⚠︎ Actionable Notice icon. Each button goes through
+ * the Section bar's own switch (`onSwitchSection`, App's full reset and
+ * announcements); the mode stays PR Review. While the Graph Service isn't
+ * live the buttons are `aria-disabled` with the Section bar's hint. Nothing
+ * for no entries. MUST STAY HOOKLESS.
+ */
+export function ChangedElsewhereLine({
+  changedInOtherSections,
+  onSwitchSection,
+  graphServiceAvailable,
+}: {
+  changedInOtherSections: readonly SectionChangeCount[];
+  onSwitchSection: (section: string) => void;
+  graphServiceAvailable: boolean;
+}) {
+  const entries = changedElsewhereLine(changedInOtherSections);
+  if (entries === null) {
+    return null;
+  }
+  return (
+    <>
+      <ul className="code-map__changed-elsewhere" aria-label="Changed in other sections">
+        {entries.map((entry) => (
+          <li key={entry.section}>
+            <code>{entry.section}/</code>: {entry.counts} —{' '}
+            <button
+              type="button"
+              {...sectionSwitchButtonProps(graphServiceAvailable, CHANGED_ELSEWHERE_HINT_ID, () =>
+                onSwitchSection(entry.section),
+              )}
+            >
+              Switch to <code>{entry.section}</code>
+            </button>
+          </li>
+        ))}
+      </ul>
+      {!graphServiceAvailable && (
+        <span id={CHANGED_ELSEWHERE_HINT_ID} className="code-map__switch-hint">
+          {SECTION_SWITCH_UNAVAILABLE_HINT}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * P4-4 phase 3b: what PR Review's change-count status line adds, for a
+ * screen reader, about other sections — " Also changed in api/: 3 changed
+ * Nodes." (several: "…; in docs/: …") — or `''` for none. The visible line
+ * (`ChangedElsewhereLine`) sits outside the live region, so its buttons are
+ * never read out on resolve.
+ */
+export function changedElsewhereAnnouncement(changedInOtherSections: readonly SectionChangeCount[]): string {
+  const entries = changedElsewhereLine(changedInOtherSections);
+  return entries === null
+    ? ''
+    : ` Also changed ${entries.map((entry) => `in ${entry.section}/: ${entry.counts}`).join('; ')}.`;
+}
+
 /** P4-2 phase 3c: what PR Review says when changed contracts were found without line ranges. */
 export const CHANGED_CONTRACTS_APPROXIMATE_NOTE = "approximate: couldn't read line ranges";
 
@@ -4908,6 +5070,9 @@ export function diffScopeStateFromResult(result: Exclude<DiffScopeResult, Unknow
         topLevelFiles: result.topLevelFiles ?? NO_TOP_LEVEL_FILES,
         changedContracts: result.changedContracts ?? NO_CHANGED_CONTRACTS,
         changedContractsApproximate: result.changedContractsApproximate === true,
+        ...(result.changedInOtherSections !== undefined && result.changedInOtherSections.length > 0
+          ? { changedInOtherSections: result.changedInOtherSections }
+          : {}),
       };
     case 'error':
       return { status: 'error', message: result.message };
@@ -5983,6 +6148,290 @@ export interface CodeMapProps {
    * for the Code Map fetch. The operation itself is reset to idle here.
    */
   onUnknownSection?: (section: string) => void;
+  /**
+   * P4-4 phase 3b: asks App to switch to another section, through the
+   * Section bar's own switch (the full reset and its announcements) — from
+   * PR Review's "changed elsewhere" line, or, with `focusNodeId`, from Node
+   * detail's "Calls into other sections" (the callee is then handed back as
+   * `pendingFocusNodeId`).
+   */
+  onSwitchSection: (section: string, focusNodeId?: string) => void;
+  /**
+   * P4-4 phase 3b: one-shot — a Node to select once the map of `section` is
+   * ready (`decidePendingFocus`), then reported via `onPendingFocusConsumed`.
+   * `null`/omitted for none.
+   */
+  pendingFocusNodeId?: string | null;
+  /** P4-4 phase 3b: `pendingFocusNodeId` was applied (or found missing): App clears it. */
+  onPendingFocusConsumed?: () => void;
+}
+
+/**
+ * P4-4 phase 3b: what to do with a `pendingFocusNodeId`:
+ * - `none`: there is none;
+ * - `wait`: the map of `section` isn't ready yet (still the previous
+ *   section's, loading or failed), or its canvas hasn't had its first fit;
+ * - `focus`: centre the canvas on it (`navigateToNode`) and focus its card;
+ * - `open-detail`: no canvas (Health Audit's grid) — open its Node detail;
+ * - `missing`: the ready map doesn't have it — say so (`NOT_ON_CURRENT_MAP`),
+ *   never a silent no-op.
+ * Pure.
+ */
+export type PendingFocusDecision =
+  | { kind: 'none' }
+  | { kind: 'wait' }
+  | { kind: 'focus'; id: string }
+  | { kind: 'open-detail'; node: CodeMapNode }
+  | { kind: 'missing'; id: string };
+
+export function decidePendingFocus({
+  pendingFocusNodeId,
+  section,
+  fetchState,
+  canvas,
+  canvasReady,
+  resolveMapNode,
+}: {
+  pendingFocusNodeId: string | null;
+  /** The section prop — the one App switched to. */
+  section: string | null;
+  fetchState: FetchState;
+  /** `surfaces.canvas`. */
+  canvas: boolean;
+  /** The canvas has its React Flow instance and its first fit has landed. */
+  canvasReady: boolean;
+  /** The rendered map Node with this id, if any (`mapNodeOf(flowNodesById.get(id))`). */
+  resolveMapNode: (id: string) => CodeMapNode | undefined;
+}): PendingFocusDecision {
+  if (pendingFocusNodeId === null) {
+    return { kind: 'none' };
+  }
+  if (fetchState.status !== 'ready' || (fetchState.section ?? null) !== section) {
+    return { kind: 'wait' };
+  }
+  const node = resolveMapNode(pendingFocusNodeId);
+  if (node === undefined) {
+    return { kind: 'missing', id: pendingFocusNodeId };
+  }
+  if (!canvas) {
+    return { kind: 'open-detail', node };
+  }
+  return canvasReady ? { kind: 'focus', id: pendingFocusNodeId } : { kind: 'wait' };
+}
+
+/** Review round 1: how many animation frames the card focus waits for a culled card before focusing the canvas. */
+export const CARD_FOCUS_MAX_FRAMES = 60;
+
+/**
+ * Review round 1: one frame of the card-focus wait — focus the card once it
+ * is rendered; keep waiting; or, once `CARD_FOCUS_MAX_FRAMES` frames have
+ * passed without it, focus the canvas wrapper, so focus never falls to
+ * `<body>`. Pure.
+ */
+export function cardFocusStep(cardFound: boolean, framesTried: number): 'focus-card' | 'retry' | 'focus-canvas' {
+  if (cardFound) {
+    return 'focus-card';
+  }
+  return framesTried + 1 >= CARD_FOCUS_MAX_FRAMES ? 'focus-canvas' : 'retry';
+}
+
+/**
+ * Review round 1: after PR Review's "Switch to api", where focus lands once
+ * the map of that section is ready: the base-ref input when it can take
+ * focus (PR Review, not disabled by a running diff), else the selected
+ * Section bar tab. `wait` until that map is ready; `cancel` when the user
+ * has since switched elsewhere. Pure.
+ */
+export function prReviewSwitchFocusTarget({
+  targetSection,
+  section,
+  fetchState,
+  baseRefFocusable,
+}: {
+  targetSection: string;
+  section: string | null;
+  fetchState: FetchState;
+  baseRefFocusable: boolean;
+}): 'wait' | 'cancel' | 'base-ref' | 'section-tab' {
+  if (section !== targetSection) {
+    return 'cancel';
+  }
+  if (fetchState.status !== 'ready' || (fetchState.section ?? null) !== targetSection) {
+    return 'wait';
+  }
+  return baseRefFocusable ? 'base-ref' : 'section-tab';
+}
+
+/**
+ * P4-4 phase 3b (founder decision 2026-10-04): what a section switch carries
+ * out of PR Review — the base-ref input to re-run with (`input`, possibly
+ * blank: auto-resolve), and the ref the Graph Service checks in the target's
+ * repository (`ref`: the input, or with a blank input the resolved diff's
+ * base commit).
+ */
+export interface DiffScopeCarry {
+  from: string | null;
+  to: string | null;
+  ref: string;
+  input: string;
+}
+
+/**
+ * P4-4 phase 3b: the switch's carry, or `null` for none — only out of PR
+ * Review, only for a real switch, and only with a diff to carry: a base ref
+ * entered, or a resolved diff. Pure.
+ */
+export function diffScopeCarryCandidate({
+  mode,
+  diffScopeState,
+  baseRefInput,
+  from,
+  to,
+}: {
+  mode: CodeMapMode;
+  diffScopeState: DiffScopeState;
+  baseRefInput: string;
+  from: string | null;
+  to: string | null;
+}): DiffScopeCarry | null {
+  if (mode !== 'prReview' || from === to) {
+    return null;
+  }
+  const input = baseRefInput.trim();
+  const ref = input.length > 0 ? input : diffScopeState.status === 'resolved' ? diffScopeState.resolvedBaseRef : '';
+  return ref.length > 0 ? { from, to, ref, input } : null;
+}
+
+/**
+ * P4-4 phase 3b: the Graph Service's answer → re-run in the new section (same
+ * repository, or the ref exists in the target's repository), or reset
+ * (anything else, including an error). Pure.
+ */
+export function diffScopeCarryDecision(result: DiffScopeCarryResult): 'rerun' | 'reset' {
+  return result.status === 'same-repository' || result.status === 'ref-exists' ? 'rerun' : 'reset';
+}
+
+/**
+ * P4-4 phase 3b: a carry check's reply applies only while it is the latest
+ * check (no later switch, load or refresh bumped the id) and its target
+ * section is still the one on screen — an old section's reply is dropped.
+ * Pure.
+ */
+export function diffScopeCarryReplyApplies(
+  carryId: number,
+  latestCarryId: number,
+  carryTo: string | null,
+  currentSection: string | null,
+): boolean {
+  return carryId === latestCarryId && carryTo === currentSection;
+}
+
+/** Carry review: what a carry check's reply does — see `diffScopeCarrySettleAction`. */
+export type DiffScopeCarrySettle = 'ignore' | 'rerun' | 'skip' | 'reset';
+
+/**
+ * Carry review: a carry check's reply → `ignore` (stale:
+ * `diffScopeCarryReplyApplies`), `rerun` (carried, still in PR Review),
+ * `skip` (carried, but PR Review was left meanwhile: no diff is run), or
+ * `reset` (not carried, or the check failed). Pure.
+ */
+export function diffScopeCarrySettleAction({
+  carryId,
+  latestCarryId,
+  carryTo,
+  currentSection,
+  mode,
+  result,
+}: {
+  carryId: number;
+  latestCarryId: number;
+  carryTo: string | null;
+  currentSection: string | null;
+  mode: CodeMapMode;
+  result: DiffScopeCarryResult;
+}): DiffScopeCarrySettle {
+  if (!diffScopeCarryReplyApplies(carryId, latestCarryId, carryTo, currentSection)) {
+    return 'ignore';
+  }
+  if (diffScopeCarryDecision(result) === 'reset') {
+    return 'reset';
+  }
+  return mode === 'prReview' ? 'rerun' : 'skip';
+}
+
+/**
+ * Carry review: carries out `diffScopeCarrySettleAction` through `effects`
+ * — nothing for a stale reply; otherwise `done` (the check is over), then at
+ * most one of `rerun` / `reset`. Returns the action. Pure apart from the
+ * effects it is given.
+ */
+export function applyDiffScopeCarryReply(
+  input: Parameters<typeof diffScopeCarrySettleAction>[0],
+  effects: { done: () => void; rerun: () => void; reset: () => void },
+): DiffScopeCarrySettle {
+  const action = diffScopeCarrySettleAction(input);
+  if (action === 'ignore') {
+    return action;
+  }
+  effects.done();
+  if (action === 'rerun') {
+    effects.rerun();
+  } else if (action === 'reset') {
+    effects.reset();
+  }
+  return action;
+}
+
+/** Carry review: "Checking whether origin/main applies in api/…" — shown while the check runs. */
+export function diffScopeCarryCheckingText(carry: Pick<DiffScopeCarry, 'ref' | 'to'>): string {
+  // `ref` is the typed input, or with a blank input the resolved diff's base commit.
+  return `Checking whether ${carry.ref} applies in ${carry.to === null ? 'all sections' : `${carry.to}/`}…`;
+}
+
+/** P4-4 phase 3b: "Recomputing the diff against origin/main in api/…" — the re-run's status text. */
+export function diffScopeCarryAnnouncement(carry: Pick<DiffScopeCarry, 'input' | 'to'>): string {
+  const against = carry.input.length > 0 ? `against ${carry.input}` : 'against the auto-resolved base ref';
+  return `Recomputing the diff ${against} in ${carry.to === null ? 'all sections' : `${carry.to}/`}…`;
+}
+
+/** Review round 1: the ids of the missed-callee notice's text and its Dismiss button (focused when it appears). */
+export const CROSS_SECTION_MISS_TEXT_ID = 'code-map-cross-section-miss-text';
+export const CROSS_SECTION_MISS_DISMISS_ID = 'code-map-cross-section-miss-dismiss';
+
+/**
+ * P4-4 phase 3b: a cross-section switch landed on a map without its callee —
+ * "render in web/ — Not on the current map (hidden by scope or filters)",
+ * with Dismiss. Hookless.
+ */
+export function CrossSectionMissNotice({
+  name,
+  section,
+  onDismiss,
+}: {
+  name: string;
+  section: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="code-map__path-trace-dismissable-notice">
+      <ActionableNotice tone="info" role="status">
+        <span id={CROSS_SECTION_MISS_TEXT_ID}>
+          <code>{name}</code> in <code>{section}/</code> — {NOT_ON_CURRENT_MAP}
+        </span>
+      </ActionableNotice>
+      {/* Review round 1: focused when the notice appears, and described by
+          its text, so the reason is heard there too. */}
+      <button
+        type="button"
+        id={CROSS_SECTION_MISS_DISMISS_ID}
+        className="code-map__path-trace-dismiss"
+        onClick={onDismiss}
+        aria-describedby={CROSS_SECTION_MISS_TEXT_ID}
+      >
+        Dismiss
+      </button>
+    </div>
+  );
 }
 
 /** P0-3: the `title` every Graph-Service-backed action carries while it's disabled for not being live. */
@@ -6088,6 +6537,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   fileTopLevel: 'code-map-node-detail-file-top-level-heading',
   uses: 'code-map-node-detail-uses-heading',
   similar: 'code-map-node-detail-similar-heading',
+  crossSectionCalls: 'code-map-node-detail-cross-section-calls-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -6119,10 +6569,103 @@ export interface NodeDetailBodyProps {
   resolveFoldedType?: (id: string) => FoldedType | undefined;
   /** P4-2 phase 3b: opens a "Uses" entry's type detail. Defaults to a no-op. */
   onOpenType?: (id: string) => void;
+  /**
+   * P4-4 phase 3b: the section the map on screen is for (`null` = `all`).
+   * "Calls into other sections" shows only on a section map. Defaults to `all`.
+   */
+  mapSection?: string | null;
+  /**
+   * P4-4 phase 3b: a "Calls into other sections" row's switch — the callee's
+   * section, then its id to select once that map is ready. Defaults to a no-op.
+   */
+  onSwitchSection?: (section: string, focusNodeId: string) => void;
 }
 
 const RESOLVE_NO_MAP_NODE = (): undefined => undefined;
 const NAVIGATE_NOWHERE = (): void => {};
+const SWITCH_NOWHERE = (): void => {};
+
+/**
+ * P4-4 phase 3b: how many cross-section callees exist beyond the listed ones
+ * — `crossSectionCallsTotal` (P4-4g, the count before the
+ * `CROSS_SECTION_CALLS_MAX` cap) less the list's length, never below 0.
+ */
+export function crossSectionCallsMore(node: Pick<CodeMapNode, 'crossSectionCalls' | 'crossSectionCallsTotal'>): number {
+  return crossSectionCallsCount(node) - (node.crossSectionCalls?.length ?? 0);
+}
+
+/**
+ * P4-4 review round 1: how many cross-section callees a Node has —
+ * `max(crossSectionCallsTotal, listed)`, so a total without rows still shows
+ * the section (as "+N more").
+ */
+export function crossSectionCallsCount(node: Pick<CodeMapNode, 'crossSectionCalls' | 'crossSectionCallsTotal'>): number {
+  return Math.max(node.crossSectionCallsTotal ?? 0, node.crossSectionCalls?.length ?? 0);
+}
+
+/**
+ * P4-4 phase 3b: a "Calls into other sections" row's switch: closes Node
+ * detail, then asks App to switch to the callee's section and select the
+ * callee once the new map is ready. Hookless, so it's testable.
+ */
+export function switchSectionFromDetail(
+  section: string,
+  focusNodeId: string,
+  {
+    closeNodeDetail,
+    onSwitchSection,
+  }: { closeNodeDetail: () => void; onSwitchSection: (section: string, focusNodeId: string) => void },
+): void {
+  closeNodeDetail();
+  onSwitchSection(section, focusNodeId);
+}
+
+/**
+ * P4-4 phase 3b: Node detail's "Calls into other sections" — this Node's
+ * callees in other sections (`crossSectionCalls`, P4-4g), each "render ·
+ * web/" with the button "Switch to web" (accessible name "Switch to web and
+ * show render"), then "+N more" from `crossSectionCallsTotal`. Disabled,
+ * with the shared title, while the Graph Service isn't live. Hookless, like
+ * `NodeDetailBody`.
+ */
+export function NodeCrossSectionCalls({
+  node,
+  graphServiceAvailable,
+  onSwitchSection,
+}: {
+  node: Pick<CodeMapNode, 'crossSectionCalls' | 'crossSectionCallsTotal'>;
+  graphServiceAvailable: boolean;
+  onSwitchSection: (section: string, focusNodeId: string) => void;
+}) {
+  const calls: readonly CrossSectionCall[] = node.crossSectionCalls ?? [];
+  const more = crossSectionCallsMore(node);
+  return (
+    <>
+      <ul className="code-map__node-detail-cross-section" aria-label="Calls into other sections">
+        {calls.map((call) => (
+          <li key={call.id}>
+            <code>{call.name}</code> · <code>{call.section}/</code>{' '}
+            <button
+              type="button"
+              {...sectionSwitchButtonProps(graphServiceAvailable, CROSS_SECTION_CALLS_HINT_ID, () =>
+                onSwitchSection(call.section, call.id),
+              )}
+              aria-label={`Switch to ${call.section} and show ${call.name}`}
+            >
+              Switch to <code>{call.section}</code>
+            </button>
+          </li>
+        ))}
+      </ul>
+      {more > 0 && <p className="code-map__more-list">+{formatCountNumber(more)} more</p>}
+      {!graphServiceAvailable && calls.length > 0 && (
+        <p id={CROSS_SECTION_CALLS_HINT_ID} className="code-map__switch-hint">
+          {SECTION_SWITCH_UNAVAILABLE_HINT}
+        </p>
+      )}
+    </>
+  );
+}
 
 /** P4-2 phase 3a: how many "File top-level" entries (and, separately, "Called at load by" files) Node detail names before "+N more". */
 export const NODE_DETAIL_FILE_TOP_LEVEL_ROWS = 5;
@@ -7220,8 +7763,9 @@ export function NodeSimilarImplementations({
 /**
  * P2-12: Node Detail's scrolling body — the mockup's labelled, divided
  * sections in the order Summary → Risk Overlay → Tested by → (Uses) →
- * (File top-level) → (Similar implementations, P4-2 phase 4) → Staleness →
- * Location; the parenthesized ones only when they have content.
+ * (File top-level) → (Similar implementations, P4-2 phase 4) → (Calls into
+ * other sections, P4-4 phase 3b: section maps only) → Staleness → Location;
+ * the parenthesized ones only when they have content.
  * Presentation only: every state, action and handler is the one the panel
  * already had, passed in. Hookless so `CodeMap.nodeDetail.test.ts` can render
  * it as a plain function.
@@ -7240,6 +7784,8 @@ export function NodeDetailBody({
   onNavigateToNode = NAVIGATE_NOWHERE,
   resolveFoldedType = RESOLVE_NO_TYPE,
   onOpenType = NAVIGATE_NOWHERE,
+  mapSection = null,
+  onSwitchSection = SWITCH_NOWHERE,
 }: NodeDetailBodyProps) {
   const ids = NODE_DETAIL_SECTION_HEADING_IDS;
   const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
@@ -7380,6 +7926,21 @@ export function NodeDetailBody({
             node={node}
             resolveMapNode={resolveMapNode}
             onNavigateToNode={onNavigateToNode}
+          />
+        </section>
+      )}
+      {/* P4-4 phase 3b: callees in other sections — real whole-scope CALLS
+          edges the section's filter dropped (P4-4g). Only on a section map,
+          and only when there are any. */}
+      {mapSection !== null && crossSectionCallsCount(node) > 0 && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.crossSectionCalls}>
+          <h3 id={ids.crossSectionCalls} className="code-map__node-detail-label">
+            Calls into other sections
+          </h3>
+          <NodeCrossSectionCalls
+            node={node}
+            graphServiceAvailable={graphServiceAvailable}
+            onSwitchSection={onSwitchSection}
           />
         </section>
       )}
@@ -7637,6 +8198,9 @@ export function CodeMap({
   onReindex,
   section = null,
   onUnknownSection,
+  onSwitchSection,
+  pendingFocusNodeId = null,
+  onPendingFocusConsumed,
 }: CodeMapProps) {
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   // P2-3: report every `fetchState` change, not just count changes — a Retry
@@ -7692,6 +8256,23 @@ export function CodeMap({
   // a small notice on whichever surface is on top, until the next open,
   // close, search or refresh.
   const [typeGone, setTypeGone] = useState(false);
+  // P4-4 phase 3b: a cross-section switch whose callee isn't on the new map
+  // — shown until dismissed or the next load. The ref names the callee the
+  // last Node detail switch asked for (App hands back only its id).
+  const [crossSectionMiss, setCrossSectionMiss] = useState<{ name: string; section: string } | null>(null);
+  const crossSectionTargetRef = useRef<{ id: string; name: string } | null>(null);
+  // P4-4 phase 3b (founder decision 2026-10-04): the carried diff's
+  // announcement, its check's request id, and the starter the section effect
+  // calls (declared further down).
+  const [diffCarryNote, setDiffCarryNote] = useState<string | null>(null);
+  // Carry review: the check in flight, for the "Checking whether …" line.
+  const [diffCarryPending, setDiffCarryPending] = useState<DiffScopeCarry | null>(null);
+  const diffCarryRequestIdRef = useRef(0);
+  const startDiffScopeCarryRef = useRef<(carry: DiffScopeCarry) => void>(() => {});
+  // Review round 1: a PR Review "Switch to …" waits for its section's map
+  // to focus the base-ref input (`prReviewSwitchFocusTarget`).
+  const prReviewSwitchFocusRef = useRef<string | null>(null);
+  const baseRefInputRef = useRef<HTMLInputElement | null>(null);
   const [regenerateState, setRegenerateState] = useState<RegenerateState>({ kind: 'idle' });
   // Story 1.9 (Phase 2): the search toolbar's own query text and its
   // `tracePath` result state — kept separate (rather than folding the query
@@ -8051,6 +8632,13 @@ export function CodeMap({
     // "focused" Node from a map that's gone).
     setHistory({ stack: [], index: -1 });
     focusedNodeIdRef.current = null;
+    // P4-4 phase 3b: a "not on the current map" notice belongs to the map it
+    // was about; a carried diff's check and announcement belong to the
+    // switch that started them (a switch starts a fresh one after this).
+    setCrossSectionMiss(null);
+    setDiffCarryNote(null);
+    diffCarryRequestIdRef.current += 1;
+    setDiffCarryPending(null);
     // Story 1.8 (Phase 4): a Retry/reload swaps in an entirely different
     // Node set, same reasoning as the history reset just above — a Node
     // Detail panel left open for a Node from the previous map must not
@@ -8151,6 +8739,7 @@ export function CodeMap({
             foldedModules: result.foldedModules,
             section: result.section,
             sections: result.sections,
+            ...(result.crossSectionEdges !== undefined ? { crossSectionEdges: result.crossSectionEdges } : {}),
           });
           return;
         }
@@ -8179,8 +8768,21 @@ export function CodeMap({
   // map through this same full reset — history, Node and type detail, Path
   // Trace, the diff scope and base ref (and their sync), Blast Radius — and
   // the canvas remounts for the new Node set (its first fit re-arms).
+  // P4-4 phase 3b (founder decision 2026-10-04): a switch out of a PR Review
+  // with a diff to carry (`diffScopeCarryCandidate`, read from the render
+  // that changed the section — before this reset) starts its carry check
+  // right after the reset.
+  const loadedSectionRef = useRef<string | null>(section);
+  const diffCarrySourceRef = useRef({ mode, diffScopeState, baseRefInput });
+  diffCarrySourceRef.current = { mode, diffScopeState, baseRefInput };
   useEffect(() => {
+    const from = loadedSectionRef.current;
+    loadedSectionRef.current = section;
+    const carry = diffScopeCarryCandidate({ ...diffCarrySourceRef.current, from, to: section });
     loadCodeMap();
+    if (carry !== null) {
+      startDiffScopeCarryRef.current(carry);
+    }
   }, [loadCodeMap, section]);
 
   /**
@@ -8207,6 +8809,11 @@ export function CodeMap({
     setRefreshError(null);
     setPathTrace({ status: 'idle' });
     pathTraceRequestIdRef.current += 1;
+    // P4-4 phase 3b: a refresh resets the diff, so a carry still in flight
+    // must not re-run it.
+    setDiffCarryNote(null);
+    diffCarryRequestIdRef.current += 1;
+    setDiffCarryPending(null);
     setDiffScopeState({ status: 'idle' });
     clearDiffScopeSync();
     diffScopeRequestIdRef.current += 1;
@@ -8251,6 +8858,7 @@ export function CodeMap({
             ...(outcome.foldedModules !== undefined ? { foldedModules: outcome.foldedModules } : {}),
             ...(outcome.section !== undefined ? { section: outcome.section } : {}),
             ...(outcome.sections !== undefined ? { sections: outcome.sections } : {}),
+            ...(outcome.crossSectionEdges !== undefined ? { crossSectionEdges: outcome.crossSectionEdges } : {}),
           });
           // P4-2 phase 3b: an open type detail and an "is a type" notice
           // follow their types to the fresh map, or close/clear when gone.
@@ -8290,6 +8898,7 @@ export function CodeMap({
                 foldedModules: result.foldedModules,
                 section: result.section,
                 sections: result.sections,
+                ...(result.crossSectionEdges !== undefined ? { crossSectionEdges: result.crossSectionEdges } : {}),
               }
             : { kind: 'failed', message: codeMapFailureMessage(result) },
         );
@@ -8422,12 +9031,16 @@ export function CodeMap({
    * since-superseded reply apply a changed-Node set that no longer belongs
    * to the project now on screen.
    */
-  const handleComputeDiffScope = useCallback(() => {
-    if (projectPath === null || diffScopeState.status === 'loading') {
+  // P4-4 phase 3b (founder decision 2026-10-04): the diff-scope run itself,
+  // for an explicit base-ref value — the button's path (`handleComputeDiffScope`)
+  // and a section switch's automatic re-run (`startDiffScopeCarry`) alike, so
+  // both share these stale-reply guards.
+  const runDiffScope = useCallback((rawBaseRef: string) => {
+    if (projectPath === null) {
       return;
     }
     const requestId = ++diffScopeRequestIdRef.current;
-    const trimmedBaseRef = baseRefInput.trim();
+    const trimmedBaseRef = rawBaseRef.trim();
     // Review finding (Blind Hunter): the input's own visible value never
     // reflected the trimmed text that was actually sent — a `" main "`
     // submission left the untrimmed string on screen afterward even though
@@ -8495,7 +9108,64 @@ export function CodeMap({
           message: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [projectPath, baseRefInput, diffScopeState.status, clearDiffScopeSync]);
+  }, [projectPath, clearDiffScopeSync]);
+
+  const handleComputeDiffScope = useCallback(() => {
+    if (projectPath === null || diffScopeState.status === 'loading') {
+      return;
+    }
+    // A manual run supersedes a carried one's announcement and check.
+    setDiffCarryNote(null);
+    diffCarryRequestIdRef.current += 1;
+    setDiffCarryPending(null);
+    runDiffScope(baseRefInput);
+  }, [projectPath, baseRefInput, diffScopeState.status, runDiffScope]);
+
+  // P4-4 phase 3b (founder decision 2026-10-04): a section switch with a
+  // diff to carry keeps the base ref while the Graph Service checks whether
+  // it applies in the new section (`checkDiffScopeCarry`), then re-runs the
+  // diff there, announced — or clears the base ref (the diff is already
+  // idle from `loadCodeMap`'s reset). A reply for a superseded switch, or
+  // after a later load/refresh, is dropped.
+  const startDiffScopeCarry = useCallback(
+    (carry: DiffScopeCarry) => {
+      if (projectPath === null) {
+        return;
+      }
+      const carryId = ++diffCarryRequestIdRef.current;
+      setBaseRefInput(carry.input);
+      setDiffCarryPending(carry);
+      // `applyDiffScopeCarryReply` decides (stale → ignored; PR Review left
+      // → no re-run); this only carries it out.
+      const settle = (result: DiffScopeCarryResult) =>
+        applyDiffScopeCarryReply(
+          {
+            carryId,
+            latestCarryId: diffCarryRequestIdRef.current,
+            carryTo: carry.to,
+            currentSection: sectionRef.current,
+            mode: diffCarrySourceRef.current.mode,
+            result,
+          },
+          {
+            done: () => setDiffCarryPending(null),
+            rerun: () => {
+              setDiffCarryNote(diffScopeCarryAnnouncement(carry));
+              runDiffScope(carry.input);
+            },
+            reset: () => setBaseRefInput(''),
+          },
+        );
+      window.driller
+        .checkDiffScopeCarry(projectPath, carry.from, carry.to, carry.ref)
+        .then(settle)
+        .catch((error: unknown) =>
+          settle({ status: 'error', message: error instanceof Error ? error.message : String(error) }),
+        );
+    },
+    [projectPath, runDiffScope],
+  );
+  startDiffScopeCarryRef.current = startDiffScopeCarry;
 
   const handleDiffScopeSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -10040,6 +10710,7 @@ export function CodeMap({
     topLevelFiles: prReviewTopLevelFiles,
     changedContracts: prReviewChangedContracts,
     changedContractsApproximate: prReviewChangedContractsApproximate,
+    changedInOtherSections: prReviewChangedInOtherSections,
     surfaces,
   } = prReviewView;
   const prReviewMetricsTableProps = prReviewMetricsTableFor(prReviewView);
@@ -10057,6 +10728,176 @@ export function CodeMap({
       reactFlowInstanceRef.current = null;
     }
   }, [surfaces.canvas]);
+
+  // P4-4 phase 3b: Node detail's cross-section switch — App switched the
+  // section and hands the callee back as `pendingFocusNodeId`. It is applied
+  // only once the map of THAT section is ready (and its canvas has had its
+  // first fit, so the fit can't move the view off it): `decidePendingFocus`.
+  // Then App is told, once, so it never re-applies.
+  const onPendingFocusConsumedRef = useRef(onPendingFocusConsumed);
+  useEffect(() => {
+    onPendingFocusConsumedRef.current = onPendingFocusConsumed;
+  }, [onPendingFocusConsumed]);
+  const focusCardFrameRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (focusCardFrameRef.current !== null) {
+        cancelAnimationFrame(focusCardFrameRef.current);
+      }
+    },
+    [],
+  );
+  // Carry review: on unmount, a carry check or diff run still in flight must
+  // never apply (nor re-run a diff) — their request ids move on.
+  useEffect(() => {
+    const carryIds = diffCarryRequestIdRef;
+    const diffIds = diffScopeRequestIdRef;
+    return () => {
+      carryIds.current += 1;
+      diffIds.current += 1;
+    };
+  }, []);
+  useEffect(() => {
+    const decision = decidePendingFocus({
+      pendingFocusNodeId,
+      section,
+      fetchState,
+      canvas: surfaces.canvas,
+      canvasReady: reactFlowInstanceRef.current !== null && !awaitingFirstFit,
+      resolveMapNode: (id) => mapNodeOf(flowNodesById.get(id)),
+    });
+    if (decision.kind === 'none' || decision.kind === 'wait') {
+      return;
+    }
+    onPendingFocusConsumedRef.current?.();
+    switch (decision.kind) {
+      case 'focus': {
+        navigateToNode(decision.id);
+        // Keyboard users land on the selected card: focus it once React Flow
+        // has rendered it (it can be culled until the centring brings it into
+        // view), for at most ~1s of frames.
+        if (focusCardFrameRef.current !== null) {
+          cancelAnimationFrame(focusCardFrameRef.current);
+        }
+        let frames = 0;
+        const selector = `.react-flow__node[data-id="${CSS.escape(decision.id)}"] .code-map__node`;
+        const tryFocus = () => {
+          focusCardFrameRef.current = null;
+          const card = canvasElement?.querySelector<HTMLElement>(selector) ?? null;
+          // Review round 1: never left on <body> — the canvas wrapper takes
+          // focus when the card never renders (`cardFocusStep`).
+          switch (cardFocusStep(card !== null, frames)) {
+            case 'focus-card':
+              card?.focus({ preventScroll: true });
+              return;
+            case 'focus-canvas':
+              canvasElement?.focus({ preventScroll: true });
+              return;
+            case 'retry':
+              frames += 1;
+              focusCardFrameRef.current = requestAnimationFrame(tryFocus);
+              return;
+          }
+        };
+        focusCardFrameRef.current = requestAnimationFrame(tryFocus);
+        return;
+      }
+      case 'open-detail': {
+        // Review round 1: the panel returns focus to whatever held it when it
+        // opened — the selected Section bar tab, never <body>.
+        const tabId =
+          fetchState.status === 'ready' ? selectedSectionTabId(fetchState.sections ?? [], section) : undefined;
+        if (tabId !== undefined) {
+          document.getElementById(tabId)?.focus();
+        }
+        focusedNodeIdRef.current = decision.node.id;
+        openNodeDetail(decision.node);
+        return;
+      }
+      case 'missing': {
+        const target = crossSectionTargetRef.current;
+        setCrossSectionMiss({
+          name: target !== null && target.id === decision.id ? target.name : decision.id,
+          section: section ?? '',
+        });
+        return;
+      }
+    }
+  }, [
+    pendingFocusNodeId,
+    section,
+    fetchState,
+    surfaces.canvas,
+    awaitingFirstFit,
+    canvasInitCount,
+    flowNodesById,
+    navigateToNode,
+    openNodeDetail,
+    canvasElement,
+  ]);
+  // Review round 1: the missed-callee notice takes focus (its Dismiss button,
+  // described by the notice's text) when it appears.
+  useEffect(() => {
+    if (crossSectionMiss !== null) {
+      document.getElementById(CROSS_SECTION_MISS_DISMISS_ID)?.focus();
+    }
+  }, [crossSectionMiss]);
+  // Review round 1: PR Review's "Switch to …" — once that section's map is
+  // ready, focus lands on the base-ref input (or the selected Section bar
+  // tab), never <body> (`prReviewSwitchFocusTarget`).
+  useEffect(() => {
+    const targetSection = prReviewSwitchFocusRef.current;
+    if (targetSection === null) {
+      return;
+    }
+    const input = baseRefInputRef.current;
+    const target = prReviewSwitchFocusTarget({
+      targetSection,
+      section,
+      fetchState,
+      baseRefFocusable: mode === 'prReview' && input !== null && !input.disabled,
+    });
+    if (target === 'wait') {
+      return;
+    }
+    prReviewSwitchFocusRef.current = null;
+    if (target === 'base-ref') {
+      input?.focus();
+    } else if (target === 'section-tab' && fetchState.status === 'ready') {
+      const tabId = selectedSectionTabId(fetchState.sections ?? [], section);
+      if (tabId !== undefined) {
+        document.getElementById(tabId)?.focus();
+      }
+    }
+  }, [section, fetchState, mode, diffScopeState.status]);
+  // Review round 1: dismissing the missed-callee notice hands focus to the
+  // selected Section bar tab (the notice, and its button, unmount).
+  const dismissCrossSectionMiss = useCallback(() => {
+    setCrossSectionMiss(null);
+    const tabId = fetchState.status === 'ready' ? selectedSectionTabId(fetchState.sections ?? [], section) : undefined;
+    if (tabId !== undefined) {
+      document.getElementById(tabId)?.focus();
+    }
+  }, [fetchState, section]);
+  const handleSwitchSectionFromPrReview = useCallback(
+    (targetSection: string) => {
+      prReviewSwitchFocusRef.current = targetSection;
+      onSwitchSection(targetSection);
+    },
+    [onSwitchSection],
+  );
+  // P4-4 phase 3b: a "Calls into other sections" row's switch. Remembers the
+  // callee's name for a "not on the current map" notice.
+  const handleSwitchSectionFromDetail = useCallback(
+    (targetSection: string, focusNodeId: string) => {
+      const call = nodeDetailRef.current.status === 'open'
+        ? nodeDetailRef.current.node.crossSectionCalls?.find((entry) => entry.id === focusNodeId)
+        : undefined;
+      crossSectionTargetRef.current = { id: focusNodeId, name: call?.name ?? focusNodeId };
+      switchSectionFromDetail(targetSection, focusNodeId, { closeNodeDetail, onSwitchSection });
+    },
+    [closeNodeDetail, onSwitchSection],
+  );
 
   // Story 3.2 (Phase 2): the stepper's own upper bound — "its own 'further'"
   // (Always: "the stepper's upper bound is the maximum hop distance actually
@@ -10114,10 +10955,17 @@ export function CodeMap({
             <input
               type="text"
               className="code-map__pr-review-input"
+              ref={baseRefInputRef}
               placeholder="Base ref (leave blank to auto-resolve)…"
               aria-label="Base ref"
               value={baseRefInput}
-              onChange={(event) => setBaseRefInput(event.target.value)}
+              onChange={(event) => {
+                // Carry review: typing cancels a carry check in flight — its
+                // late reply must never wipe or override what was typed.
+                diffCarryRequestIdRef.current += 1;
+                setDiffCarryPending(null);
+                setBaseRefInput(event.target.value);
+              }}
               disabled={projectPath === null || diffScopeState.status === 'loading'}
               aria-describedby={prReviewNoticeStatus !== null ? PR_REVIEW_NOTICE_ID : undefined}
             />
@@ -10163,7 +11011,10 @@ export function CodeMap({
               own Actionable Notice convention. */}
           {diffScopeState.status === 'idle' && (
             <p className="code-map__pr-review-resolved" role="status">
-              Enter a base ref (or leave it blank to auto-resolve) and compute the diff scope to see changed Nodes.
+              {/* Carry review: a section switch's base-ref check says so. */}
+              {diffCarryPending !== null
+                ? diffScopeCarryCheckingText(diffCarryPending)
+                : 'Enter a base ref (or leave it blank to auto-resolve) and compute the diff scope to see changed Nodes.'}
             </p>
           )}
           {/* Review finding (Blind Hunter): the button's own text changing
@@ -10173,7 +11024,8 @@ export function CodeMap({
               here. */}
           {diffScopeState.status === 'loading' && (
             <p className="code-map__pr-review-resolved" role="status">
-              Computing diff scope…
+              {/* P4-4 phase 3b: a section switch's automatic re-run says so. */}
+              {diffCarryNote ?? 'Computing diff scope…'}
             </p>
           )}
 
@@ -10186,8 +11038,21 @@ export function CodeMap({
                 diffScopeState.changedContracts.length,
               )}
               .
+              {/* P4-4 phase 3b: the "changed elsewhere" line below sits
+                  outside this live region (its buttons aren't read out); its
+                  text is announced here. */}
+              <span className="visually-hidden">{changedElsewhereAnnouncement(prReviewChangedInOtherSections)}</span>
             </p>
           )}
+          {/* P4-4 phase 3b: what the diff changed in other sections of the
+              same repository, beneath the change count — "3 changed Nodes in
+              `api/` — Switch to `api`". Only on a section map; absent for
+              none. The switch keeps PR Review. */}
+          <ChangedElsewhereLine
+            changedInOtherSections={prReviewChangedInOtherSections}
+            onSwitchSection={handleSwitchSectionFromPrReview}
+            graphServiceAvailable={graphServiceAvailable}
+          />
 
           {/* Story 3.2 (Phase 2): the combined blast radius's own status
               line + stepper — only ever relevant once a diff scope is
@@ -10524,6 +11389,18 @@ export function CodeMap({
           the route lands on a canvas (`resolvePathTraceSubmit`). The RESULT
           surfaces inside this wrapper follow `pathTraceResult` instead, which
           does track the canvas — see `CodeMapSurfaces`. */}
+      {/* Review round 1: with no showable map (an empty section) the Path
+          Trace wrapper below isn't rendered — the missed-callee notice still
+          is, in the same corner. */}
+      {!surfaces.pathTraceInput && crossSectionMiss !== null && (
+        <div className="code-map__path-trace">
+          <CrossSectionMissNotice
+            name={crossSectionMiss.name}
+            section={crossSectionMiss.section}
+            onDismiss={dismissCrossSectionMiss}
+          />
+        </div>
+      )}
       {surfaces.pathTraceInput && (
         // Story 1.9 (Phase 2): the always-reachable Path Trace search
         // affordance — persistent/non-modal, mirroring the history
@@ -10546,6 +11423,17 @@ export function CodeMap({
             searching={pathTrace.status === 'searching'}
             graphServiceAvailable={graphServiceAvailable}
           />
+
+          {/* P4-4 phase 3b: a cross-section switch's callee isn't on the new
+              map — said, never a silent no-op. Outside the result gate, so it
+              shows over Health Audit's grid too. */}
+          {crossSectionMiss !== null && (
+            <CrossSectionMissNotice
+              name={crossSectionMiss.name}
+              section={crossSectionMiss.section}
+              onDismiss={dismissCrossSectionMiss}
+            />
+          )}
 
           {/* P0-2b: the RESULT surfaces, gated on `pathTraceResult` — which
               tracks the canvas, not the input above. Every one of them
@@ -10888,6 +11776,11 @@ export function CodeMap({
               // place of this panel.
               resolveFoldedType={resolveFoldedType}
               onOpenType={openType}
+              // P4-4 phase 3b: "Calls into other sections" — only on a
+              // section map; a row's switch closes this panel, switches
+              // through App and selects the callee on the new map.
+              mapSection={fetchState.status === 'ready' ? (fetchState.section ?? null) : null}
+              onSwitchSection={handleSwitchSectionFromDetail}
             />
             {typeGone && typeDetail.status === 'closed' && <TypeGoneNotice />}
             {/* P0-1: the one-click source action this panel's IA row

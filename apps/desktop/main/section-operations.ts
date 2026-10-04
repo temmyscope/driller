@@ -15,7 +15,9 @@
  *   phase (same fields, same order, no `section` key at all).
  */
 import type {
+  DiffScopeCarryResult,
   GraphServiceComputeDiffScopeRequest,
+  GraphServiceDiffScopeCarryRequest,
   GraphServiceExpandBlastRadiusRequest,
   GraphServicePathTraceRequest,
 } from '@driller/ipc-contracts';
@@ -70,4 +72,69 @@ export function buildExpandBlastRadiusRequest(
   section?: string,
 ): GraphServiceExpandBlastRadiusRequest {
   return { type: 'graphService:expandBlastRadius', projectPath, nodeIds, requestId, ...sectionField(section) };
+}
+
+// ---------------------------------------------------------------------------
+// P4-4 phase 3b (founder decision 2026-10-04): may PR Review's base ref carry
+// over a section switch?
+// ---------------------------------------------------------------------------
+
+/** The validated `diffScope:carry` arguments, or why they were rejected (nothing is sent then). */
+export type ParsedDiffScopeCarryArgs =
+  | { ok: true; projectPath: string; fromSection: string | null; toSection: string | null; baseRef: string }
+  | { ok: false; result: DiffScopeCarryResult };
+
+const isSectionKey = (value: unknown): value is string | null =>
+  value === null || (typeof value === 'string' && value.length > 0);
+
+/**
+ * The renderer's untyped `diffScope:carry` arguments: a non-empty project
+ * path, each section `null` (`all`) or a non-empty string, and a base ref
+ * that is non-empty once trimmed (sent trimmed).
+ */
+export function parseDiffScopeCarryArgs(
+  projectPath: unknown,
+  fromSection: unknown,
+  toSection: unknown,
+  baseRef: unknown,
+): ParsedDiffScopeCarryArgs {
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return { ok: false, result: { status: 'error', message: 'Invalid project path.' } };
+  }
+  if (!isSectionKey(fromSection) || !isSectionKey(toSection)) {
+    return { ok: false, result: INVALID_OPERATION_SECTION_RESULT };
+  }
+  const trimmed = typeof baseRef === 'string' ? baseRef.trim() : '';
+  if (trimmed.length === 0) {
+    return { ok: false, result: { status: 'error', message: 'Invalid base ref.' } };
+  }
+  return { ok: true, projectPath, fromSection, toSection, baseRef: trimmed };
+}
+
+/** The `graphService:diffScopeCarry` request. */
+export function buildDiffScopeCarryRequest(
+  args: Extract<ParsedDiffScopeCarryArgs, { ok: true }>,
+  requestId: number,
+): GraphServiceDiffScopeCarryRequest {
+  return {
+    type: 'graphService:diffScopeCarry',
+    projectPath: args.projectPath,
+    requestId,
+    fromSection: args.fromSection,
+    toSection: args.toSection,
+    baseRef: args.baseRef,
+  };
+}
+
+/** The Graph Service's reply, validated at the process boundary: anything malformed is an `error`. */
+export function toValidatedDiffScopeCarryResult(result: unknown): DiffScopeCarryResult {
+  const status = (result as { status?: unknown } | null)?.status;
+  if (status === 'same-repository' || status === 'ref-exists' || status === 'not-carried') {
+    return { status };
+  }
+  const message = (result as { message?: unknown } | null)?.message;
+  if (status === 'error' && typeof message === 'string') {
+    return { status: 'error', message };
+  }
+  return { status: 'error', message: 'Malformed diff-scope carry reply.' };
 }

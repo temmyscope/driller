@@ -13,6 +13,7 @@
 import type {
   CodeMapEdge,
   CodeMapNode,
+  CrossSectionEdgeCount,
   FoldedModule,
   FoldedType,
   GraphServiceStatusMessage,
@@ -236,6 +237,8 @@ export type CodeMapFetchReply =
       section?: string | null;
       /** P4-4 phase 1c: `CodeMapResult.sections`; absent means none. */
       sections?: SectionNodeCount[];
+      /** P4-4 phase 3b: `CodeMapResult.crossSectionEdges`; absent means none. */
+      crossSectionEdges?: CrossSectionEdgeCount[];
     }
   | { kind: 'failed'; message: string };
 
@@ -262,6 +265,8 @@ export type RefreshOutcome =
       /** P4-4 phase 1c: both carried through from the reply, when it has them. */
       section?: string | null;
       sections?: SectionNodeCount[];
+      /** P4-4 phase 3b: carried through from the reply, when it has one. */
+      crossSectionEdges?: CrossSectionEdgeCount[];
       nodeDetail: NodeDetailRefresh;
     }
   /** The refresh failed but a completed map is on screen: keep it, and say the refresh failed. */
@@ -309,6 +314,7 @@ export function resolveRefreshOutcome({
     ...(reply.foldedModules !== undefined ? { foldedModules: reply.foldedModules } : {}),
     ...(reply.section !== undefined ? { section: reply.section } : {}),
     ...(reply.sections !== undefined ? { sections: reply.sections } : {}),
+    ...(reply.crossSectionEdges !== undefined ? { crossSectionEdges: reply.crossSectionEdges } : {}),
     nodeDetail,
   };
 }

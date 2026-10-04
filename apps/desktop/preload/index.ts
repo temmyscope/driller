@@ -16,6 +16,7 @@ import {
   type CloudBackend,
   type CodeMapResult,
   type DiagnosticLogEntry,
+  type DiffScopeCarryResult,
   type DiffScopeResult,
   type DrillerApi,
   type EditorPreference,
@@ -212,6 +213,14 @@ const drillerApi: DrillerApi = {
       ? ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef)
       : ipcRenderer.invoke(IpcChannels.diffScopeCompute, projectPath, baseRef, section),
 
+  // P4-4 phase 3b: may PR Review's base ref carry over a section switch?
+  checkDiffScopeCarry: (
+    projectPath: string,
+    fromSection: string | null,
+    toSection: string | null,
+    baseRef: string,
+  ): Promise<DiffScopeCarryResult> =>
+    ipcRenderer.invoke(IpcChannels.diffScopeCarry, projectPath, fromSection, toSection, baseRef),
   expandBlastRadius: (projectPath: string, nodeIds: string[], section?: string): Promise<BlastRadiusExpansionResult> =>
     section === undefined
       ? ipcRenderer.invoke(IpcChannels.blastRadiusExpand, projectPath, nodeIds)

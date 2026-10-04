@@ -141,6 +141,9 @@ import type {
   GraphServiceCodeMapMessage,
   GraphServiceComputeDiffScopeRequest,
   GraphServiceComputeDiffScopeResultMessage,
+  GraphServiceDiffScopeCarryRequest,
+  GraphServiceDiffScopeCarryResultMessage,
+  DiffScopeCarryResult,
   GraphServiceExpandBlastRadiusRequest,
   GraphServiceExpandBlastRadiusResultMessage,
   GraphServiceGetCodeMapRequest,
@@ -171,7 +174,7 @@ import type {} from 'electron';
 import { backendSwitchKind, nextBackendConfig, type BackendConfigState } from './backend-switch';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
-import { computeDiffScope, resolveGitToplevel } from './git-diff-scope';
+import { computeDiffScope, decideDiffScopeCarry, resolveGitToplevel } from './git-diff-scope';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { loadLcovCoverage } from './lcov';
@@ -1269,6 +1272,83 @@ function isExpandBlastRadiusRequest(data: unknown): data is GraphServiceExpandBl
     // P4-4 phase 2a.
     isOptionalSection(section)
   );
+}
+
+/**
+ * P4-4 phase 3b: true for a `graphService:diffScopeCarry` request — the same
+ * untrusted-shape treatment as the other guards here: a non-empty
+ * `projectPath` and `baseRef`, a numeric `requestId`, and each section `null`
+ * (`all`) or a non-empty string.
+ */
+function isDiffScopeCarryRequest(data: unknown): data is GraphServiceDiffScopeCarryRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, projectPath, requestId, fromSection, toSection, baseRef } = data as Record<string, unknown>;
+  const isSectionKey = (value: unknown) => value === null || (typeof value === 'string' && value.length > 0);
+  return (
+    type === 'graphService:diffScopeCarry' &&
+    typeof projectPath === 'string' &&
+    projectPath.length > 0 &&
+    typeof requestId === 'number' &&
+    isSectionKey(fromSection) &&
+    isSectionKey(toSection) &&
+    typeof baseRef === 'string' &&
+    baseRef.trim().length > 0
+  );
+}
+
+/**
+ * P4-4 phase 3b (founder decision 2026-10-04): may PR Review's base ref
+ * carry from `fromSection` to `toSection` (`null` = `all`: the project root)?
+ * Only for the active project, and only for sections in the live allowlist
+ * (any other is `not-carried`, never a folder outside the scope). The
+ * repository check is `decideDiffScopeCarry` (git-diff-scope.ts). Never
+ * throws.
+ */
+export async function computeDiffScopeCarryResult(
+  projectPath: string,
+  fromSection: string | null,
+  toSection: string | null,
+  baseRef: string,
+): Promise<DiffScopeCarryResult> {
+  const projectRoot = activeProjectPath;
+  if (!projectRoot || projectRoot !== projectPath) {
+    return { status: 'error', message: 'The requested project is not the currently active project.' };
+  }
+  const folderOf = (section: string | null): string | undefined =>
+    section === null ? projectRoot : activeIncludedPaths.includes(section) ? path.join(projectRoot, section) : undefined;
+  const fromDir = folderOf(fromSection);
+  const toDir = folderOf(toSection);
+  if (fromDir === undefined || toDir === undefined) {
+    return { status: 'not-carried' };
+  }
+  return { status: await decideDiffScopeCarry(fromDir, toDir, baseRef) };
+}
+
+/** P4-4 phase 3b: posts the `graphService:diffScopeCarryResult` reply. */
+function postDiffScopeCarryResultMessage(message: GraphServiceDiffScopeCarryResultMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+async function handleDiffScopeCarryRequest(request: GraphServiceDiffScopeCarryRequest): Promise<void> {
+  let result: DiffScopeCarryResult;
+  try {
+    result = await computeDiffScopeCarryResult(
+      request.projectPath,
+      request.fromSection,
+      request.toSection,
+      request.baseRef,
+    );
+  } catch (error) {
+    result = { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+  postDiffScopeCarryResultMessage({
+    type: 'graphService:diffScopeCarryResult',
+    projectPath: request.projectPath,
+    requestId: request.requestId,
+    result,
+  });
 }
 
 /** True for a recognized `CloudBackend` value — shared by both message-shape guards below. */
@@ -3105,6 +3185,11 @@ process.parentPort?.on('message', (event) => {
       requestId,
       result: INVALID_SECTION_RESULT,
     });
+    return;
+  }
+  if (!isShuttingDown && isDiffScopeCarryRequest(event.data)) {
+    // P4-4 phase 3b: posts its own reply; never throws.
+    void handleDiffScopeCarryRequest(event.data);
     return;
   }
   if (!isShuttingDown && isExpandBlastRadiusRequest(event.data)) {

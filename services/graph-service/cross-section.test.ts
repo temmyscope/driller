@@ -763,3 +763,85 @@ describe('P4-4 phase 3a: MCP parity', () => {
     assert.ok(!('changedInOtherSections' in unsectioned));
   });
 });
+
+// ---------------------------------------------------------------------------
+// P4-4h (founder decision 2026-10-04): does PR Review's base ref carry over a
+// section switch?
+// ---------------------------------------------------------------------------
+
+describe('P4-4h: decideDiffScopeCarry (temp repositories)', { skip: !GIT_AVAILABLE && 'git is not installed' }, () => {
+  it('same repository; another repository with or without the ref; no repository; option-like ref', { timeout: 30_000 }, async () => {
+    const { decideDiffScopeCarry } = await import('./git-diff-scope');
+    const root = makeTempDir('driller-carry-repos-');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], {
+        cwd,
+        stdio: 'pipe',
+      });
+    for (const repo of ['one', 'two']) {
+      mkdirSync(path.join(root, repo, 'a'), { recursive: true });
+      mkdirSync(path.join(root, repo, 'b'), { recursive: true });
+      writeFileSync(path.join(root, repo, 'a', 'x.ts'), '// x\n');
+      git(path.join(root, repo), 'init', '-q', '-b', 'main');
+      git(path.join(root, repo), 'add', '.');
+      git(path.join(root, repo), 'commit', '-q', '-m', 'base');
+    }
+    git(path.join(root, 'one'), 'tag', 'only-in-one');
+    mkdirSync(path.join(root, 'plain'));
+    const one = path.join(root, 'one');
+    const two = path.join(root, 'two');
+
+    assert.equal(await decideDiffScopeCarry(path.join(one, 'a'), path.join(one, 'b'), 'whatever'), 'same-repository');
+    assert.equal(await decideDiffScopeCarry(path.join(one, 'a'), two, 'main'), 'ref-exists');
+    assert.equal(await decideDiffScopeCarry(path.join(one, 'a'), two, 'only-in-one'), 'not-carried');
+    assert.equal(await decideDiffScopeCarry(path.join(root, 'plain'), two, 'main'), 'ref-exists', 'from no repository: the ref decides');
+    assert.equal(await decideDiffScopeCarry(one, path.join(root, 'plain'), 'main'), 'not-carried', 'to no repository');
+    assert.equal(await decideDiffScopeCarry(one, path.join(root, 'missing'), 'main'), 'not-carried', 'a git call that fails');
+    assert.equal(await decideDiffScopeCarry(one, two, '--all'), 'not-carried', 'never an option');
+    assert.equal(await decideDiffScopeCarry(one, two, '   '), 'not-carried');
+  });
+});
+
+describe('P4-4h: the base-ref carry through index.ts', { skip: !GIT_AVAILABLE && 'git is not installed' }, () => {
+  it('same repository, another repository with / without the ref, and every guard', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    setScope(['web', 'api', 'docs']);
+    await requestMap();
+    // docs/ is its own repository (makeGitRepo); give it one commit and a tag.
+    const docs = path.join(PROJECT, 'docs');
+    execFileSync(
+      'git',
+      ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'docs'],
+      { cwd: docs, stdio: 'pipe' },
+    );
+    execFileSync('git', ['tag', 'docs-release'], { cwd: docs, stdio: 'pipe' });
+
+    assert.deepEqual(await indexModule.computeDiffScopeCarryResult(PROJECT, 'web', 'api', 'feature'), { status: 'same-repository' });
+    assert.deepEqual(await indexModule.computeDiffScopeCarryResult(PROJECT, null, 'api', 'main'), { status: 'same-repository' });
+    assert.deepEqual(await indexModule.computeDiffScopeCarryResult(PROJECT, 'web', 'docs', 'docs-release'), { status: 'ref-exists' });
+    assert.deepEqual(await indexModule.computeDiffScopeCarryResult(PROJECT, 'web', 'docs', 'feature'), { status: 'not-carried' });
+    assert.deepEqual(await indexModule.computeDiffScopeCarryResult(PROJECT, 'web', 'gone', 'main'), { status: 'not-carried' });
+    assert.deepEqual(await indexModule.computeDiffScopeCarryResult(PROJECT, '../..', 'web', 'main'), { status: 'not-carried' });
+    assert.equal((await indexModule.computeDiffScopeCarryResult('/elsewhere', 'web', 'api', 'main')).status, 'error');
+  });
+
+  it('answers a parentPort request with its own requestId; a malformed one gets no reply', { timeout: 30_000 }, async () => {
+    setScope(['web', 'api']);
+    await requestMap();
+    const from = posted.length;
+    send({ type: 'graphService:diffScopeCarry', projectPath: PROJECT, requestId: 41, fromSection: 'web', toSection: 'api', baseRef: 'main' });
+    send({ type: 'graphService:diffScopeCarry', projectPath: PROJECT, requestId: 42, fromSection: '', toSection: 'api', baseRef: 'main' });
+    const reply = await waitFor(
+      () => posted.slice(from).find((m) => m.type === 'graphService:diffScopeCarryResult' && m.requestId === 41),
+      'a carry reply',
+    );
+    assert.deepEqual(reply, {
+      type: 'graphService:diffScopeCarryResult',
+      projectPath: PROJECT,
+      requestId: 41,
+      result: { status: 'same-repository' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(posted.slice(from).some((m) => m.requestId === 42), false);
+  });
+});

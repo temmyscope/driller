@@ -98,6 +98,9 @@ export const SECTION_PANEL_ID = 'section-panel';
 
 export const SECTION_BAR_HINT_ID = 'section-bar-hint';
 
+/** Why a section switch is unavailable — the Section bar's hint, reused by every other switch button (P4-4h). */
+export const SECTION_SWITCH_UNAVAILABLE_HINT = 'Sections switch once the map is live again';
+
 /** The id of the selected tab, for the tabpanel's `aria-labelledby`; `undefined` when none is selected. */
 export function selectedSectionTabId(sections: readonly SectionNodeCount[], section: string | null): string | undefined {
   const index = sectionTabs(sections).findIndex((tab) => tab.path === section);
@@ -192,7 +195,7 @@ export function SectionBar({
       </div>
       {!enabled && (
         <span id={SECTION_BAR_HINT_ID} className="section-bar__hint">
-          Sections switch once the map is live again
+          {SECTION_SWITCH_UNAVAILABLE_HINT}
         </span>
       )}
     </div>

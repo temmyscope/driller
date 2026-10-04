@@ -171,7 +171,11 @@ describe('Blast Radius unknown-section ends idle on all (P4-4e review (d))', () 
   });
 
   it('…and that reload is loadCodeMap, keyed on the section, which resets the expansion to idle', () => {
-    assert.match(codeMapSrc, /useEffect\(\(\) => \{\s*loadCodeMap\(\);\s*\}, \[loadCodeMap, section\]\);/);
+    // P4-4h (founder decision 2026-10-04): the effect also starts a PR Review carry after the reset.
+    assert.match(
+      codeMapSrc,
+      /useEffect\(\(\) => \{[^}]*const carry = diffScopeCarryCandidate\(\{ \.\.\.diffCarrySourceRef\.current, from, to: section \}\);\s*loadCodeMap\(\);[\s\S]*?\}, \[loadCodeMap, section\]\);/,
+    );
     const body = loadCodeMapBody();
     assert.match(body, /setBlastRadiusState\(\{ status: 'idle' \}\);/);
     assert.match(body, /blastRadiusRequestIdRef\.current \+= 1;/);
@@ -348,7 +352,14 @@ describe('App source: shell state and wiring', () => {
   });
 
   it('resets the section on a project open (with the mode) and on Close', () => {
-    assert.match(appSrc, /setMode\(wasAlreadyInRecentProjects \? 'codeMap' : 'healthAudit'\);\s*setSectionShell\(INITIAL_SECTION_SHELL_STATE\);/);
-    assert.match(appSrc, /setMode\('codeMap'\);\s*setSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*focusOpenFolderAfterCloseRef/);
+    assert.match(
+      appSrc,
+      /setMode\(wasAlreadyInRecentProjects \? 'codeMap' : 'healthAudit'\);\s*setSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);/,
+    );
+    // P4-4 phase 3b: a pending cross-section focus goes with it.
+    assert.match(
+      appSrc,
+      /setMode\('codeMap'\);\s*setSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);\s*focusOpenFolderAfterCloseRef/,
+    );
   });
 });

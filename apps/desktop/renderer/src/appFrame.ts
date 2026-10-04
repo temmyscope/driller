@@ -8,7 +8,12 @@
  * (EXPERIENCE.md: "never specify data the product cannot produce"). That is
  * why there is no git branch in the titlebar — nothing supplies it.
  */
-import type { DiffScopeResult, GraphServiceStatusMessage, SectionNodeCount } from '@driller/ipc-contracts';
+import type {
+  CrossSectionEdgeCount,
+  DiffScopeResult,
+  GraphServiceStatusMessage,
+  SectionNodeCount,
+} from '@driller/ipc-contracts';
 
 import type { CodeMapMode } from './CodeMap';
 import { formatCount, formatMapCounts } from './format';
@@ -35,6 +40,12 @@ export type MapFooterState =
       sections: readonly SectionNodeCount[];
       /** P4-4d review round 1: the section the reply is for (`null` = `all`). */
       section: string | null;
+      /**
+       * P4-4 phase 3b: the reply's `crossSectionEdges` (P4-4g) — the edges the
+       * section's filter dropped, per other section and direction. Absent for
+       * none, and on every whole-scope reply.
+       */
+      crossSectionEdges?: readonly CrossSectionEdgeCount[];
     };
 
 /**
@@ -55,6 +66,7 @@ export function mapFooterState(
         appliedScope: readonly string[];
         sections?: readonly SectionNodeCount[];
         section?: string | null;
+        crossSectionEdges?: readonly CrossSectionEdgeCount[];
       },
 ): MapFooterState {
   switch (fetchState.status) {
@@ -70,6 +82,9 @@ export function mapFooterState(
         appliedScope: fetchState.appliedScope,
         sections: fetchState.sections ?? [],
         section: fetchState.section ?? null,
+        ...(fetchState.crossSectionEdges !== undefined && fetchState.crossSectionEdges.length > 0
+          ? { crossSectionEdges: fetchState.crossSectionEdges }
+          : {}),
       };
   }
 }
@@ -85,6 +100,23 @@ function sameSections(a: readonly SectionNodeCount[], b: readonly SectionNodeCou
   );
 }
 
+function sameCrossSectionEdges(
+  a: readonly CrossSectionEdgeCount[] | undefined,
+  b: readonly CrossSectionEdgeCount[] | undefined,
+): boolean {
+  const left = a ?? [];
+  const right = b ?? [];
+  return (
+    left.length === right.length &&
+    left.every(
+      (entry, index) =>
+        entry.section === right[index]?.section &&
+        entry.outgoing === right[index]?.outgoing &&
+        entry.incoming === right[index]?.incoming,
+    )
+  );
+}
+
 export function sameMapFooterState(a: MapFooterState, b: MapFooterState): boolean {
   if (a.status !== b.status) {
     return false;
@@ -96,7 +128,8 @@ export function sameMapFooterState(a: MapFooterState, b: MapFooterState): boolea
       a.edges === b.edges &&
       a.section === b.section &&
       sameStrings(a.appliedScope, b.appliedScope) &&
-      sameSections(a.sections, b.sections))
+      sameSections(a.sections, b.sections) &&
+      sameCrossSectionEdges(a.crossSectionEdges, b.crossSectionEdges))
   );
 }
 
@@ -261,6 +294,99 @@ export function applyUnknownSection(state: SectionShellState, section: string): 
     return state;
   }
   return { section: null, announcement: unknownSectionAnnouncement(section), pending: false };
+}
+
+// ---------------------------------------------------------------------------
+// P4-4 phase 3b: cross-section honesty — the footer line, and the switch that
+// lands on a Node in another section
+// ---------------------------------------------------------------------------
+
+/**
+ * One section's directions, a 0 direction left out, each with its own noun
+ * (review round 1): "1 edge into web/, 3 edges from web/".
+ */
+function crossSectionEdgeText(entry: CrossSectionEdgeCount): string | null {
+  const parts: string[] = [];
+  for (const [count, preposition] of [
+    [entry.outgoing, 'into'],
+    [entry.incoming, 'from'],
+  ] as const) {
+    if (count > 0) {
+      parts.push(`${formatCount(count, 'edge', 'edges')} ${preposition} ${entry.section}/`);
+    }
+  }
+  return parts.length > 0 ? parts.join(', ') : null;
+}
+
+/**
+ * P4-4 phase 3b: the footer line for a section map's `crossSectionEdges`
+ * (P4-4g, split by direction — founder decision 2026-10-03): "9 edges into
+ * web/, 3 edges from web/ — not shown in this section". Several sections are
+ * joined with " · " in the reply's order ("… · 3 edges into docs/ — …"); a
+ * direction with a 0 count is left out; every count carries its own
+ * "edge"/"edges". Every number is the field's own, never computed here.
+ * `null` for an absent or empty list, or one with no count above 0.
+ */
+export function crossSectionEdgesLine(crossSectionEdges: readonly CrossSectionEdgeCount[] | undefined): string | null {
+  const texts = (crossSectionEdges ?? [])
+    .map(crossSectionEdgeText)
+    .filter((text): text is string => text !== null);
+  return texts.length === 0 ? null : `${texts.join(' · ')} — not shown in this section`;
+}
+
+/**
+ * P4-4 review round 1: the footer line's text from one render to the next.
+ * While a section switch is pending, or the map is reloading, the previous
+ * text is kept — so the polite status region never announces a half-way
+ * state, and a full reload landing the same counts changes no text (nothing
+ * is re-announced). Otherwise it is `footerCrossSectionLine`.
+ */
+export function nextFooterCrossSectionLine(
+  previous: string | null,
+  map: MapFooterState | null,
+  switchPending: boolean,
+): string | null {
+  if (switchPending || map?.status === 'loading') {
+    return previous;
+  }
+  return footerCrossSectionLine(map);
+}
+
+/**
+ * P4-4 phase 3b: the footer line for the map on screen — only a ready
+ * section map's (never `all`, never while loading), else `null`.
+ */
+export function footerCrossSectionLine(map: MapFooterState | null): string | null {
+  if (map?.status !== 'ready' || map.section === null) {
+    return null;
+  }
+  return crossSectionEdgesLine(map.crossSectionEdges);
+}
+
+/**
+ * P4-4 phase 3b: a switch asked to land on a Node of the target section once
+ * its map is ready (Node detail's "Calls into other sections").
+ */
+export interface PendingSectionFocus {
+  section: string;
+  nodeId: string;
+}
+
+/**
+ * The switch's pending focus: one for a `focusNodeId`, none without (the
+ * PR Review line's switch, or a Section bar tab, cancels an earlier one).
+ */
+export function pendingFocusForSwitch(section: string, focusNodeId?: string): PendingSectionFocus | null {
+  return focusNodeId === undefined ? null : { section, nodeId: focusNodeId };
+}
+
+/**
+ * The one-shot `pendingFocusNodeId` `CodeMap` receives: the pending Node only
+ * while its section is the selected one — a later switch elsewhere (or the
+ * fallback to `all`) never lands it on the wrong map.
+ */
+export function pendingFocusNodeIdFor(pending: PendingSectionFocus | null, section: string | null): string | null {
+  return pending !== null && pending.section === section ? pending.nodeId : null;
 }
 
 // ---------------------------------------------------------------------------
