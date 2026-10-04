@@ -289,11 +289,200 @@ export function applyMapReportToSectionShell(state: SectionShellState, map: MapF
  * and say so. Ignored unless it is the section still selected — a late
  * report about a section the user already left must not undo their choice.
  */
-export function applyUnknownSection(state: SectionShellState, section: string): SectionShellState {
+export function applyUnknownSection(state: SectionShellState, section: string, silent = false): SectionShellState {
   if (state.section !== section) {
     return state;
   }
+  // P4-4i: `silent` — a remembered section rejected on the launch path
+  // falls back to `all` without a word (AD-5, "Remembered section").
+  if (silent) {
+    return INITIAL_SECTION_SHELL_STATE;
+  }
   return { section: null, announcement: unknownSectionAnnouncement(section), pending: false };
+}
+
+// ---------------------------------------------------------------------------
+// P4-4i: the remembered section (AD-5, "Remembered section")
+// ---------------------------------------------------------------------------
+
+/** How many different entries an allowlist has — the Section bar's own measure (2 or more shows it). */
+function distinctEntries(includedPaths: readonly string[]): number {
+  return new Set(includedPaths).size;
+}
+
+/**
+ * P4-4i: the saved section to open in, checked against the project's
+ * persisted allowlist (`getProjectScope(...).includedPaths`): used only when
+ * it is one of the entries and the allowlist has 2 or more (the Section bar
+ * is shown). Anything else is `null` (`all`).
+ */
+export function resolveSavedSection(saved: string | null, includedPaths: readonly string[]): string | null {
+  if (saved === null || distinctEntries(includedPaths) < 2 || !includedPaths.includes(saved)) {
+    return null;
+  }
+  return saved;
+}
+
+/**
+ * P4-4i: the result of reading a project's saved section on open: the
+ * section to open in (`null` = `all`), and whether a saved value turned out
+ * to be stale and must be cleared.
+ */
+export interface SavedSectionRead {
+  section: string | null;
+  clear: boolean;
+}
+
+/**
+ * P4-4i: reads the saved section and the persisted allowlist together (one
+ * round trip) and validates the one against the other
+ * (`resolveSavedSection`). A failed or malformed read of either opens in
+ * `all` without clearing anything — a value that can't be checked is not
+ * known to be stale. A getter that throws synchronously (a missing preload
+ * method, say) counts as a failed read. Never rejects. Hookless.
+ */
+export async function loadSavedSection(
+  projectPath: string,
+  getSaved: (projectPath: string) => Promise<string | null>,
+  getScope: (projectPath: string) => Promise<{ includedPaths: string[] }>,
+): Promise<SavedSectionRead> {
+  // Review round 1: each call wrapped in an async function, so a synchronous
+  // throw becomes a rejected read rather than a rejection of this function.
+  const [savedRead, scopeRead] = await Promise.allSettled([
+    (async () => getSaved(projectPath))(),
+    (async () => getScope(projectPath))(),
+  ]);
+  if (savedRead.status === 'rejected') {
+    console.warn('App: could not read the remembered section.', savedRead.reason);
+    return { section: null, clear: false };
+  }
+  const saved: unknown = savedRead.value;
+  if (typeof saved !== 'string' || saved.length === 0) {
+    return { section: null, clear: false };
+  }
+  if (scopeRead.status === 'rejected') {
+    console.warn('App: could not read the indexing scope to check the remembered section.', scopeRead.reason);
+    return { section: null, clear: false };
+  }
+  const includedPaths: unknown = (scopeRead.value as { includedPaths?: unknown } | null)?.includedPaths;
+  if (!Array.isArray(includedPaths) || !includedPaths.every((entry) => typeof entry === 'string')) {
+    return { section: null, clear: false };
+  }
+  const section = resolveSavedSection(saved, includedPaths as string[]);
+  return { section, clear: section === null };
+}
+
+/**
+ * P4-4i review round 1: whether an applied open is a different project from
+ * the one whose shell state (mode, section) is in effect — so the mode and
+ * section reset. `previousOpenPath` must be that project, never a path set
+ * early for the status filter (`handleOpenRecent`). Re-selecting the open
+ * project is not a different project.
+ */
+export function isDifferentProjectOpen(previousOpenPath: string | null, openedPath: string): boolean {
+  return previousOpenPath !== openedPath;
+}
+
+/**
+ * P4-4i: remembers `section` (`null` = `all`) for `projectPath`. A failure is
+ * logged and otherwise ignored — the section on screen is unaffected. Never
+ * rejects. Hookless.
+ */
+export async function rememberSection(
+  projectPath: string,
+  section: string | null,
+  set: (projectPath: string, section: string | null) => Promise<string | null>,
+): Promise<void> {
+  try {
+    await set(projectPath, section);
+  } catch (error) {
+    console.warn('App: could not remember the section.', error);
+  }
+}
+
+/**
+ * P4-4i: the shell state a project opens in once its saved section has been
+ * read — that section (or `all`), with nothing to announce and no switch
+ * pending: an open is not a switch, so it is as quiet as opening in `all`.
+ */
+export function restoredSectionShell(section: string | null): SectionShellState {
+  return section === null ? INITIAL_SECTION_SHELL_STATE : { section, announcement: '', pending: false };
+}
+
+/**
+ * P4-4i: which section a shell transition saves — `undefined` for none.
+ * `saved` is what this session last read or saved for the open project.
+ * - Any fallback to `all` from a selected section that is not itself a
+ *   switch (fewer than 2 entries, `unknown-section`, a scope save): `null`,
+ *   so a section the bar no longer offers is never left saved.
+ * - A ready reply for the selected section, with no switch pending, when
+ *   that section isn't what's saved: that section. So a switch is saved only
+ *   once the Graph Service has answered it with a map — never on
+ *   activation, never after a failure or a rejection — and a section that
+ *   is merely restored (already saved) is not written again.
+ * Opening a project (a restore or a reset) is not a transition this sees.
+ */
+export function sectionToRemember(
+  previous: SectionShellState,
+  next: SectionShellState,
+  map: MapFooterState | null,
+  saved: string | null,
+): string | null | undefined {
+  if (next.section === null && previous.section !== null && !next.pending) {
+    return null;
+  }
+  if (!next.pending && map?.status === 'ready' && map.section === next.section && next.section !== saved) {
+    return next.section;
+  }
+  return undefined;
+}
+
+/**
+ * P4-4i: Settings saved a new allowlist for the open project and handed it
+ * to the Graph Service. A selected section it no longer offers falls back to
+ * `all` before the map refetches: silently when fewer than 2 entries are left
+ * (the bar is hidden, as in `applyMapReportToSectionShell`), else with the
+ * `unknown-section` sentence (`applyUnknownSection`).
+ */
+export function applyScopeSavedToSectionShell(
+  state: SectionShellState,
+  includedPaths: readonly string[],
+): SectionShellState {
+  if (state.section === null) {
+    return state;
+  }
+  if (distinctEntries(includedPaths) < 2) {
+    return INITIAL_SECTION_SHELL_STATE;
+  }
+  return includedPaths.includes(state.section) ? state : applyUnknownSection(state, state.section);
+}
+
+/**
+ * P4-4i: which open's saved-section read has settled — the project, and the
+ * read's request id (`createLatestRequestGuard`).
+ */
+export interface SectionRestore {
+  projectPath: string;
+  requestId: number;
+}
+
+/**
+ * P4-4i: `CodeMap` mounts — and so makes its first fetch — only once the
+ * open project's saved section has been read, so a remembered `api` never
+ * flashes `all` first. A settled read for another project, or one a later
+ * open or Close has superseded, doesn't count.
+ */
+export function sectionRestoreSettled(
+  restore: SectionRestore | null,
+  currentProjectPath: string | null,
+  isLatest: (requestId: number) => boolean,
+): boolean {
+  return (
+    restore !== null &&
+    currentProjectPath !== null &&
+    restore.projectPath === currentProjectPath &&
+    isLatest(restore.requestId)
+  );
 }
 
 // ---------------------------------------------------------------------------

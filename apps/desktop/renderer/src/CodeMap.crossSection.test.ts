@@ -488,14 +488,14 @@ describe('App switches through the Section bar path (source)', () => {
   it('handleSwitchSection uses the Section bar\'s transition and keeps the callee', () => {
     const start = appSrc.indexOf('const handleSwitchSection = useCallback(');
     assert.ok(start >= 0);
-    const body = appSrc.slice(start, appSrc.indexOf('}, []);', start));
-    assert.match(body, /setSectionShell\(\(current\) => applySectionActivated\(current, next\)\);/);
+    const body = appSrc.slice(start, appSrc.indexOf('}, [transitionSectionShell]);', start));
+    assert.match(body, /transitionSectionShell\(\(current\) => applySectionActivated\(current, next\)\);/);
     assert.match(body, /setPendingSectionFocus\(pendingFocusForSwitch\(next, focusNodeId\)\);/);
   });
 
   it('a Section bar tab cancels a pending focus', () => {
     const start = appSrc.indexOf('const handleSectionChange = useCallback(');
-    const body = appSrc.slice(start, appSrc.indexOf('}, []);', start));
+    const body = appSrc.slice(start, appSrc.indexOf('}, [transitionSectionShell]);', start));
     assert.match(body, /setPendingSectionFocus\(null\);/);
   });
 

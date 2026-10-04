@@ -101,8 +101,13 @@ import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
 import { getProjectScope, setProjectScope } from './project-scope-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
-import { handleGetShowFoldedKinds, handleSetShowFoldedKinds } from './ui-settings';
-import { showFoldedKindsSetting, uiSettings } from './ui-settings-store';
+import {
+  handleGetActiveSection,
+  handleGetShowFoldedKinds,
+  handleSetActiveSection,
+  handleSetShowFoldedKinds,
+} from './ui-settings';
+import { activeSectionSetting, showFoldedKindsSetting, uiSettings } from './ui-settings-store';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -1990,6 +1995,19 @@ function registerIpcHandlers(): void {
     IpcChannels.settingsSetShowFoldedKinds,
     (_event, projectPath: unknown, show: unknown): boolean =>
       handleSetShowFoldedKinds(showFoldedKindsSetting, projectPath, show),
+  );
+
+  // P4-4i: the last Section bar selection per project — same thin delegation
+  // and untyped-arg discipline. A malformed project path reads as `null` and
+  // stores nothing; a malformed value is a no-op returning what's stored.
+  ipcMain.handle(IpcChannels.settingsGetActiveSection, (_event, projectPath: unknown): string | null =>
+    handleGetActiveSection(activeSectionSetting, projectPath),
+  );
+
+  ipcMain.handle(
+    IpcChannels.settingsSetActiveSection,
+    (_event, projectPath: unknown, section: unknown): string | null =>
+      handleSetActiveSection(activeSectionSetting, projectPath, section),
   );
 
   ipcMain.handle(

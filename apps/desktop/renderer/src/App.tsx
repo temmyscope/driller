@@ -23,6 +23,7 @@ import {
   applyProjectOpenedToFrame,
   applyProjectOpenedToFrameSync,
   applyMapReportToSectionShell,
+  applyScopeSavedToSectionShell,
   applySectionActivated,
   applyUnknownSection,
   deriveFooterBar,
@@ -32,17 +33,25 @@ import {
   frameMapFor,
   frameSectionBarFor,
   frameSyncFor,
+  isDifferentProjectOpen,
+  loadSavedSection,
   mapNodesForStatusLine,
   nextFooterCrossSectionLine,
   nextSyncAgeTickMs,
   pendingFocusForSwitch,
   pendingFocusNodeIdFor,
+  rememberSection,
+  restoredSectionShell,
+  sectionRestoreSettled,
+  sectionToRemember,
   type FrameMapState,
   type PendingSectionFocus,
+  type SectionRestore,
+  type SectionShellState,
   type FrameSyncState,
   type MapFooterState,
 } from './appFrame';
-import { CodeMap, type CodeMapMode } from './CodeMap';
+import { CodeMap, createLatestRequestGuard, type CodeMapMode } from './CodeMap';
 import { createMenuOpenFolderHandler } from './menuOpenFolder';
 import { openModalLayers } from './modalStack';
 import { ModeSwitcher } from './ModeSwitcher';
@@ -190,6 +199,12 @@ export function App() {
   // close over a stale value.
   const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
   const currentProjectPathRef = useRef<string | null>(null);
+  // P4-4i review round 1: the project whose shell state (mode, section) is
+  // in effect — set only where an open is applied and on Close. Unlike
+  // `currentProjectPathRef`, `handleOpenRecent` never sets it early, so an
+  // open from Recent Projects is still recognised as a different project
+  // (`isDifferentProjectOpen`).
+  const openProjectPathRef = useRef<string | null>(null);
   // Story 3.1 (Phase 2): the active mode — first-class shell state (UX-DR9:
   // "never a settings toggle"), independent of `showMap`, so the switcher
   // itself always renders regardless of whether a project is even open yet.
@@ -205,9 +220,57 @@ export function App() {
   // `mode`, kept across a mode switch — plus the text of its one
   // `role="status"` announcement. Every transition is a pure function in
   // appFrame.ts. Reset with `mode` when a different project opens and on
-  // Close; never persisted (that is P4-4i).
+  // Close. P4-4i: remembered per project (AD-5) — restored on open before
+  // `CodeMap` mounts, saved after a successful switch, cleared by every
+  // fallback to `all`. The ref is the synchronous source of truth, so a
+  // transition can be compared with the state it came from (same shape as
+  // `sessionMapRef`); every change goes through `commitSectionShell`.
+  const sectionShellRef = useRef<SectionShellState>(INITIAL_SECTION_SHELL_STATE);
   const [sectionShell, setSectionShell] = useState(INITIAL_SECTION_SHELL_STATE);
+  const commitSectionShell = useCallback((next: SectionShellState) => {
+    if (next === sectionShellRef.current) {
+      return;
+    }
+    sectionShellRef.current = next;
+    setSectionShell(next);
+  }, []);
   const section = sectionShell.section;
+  // P4-4i: the open project's saved section as this session last read or
+  // wrote it (`sectionToRemember` writes only a change), and the section
+  // restored on open until its first ready map lands — an `unknown-section`
+  // for it on that launch path falls back to `all` silently.
+  const savedSectionRef = useRef<string | null>(null);
+  const launchSectionRef = useRef<string | null>(null);
+  // P4-4i: whose saved-section read has settled — `CodeMap` mounts only
+  // after it (`sectionRestoreSettled`), so its first fetch asks for the
+  // remembered section.
+  const sectionRestoreRequests = useRef(createLatestRequestGuard()).current;
+  const [sectionRestore, setSectionRestore] = useState<SectionRestore | null>(null);
+  /** P4-4i: saves `next` for the open project (`null` = `all`, which removes the entry). */
+  const rememberSectionForCurrentProject = useCallback((next: string | null) => {
+    const projectPath = currentProjectPathRef.current;
+    if (projectPath === null) {
+      return;
+    }
+    savedSectionRef.current = next;
+    void rememberSection(projectPath, next, (path, value) => window.driller.setActiveSection(path, value));
+  }, []);
+  /**
+   * P4-4i: one section-shell transition, and whatever it means for the
+   * saved section (`sectionToRemember`).
+   */
+  const transitionSectionShell = useCallback(
+    (transition: (current: SectionShellState) => SectionShellState, map: MapFooterState | null = null) => {
+      const previous = sectionShellRef.current;
+      const next = transition(previous);
+      commitSectionShell(next);
+      const remember = sectionToRemember(previous, next, map, savedSectionRef.current);
+      if (remember !== undefined) {
+        rememberSectionForCurrentProject(remember);
+      }
+    },
+    [commitSectionShell, rememberSectionForCurrentProject],
+  );
   // P4-4 phase 3b: Node detail's cross-section switch asks for its callee to
   // be selected once the new section's map is ready — handed to `CodeMap` as
   // the one-shot `pendingFocusNodeId` while that section is selected, and
@@ -247,9 +310,13 @@ export function App() {
     // pending section switch's announcement, and drop a section whose bar
     // the reply hides (`applyMapReportToSectionShell`).
     if (reportPath !== null && reportPath === currentProjectPathRef.current) {
-      setSectionShell((current) => applyMapReportToSectionShell(current, state));
+      transitionSectionShell((current) => applyMapReportToSectionShell(current, state), state);
+      // P4-4i: the restored section's map landed — the launch path is over.
+      if (state.status === 'ready' && state.section === launchSectionRef.current) {
+        launchSectionRef.current = null;
+      }
     }
-  }, []);
+  }, [transitionSectionShell]);
   // P3-10: when the open project's diff scope last synced, reported by
   // `CodeMap`'s `onDiffScopeSynced` — same drop-other-projects and
   // reset-on-switch/Close rules as `frameMap`. Session-only, never persisted.
@@ -273,6 +340,49 @@ export function App() {
   useEffect(() => {
     currentProjectPathRef.current = currentProjectPath;
   }, [currentProjectPath]);
+
+  // P4-4i: on a project open, read its saved section and its persisted
+  // allowlist (one round trip) before `CodeMap` mounts. A valid section is
+  // restored quietly — not through a Section bar activation: nothing is on
+  // screen to switch from, so there is no loading/result announcement, no
+  // PR Review diff to carry, and never a pending cross-section focus. A
+  // stale one opens in `all` silently and is cleared. A superseded read
+  // (another open, or Close) is dropped.
+  useEffect(() => {
+    const requestId = sectionRestoreRequests.begin();
+    if (currentProjectPath === null) {
+      return;
+    }
+    const projectPath = currentProjectPath;
+    void loadSavedSection(
+      projectPath,
+      (path) => window.driller.getActiveSection(path),
+      (path) => window.driller.getProjectScope(path),
+    ).then((read) => {
+      if (!sectionRestoreRequests.isLatest(requestId) || currentProjectPathRef.current !== projectPath) {
+        return;
+      }
+      savedSectionRef.current = read.section;
+      launchSectionRef.current = read.section;
+      if (read.clear) {
+        void rememberSection(projectPath, null, (path, value) => window.driller.setActiveSection(path, value));
+      }
+      commitSectionShell(restoredSectionShell(read.section));
+      setPendingSectionFocus(null);
+      setSectionRestore({ projectPath, requestId });
+    }).catch((error: unknown) => {
+      // Review round 1: `loadSavedSection` never rejects, but should anything
+      // above throw, the project still opens (in `all`) — `CodeMap` must
+      // always mount.
+      console.warn('App: could not restore the remembered section.', error);
+      if (sectionRestoreRequests.isLatest(requestId) && currentProjectPathRef.current === projectPath) {
+        savedSectionRef.current = null;
+        launchSectionRef.current = null;
+        commitSectionShell(INITIAL_SECTION_SHELL_STATE);
+        setSectionRestore({ projectPath, requestId });
+      }
+    });
+  }, [currentProjectPath, sectionRestoreRequests, commitSectionShell]);
 
   useEffect(() => {
     let cancelled = false;
@@ -334,9 +444,22 @@ export function App() {
   // P2-1: Settings reports each scope save main handed to the running Graph
   // Service. The scope is a query-time filter, so the loaded map is refetched
   // through the same `dataVersion` path — no re-index, no `indexing` status.
-  const handleProjectScopeApplied = useCallback(() => {
-    commitSessionMap(applyProjectScopeAppliedToSessionMap(sessionMapRef.current));
-  }, [commitSessionMap]);
+  //
+  // P4-4i: a selected section the saved allowlist no longer offers (or one
+  // left with fewer than 2 entries) falls back to `all` first, and that is
+  // saved — so the refetch asks for `all`.
+  const handleProjectScopeApplied = useCallback(
+    (includedPaths: readonly string[]) => {
+      const before = sectionShellRef.current;
+      transitionSectionShell((current) => applyScopeSavedToSectionShell(current, includedPaths));
+      if (sectionShellRef.current !== before) {
+        launchSectionRef.current = null;
+        setPendingSectionFocus(null);
+      }
+      commitSessionMap(applyProjectScopeAppliedToSessionMap(sessionMapRef.current));
+    },
+    [commitSessionMap, transitionSectionShell],
+  );
 
   useEffect(() => {
     refetchBackendConfig();
@@ -425,8 +548,10 @@ export function App() {
         // Recent Projects entry) reaches this same `'opened'` case with an
         // unchanged path. Without this guard, that action would silently
         // discard an in-progress PR Review Mode session even though nothing
-        // about the project actually changed — checked against the ref
-        // before it's overwritten just below.
+        // about the project actually changed — checked against
+        // `openProjectPathRef` before it's overwritten just below (P4-4i
+        // review round 1: not `currentProjectPathRef`, which
+        // `handleOpenRecent` sets before this runs).
         //
         // Story 4.1 (UX-DR32): composed with the same guard — a genuinely
         // new open lands on Health Audit Mode by default when this is the
@@ -460,7 +585,7 @@ export function App() {
         // `normalizePathForComparison`. Mirrored here as
         // `normalizePathForComparisonLocal` (see its own doc comment for why
         // this can't just import that function) and applied to both sides.
-        if (result.project.path !== currentProjectPathRef.current) {
+        if (isDifferentProjectOpen(openProjectPathRef.current, result.project.path)) {
           const normalizedNewPath = normalizePathForComparisonLocal(result.project.path);
           const wasAlreadyInRecentProjects =
             recentProjects === null
@@ -469,7 +594,7 @@ export function App() {
                   (project) => normalizePathForComparisonLocal(project.path) === normalizedNewPath,
                 );
           setMode(wasAlreadyInRecentProjects ? 'codeMap' : 'healthAudit');
-          setSectionShell(INITIAL_SECTION_SHELL_STATE);
+          commitSectionShell(INITIAL_SECTION_SHELL_STATE);
           setPendingSectionFocus(null);
         }
         // P2-3: the previous project's map state never labels this one (a
@@ -481,6 +606,7 @@ export function App() {
         // part of producing this very result) could in principle reach
         // this window before React has re-rendered and run that effect.
         currentProjectPathRef.current = result.project.path;
+        openProjectPathRef.current = result.project.path;
         setCurrentProjectPath(result.project.path);
         // P0-3: a map loaded for a different project never survives a switch
         // — but an `indexed` for the NEW project that landed before this
@@ -511,7 +637,7 @@ export function App() {
     // closure was created in — not a stale one frozen at mount, which would
     // permanently read as "always empty" and misclassify every open after
     // the first as a first-ever open.
-  }, [recentProjects, commitSessionMap]);
+  }, [recentProjects, commitSessionMap, commitSectionShell]);
 
   const reportUnexpectedError = useCallback((error: unknown) => {
     setNotice({
@@ -647,6 +773,7 @@ export function App() {
    */
   const handleCloseProject = useCallback(() => {
     currentProjectPathRef.current = null;
+    openProjectPathRef.current = null;
     setCurrentProjectPath(null);
     commitSessionMap(applyProjectClosedToSessionMap(sessionMapRef.current));
     setFrameMap(applyProjectClosedToFrame);
@@ -657,10 +784,10 @@ export function App() {
     // P2-2: with no project open the (disabled) switcher shows Code Map, not
     // the closed project's mode; the first-open rule picks again on open.
     setMode('codeMap');
-    setSectionShell(INITIAL_SECTION_SHELL_STATE);
+    commitSectionShell(INITIAL_SECTION_SHELL_STATE);
     setPendingSectionFocus(null);
     focusOpenFolderAfterCloseRef.current = true;
-  }, [commitSessionMap]);
+  }, [commitSessionMap, commitSectionShell]);
 
   // P2-3: the window title follows the titlebar.
   const title = deriveTitle({ currentProjectPath });
@@ -877,18 +1004,20 @@ export function App() {
   // tabpanel the tabs control, labelled by the selected tab.
   const sectionPanelLabelledBy = sectionBarShown ? selectedSectionTabId(sectionBarSource.sections, section) : undefined;
   const handleSectionChange = useCallback((next: string | null) => {
-    setSectionShell((current) => applySectionActivated(current, next));
+    launchSectionRef.current = null;
+    transitionSectionShell((current) => applySectionActivated(current, next));
     setPendingSectionFocus(null);
-  }, []);
+  }, [transitionSectionShell]);
   // P4-4 phase 3b: a switch asked for by `CodeMap` — PR Review's "changed
   // elsewhere" line, or Node detail's "Calls into other sections" with the
   // callee to select. The Section bar's own switch path: the same section
   // shell transition (full reset in `CodeMap`, the loading and result
   // announcements), plus the pending focus.
   const handleSwitchSection = useCallback((next: string, focusNodeId?: string) => {
-    setSectionShell((current) => applySectionActivated(current, next));
+    launchSectionRef.current = null;
+    transitionSectionShell((current) => applySectionActivated(current, next));
     setPendingSectionFocus(pendingFocusForSwitch(next, focusNodeId));
-  }, []);
+  }, [transitionSectionShell]);
   const handlePendingFocusConsumed = useCallback(() => {
     setPendingSectionFocus(null);
   }, []);
@@ -908,11 +1037,17 @@ export function App() {
   // back to `all`, announced as status text (never an error notice); the
   // section change reloads the map. Wired to `CodeMap`'s fetch, Path Trace,
   // diff scope and Blast Radius expansion alike.
+  //
+  // P4-4i: the persisted value is cleared too. On the launch path (the
+  // restored section, rejected before its first map landed) the fallback is
+  // silent — AD-5: a stale saved section never produces a notice.
   const handleUnknownSection = useCallback((gone: string) => {
-    setSectionShell((current) => applyUnknownSection(current, gone));
+    const silent = launchSectionRef.current === gone;
+    launchSectionRef.current = null;
+    transitionSectionShell((current) => applyUnknownSection(current, gone, silent));
     // Review round 1: a pending cross-section focus goes with the section.
     setPendingSectionFocus(null);
-  }, []);
+  }, [transitionSectionShell]);
 
   return (
     // P2-3: one frame on both screens — titlebar, a body (the landing column
@@ -1064,24 +1199,28 @@ export function App() {
                 user has since navigated away from — reliably non-null here:
                 `showMap` requires `currentProjectPath` to equal the
                 non-null `loadedProjectPath` (P0-3). */}
-            <CodeMap
-              projectPath={currentProjectPath}
-              noSummaryBackendAvailable={noSummaryBackendAvailable}
-              cloudSelectedNoKey={cloudSelectedNoKey}
-              mode={mode}
-              onRequestCodeMapMode={handleRequestCodeMapMode}
-              graphServiceAvailable={graphServiceLive}
-              dataVersion={sessionMap.dataVersion}
-              onMapState={handleMapState}
-              onDiffScopeSynced={handleDiffScopeSynced}
-              onOpenSettings={handleOpenSettingsForScope}
-              onReindex={restartGraphServiceForRetry}
-              section={section}
-              onUnknownSection={handleUnknownSection}
-              onSwitchSection={handleSwitchSection}
-              pendingFocusNodeId={pendingFocusNodeIdFor(pendingSectionFocus, section)}
-              onPendingFocusConsumed={handlePendingFocusConsumed}
-            />
+            {/* P4-4i: mounted once the saved section has been read, so the
+                first fetch asks for it. */}
+            {sectionRestoreSettled(sectionRestore, currentProjectPath, sectionRestoreRequests.isLatest) && (
+              <CodeMap
+                projectPath={currentProjectPath}
+                noSummaryBackendAvailable={noSummaryBackendAvailable}
+                cloudSelectedNoKey={cloudSelectedNoKey}
+                mode={mode}
+                onRequestCodeMapMode={handleRequestCodeMapMode}
+                graphServiceAvailable={graphServiceLive}
+                dataVersion={sessionMap.dataVersion}
+                onMapState={handleMapState}
+                onDiffScopeSynced={handleDiffScopeSynced}
+                onOpenSettings={handleOpenSettingsForScope}
+                onReindex={restartGraphServiceForRetry}
+                section={section}
+                onUnknownSection={handleUnknownSection}
+                onSwitchSection={handleSwitchSection}
+                pendingFocusNodeId={pendingFocusNodeIdFor(pendingSectionFocus, section)}
+                onPendingFocusConsumed={handlePendingFocusConsumed}
+              />
+            )}
           </section>
         </div>
       )}

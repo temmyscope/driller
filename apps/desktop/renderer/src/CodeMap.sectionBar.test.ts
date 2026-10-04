@@ -316,7 +316,7 @@ describe('empty section notice', () => {
 describe('App source: shell state and wiring', () => {
   it('passes the section and the fallback to CodeMap', () => {
     assert.match(appSrc, /section=\{section\}\s*onUnknownSection=\{handleUnknownSection\}/);
-    assert.match(appSrc, /setSectionShell\(\(current\) => applyUnknownSection\(current, gone\)\)/);
+    assert.match(appSrc, /transitionSectionShell\(\(current\) => applyUnknownSection\(current, gone, silent\)\)/);
   });
 
   it('renders the bar from the reply under the header, gated on 2+ applied entries, enabled only while live', () => {
@@ -332,7 +332,7 @@ describe('App source: shell state and wiring', () => {
   it('map reports for the open project settle the section shell', () => {
     assert.match(
       appSrc,
-      /if \(reportPath !== null && reportPath === currentProjectPathRef\.current\) \{\s*setSectionShell\(\(current\) => applyMapReportToSectionShell\(current, state\)\);/,
+      /if \(reportPath !== null && reportPath === currentProjectPathRef\.current\) \{\s*transitionSectionShell\(\(current\) => applyMapReportToSectionShell\(current, state\), state\);/,
     );
   });
 
@@ -354,12 +354,12 @@ describe('App source: shell state and wiring', () => {
   it('resets the section on a project open (with the mode) and on Close', () => {
     assert.match(
       appSrc,
-      /setMode\(wasAlreadyInRecentProjects \? 'codeMap' : 'healthAudit'\);\s*setSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);/,
+      /setMode\(wasAlreadyInRecentProjects \? 'codeMap' : 'healthAudit'\);\s*commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);/,
     );
     // P4-4 phase 3b: a pending cross-section focus goes with it.
     assert.match(
       appSrc,
-      /setMode\('codeMap'\);\s*setSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);\s*focusOpenFolderAfterCloseRef/,
+      /setMode\('codeMap'\);\s*commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);\s*focusOpenFolderAfterCloseRef/,
     );
   });
 });

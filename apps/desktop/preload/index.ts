@@ -191,6 +191,13 @@ const drillerApi: DrillerApi = {
   setShowFoldedKinds: (projectPath: string, show: boolean): Promise<boolean> =>
     ipcRenderer.invoke(IpcChannels.settingsSetShowFoldedKinds, projectPath, show),
 
+  // P4-4i: the last Section bar selection per project.
+  getActiveSection: (projectPath: string): Promise<string | null> =>
+    ipcRenderer.invoke(IpcChannels.settingsGetActiveSection, projectPath),
+
+  setActiveSection: (projectPath: string, section: string | null): Promise<string | null> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetActiveSection, projectPath, section),
+
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),
 

@@ -1343,6 +1343,8 @@ export const IpcChannels = {
   settingsSetProjectScope: 'settings:setProjectScope',
   settingsGetShowFoldedKinds: 'settings:getShowFoldedKinds',
   settingsSetShowFoldedKinds: 'settings:setShowFoldedKinds',
+  settingsGetActiveSection: 'settings:getActiveSection',
+  settingsSetActiveSection: 'settings:setActiveSection',
   prBotRunIngestion: 'prBot:runIngestion',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
@@ -1561,6 +1563,19 @@ export interface DrillerApi {
    * render-only preference: nothing is re-indexed or recomputed.
    */
   setShowFoldedKinds: (projectPath: string, show: boolean) => Promise<boolean>;
+  /**
+   * P4-4i: one project's last selected section (AD-5, "Remembered section")
+   * — `null` (`all`) when nothing is saved. Not validated against the
+   * project's allowlist: the renderer checks it against `getProjectScope`
+   * before using it.
+   */
+  getActiveSection: (projectPath: string) => Promise<string | null>;
+  /**
+   * P4-4i: remembers one project's section in the UI settings store and
+   * resolves with the value now in effect. `null` (`all`) removes the
+   * project's entry — the string `"all"` is never stored for it.
+   */
+  setActiveSection: (projectPath: string, section: string | null) => Promise<string | null>;
   /**
    * Runs one PR-bot's ingestion pass against `projectPath` (Story 2.3, Phase
    * 2) — this phase's only entry point (Never: "Any UI trigger, entry

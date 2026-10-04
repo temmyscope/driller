@@ -4,7 +4,8 @@
  * `{zoomFactor: 1, showFoldedKindsByProject: {}}` (P4-2 phase 3c: the
  * per-project "Show types & modules" canvas toggle). A corrupted file or
  * an unwritable `userData` directory falls back to an in-memory store for
- * the session (same discipline as project-scope-settings.ts). All
+ * the session (same discipline as project-scope-settings.ts). P4-4i adds
+ * `activeSectionByProject`, the last Section bar selection per project. All
  * validation and caching live in ui-settings.ts.
  */
 
@@ -12,8 +13,10 @@ import Store from 'electron-store';
 
 import { DEFAULT_ZOOM_FACTOR } from './app-menu';
 import {
+  createActiveSectionSetting,
   createShowFoldedKindsSetting,
   createUiSettings,
+  type ActiveSectionBackingStore,
   type ShowFoldedKindsBackingStore,
   type UiSettingsBackingStore,
 } from './ui-settings';
@@ -22,18 +25,20 @@ interface UiSettingsSchema {
   zoomFactor: number;
   /** P4-2 phase 3c: projects whose canvas shows folded types & modules (only `true` entries). */
   showFoldedKindsByProject: Record<string, boolean>;
+  /** P4-4i: each project's last selected section (no entry = `all`). */
+  activeSectionByProject: Record<string, string>;
 }
 
 function openStore(): Store<UiSettingsSchema> {
   return new Store<UiSettingsSchema>({
     name: 'driller-ui-settings',
-    defaults: { zoomFactor: DEFAULT_ZOOM_FACTOR, showFoldedKindsByProject: {} },
+    defaults: { zoomFactor: DEFAULT_ZOOM_FACTOR, showFoldedKindsByProject: {}, activeSectionByProject: {} },
   });
 }
 
 let sharedStore: Store<UiSettingsSchema> | null | undefined;
 
-/** One `electron-store` instance for both settings; `null` when it can't be opened. */
+/** One `electron-store` instance for every UI setting; `null` when it can't be opened. */
 function getSharedStore(): Store<UiSettingsSchema> | null {
   if (sharedStore === undefined) {
     try {
@@ -83,7 +88,27 @@ function createShowFoldedKindsBackingStore(): ShowFoldedKindsBackingStore {
   };
 }
 
+function createActiveSectionBackingStore(): ActiveSectionBackingStore {
+  const store = getSharedStore();
+  if (store !== null) {
+    return {
+      get: () => store.get('activeSectionByProject'),
+      set: (value) => store.set('activeSectionByProject', value),
+    };
+  }
+  let inMemory: unknown = {};
+  return {
+    get: () => inMemory,
+    set: (value) => {
+      inMemory = value;
+    },
+  };
+}
+
 export const uiSettings = createUiSettings(createBackingStore());
 
 /** P4-2 phase 3c: the per-project "Show types & modules" canvas toggle. */
 export const showFoldedKindsSetting = createShowFoldedKindsSetting(createShowFoldedKindsBackingStore());
+
+/** P4-4i: the last Section bar selection per project. */
+export const activeSectionSetting = createActiveSectionSetting(createActiveSectionBackingStore());

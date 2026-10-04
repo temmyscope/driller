@@ -220,3 +220,145 @@ export function handleSetShowFoldedKinds(setting: ShowFoldedKindsSetting, projec
   }
   return setting.set(projectPath, show);
 }
+
+// ---------------------------------------------------------------------------
+// P4-4i: the last Section bar selection per project.
+// ---------------------------------------------------------------------------
+
+/** The raw persisted `{projectPath: section}` record, as stored — untrusted. */
+export interface ActiveSectionBackingStore {
+  get(): unknown;
+  set(value: Record<string, string>): void;
+}
+
+export interface ActiveSectionSetting {
+  /**
+   * `projectPath`'s last selected section — `null` (the whole scope, `all`)
+   * when unset, invalid or unreadable. Whether it is still in the project's
+   * allowlist is the renderer's check, not this store's.
+   */
+  get(projectPath: string): string | null;
+  /** Stores `section` (`null` = `all`) for `projectPath` and returns what is now in effect. */
+  set(projectPath: string, section: string | null): string | null;
+}
+
+/**
+ * The last section is remembered per project in the UI settings store (AD-5,
+ * "Remembered section"), with the same discipline as
+ * `createShowFoldedKindsSetting`: keys normalised with
+ * `normalizePathForComparison`, a defensive read into a `Map` (a non-object
+ * reads as empty; only a non-empty string value is a section), and no write
+ * until one read has succeeded — changes made meanwhile wait in memory and
+ * are merged in once a read succeeds. A read failure is logged once; a failed
+ * write keeps the value in memory for the session.
+ *
+ * `all` is stored by removing the project's entry, never as the string
+ * `"all"` — so an entry whose value is `"all"` is an ordinary section named
+ * `all`.
+ */
+export function createActiveSectionSetting(
+  store: ActiveSectionBackingStore,
+  log: UiSettingsLog = console,
+): ActiveSectionSetting {
+  let persisted: Map<string, string> | undefined;
+  // `null` = removed (back to `all`), waiting to be merged in.
+  const unsaved = new Map<string, string | null>();
+  let readFailureLogged = false;
+
+  /** Reads the record once; `false` while the store can't be read. */
+  const ensureRead = (): boolean => {
+    if (persisted !== undefined) {
+      return true;
+    }
+    let raw: unknown;
+    try {
+      raw = store.get();
+    } catch (error) {
+      if (!readFailureLogged) {
+        readFailureLogged = true;
+        log.error('Failed to read the remembered sections; keeping changes in memory.', errorMessage(error));
+      }
+      return false;
+    }
+    persisted = new Map();
+    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+      for (const [projectPath, value] of Object.entries(raw)) {
+        if (typeof value === 'string' && value.length > 0) {
+          persisted.set(normalizePathForComparison(projectPath), value);
+        }
+      }
+    }
+    return true;
+  };
+
+  const write = (): void => {
+    const record: Record<string, string> = Object.create(null) as Record<string, string>;
+    for (const [key, value] of persisted ?? []) {
+      record[key] = value;
+    }
+    try {
+      store.set({ ...record });
+    } catch (error) {
+      log.error('Failed to persist the remembered sections.', errorMessage(error));
+    }
+  };
+
+  return {
+    get: (projectPath) => {
+      const key = normalizePathForComparison(projectPath);
+      if (unsaved.has(key)) {
+        return unsaved.get(key) ?? null;
+      }
+      return ensureRead() ? (persisted?.get(key) ?? null) : null;
+    },
+    set: (projectPath, section) => {
+      const key = normalizePathForComparison(projectPath);
+      unsaved.set(key, section);
+      if (!ensureRead() || persisted === undefined) {
+        return section;
+      }
+      for (const [pendingKey, pendingSection] of unsaved) {
+        if (pendingSection === null) {
+          persisted.delete(pendingKey);
+        } else {
+          persisted.set(pendingKey, pendingSection);
+        }
+      }
+      unsaved.clear();
+      write();
+      return section;
+    },
+  };
+}
+
+/**
+ * P4-4i: the `settings:getActiveSection` IPC handler's logic. The argument
+ * crosses the contextBridge untyped: a missing or empty project path reads
+ * as `null` (`all`).
+ */
+export function handleGetActiveSection(setting: ActiveSectionSetting, projectPath: unknown): string | null {
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return null;
+  }
+  return setting.get(projectPath);
+}
+
+/**
+ * P4-4i: the `settings:setActiveSection` IPC handler's logic. A missing or
+ * empty project path stores nothing and returns `null`; a value that is
+ * neither `null` nor a non-empty string stores nothing and returns the
+ * project's current value.
+ */
+export function handleSetActiveSection(
+  setting: ActiveSectionSetting,
+  projectPath: unknown,
+  section: unknown,
+): string | null {
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return null;
+  }
+  if (section !== null && (typeof section !== 'string' || section.length === 0)) {
+    return setting.get(projectPath);
+  }
+  return setting.set(projectPath, section);
+}

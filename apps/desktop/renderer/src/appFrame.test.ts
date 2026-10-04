@@ -6,6 +6,8 @@
  * bars stay put) and is an owed in-app check.
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import type { DiffScopeResult, GraphServiceStatusMessage } from '@driller/ipc-contracts';
@@ -13,7 +15,20 @@ import type { DiffScopeResult, GraphServiceStatusMessage } from '@driller/ipc-co
 import {
   INITIAL_FRAME_MAP_STATE,
   INITIAL_FRAME_SYNC_STATE,
+  INITIAL_SECTION_SHELL_STATE,
   applyDiffScopeSyncToFrame,
+  applyMapReportToSectionShell,
+  applyScopeSavedToSectionShell,
+  applySectionActivated,
+  applyUnknownSection,
+  isDifferentProjectOpen,
+  loadSavedSection,
+  rememberSection,
+  resolveSavedSection,
+  restoredSectionShell,
+  sectionRestoreSettled,
+  sectionToRemember,
+  type SectionShellState,
   applyMapReportToFrame,
   applyProjectClosedToFrame,
   applyProjectClosedToFrameSync,
@@ -693,5 +708,326 @@ describe('the pending cross-section focus', () => {
     assert.equal(pendingFocusNodeIdFor(pending, 'api'), null);
     assert.equal(pendingFocusNodeIdFor(pending, null), null);
     assert.equal(pendingFocusNodeIdFor(null, 'web'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4-4i: the remembered section
+// ---------------------------------------------------------------------------
+
+const appSrc = readFileSync(fileURLToPath(new URL('./App.tsx', import.meta.url)), 'utf8');
+
+/** A ready map report for `section`, over the `web`, `api` allowlist by default. */
+function sectionReady(section: string | null, appliedScope: string[] = ['web', 'api']): MapFooterState {
+  return { status: 'ready', nodes: 10, edges: 0, appliedScope, sections: [], section };
+}
+
+/** Runs `fn` with `console.warn` silenced, returning what was warned. */
+async function quietly<T>(fn: () => Promise<T>): Promise<{ value: T; warnings: unknown[][] }> {
+  const original = console.warn;
+  const warnings: unknown[][] = [];
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args);
+  };
+  try {
+    return { value: await fn(), warnings };
+  } finally {
+    console.warn = original;
+  }
+}
+
+describe('resolveSavedSection (P4-4i)', () => {
+  it('relaunch: a saved section that is in an allowlist of 2 or more is used', () => {
+    assert.equal(resolveSavedSection('api', ['web', 'api']), 'api');
+    assert.equal(resolveSavedSection('all', ['all', 'api']), 'all', 'an entry named all is a normal section');
+  });
+
+  it('stale: a section no longer in the allowlist reads as all', () => {
+    assert.equal(resolveSavedSection('docs', ['web', 'api']), null);
+    assert.equal(resolveSavedSection('api/', ['web', 'api']), null, 'compared verbatim, like the Graph Service');
+  });
+
+  it('allowlist shrank below 2 entries: all, even when the section is the one left', () => {
+    assert.equal(resolveSavedSection('api', ['api']), null);
+    assert.equal(resolveSavedSection('api', ['api', 'api']), null, 'counted by distinct entries, like the Section bar');
+    assert.equal(resolveSavedSection('api', []), null);
+  });
+
+  it('nothing saved: all', () => {
+    assert.equal(resolveSavedSection(null, ['web', 'api']), null);
+  });
+});
+
+describe('loadSavedSection (P4-4i)', () => {
+  const scope = (includedPaths: string[]) => async () => ({ includedPaths });
+
+  it('reads the saved section and the allowlist for the project, together', { timeout: 5_000 }, async () => {
+    const asked: string[] = [];
+    let scopeAskedBeforeSavedResolved = false;
+    let savedResolved = false;
+    const read = await loadSavedSection(
+      '/p',
+      async (path) => {
+        asked.push(`saved:${path}`);
+        await Promise.resolve();
+        savedResolved = true;
+        return 'api';
+      },
+      async (path) => {
+        asked.push(`scope:${path}`);
+        scopeAskedBeforeSavedResolved = !savedResolved;
+        return { includedPaths: ['web', 'api'] };
+      },
+    );
+    assert.deepEqual(read, { section: 'api', clear: false });
+    assert.deepEqual(asked, ['saved:/p', 'scope:/p']);
+    assert.ok(scopeAskedBeforeSavedResolved, 'one round trip: both asked at once');
+  });
+
+  it('a stale or shrunk saved section opens in all and must be cleared', { timeout: 5_000 }, async () => {
+    assert.deepEqual(await loadSavedSection('/p', async () => 'docs', scope(['web', 'api'])), { section: null, clear: true });
+    assert.deepEqual(await loadSavedSection('/p', async () => 'api', scope(['api'])), { section: null, clear: true });
+  });
+
+  it('nothing saved: all, nothing to clear', { timeout: 5_000 }, async () => {
+    assert.deepEqual(await loadSavedSection('/p', async () => null, scope(['web', 'api'])), { section: null, clear: false });
+  });
+
+  it('a failed or malformed read opens in all without clearing; never rejects', { timeout: 5_000 }, async () => {
+    const failing = async (): Promise<never> => {
+      throw new Error('ipc down');
+    };
+    const { value: savedFailed, warnings } = await quietly(() => loadSavedSection('/p', failing, scope(['web', 'api'])));
+    assert.deepEqual(savedFailed, { section: null, clear: false });
+    assert.equal(warnings.length, 1);
+    const { value: scopeFailed } = await quietly(() => loadSavedSection('/p', async () => 'api', failing));
+    assert.deepEqual(scopeFailed, { section: null, clear: false }, 'unchecked is not stale');
+    assert.deepEqual(await loadSavedSection('/p', async () => 42 as unknown as string, scope(['web', 'api'])), {
+      section: null,
+      clear: false,
+    });
+    assert.deepEqual(
+      await loadSavedSection('/p', async () => 'api', async () => ({ includedPaths: 'api' }) as unknown as { includedPaths: string[] }),
+      { section: null, clear: false },
+    );
+  });
+});
+
+describe('rememberSection (P4-4i)', () => {
+  it('passes the section (null = all) through, and never rejects', { timeout: 5_000 }, async () => {
+    const calls: unknown[][] = [];
+    await rememberSection('/p', null, async (path, section) => {
+      calls.push([path, section]);
+      return section;
+    });
+    assert.deepEqual(calls, [['/p', null]], 'all is null, never the string "all"');
+    const { warnings } = await quietly(() =>
+      rememberSection('/p', 'api', async () => {
+        throw new Error('ipc down');
+      }),
+    );
+    assert.equal(warnings.length, 1);
+  });
+});
+
+describe('restoring and saving the section (P4-4i)', () => {
+  it('a restored section is selected quietly: no announcement, no switch pending', () => {
+    assert.deepEqual(restoredSectionShell('api'), { section: 'api', announcement: '', pending: false });
+    assert.equal(restoredSectionShell(null), INITIAL_SECTION_SHELL_STATE);
+  });
+
+  it('a switch is saved only once its own ready reply lands', () => {
+    const loading = applySectionActivated(INITIAL_SECTION_SHELL_STATE, 'api');
+    assert.equal(sectionToRemember(INITIAL_SECTION_SHELL_STATE, loading, null, null), undefined, 'not on activation');
+    // A ready reply for the previous section, while pending: nothing.
+    const stillLoading = applyMapReportToSectionShell(loading, sectionReady(null));
+    assert.equal(sectionToRemember(loading, stillLoading, sectionReady(null), null), undefined);
+    const shown = applyMapReportToSectionShell(loading, sectionReady('api'));
+    assert.equal(sectionToRemember(loading, shown, sectionReady('api'), null), 'api');
+    // Back to all: saved as null once its reply lands.
+    const allLoading = applySectionActivated(shown, null);
+    assert.equal(sectionToRemember(shown, allLoading, null, 'api'), undefined);
+    const allShown = applyMapReportToSectionShell(allLoading, sectionReady(null));
+    assert.equal(sectionToRemember(allLoading, allShown, sectionReady(null), 'api'), null);
+  });
+
+  it('a failed switch is not saved; the section is saved once a ready map for it lands', () => {
+    const loading = applySectionActivated(INITIAL_SECTION_SHELL_STATE, 'api');
+    const failed = applyMapReportToSectionShell(loading, { status: 'error' });
+    assert.equal(sectionToRemember(loading, failed, { status: 'error' }, null), undefined);
+    // Retry: the map reloads in api and lands.
+    assert.equal(sectionToRemember(failed, failed, sectionReady('api'), null), 'api');
+  });
+
+  it('a restored section is not written again by its first map', () => {
+    const restored = restoredSectionShell('api');
+    assert.equal(sectionToRemember(restored, restored, sectionReady('api'), 'api'), undefined);
+    assert.equal(sectionToRemember(INITIAL_SECTION_SHELL_STATE, INITIAL_SECTION_SHELL_STATE, sectionReady(null), null), undefined);
+  });
+
+  it('every fallback to all clears the saved section', () => {
+    const restored = restoredSectionShell('api');
+    // 4d: a reply with fewer than 2 entries resets silently.
+    const shrunk = applyMapReportToSectionShell(restored, sectionReady('api', ['api']));
+    assert.equal(shrunk.section, null);
+    assert.equal(sectionToRemember(restored, shrunk, sectionReady('api', ['api']), 'api'), null);
+    // unknown-section.
+    const gone = applyUnknownSection(restored, 'api');
+    assert.equal(sectionToRemember(restored, gone, null, 'api'), null);
+    // A scope save without the section.
+    const saved = applyScopeSavedToSectionShell(restored, ['web', 'docs']);
+    assert.equal(sectionToRemember(restored, saved, null, 'api'), null);
+  });
+
+  it('the launch-path unknown-section fallback is silent; otherwise it is announced', () => {
+    const restored = restoredSectionShell('api');
+    assert.equal(applyUnknownSection(restored, 'api', true), INITIAL_SECTION_SHELL_STATE);
+    assert.match(applyUnknownSection(restored, 'api').announcement, /no longer in the indexing scope/);
+    assert.equal(applyUnknownSection(restored, 'web', true), restored, 'only for the section still selected');
+  });
+});
+
+describe('applyScopeSavedToSectionShell (P4-4i)', () => {
+  const api: SectionShellState = { section: 'api', announcement: 'Showing section api — 10 Nodes', pending: false };
+
+  it('scope edited while in api: a save without api falls back to all, announced', () => {
+    const next = applyScopeSavedToSectionShell(api, ['web', 'docs']);
+    assert.equal(next.section, null);
+    assert.match(next.announcement, /api is no longer in the indexing scope/);
+  });
+
+  it('a save leaving fewer than 2 entries falls back silently, even when it keeps api', () => {
+    assert.equal(applyScopeSavedToSectionShell(api, ['api']), INITIAL_SECTION_SHELL_STATE);
+    assert.equal(applyScopeSavedToSectionShell(api, []), INITIAL_SECTION_SHELL_STATE);
+  });
+
+  it('a save that keeps api (with 2 or more entries), or with all selected, changes nothing', () => {
+    assert.equal(applyScopeSavedToSectionShell(api, ['web', 'api', 'docs']), api);
+    assert.equal(applyScopeSavedToSectionShell(INITIAL_SECTION_SHELL_STATE, ['api']), INITIAL_SECTION_SHELL_STATE);
+  });
+});
+
+describe('sectionRestoreSettled (P4-4i)', () => {
+  const latest = (id: number) => (requestId: number) => requestId === id;
+
+  it('only the latest settled read for the open project lets CodeMap mount', () => {
+    assert.equal(sectionRestoreSettled(null, '/p', latest(1)), false, 'not read yet');
+    assert.equal(sectionRestoreSettled({ projectPath: '/p', requestId: 1 }, '/p', latest(1)), true);
+    assert.equal(sectionRestoreSettled({ projectPath: '/a', requestId: 1 }, '/p', latest(1)), false, 'another project');
+    assert.equal(
+      sectionRestoreSettled({ projectPath: '/p', requestId: 1 }, '/p', latest(2)),
+      false,
+      'superseded (Close and reopen)',
+    );
+    assert.equal(sectionRestoreSettled({ projectPath: '/p', requestId: 1 }, null, latest(1)), false);
+  });
+});
+
+describe('App source: the remembered section (P4-4i)', () => {
+  function body(start: string, end: string): string {
+    const from = appSrc.indexOf(start);
+    assert.ok(from >= 0, start);
+    const to = appSrc.indexOf(end, from);
+    assert.ok(to > from, end);
+    return appSrc.slice(from, to);
+  }
+
+  it('CodeMap mounts (and fetches) only once the saved section has been read', () => {
+    assert.match(
+      appSrc,
+      /\{sectionRestoreSettled\(sectionRestore, currentProjectPath, sectionRestoreRequests\.isLatest\) && \(\s*<CodeMap\s+projectPath=\{currentProjectPath\}/,
+    );
+    assert.equal((appSrc.match(/<CodeMap\b/g) ?? []).length, 1, 'no other, ungated CodeMap');
+  });
+
+  it('the open path reads, validates and restores the section quietly, clearing a stale one', () => {
+    const effect = body('const requestId = sectionRestoreRequests.begin();', '}, [currentProjectPath, sectionRestoreRequests, commitSectionShell]);');
+    assert.match(effect, /if \(currentProjectPath === null\) \{\s*return;\s*\}/);
+    assert.match(effect, /loadSavedSection\(\s*projectPath,\s*\(path\) => window\.driller\.getActiveSection\(path\),\s*\(path\) => window\.driller\.getProjectScope\(path\),/);
+    assert.match(effect, /if \(!sectionRestoreRequests\.isLatest\(requestId\) \|\| currentProjectPathRef\.current !== projectPath\) \{\s*return;/);
+    assert.match(effect, /if \(read\.clear\) \{\s*void rememberSection\(projectPath, null,/);
+    assert.match(effect, /commitSectionShell\(restoredSectionShell\(read\.section\)\);/);
+    assert.doesNotMatch(effect, /applySectionActivated/, 'a restore is not a switch: no announcement, no PR Review carry');
+    // Pending focus is never applied from a restored section.
+    assert.match(effect, /setPendingSectionFocus\(null\);\s*setSectionRestore\(\{ projectPath, requestId \}\);/);
+    assert.match(effect, /savedSectionRef\.current = read\.section;\s*launchSectionRef\.current = read\.section;/);
+  });
+
+  it('every section transition goes through the saving path', () => {
+    const transition = body('const transitionSectionShell = useCallback(', '[commitSectionShell, rememberSectionForCurrentProject],');
+    assert.match(transition, /const remember = sectionToRemember\(previous, next, map, savedSectionRef\.current\);/);
+    assert.match(transition, /if \(remember !== undefined\) \{\s*rememberSectionForCurrentProject\(remember\);/);
+    const remember = body('const rememberSectionForCurrentProject = useCallback(', '}, []);');
+    assert.match(remember, /savedSectionRef\.current = next;/);
+    assert.match(remember, /rememberSection\(projectPath, next, \(path, value\) => window\.driller\.setActiveSection\(path, value\)\)/);
+    // Only the commit itself touches the state setter.
+    assert.equal((appSrc.match(/setSectionShell\(/g) ?? []).length, 1);
+  });
+
+  it('the unknown-section fallback is silent on the launch path only', () => {
+    const handler = body('const handleUnknownSection = useCallback(', '}, [transitionSectionShell]);');
+    assert.match(handler, /const silent = launchSectionRef\.current === gone;/);
+    const mapState = body('const handleMapState = useCallback(', '}, [transitionSectionShell]);');
+    assert.match(mapState, /if \(state\.status === 'ready' && state\.section === launchSectionRef\.current\) \{\s*launchSectionRef\.current = null;/);
+    for (const name of ['handleSectionChange', 'handleSwitchSection']) {
+      assert.match(body(`const ${name} = useCallback(`, '}, [transitionSectionShell]);'), /launchSectionRef\.current = null;/);
+    }
+  });
+
+  it('a scope save re-validates the section before the map refetches', () => {
+    const handler = body('const handleProjectScopeApplied = useCallback(', '[commitSessionMap, transitionSectionShell],');
+    const revalidate = handler.indexOf('transitionSectionShell((current) => applyScopeSavedToSectionShell(current, includedPaths));');
+    const refetch = handler.indexOf('commitSessionMap(applyProjectScopeAppliedToSessionMap(sessionMapRef.current));');
+    assert.ok(revalidate >= 0 && refetch > revalidate);
+    assert.match(handler, /setPendingSectionFocus\(null\);/);
+  });
+
+  it('Settings reports the saved allowlist', () => {
+    const settingsSrc = readFileSync(fileURLToPath(new URL('./Settings.tsx', import.meta.url)), 'utf8');
+    assert.match(settingsSrc, /onProjectScopeApplied\(result\.config\.includedPaths\);/);
+  });
+});
+
+describe('P4-4i review round 1', () => {
+  it('loadSavedSection: a getter that throws synchronously is a failed read, never a rejection', { timeout: 5_000 }, async () => {
+    const throwsNow = (): Promise<never> => {
+      throw new Error('window.driller.getActiveSection is not a function');
+    };
+    const { value: savedThrew } = await quietly(() =>
+      loadSavedSection('/p', throwsNow, async () => ({ includedPaths: ['web', 'api'] })),
+    );
+    assert.deepEqual(savedThrew, { section: null, clear: false });
+    const { value: scopeThrew } = await quietly(() => loadSavedSection('/p', async () => 'api', throwsNow));
+    assert.deepEqual(scopeThrew, { section: null, clear: false });
+  });
+
+  it('App: CodeMap still mounts if restoring the section fails', () => {
+    const from = appSrc.indexOf('const requestId = sectionRestoreRequests.begin();');
+    const effect = appSrc.slice(from, appSrc.indexOf('}, [currentProjectPath, sectionRestoreRequests, commitSectionShell]);', from));
+    assert.match(
+      effect,
+      /\}\)\.catch\(\(error: unknown\) => \{[\s\S]*commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setSectionRestore\(\{ projectPath, requestId \}\);/,
+    );
+  });
+
+  it('isDifferentProjectOpen: another project resets; re-selecting the open one does not', () => {
+    assert.equal(isDifferentProjectOpen(null, '/p'), true, 'first open');
+    assert.equal(isDifferentProjectOpen('/a', '/p'), true);
+    assert.equal(isDifferentProjectOpen('/p', '/p'), false);
+  });
+
+  it('App: an open from Recent Projects resets mode and section (the early status-filter ref is not the guard)', () => {
+    assert.match(
+      appSrc,
+      /if \(isDifferentProjectOpen\(openProjectPathRef\.current, result\.project\.path\)\) \{[\s\S]{0,600}commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);/,
+    );
+    assert.match(appSrc, /currentProjectPathRef\.current = result\.project\.path;\s*openProjectPathRef\.current = result\.project\.path;/);
+    assert.match(appSrc, /currentProjectPathRef\.current = null;\s*openProjectPathRef\.current = null;/);
+    // `handleOpenRecent` sets only the status-filter ref early.
+    const from = appSrc.indexOf('const handleOpenRecent = useCallback(');
+    const openRecent = appSrc.slice(from, appSrc.indexOf('[applyOpenResult, reportUnexpectedError],', from));
+    assert.match(openRecent, /currentProjectPathRef\.current = path;/);
+    assert.doesNotMatch(openRecent, /openProjectPathRef/);
+    assert.equal((appSrc.match(/openProjectPathRef\.current = /g) ?? []).length, 2, 'set only on an applied open and on Close');
   });
 });

@@ -76,9 +76,11 @@ interface SettingsProps {
    * `applied` — handed to the running Graph Service for the open project, so
    * App.tsx refetches the loaded map to show the new scope. Fired after the
    * IPC reply, which main sends only after posting `scopeChanged`, so the
-   * refetch is ordered after the scope change.
+   * refetch is ordered after the scope change. P4-4i: called with the
+   * persisted allowlist, so App can drop a selected section it no longer
+   * offers before the refetch.
    */
-  onProjectScopeApplied: () => void;
+  onProjectScopeApplied: (includedPaths: readonly string[]) => void;
   /**
    * P2-5: true when Settings was opened from the empty map's "Edit indexing
    * scope" — the scope field takes focus once it has loaded.
@@ -1222,7 +1224,7 @@ export function Settings({
         const { notice, refetch } = projectScopeSaveOutcome(result);
         setProjectScopeSavedNotice(notice);
         if (refetch) {
-          onProjectScopeApplied();
+          onProjectScopeApplied(result.config.includedPaths);
         }
       })
       .catch((error) => {
