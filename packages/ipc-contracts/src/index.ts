@@ -76,6 +76,8 @@ export type {
   CodeMapEdge,
   DiffScopeResult,
   BlastRadiusExpansionResult,
+  EntryCandidatesResult,
+  EntryCandidate,
   NodeLookupResult,
   CoverageSummaryResult,
   UnknownSectionResult,

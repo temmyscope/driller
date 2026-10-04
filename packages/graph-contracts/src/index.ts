@@ -519,6 +519,415 @@ export function computeBlastRadiusHopDistances(
 }
 
 // ---------------------------------------------------------------------------
+// P4-7: entry candidates (AD-13 (f), FR-3, FR-4, FR-15).
+//
+// Candidate entry points for the Code Map's Revealed view and the
+// Agent-Facing `list_entry_candidates` tool — one pure function over the
+// same Nodes and edges both transports read, so both get the same answer.
+// The recipe (brief p4-7, Decisions 2026-09-30):
+//  1. take the map Nodes with no incoming caller edge (`CALLS` or `USAGE`
+//     from another map Node — `ENTRY_CALLER_EDGE_KINDS`);
+//  2. rank them by forward reach over those same edge kinds;
+//  3. drop any with reach below `ENTRY_CANDIDATE_MIN_REACH`;
+//  4. cap the list at `ENTRY_CANDIDATE_MAX`.
+// A candidate is a heuristic claim about indexed code, never "the entry
+// point": every "no callers" and every reach count comes from the real
+// edges passed in, nothing from names, exports or CBM's `is_entry_point`.
+//
+// Test code never reaches here: callers pass `fetchProductionCodeMap`'s
+// output (P4-2), which has already dropped test Nodes and their edges. A
+// section's candidates (AD-13 "(f) per section") come from calling this
+// with that section's own Nodes and edges — the caller's job, never a
+// filter over the whole-scope result.
+// ---------------------------------------------------------------------------
+
+/**
+ * P4-7: the edge kinds that make one map Node a caller of another, and that
+ * a candidate's reach walks. `USAGE` counts (Decision 4), so a component
+ * rendered only through JSX is not a root. `IMPORTS` never counts: importing
+ * a module is not calling into it.
+ */
+export const ENTRY_CALLER_EDGE_KINDS: readonly CodeMapEdgeKind[] = ['CALLS', 'USAGE'];
+
+/** P4-7: a root reaching fewer Nodes than this (in indexed code) is not a candidate. */
+export const ENTRY_CANDIDATE_MIN_REACH = 3;
+
+/** P4-7: at most this many candidates are returned; `totalQualifying` counts before the cap. */
+export const ENTRY_CANDIDATE_MAX = 12;
+
+/** P4-7: at most this many `calledAtLoadBy` files are named in a candidate's `reason.loadedBy`. */
+export const ENTRY_CANDIDATE_LOADED_BY_MAX = 3;
+
+/** The structural Node shape `listEntryCandidates` reads — any `CodeMapNode` fits. */
+export type EntryCandidateInputNode = Pick<CodeMapNode, 'id' | 'name' | 'file' | 'startLine' | 'endLine' | 'calledAtLoadBy'>;
+
+/**
+ * P4-7: one candidate entry point. `reach` is the number of distinct Nodes
+ * it reaches forward over `ENTRY_CALLER_EDGE_KINDS` in the given Nodes and
+ * edges, itself excluded — exactly what a full drill from it reveals.
+ *
+ * `reason` is a discriminated union on `kind` so a later phase can add
+ * `{kind: 'pinned'}` without breaking consumers. `'no-callers'`: no other
+ * map Node calls or uses it in indexed code. `loadedBy` names (sorted, at
+ * most `ENTRY_CANDIDATE_LOADED_BY_MAX`) the files whose folded top-level
+ * code calls or uses it (`CodeMapNode.calledAtLoadBy`), and
+ * `loadedByTotal` how many there are; both are absent when there is none.
+ * Being called at load does not disqualify a candidate: top-level code
+ * (`main()`, `app.whenReady().then(createWindow)`) is how programs start.
+ */
+export interface EntryCandidate {
+  id: string;
+  name: string;
+  file: string;
+  startLine: number;
+  endLine: number;
+  reach: number;
+  reason: { kind: 'no-callers'; loadedBy?: string[]; loadedByTotal?: number };
+}
+
+/**
+ * P4-7 (AD-13 (f)): the entry-candidate listing's explicit result state.
+ *  - `'found'`: `candidates` ranked by reach (highest first), then `id`
+ *    ascending, at most `ENTRY_CANDIDATE_MAX`; `totalQualifying` is how many
+ *    qualified before the cap.
+ *  - `'none'`: no Node qualifies (fully cyclic code, or every root reaches
+ *    fewer than `ENTRY_CANDIDATE_MIN_REACH` Nodes) — never "the code has no
+ *    way in".
+ *  - `'error'`: the listing couldn't be attempted (the transport's guards);
+ *    `listEntryCandidates` itself never produces it.
+ *  - `UnknownSectionResult`: a `section` outside the allowlist (AD-13
+ *    "(f) per section"); the transport produces it, never the pure function.
+ */
+export type EntryCandidatesResult =
+  | { status: 'found'; candidates: EntryCandidate[]; totalQualifying: number }
+  | { status: 'none' }
+  | { status: 'error'; message: string }
+  | UnknownSectionResult;
+
+/**
+ * P4-7: the adjacency a candidate's reach is counted on, and the one a
+ * drill from it walks — `buildBidirectionalAdjacency` over only the
+ * `ENTRY_CALLER_EDGE_KINDS` edges, so a stated reach always equals what a
+ * full drill reveals. Dangling edges are dropped by
+ * `buildBidirectionalAdjacency`; self-loops are kept there, and ignored by
+ * `listEntryCandidates`.
+ */
+export function entryReachAdjacency(nodes: PathTraceNode[], edges: PathTraceEdge[]): BidirectionalAdjacency {
+  return buildBidirectionalAdjacency(
+    nodes,
+    edges.filter((edge) => ENTRY_CALLER_EDGE_KINDS.includes(edge.kind)),
+  );
+}
+
+/** `true` when `id` has no caller in `adjacency` other than itself (a self-loop is not a caller). */
+function hasNoCaller(adjacency: BidirectionalAdjacency, id: string): boolean {
+  const callers = adjacency.backward.get(id);
+  return callers === undefined || callers.every((caller) => caller === id);
+}
+
+/** A candidate's `reason`: `no-callers`, plus its load-time callers when there are any. */
+function noCallersReason(calledAtLoadBy: readonly string[] | undefined): EntryCandidate['reason'] {
+  const loadedBy = [...new Set(calledAtLoadBy ?? [])].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  if (loadedBy.length === 0) {
+    return { kind: 'no-callers' };
+  }
+  return {
+    kind: 'no-callers',
+    loadedBy: loadedBy.slice(0, ENTRY_CANDIDATE_LOADED_BY_MAX),
+    loadedByTotal: loadedBy.length,
+  };
+}
+
+/**
+ * P4-7: the reach walks, over Node indices rather than ids. A walk counts
+ * exactly what `directionalHopDistances(forward, [root]).size` counts — the
+ * distinct Nodes reachable forward, the root excluded — with one reused
+ * queue and a generation-stamped `visited`, so it allocates nothing and
+ * hashes no strings (the string-keyed walk took ~700 ms on the 50k dev
+ * fixture, over AD-14's ~150 ms). `entryCandidates.test.ts` proves
+ * `listEntryCandidates` equal to a reference built on that string-keyed
+ * walk, on generated graphs and the fixtures.
+ */
+class EntryReachIndex {
+  /** Compressed forward adjacency: Node `i`'s targets are `targets[offsets[i] .. offsets[i + 1])`. */
+  private readonly offsets: Int32Array;
+  private readonly targets: Int32Array;
+  private readonly visitedStamp: Uint32Array;
+  private readonly queue: Int32Array;
+  private stamp = 0;
+
+  /** `ids` must be unique; edges to an id outside them are dropped (the adjacency has none). */
+  constructor(ids: readonly string[], forward: Map<string, string[]>) {
+    const indexOf = new Map<string, number>();
+    ids.forEach((id, index) => indexOf.set(id, index));
+    this.offsets = new Int32Array(ids.length + 1);
+    const targets: number[] = [];
+    ids.forEach((id, index) => {
+      for (const target of forward.get(id) ?? []) {
+        const targetIndex = indexOf.get(target);
+        if (targetIndex !== undefined) {
+          targets.push(targetIndex);
+        }
+      }
+      this.offsets[index + 1] = targets.length;
+    });
+    this.targets = Int32Array.from(targets);
+    this.visitedStamp = new Uint32Array(ids.length);
+    this.queue = new Int32Array(ids.length);
+  }
+
+  /**
+   * The number of distinct Nodes reachable forward from `root`, `root`
+   * excluded — or, with `limit`, `limit` as soon as that many are found (an
+   * early exit for "reaches at least `limit`").
+   */
+  reach(root: number, limit: number = Number.POSITIVE_INFINITY): number {
+    this.stamp += 1;
+    const { offsets, targets, visitedStamp, queue, stamp } = this;
+    visitedStamp[root] = stamp;
+    queue[0] = root;
+    let head = 0;
+    let tail = 1;
+    while (head < tail) {
+      // Non-null: every queued index and every offset is in range.
+      const node = queue[head]!;
+      for (let edge = offsets[node]!; edge < offsets[node + 1]!; edge += 1) {
+        const next = targets[edge]!;
+        if (visitedStamp[next] !== stamp) {
+          visitedStamp[next] = stamp;
+          queue[tail] = next;
+          tail += 1;
+          if (tail - 1 >= limit) {
+            return limit;
+          }
+        }
+      }
+      head += 1;
+    }
+    return tail - 1;
+  }
+
+  /**
+   * An upper bound on every Node's `reach`, from the condensation of the
+   * graph into strongly connected components (iterative Tarjan, so a deep
+   * graph can't overflow the call stack). A component's reachable-set bound
+   * is its own size plus the bounds of its distinct successor components,
+   * capped at the Node count; a Node's reach bound is its component's bound
+   * minus itself. Exact on a tree; looser where paths share Nodes, never
+   * lower than the true reach. O(V+E).
+   *
+   * Tarjan emits a component only after every component it reaches, so each
+   * successor's bound is known when it is summed.
+   */
+  reachUpperBounds(): Int32Array {
+    const { offsets, targets } = this;
+    const count = offsets.length - 1;
+    const order = new Int32Array(count).fill(-1);
+    const low = new Int32Array(count);
+    const onStack = new Uint8Array(count);
+    const componentStack = new Int32Array(count);
+    const callNode = new Int32Array(count);
+    const callEdge = new Int32Array(count);
+    const component = new Int32Array(count).fill(-1);
+    const componentSetBound: number[] = [];
+    const summedBy = new Int32Array(count).fill(-1);
+    let nextOrder = 0;
+    let componentTop = 0;
+    for (let start = 0; start < count; start += 1) {
+      if (order[start] !== -1) {
+        continue;
+      }
+      let callTop = 0;
+      const enter = (node: number): void => {
+        order[node] = nextOrder;
+        low[node] = nextOrder;
+        nextOrder += 1;
+        componentStack[componentTop] = node;
+        componentTop += 1;
+        onStack[node] = 1;
+        callNode[callTop] = node;
+        callEdge[callTop] = offsets[node]!;
+        callTop += 1;
+      };
+      enter(start);
+      while (callTop > 0) {
+        const node = callNode[callTop - 1]!;
+        const position = callEdge[callTop - 1]!;
+        if (position < offsets[node + 1]!) {
+          callEdge[callTop - 1] = position + 1;
+          const next = targets[position]!;
+          if (order[next] === -1) {
+            enter(next);
+          } else if (onStack[next] === 1) {
+            low[node] = Math.min(low[node]!, order[next]!);
+          }
+          continue;
+        }
+        callTop -= 1;
+        if (callTop > 0) {
+          const parent = callNode[callTop - 1]!;
+          low[parent] = Math.min(low[parent]!, low[node]!);
+        }
+        if (low[node] !== order[node]) {
+          continue;
+        }
+        // `node` roots a component: its members are the stack from `node` up.
+        const id = componentSetBound.length;
+        let from = componentTop - 1;
+        while (componentStack[from] !== node) {
+          from -= 1;
+        }
+        for (let index = from; index < componentTop; index += 1) {
+          const member = componentStack[index]!;
+          onStack[member] = 0;
+          component[member] = id;
+        }
+        let setBound = componentTop - from;
+        for (let index = from; index < componentTop; index += 1) {
+          const member = componentStack[index]!;
+          for (let edge = offsets[member]!; edge < offsets[member + 1]!; edge += 1) {
+            const successor = component[targets[edge]!]!;
+            if (successor !== id && summedBy[successor] !== id) {
+              summedBy[successor] = id;
+              setBound += componentSetBound[successor]!;
+            }
+          }
+        }
+        componentSetBound.push(Math.min(setBound, count));
+        componentTop = from;
+      }
+    }
+    const bounds = new Int32Array(count);
+    for (let node = 0; node < count; node += 1) {
+      bounds[node] = componentSetBound[component[node]!]! - 1;
+    }
+    return bounds;
+  }
+}
+
+/** `true` when `a` ranks ahead of `b`: higher reach, then lower `id` by code unit. */
+function ranksAhead(a: { id: string; reach: number }, b: { id: string; reach: number }): boolean {
+  return a.reach > b.reach || (a.reach === b.reach && a.id < b.id);
+}
+
+/**
+ * P4-7: `listEntryCandidates` plus how much walking it did — a seam for
+ * `entryCandidates.test.ts` (proving the pruning skips work) and
+ * `bench/entryCandidates.bench.ts`. `roots` is the caller-free Node count;
+ * `exactReachWalks` the ids whose reach was walked in full, in walk order.
+ *
+ * Ranking without walking every root in full:
+ *  - every caller-free Node gets an upper bound on its reach
+ *    (`EntryReachIndex.reachUpperBounds`), and they are taken in descending
+ *    bound order, then `id` ascending;
+ *  - while the top `ENTRY_CANDIDATE_MAX` can still change, a root's reach
+ *    is walked in full;
+ *  - once the last-ranked candidate's reach beats the next root's bound
+ *    (ties: equal, and that root's id sorts after it), no later root can
+ *    rank, so the rest are walked only until they reach
+ *    `ENTRY_CANDIDATE_MIN_REACH` Nodes, for `totalQualifying`;
+ *  - once a root's bound is under `ENTRY_CANDIDATE_MIN_REACH`, no later
+ *    root qualifies, and the walk stops.
+ * The result is the same as walking every root in full.
+ */
+export function listEntryCandidatesWithWork(
+  nodes: EntryCandidateInputNode[],
+  edges: PathTraceEdge[],
+): { result: EntryCandidatesResult; roots: number; exactReachWalks: string[] } {
+  const adjacency = entryReachAdjacency(nodes, edges);
+  const nodesById = new Map<string, EntryCandidateInputNode>();
+  for (const node of nodes) {
+    if (!nodesById.has(node.id)) {
+      nodesById.set(node.id, node);
+    }
+  }
+  const ordered = [...nodesById.values()];
+  const roots: number[] = [];
+  ordered.forEach((node, index) => {
+    if (hasNoCaller(adjacency, node.id)) {
+      roots.push(index);
+    }
+  });
+  const exactReachWalks: string[] = [];
+  if (roots.length === 0) {
+    return { result: { status: 'none' }, roots: 0, exactReachWalks };
+  }
+  const reachIndex = new EntryReachIndex(
+    ordered.map((node) => node.id),
+    adjacency.forward,
+  );
+  const bounds = reachIndex.reachUpperBounds();
+  const idOf = (index: number): string => ordered[index]!.id;
+  roots.sort((a, b) => bounds[b]! - bounds[a]! || (idOf(a) < idOf(b) ? -1 : idOf(a) > idOf(b) ? 1 : 0));
+
+  const ranked: EntryCandidate[] = [];
+  let totalQualifying = 0;
+  let ranking = true;
+  for (const root of roots) {
+    const bound = bounds[root]!;
+    if (bound < ENTRY_CANDIDATE_MIN_REACH) {
+      break;
+    }
+    const node = ordered[root]!;
+    if (ranking && ranked.length === ENTRY_CANDIDATE_MAX && !ranksAhead({ id: node.id, reach: bound }, ranked[ranked.length - 1]!)) {
+      ranking = false;
+    }
+    if (!ranking) {
+      if (reachIndex.reach(root, ENTRY_CANDIDATE_MIN_REACH) >= ENTRY_CANDIDATE_MIN_REACH) {
+        totalQualifying += 1;
+      }
+      continue;
+    }
+    exactReachWalks.push(node.id);
+    const reach = reachIndex.reach(root);
+    if (reach < ENTRY_CANDIDATE_MIN_REACH) {
+      continue;
+    }
+    totalQualifying += 1;
+    const candidate: EntryCandidate = {
+      id: node.id,
+      name: node.name,
+      file: node.file,
+      startLine: node.startLine,
+      endLine: node.endLine,
+      reach,
+      reason: noCallersReason(node.calledAtLoadBy),
+    };
+    let position = ranked.length;
+    while (position > 0 && ranksAhead(candidate, ranked[position - 1]!)) {
+      position -= 1;
+    }
+    ranked.splice(position, 0, candidate);
+    if (ranked.length > ENTRY_CANDIDATE_MAX) {
+      ranked.pop();
+    }
+  }
+  const result: EntryCandidatesResult =
+    totalQualifying === 0 ? { status: 'none' } : { status: 'found', candidates: ranked, totalQualifying };
+  return { result, roots: roots.length, exactReachWalks };
+}
+
+/**
+ * P4-7 (AD-13 (f)): the ranked candidate entry points in `nodes`/`edges` —
+ * see this section's comment for the recipe, and `EntryCandidatesResult`.
+ *
+ * Deterministic: the order of `nodes` and `edges` never changes the result
+ * (ranked by reach descending, then `id` ascending by code unit). Node ids
+ * are expected to be unique, as Code Map ids are; a repeated id is listed
+ * once.
+ *
+ * Cost: one adjacency build and one component condensation (O(V+E)), then
+ * a forward walk per caller-free Node — in full only while the top
+ * `ENTRY_CANDIDATE_MAX` can still change, otherwise only until it reaches
+ * `ENTRY_CANDIDATE_MIN_REACH` Nodes (`listEntryCandidatesWithWork`).
+ *
+ * Pure (Always): no I/O, no dependency on any other `@driller/` package.
+ */
+export function listEntryCandidates(nodes: EntryCandidateInputNode[], edges: PathTraceEdge[]): EntryCandidatesResult {
+  return listEntryCandidatesWithWork(nodes, edges).result;
+}
+
+// ---------------------------------------------------------------------------
 // Story 2.3 (Phase 2): file+line-to-enclosing-Node lookup (Design Notes).
 //
 // Lives here, not `services/graph-service` (Design Notes: "transport-

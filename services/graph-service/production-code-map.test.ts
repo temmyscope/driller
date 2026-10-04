@@ -6,10 +6,12 @@
 import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 
+import { listEntryCandidates } from '@driller/graph-contracts';
 import type { CodeMapEdge } from '@driller/ipc-contracts';
 
 import { joinHotspotChangeCounts, type CodeMapNodeWithSignalSources, type FetchCodeMapOptions } from './mcp-client';
 import { fetchProductionCodeMap } from './production-code-map';
+import { isTestPath } from './test-code';
 
 function node(id: string, file: string): CodeMapNodeWithSignalSources {
   return { id, name: id, file, startLine: 1, endLine: 2, kind: 'Function', summaryStatus: 'pending', riskSignals: [] };
@@ -260,5 +262,49 @@ describe('fetchProductionCodeMap', () => {
     const warned = warn.mock.calls.map((call) => String(call.arguments[0]));
     assert.equal(warned.filter((m) => m.includes('/elsewhere/x.ts')).length, 1);
     assert.equal(warned.filter((m) => m.includes('/elsewhere/z.ts')).length, 1);
+  });
+  it('P4-7: entry candidates over its output are never test code, and a load-time caller is a reason, not a caller', { timeout: 10_000 }, async () => {
+    const root = '/home/u/proj-entry';
+    const nodes = [
+      node('run', `${root}/src/run.ts`),
+      node('a', `${root}/src/a.ts`),
+      node('b', `${root}/src/b.ts`),
+      node('c', `${root}/src/c.ts`),
+      { ...node('mod:boot', `${root}/src/boot.ts`), kind: 'Module' as const },
+      // Test code: a caller-free test reaching far more than `run` does.
+      node('t', `${root}/src/run.test.ts`),
+      node('h1', `${root}/test/helpers.ts`),
+      node('h2', `${root}/test/helpers.ts`),
+      node('h3', `${root}/test/helpers.ts`),
+    ];
+    const edges: CodeMapEdge[] = [
+      { source: 'run', target: 'a', kind: 'CALLS' },
+      { source: 'a', target: 'b', kind: 'CALLS' },
+      { source: 'b', target: 'c', kind: 'USAGE' },
+      { source: 'mod:boot', target: 'run', kind: 'CALLS' },
+      { source: 't', target: 'run', kind: 'CALLS' },
+      { source: 't', target: 'h1', kind: 'CALLS' },
+      { source: 'h1', target: 'h2', kind: 'CALLS' },
+      { source: 'h2', target: 'h3', kind: 'CALLS' },
+    ];
+    const result = await fetchProductionCodeMap('p', root, 'test', { fetch: fakeFetch(nodes, edges) });
+    const candidates = listEntryCandidates(result.nodes, result.edges);
+    assert.ok(candidates.status === 'found');
+    assert.ok(candidates.candidates.every((candidate) => !isTestPath(candidate.file)));
+    assert.deepEqual(candidates, {
+      status: 'found',
+      candidates: [
+        {
+          id: 'run',
+          name: 'run',
+          file: 'src/run.ts',
+          startLine: 1,
+          endLine: 2,
+          reach: 3,
+          reason: { kind: 'no-callers', loadedBy: ['src/boot.ts'], loadedByTotal: 1 },
+        },
+      ],
+      totalQualifying: 1,
+    });
   });
 });

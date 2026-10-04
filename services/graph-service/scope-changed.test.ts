@@ -176,6 +176,7 @@ port.postMessage = (message) => {
 
 const PROJECT = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-project-'));
 const OTHER_PROJECT = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-other-'));
+const USER_DATA = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-userdata-'));
 
 const send = (data: unknown): void => {
   port.emit('message', { data });
@@ -250,17 +251,21 @@ describe('graphService:scopeChanged through index.ts', () => {
   before(async () => {
     register(HOOKS, import.meta.url);
     (process as unknown as { parentPort: typeof port }).parentPort = port;
-    process.argv[2] = mkdtempSync(path.join(os.tmpdir(), 'driller-scope-userdata-'));
+    process.argv[2] = USER_DATA;
     await import('./index');
     await index(PROJECT);
   });
 
   // The stubbed `startMcpServer` parks `index.ts`'s live getters on
   // `globalThis`; nothing outside this file reads them, so don't leak them.
+  // Nor the three temp dirs.
   after(() => {
     delete (globalThis as { __scopeTestGetNodes?: unknown }).__scopeTestGetNodes;
     delete (globalThis as { __scopeTestGetFolded?: unknown }).__scopeTestGetFolded;
     delete (globalThis as { __scopeTestGetFoldedTypes?: unknown }).__scopeTestGetFoldedTypes;
+    for (const dir of [PROJECT, OTHER_PROJECT, USER_DATA]) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('filters the next Code Map fetch with the saved scope, posting no status', async () => {

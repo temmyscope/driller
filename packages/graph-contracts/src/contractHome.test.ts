@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 
 import ts from 'typescript';
 
-/** The six Graph Service operation result types (AD-13). */
+/** The Graph Service operation result types (AD-13 (a)–(f)). */
 const OPERATION_RESULT_TYPES = [
   'PathTraceResult',
   'NodeLookupResult',
@@ -44,6 +44,9 @@ const OPERATION_RESULT_TYPES = [
   'IndexCoverageSummary',
   'DiffScopeResult',
   'BlastRadiusExpansionResult',
+  // P4-7 (AD-13 (f)): the entry-candidate listing.
+  'EntryCandidatesResult',
+  'EntryCandidate',
 ] as const;
 
 /** Graph shapes moved with the result types in P4-6: their structural dependencies, plus `CodeMapEdge`/`CodeMapEdgeKind` beside `CodeMapNode`. */
