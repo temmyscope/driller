@@ -1,0 +1,662 @@
+{
+ "plain": [
+  {
+   "id": "src/handleRequest.ts::handleRequest",
+   "type": "codeMapNode",
+   "position": {
+    "x": 0,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/handleRequest.ts::handleRequest",
+     "name": "handleRequest",
+     "file": "src/handleRequest.ts",
+     "startLine": 1,
+     "endLine": 9,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does handleRequest.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 2,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false,
+    "affectedByContracts": [
+     "Request"
+    ]
+   }
+  },
+  {
+   "id": "src/serviceA.ts::serviceA",
+   "type": "codeMapNode",
+   "position": {
+    "x": 260,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/serviceA.ts::serviceA",
+     "name": "serviceA",
+     "file": "src/serviceA.ts",
+     "startLine": 2,
+     "endLine": 10,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/serviceB.ts::serviceB",
+   "type": "codeMapNode",
+   "position": {
+    "x": 520,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/serviceB.ts::serviceB",
+     "name": "serviceB",
+     "file": "src/serviceB.ts",
+     "startLine": 3,
+     "endLine": 11,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": true
+   }
+  },
+  {
+   "id": "src/repository.ts::repository",
+   "type": "codeMapNode",
+   "position": {
+    "x": 780,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/repository.ts::repository",
+     "name": "repository",
+     "file": "src/repository.ts",
+     "startLine": 4,
+     "endLine": 12,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does repository.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 3,
+    "calleeCount": 1,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/cacheLookup.ts::cacheLookup",
+   "type": "codeMapNode",
+   "position": {
+    "x": 0,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/cacheLookup.ts::cacheLookup",
+     "name": "cacheLookup",
+     "file": "src/cacheLookup.ts",
+     "startLine": 5,
+     "endLine": 13,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/helperOne.ts::helperOne",
+   "type": "codeMapNode",
+   "position": {
+    "x": 260,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/helperOne.ts::helperOne",
+     "name": "helperOne",
+     "file": "src/helperOne.ts",
+     "startLine": 6,
+     "endLine": 14,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/helperTwo.ts::helperTwo",
+   "type": "codeMapNode",
+   "position": {
+    "x": 520,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/helperTwo.ts::helperTwo",
+     "name": "helperTwo",
+     "file": "src/helperTwo.ts",
+     "startLine": 7,
+     "endLine": 15,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does helperTwo.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/render.ts::render",
+   "type": "codeMapNode",
+   "position": {
+    "x": 780,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/render.ts::render",
+     "name": "render",
+     "file": "src/render.ts",
+     "startLine": 8,
+     "endLine": 16,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/format.ts::format",
+   "type": "codeMapNode",
+   "position": {
+    "x": 0,
+    "y": 220
+   },
+   "data": {
+    "node": {
+     "id": "src/format.ts::format",
+     "name": "format",
+     "file": "src/format.ts",
+     "startLine": 9,
+     "endLine": 17,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/parse.ts::parse",
+   "type": "codeMapNode",
+   "position": {
+    "x": 260,
+    "y": 220
+   },
+   "data": {
+    "node": {
+     "id": "src/parse.ts::parse",
+     "name": "parse",
+     "file": "src/parse.ts",
+     "startLine": 10,
+     "endLine": 18,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does parse.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  }
+ ],
+ "folded": [
+  {
+   "id": "src/handleRequest.ts::handleRequest",
+   "type": "codeMapNode",
+   "position": {
+    "x": 0,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/handleRequest.ts::handleRequest",
+     "name": "handleRequest",
+     "file": "src/handleRequest.ts",
+     "startLine": 1,
+     "endLine": 9,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does handleRequest.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 2,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false,
+    "affectedByContracts": [
+     "Request"
+    ]
+   }
+  },
+  {
+   "id": "src/serviceA.ts::serviceA",
+   "type": "codeMapNode",
+   "position": {
+    "x": 260,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/serviceA.ts::serviceA",
+     "name": "serviceA",
+     "file": "src/serviceA.ts",
+     "startLine": 2,
+     "endLine": 10,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/serviceB.ts::serviceB",
+   "type": "codeMapNode",
+   "position": {
+    "x": 520,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/serviceB.ts::serviceB",
+     "name": "serviceB",
+     "file": "src/serviceB.ts",
+     "startLine": 3,
+     "endLine": 11,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": true
+   }
+  },
+  {
+   "id": "src/repository.ts::repository",
+   "type": "codeMapNode",
+   "position": {
+    "x": 780,
+    "y": 0
+   },
+   "data": {
+    "node": {
+     "id": "src/repository.ts::repository",
+     "name": "repository",
+     "file": "src/repository.ts",
+     "startLine": 4,
+     "endLine": 12,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does repository.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 3,
+    "calleeCount": 1,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/cacheLookup.ts::cacheLookup",
+   "type": "codeMapNode",
+   "position": {
+    "x": 0,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/cacheLookup.ts::cacheLookup",
+     "name": "cacheLookup",
+     "file": "src/cacheLookup.ts",
+     "startLine": 5,
+     "endLine": 13,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/helperOne.ts::helperOne",
+   "type": "codeMapNode",
+   "position": {
+    "x": 260,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/helperOne.ts::helperOne",
+     "name": "helperOne",
+     "file": "src/helperOne.ts",
+     "startLine": 6,
+     "endLine": 14,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/helperTwo.ts::helperTwo",
+   "type": "codeMapNode",
+   "position": {
+    "x": 520,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/helperTwo.ts::helperTwo",
+     "name": "helperTwo",
+     "file": "src/helperTwo.ts",
+     "startLine": 7,
+     "endLine": 15,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does helperTwo.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/render.ts::render",
+   "type": "codeMapNode",
+   "position": {
+    "x": 780,
+    "y": 110
+   },
+   "data": {
+    "node": {
+     "id": "src/render.ts::render",
+     "name": "render",
+     "file": "src/render.ts",
+     "startLine": 8,
+     "endLine": 16,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/format.ts::format",
+   "type": "codeMapNode",
+   "position": {
+    "x": 0,
+    "y": 220
+   },
+   "data": {
+    "node": {
+     "id": "src/format.ts::format",
+     "name": "format",
+     "file": "src/format.ts",
+     "startLine": 9,
+     "endLine": 17,
+     "kind": "Function",
+     "summaryStatus": "pending",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/parse.ts::parse",
+   "type": "codeMapNode",
+   "position": {
+    "x": 260,
+    "y": 220
+   },
+   "data": {
+    "node": {
+     "id": "src/parse.ts::parse",
+     "name": "parse",
+     "file": "src/parse.ts",
+     "startLine": 10,
+     "endLine": 18,
+     "kind": "Function",
+     "summaryStatus": "ready",
+     "summary": "Does parse.",
+     "riskSignals": []
+    },
+    "onActivate": "fn:onActivate",
+    "onShowNeighbors": "fn:onShowNeighbors",
+    "onOpenSource": "fn:onOpenSource",
+    "callerCount": 0,
+    "calleeCount": 0,
+    "noSummaryBackendAvailable": false,
+    "cloudSelectedNoKey": true,
+    "showDeterministicSignals": true,
+    "showLlmJudgment": false,
+    "showIngestedFindings": true,
+    "isChanged": false
+   }
+  },
+  {
+   "id": "src/types.ts::Request",
+   "type": "codeMapFolded",
+   "position": {
+    "x": 520,
+    "y": 220
+   },
+   "data": {
+    "folded": {
+     "folded": true,
+     "id": "src/types.ts::Request",
+     "name": "Request",
+     "kind": "Interface",
+     "file": "src/types.ts",
+     "startLine": 1,
+     "endLine": 4,
+     "usedByTotal": 1
+    },
+    "onActivate": "fn:onActivate",
+    "isChanged": true
+   }
+  }
+ ]
+}

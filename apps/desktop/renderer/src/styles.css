@@ -1722,6 +1722,73 @@ code,
   padding-left: calc(var(--signal-toggle-box) + var(--signal-toggle-gap));
 }
 
+/* P4-7d: the "Revealed / Full map" control in the canvas Panel — two
+   buttons; the pressed one is filled and its state is `aria-pressed`
+   (never colour alone: the pressed button also carries an underline). */
+.code-map__reveal-toggle {
+  display: flex;
+  margin-top: 0.2rem;
+  border: 1px solid var(--border);
+}
+
+.code-map__reveal-toggle-option {
+  flex: 1;
+  padding: 0.2rem 0.5rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.code-map__reveal-toggle-option[aria-pressed='true'] {
+  background: var(--accent-dim);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.code-map__reveal-toggle-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* P4-7d: the Revealed status line (loading, or the switch to Full). */
+.code-map__reveal-status {
+  margin: 0;
+  max-width: 16rem;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.code-map__reveal-status:empty {
+  display: none;
+}
+
+/* P4-7d: an entry candidate's badge and reason line on its card. */
+.code-map__node-candidate {
+  margin: 0.1rem 0 0;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.code-map__node-candidate-badge {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* P4-7d: the no-candidates / listing-error notice over an empty Revealed
+   canvas — above it, but letting the canvas (and its Panel) take the
+   pointer everywhere except the notice itself. */
+.code-map__notice--reveal {
+  z-index: 4;
+  pointer-events: none;
+}
+
+.code-map__notice--reveal > * {
+  pointer-events: auto;
+}
+
 /* P4-2 phase 3c: a folded Type/Interface/Module card drawn back by "Show
    types & modules" (`CodeMapFoldedCard`): a dashed, dimmed card so it never
    reads as a map Node; its kind label says "folded" in text too. */

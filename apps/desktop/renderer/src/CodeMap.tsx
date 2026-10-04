@@ -110,6 +110,8 @@ import type {
   CrossSectionCall,
   CrossSectionEdgeCount,
   DiffScopeCarryResult,
+  EntryCandidate,
+  EntryCandidatesResult,
   UnknownSectionResult,
 } from '@driller/ipc-contracts';
 import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
@@ -126,6 +128,38 @@ import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
 import { SECTION_SWITCH_UNAVAILABLE_HINT, selectedSectionTabId } from './SectionBar';
+import {
+  candidateAriaSuffix,
+  candidateLoadedBy,
+  candidatesById,
+  drawnRevealState,
+  formatCandidateReason,
+  hiddenNavigationTarget,
+  layeredLayout,
+  needsRevealListing,
+  NODE_COLUMN_GAP,
+  NODE_ROW_GAP,
+  revealedPopulation,
+  revealKey,
+  revealListingReplyOutcome,
+  revealNoticeFor,
+  revealSwitchMessage,
+  startRevealListing,
+  decideRevealView,
+  isCanvasRevealNotice,
+  revealCapText,
+  REVEAL_SWITCH_STATUS_MS,
+  revealEndsFirstFitWait,
+  revealRefitOnListing,
+  revealStatusText,
+  revealViewRequestForToggle,
+  type HeldReveal,
+  type RevealNotice,
+  type RevealViewMode,
+  type RevealViewRequest,
+  type SavedFullViewport,
+  type Viewport,
+} from './revealView';
 
 export type FetchState =
   | { status: 'loading' }
@@ -488,11 +522,10 @@ export type BlastRadiusState =
   | { status: 'resolved'; hopDistances: Map<string, number>; maxDepth: number }
   | { status: 'error'; message: string };
 
-// No LOD/layout library yet (Design Notes: acceptable at this phase's real
-// scale) — a plain deterministic grid, roughly square, is enough to lay the
-// full fetched Node set out without overlap.
-export const NODE_COLUMN_GAP = 260;
-export const NODE_ROW_GAP = 110;
+// The grid spacing (`NODE_COLUMN_GAP`×`NODE_ROW_GAP`) is declared in
+// `revealView.ts` (P4-7d), shared by the Full grid and the Revealed columns,
+// and re-exported from here unchanged.
+export { NODE_COLUMN_GAP, NODE_ROW_GAP };
 
 // FIX-1: a Node card's size when `@xyflow/react` hasn't measured it (a card
 // still folded into an LOD cluster has no DOM, so no `measured` size). An
@@ -1184,6 +1217,11 @@ type CodeMapFlowNode = FlowNode<
      * and its accessible name says "affected by changed contract X".
      */
     affectedByContracts?: readonly string[];
+    /**
+     * P4-7d: set only on an entry candidate's card in the Revealed view —
+     * the "◎ candidate" badge, its reason line and the aria suffix.
+     */
+    candidate?: EntryCandidate;
   },
   'codeMapNode'
 >;
@@ -1784,7 +1822,7 @@ export function layoutPosition(index: number, nodeCount: number): { x: number; y
   return { x: (index % columns) * NODE_COLUMN_GAP, y: Math.floor(index / columns) * NODE_ROW_GAP };
 }
 
-function layoutNodes(
+export function layoutNodes(
   nodes: readonly CodeMapNode[],
   onActivate: (node: CodeMapNode) => void,
   onShowNeighbors: (originId: string, direction: NeighborDirection) => void,
@@ -1807,15 +1845,23 @@ function layoutNodes(
   onActivateFolded: (folded: FoldedCanvasNode) => void = () => {},
   // P4-2 phase 3c: map Node id → the changed contracts it depends on.
   contractDependents: ReadonlyMap<string, readonly string[]> = NO_CONTRACT_DEPENDENTS,
+  // P4-7d: Revealed passes `layeredLayout`'s positions. Omitted (Full map),
+  // every card is exactly `layoutPosition(index, gridSize)`, as before.
+  positionOf?: (id: string, index: number) => { x: number; y: number },
+  // P4-7d: Revealed's entry candidates by id — a candidate's card gets
+  // `data.candidate` (badge, reason, aria suffix). Omitted, no card has it.
+  candidates?: ReadonlyMap<string, EntryCandidate>,
 ): CodeMapCardFlowNode[] {
   const gridSize = canvasGridSize(nodes.length, foldedNodes.length);
+  const place = positionOf ?? ((_id: string, index: number) => layoutPosition(index, gridSize));
   const cards: CodeMapCardFlowNode[] = nodes.map((node, index) => {
     const entry = adjacency.get(node.id);
     const affectedByContracts = contractDependents.get(node.id);
+    const candidate = candidates?.get(node.id);
     return {
       id: node.id,
       type: 'codeMapNode',
-      position: layoutPosition(index, gridSize),
+      position: place(node.id, index),
       data: {
         node,
         onActivate,
@@ -1830,6 +1876,7 @@ function layoutNodes(
         showIngestedFindings,
         isChanged: changedNodeIds.has(node.id),
         ...(affectedByContracts !== undefined ? { affectedByContracts } : {}),
+        ...(candidate !== undefined ? { candidate } : {}),
       },
     };
   });
@@ -1837,7 +1884,7 @@ function layoutNodes(
     cards.push({
       id: folded.id,
       type: 'codeMapFolded',
-      position: layoutPosition(nodes.length + index, gridSize),
+      position: place(folded.id, nodes.length + index),
       data: { folded, onActivate: onActivateFolded, isChanged: changedNodeIds.has(folded.id) },
     });
   });
@@ -2835,6 +2882,115 @@ export function NodeRiskSignalSections({
  * positions) — only its visibility/interactivity is suppressed, not its
  * presence.
  */
+/**
+ * P4-7d: a candidate card's badge and reason line — "◎ candidate · no callers
+ * in indexed code · reaches N Nodes", plus "· run at load by `file`" when the
+ * candidate is run by a file's top-level code. Hookless.
+ */
+export function CandidateReasonLine({ candidate }: { candidate: EntryCandidate }) {
+  const loadedBy = candidateLoadedBy(candidate);
+  return (
+    <p className="code-map__node-candidate">
+      <span className="code-map__node-candidate-badge">
+        <span aria-hidden="true">◎</span> candidate
+      </span>{' '}
+      <span className="code-map__node-candidate-reason">
+        · {formatCandidateReason(candidate)}
+        {loadedBy !== null && (
+          <>
+            {' '}
+            · run at load by{' '}
+            {loadedBy.files.map((file, index) => (
+              <Fragment key={file}>
+                {index > 0 && ', '}
+                <code>{file}</code>
+              </Fragment>
+            ))}
+            {loadedBy.more > 0 && ` and ${loadedBy.more} more`}
+          </>
+        )}
+      </span>
+    </p>
+  );
+}
+
+/** P4-7d: the listing error for a dev-fixture session, which has no Graph Service map. */
+const DEV_FIXTURE_NO_ENTRY_CANDIDATES = 'the dev fixture has no indexed map to list them from.';
+
+/** P4-7d: a navigation to a hidden Node, replayed once the switch to Full has laid the full map out. */
+type PendingFullNavigation =
+  | { kind: 'navigate'; id: string }
+  | { kind: 'history'; id: string; index: number }
+  | { kind: 'fit'; ids: readonly string[] };
+
+/**
+ * P4-7d: the canvas Panel's "Revealed / Full map" control — two buttons in a
+ * group, the active one `aria-pressed`. Code Map mode only (the caller
+ * gates it). Hookless.
+ */
+export function RevealViewToggle({
+  view,
+  onChange,
+}: {
+  view: RevealViewMode;
+  onChange: (view: RevealViewMode) => void;
+}) {
+  return (
+    <div className="code-map__reveal-toggle" role="group" aria-label="Code Map view">
+      <button
+        type="button"
+        className="code-map__reveal-toggle-option"
+        aria-pressed={view === 'revealed'}
+        onClick={() => onChange('revealed')}
+      >
+        Revealed
+      </button>
+      <button
+        type="button"
+        className="code-map__reveal-toggle-option"
+        aria-pressed={view === 'full'}
+        onClick={() => onChange('full')}
+      >
+        Full map
+      </button>
+    </div>
+  );
+}
+
+/**
+ * P4-7d: the Revealed view's notice for a `none`, `error` or `stale`
+ * listing — the shared Actionable Notice with its one action (EXPERIENCE.md),
+ * "Show full map", which flips the toggle. A new map fetch lists again, and
+ * so does Full → Revealed after an error. `null` for any other state (the
+ * loading line is the Panel's).
+ * Hookless.
+ */
+export function RevealListingNotice({
+  notice,
+  onShowFullMap,
+}: {
+  notice: RevealNotice;
+  onShowFullMap: () => void;
+}) {
+  if (!isCanvasRevealNotice(notice)) {
+    return null;
+  }
+  // Review round 1: no live-region role — the Panel's one `role="status"`
+  // line already announces this sentence (`revealStatusText`).
+  return (
+    <ActionableNotice
+      tone={notice.tone}
+      action={
+        <button type="button" onClick={onShowFullMap}>
+          Show full map
+        </button>
+      }
+    >
+      {notice.sentence}
+    </ActionableNotice>
+  );
+}
+
 export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data'>) {
   const {
     node,
@@ -2850,6 +3006,7 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
     showIngestedFindings,
     isChanged,
     affectedByContracts,
+    candidate,
   } = data;
   const summaryStatus = node.summaryStatus;
   return (
@@ -2860,7 +3017,7 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
       role="button"
       aria-label={`${node.kind} ${node.name}${isChanged ? ', changed' : ''}${contractDependentAriaSuffix(
         affectedByContracts,
-      )}, open Node detail`}
+      )}${candidateAriaSuffix(candidate)}, open Node detail`}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
@@ -2871,6 +3028,10 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
       <Handle type="target" position={Position.Left} />
       <span className="code-map__node-kind">{node.kind}</span>
       <code className="code-map__node-id">{node.name}</code>
+      {/* P4-7d: an entry candidate (Revealed only) — a glyph plus the text
+          "candidate", never colour alone, and its reason, qualified "in
+          indexed code". */}
+      {candidate !== undefined && <CandidateReasonLine candidate={candidate} />}
       {/* Story 3.1 (Phase 2): PR Review Mode's changed-Node treatment —
           never color-only (Accessibility Floor): this visible "Changed"
           text label carries the meaning on its own; `code-map__node--changed`
@@ -8356,6 +8517,66 @@ export function CodeMap({
     },
     [projectPath, showFoldedKindsRequests],
   );
+  // P4-7d: the "Revealed / Full map" view — renderer-session state, default
+  // Full, reset to Full on a project change (never persisted: Ask First).
+  // Applied only in Code Map mode: PR Review always renders Full.
+  const [revealView, setRevealView] = useState<RevealViewMode>('full');
+  // P4-7d: the held reveal state — keyed by project and section (`revealKey`)
+  // and by the map fetch it was listed for. Switching to Full and back keeps
+  // it; a section switch or a reload drops it (`loadCodeMap`). Mirrored in a
+  // ref so a listing reply settles against the latest value.
+  const [revealHeld, setRevealHeld] = useState<HeldReveal | null>(null);
+  const revealHeldRef = useRef<HeldReveal | null>(null);
+  revealHeldRef.current = revealHeld;
+  // P4-7d: drops an out-of-order listing reply (with the section check in
+  // `revealListingReplyOutcome`).
+  const revealListingRequests = useRef(createLatestRequestGuard()).current;
+  // P4-7d: "Showing the full map to reach `<name>`" after a navigation to a
+  // hidden Node switched to Full; cleared by the next navigation, toggle,
+  // mode change or reload, or after `REVEAL_SWITCH_STATUS_MS` (review round 1).
+  const [revealSwitchStatus, setRevealSwitchStatus] = useState<string | null>(null);
+  // Review round 1: set while a switched navigation is being replayed, so the
+  // replay itself doesn't clear the status line it just set.
+  const replayingFullNavigationRef = useRef(false);
+  // P4-7d: a navigation that switched to Full, replayed once Full is laid out.
+  const pendingFullNavigationRef = useRef<PendingFullNavigation | null>(null);
+  // P4-7d (review round 1: explicit toggles only — `revealViewRequestForToggle`
+  // / `decideRevealView`): the view change still owed to the viewport — fit
+  // the candidates on entering Revealed; on leaving it, restore the Full
+  // viewport saved on entry (same map fetch) or fit the full map.
+  const revealViewRequestRef = useRef<RevealViewRequest | null>(null);
+  const fullViewportRef = useRef<SavedFullViewport | null>(null);
+  // Review round 1: the user moved the view since Revealed last fitted (a
+  // refresh's listing re-fits only when they haven't).
+  const revealUserMovedRef = useRef(false);
+  // The current view, project/section key and map fetch, for the toggle
+  // handler below (synced each render, further down).
+  const revealViewRef = useRef<RevealViewMode>('full');
+  revealViewRef.current = revealView;
+  const revealMapRef = useRef<{ key: string | null; mapStamp: readonly CodeMapEdge[] | null }>({
+    key: null,
+    mapStamp: null,
+  });
+  const changeRevealView = useCallback((next: RevealViewMode) => {
+    pendingFullNavigationRef.current = null;
+    setRevealSwitchStatus(null);
+    const { request, saved } = revealViewRequestForToggle({
+      from: revealViewRef.current,
+      to: next,
+      key: revealMapRef.current.key,
+      mapStamp: revealMapRef.current.mapStamp,
+      viewport: reactFlowInstanceRef.current?.getViewport() ?? null,
+      saved: fullViewportRef.current,
+    });
+    if (request !== null) {
+      revealViewRequestRef.current = request;
+      fullViewportRef.current = saved;
+      revealUserMovedRef.current = false;
+      // Review round 1: cluster expansions belong to one view's layout.
+      setExpandedClusterIds(new Set());
+    }
+    setRevealView(next);
+  }, []);
   // P0-1 (2026-09-24): the three family toggles above, bundled once for the
   // two surfaces that render risk signals (the Node card, via `layoutNodes`'
   // own separate scalar props, and the Node Detail panel below). Passing one
@@ -8632,6 +8853,17 @@ export function CodeMap({
     // "focused" Node from a map that's gone).
     setHistory({ stack: [], index: -1 });
     focusedNodeIdRef.current = null;
+    // P4-7d (founder decision 2026-10-04): the held reveal state belongs to
+    // one project, section and map — a section switch (or a Retry) drops it,
+    // so Revealed restarts from the new map's candidates; a listing still in
+    // flight can't land. The toggle itself stays as it is.
+    setRevealHeld(null);
+    revealHeldRef.current = null;
+    revealListingRequests.begin();
+    pendingFullNavigationRef.current = null;
+    setRevealSwitchStatus(null);
+    // Review round 1: an owed view can't apply to another project or section.
+    revealViewRequestRef.current = null;
     // P4-4 phase 3b: a "not on the current map" notice belongs to the map it
     // was about; a carried diff's check and announcement belong to the
     // switch that started them (a switch starts a fresh one after this).
@@ -9012,6 +9244,10 @@ export function CodeMap({
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
+    // P4-7d: the Revealed / Full toggle is per session and per project — a
+    // project change goes back to Full (its held state is dropped by
+    // `loadCodeMap`'s reset).
+    setRevealView('full');
   }, [projectPath, clearDiffScopeSync]);
 
   /**
@@ -9562,6 +9798,8 @@ export function CodeMap({
     (event) => {
       if (event) {
         clearRouteClamp();
+        // P4-7d review round 1: a refresh's listing won't re-fit over this.
+        revealUserMovedRef.current = true;
       }
     },
     [clearRouteClamp],
@@ -9794,29 +10032,88 @@ export function CodeMap({
     activateFoldedNodeRef.current(folded);
   }, []);
 
+  // P4-7d: the Revealed view — Code Map mode only (PR Review always renders
+  // Full; Health Audit mounts no canvas). It filters what the canvas lays
+  // out and hands to `computeLOD` (AD-2: before layout; `computeLOD` is
+  // untouched); `population.riskNodes`/`riskEdges` — every number — never
+  // change. `revealCanvas` is `null` in Full, which then takes exactly
+  // today's path below.
+  const revealDrawn = revealView === 'revealed' && mode === 'codeMap';
+  const revealDrawnRef = useRef(revealDrawn);
+  revealDrawnRef.current = revealDrawn;
+  const revealMapStamp = fetchState.status === 'ready' ? fetchState.edges : null;
+  const revealSection = fetchState.status === 'ready' ? (fetchState.section ?? null) : null;
+  const currentRevealKey =
+    projectPath !== null && revealMapStamp !== null ? revealKey(projectPath, revealSection) : null;
+  revealMapRef.current = { key: currentRevealKey, mapStamp: revealMapStamp };
+  const revealCanvas = useMemo(() => {
+    if (!revealDrawn || fetchState.status !== 'ready') {
+      return null;
+    }
+    const state = drawnRevealState(revealHeld, currentRevealKey);
+    const positions = layeredLayout(state);
+    const drawn = revealedPopulation(population, state);
+    return {
+      population: drawn,
+      positionOf: (id: string, index: number) =>
+        positions.get(id) ?? layoutPosition(index, canvasGridSize(drawn.mapNodes.length, drawn.foldedNodes.length)),
+      candidates: candidatesById(state),
+    };
+  }, [revealDrawn, fetchState.status, revealHeld, currentRevealKey, population]);
+  // Review round 1: a ready listing that draws nothing here is the `stale`
+  // notice — never an empty canvas without one.
+  const revealNotice = revealDrawn
+    ? revealNoticeFor(revealHeld, currentRevealKey, revealCanvas?.population.mapNodes.length ?? 0)
+    : null;
+  const revealStatus = revealStatusText({
+    switchStatus: revealSwitchStatus,
+    notice: revealNotice,
+    capText: revealDrawn ? revealCapText(revealHeld, currentRevealKey) : null,
+  });
+
   const flowNodes = useMemo(
     () =>
       fetchState.status === 'ready'
-        ? layoutNodes(
-            population.riskNodes,
-            activateNode,
-            showNeighbors,
-            openSourceForNode,
-            adjacency,
-            noSummaryBackendAvailable,
-            cloudSelectedNoKey,
-            showDeterministicSignals,
-            showLlmJudgment,
-            showIngestedFindings,
-            renderChangedIds,
-            population.foldedNodes,
-            activateFoldedNode,
-            contractDependentsById,
-          )
+        ? revealCanvas === null
+          ? layoutNodes(
+              population.riskNodes,
+              activateNode,
+              showNeighbors,
+              openSourceForNode,
+              adjacency,
+              noSummaryBackendAvailable,
+              cloudSelectedNoKey,
+              showDeterministicSignals,
+              showLlmJudgment,
+              showIngestedFindings,
+              renderChangedIds,
+              population.foldedNodes,
+              activateFoldedNode,
+              contractDependentsById,
+            )
+          : layoutNodes(
+              revealCanvas.population.mapNodes,
+              activateNode,
+              showNeighbors,
+              openSourceForNode,
+              adjacency,
+              noSummaryBackendAvailable,
+              cloudSelectedNoKey,
+              showDeterministicSignals,
+              showLlmJudgment,
+              showIngestedFindings,
+              renderChangedIds,
+              revealCanvas.population.foldedNodes,
+              activateFoldedNode,
+              contractDependentsById,
+              revealCanvas.positionOf,
+              revealCanvas.candidates,
+            )
         : [],
     [
       fetchState.status,
       population,
+      revealCanvas,
       activateNode,
       showNeighbors,
       openSourceForNode,
@@ -9831,7 +10128,10 @@ export function CodeMap({
       contractDependentsById,
     ],
   );
-  const flowEdges = useMemo(() => toFlowEdges(population.canvasEdges), [population]);
+  const flowEdges = useMemo(
+    () => toFlowEdges((revealCanvas === null ? population : revealCanvas.population).canvasEdges),
+    [population, revealCanvas],
+  );
   // FIX-2: the map's real `CALLS` edges, for the `'found'` trace highlight.
   const callEdges = useMemo(() => callEdgesOf(population.riskEdges), [population]);
 
@@ -9842,6 +10142,115 @@ export function CodeMap({
     }
     return byId;
   }, [flowNodes]);
+
+  // P4-7d: the entry-candidate listing for the map on screen, fetched with
+  // its section while Revealed is shown — once per map fetch (a refresh's
+  // new edges array starts a new one; a summary patch doesn't), never on a
+  // toggle back to a state already held. The canvas is never blocked on it:
+  // a refresh keeps the previous state drawn, and loading has a status line.
+  // Out-of-order replies are dropped (`revealListingRequests` +
+  // `revealListingReplyOutcome`'s section and held-state checks).
+  useEffect(() => {
+    if (!revealDrawn || projectPath === null || revealMapStamp === null || currentRevealKey === null) {
+      return;
+    }
+    if (!needsRevealListing(revealHeldRef.current, currentRevealKey, revealMapStamp)) {
+      return;
+    }
+    const key = currentRevealKey;
+    const mapStamp = revealMapStamp;
+    const requestedSection = revealSection;
+    const requestId = revealListingRequests.begin();
+    const started = startRevealListing(revealHeldRef.current, key, mapStamp);
+    revealHeldRef.current = started;
+    setRevealHeld(started);
+    const settle = (result: EntryCandidatesResult) => {
+      const outcome = revealListingReplyOutcome({
+        isLatest: revealListingRequests.isLatest(requestId),
+        requestedSection,
+        currentSection: sectionRef.current,
+        held: revealHeldRef.current,
+        key,
+        mapStamp,
+        result,
+      });
+      if (outcome.kind === 'ignore') {
+        return;
+      }
+      if (outcome.kind === 'unknown-section') {
+        // The section left the allowlist: the shell falls back to `all`
+        // (P4-4d), like every other section-scoped operation.
+        const gone: HeldReveal = {
+          key,
+          mapStamp,
+          listing: {
+            status: 'error',
+            message: codeMapFailureMessage({ status: 'unknown-section', section: outcome.section, knownSections: [] }),
+          },
+        };
+        revealHeldRef.current = gone;
+        setRevealHeld(gone);
+        onUnknownSectionRef.current?.(outcome.section);
+        return;
+      }
+      // Review round 1: a refresh's listing re-fits once, unless the user
+      // has moved the view since Revealed last fitted. A first listing is
+      // fitted by the toggle's own request (or the first fit).
+      if (
+        outcome.held.listing.status === 'ready' &&
+        revealRefitOnListing({
+          revealDrawn: revealDrawnRef.current,
+          hadPrevious: started.listing.status === 'loading' && started.listing.previous !== null,
+          userMoved: revealUserMovedRef.current,
+        })
+      ) {
+        revealViewRequestRef.current = { target: 'revealed', key, mapStamp };
+      }
+      revealHeldRef.current = outcome.held;
+      setRevealHeld(outcome.held);
+    };
+    if (isDevFixtureMode) {
+      // A synthetic fixture has no Graph Service map to list candidates from.
+      settle({ status: 'error', message: DEV_FIXTURE_NO_ENTRY_CANDIDATES });
+      return;
+    }
+    window.driller.listEntryCandidates(projectPath, requestedSection ?? undefined).then(settle, (error: unknown) =>
+      settle({ status: 'error', message: error instanceof Error ? error.message : String(error) }),
+    );
+  }, [revealDrawn, projectPath, revealMapStamp, revealSection, currentRevealKey, revealListingRequests, isDevFixtureMode]);
+
+  // P4-7d: a navigation to a Node Revealed doesn't draw switches to Full
+  // (keeping the reveal state), says so, and replays once Full is laid out —
+  // never a silent no-op. Read through a ref by `navigateToNodeImpl`,
+  // `goBack`/`goForward` and `fitViewToPath`, so their identities (and Full's
+  // behaviour) don't change: outside Revealed it returns `false` at once.
+  const routeThroughFullMapRef = useRef<(ids: readonly string[], action: PendingFullNavigation) => boolean>(
+    () => false,
+  );
+  routeThroughFullMapRef.current = (ids, action) => {
+    if (!revealDrawn || fetchState.status !== 'ready') {
+      // Review round 1: the next navigation clears the switch status line —
+      // but not the replay of the navigation that set it.
+      if (!replayingFullNavigationRef.current) {
+        setRevealSwitchStatus(null);
+      }
+      return false;
+    }
+    const mapNodes = fetchState.nodes;
+    const target = hiddenNavigationTarget(
+      ids,
+      (id) => flowNodesById.has(id),
+      (id) => mapNodes.find((node) => node.id === id),
+    );
+    if (target === null) {
+      return false;
+    }
+    pendingFullNavigationRef.current = action;
+    setRevealSwitchStatus(revealSwitchMessage(target.name));
+    setExpandedClusterIds(new Set());
+    setRevealView('full');
+    return true;
+  };
 
   // Shared with both the live render's `lodResult` (below) and
   // `centerOnNode`'s hypothetical-viewport resolution — the same
@@ -10156,6 +10565,9 @@ export function CodeMap({
 
   const navigateToNodeImpl = useCallback(
     (id: string) => {
+      if (routeThroughFullMapRef.current([id], { kind: 'navigate', id })) {
+        return;
+      }
       if (centerOnNode(id)) {
         pushHistory(id);
       }
@@ -10195,6 +10607,9 @@ export function CodeMap({
     if (id === undefined) {
       return;
     }
+    if (routeThroughFullMapRef.current([id], { kind: 'history', id, index: nextIndex })) {
+      return;
+    }
     // Review fix: only move `history.index` if `centerOnNode` actually
     // succeeded — a stale id (e.g. one somehow left over across a map
     // reload) or the ReactFlow instance not being ready would otherwise
@@ -10214,6 +10629,9 @@ export function CodeMap({
     const nextIndex = history.index + 1;
     const id = history.stack[nextIndex];
     if (id === undefined) {
+      return;
+    }
+    if (routeThroughFullMapRef.current([id], { kind: 'history', id, index: nextIndex })) {
       return;
     }
     // Review fix: see `goBack`'s matching comment — only advance on success.
@@ -10266,7 +10684,9 @@ export function CodeMap({
       return undefined;
     }
     if (decision === 'wait') {
-      if (initialFitRetry >= INITIAL_FIT_MAX_RETRIES) {
+      // Review round 1: Revealed with nothing to draw yet shows the canvas
+      // (and its Panel status) at once; the fit stays armed for the cards.
+      if (initialFitRetry >= INITIAL_FIT_MAX_RETRIES || revealEndsFirstFitWait(revealDrawn, lodInputNodes.length)) {
         // Never became fittable: reveal what's there rather than leave the
         // canvas hidden. The fit stays armed, so it still lands if it can.
         setAwaitingFirstFit(false);
@@ -10292,7 +10712,55 @@ export function CodeMap({
     setViewport(nextViewport);
     setAwaitingFirstFit(false);
     return undefined;
-  }, [canvasInitCount, initialFitRetry, lodInputNodes, containerSize, measuredViewportSize, projectPath, shownSection]);
+  }, [canvasInitCount, initialFitRetry, lodInputNodes, containerSize, measuredViewportSize, projectPath, shownSection, revealDrawn]);
+
+  // P4-7d (review round 1): applies the view an explicit toggle owes
+  // (`changeRevealView`, or a refresh's re-fit) once its cards are laid out,
+  // after the first fit — `decideRevealView` decides. Entering PR Review never
+  // moves the viewport (it waits); a request for another project or section
+  // is dropped. Bumps `routeFitSeqRef`, so a route fit's late lift can't land
+  // over it. A session that never toggles never gets a request.
+  useLayoutEffect(() => {
+    const instance = reactFlowInstanceRef.current;
+    const decision = decideRevealView({
+      request: revealViewRequestRef.current,
+      codeMapMode: mode === 'codeMap',
+      revealDrawn,
+      key: currentRevealKey,
+      mapStamp: revealMapStamp,
+      canvasReady: instance !== null,
+      nodesCount: lodInputNodes.length,
+      awaitingFirstFit,
+      saved: fullViewportRef.current,
+    });
+    if (decision.kind === 'none' || decision.kind === 'wait' || instance === null) {
+      return;
+    }
+    if (decision.kind === 'drop') {
+      revealViewRequestRef.current = null;
+      return;
+    }
+    let next: Viewport | null = decision.kind === 'restore' ? decision.viewport : null;
+    if (decision.kind === 'fit') {
+      const fit = initialViewport({
+        nodes: lodInputNodes,
+        cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
+        viewport: measuredViewportSize(),
+        minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
+        maxZoom: MAP_MAX_ZOOM,
+        lodThreshold: LOD_ZOOM_THRESHOLD,
+      });
+      next = fit === null ? null : { x: fit.x, y: fit.y, zoom: fit.zoom };
+    }
+    if (next === null) {
+      return;
+    }
+    revealViewRequestRef.current = null;
+    revealUserMovedRef.current = false;
+    routeFitSeqRef.current += 1;
+    void instance.setViewport(next);
+    setViewport(next);
+  }, [mode, revealDrawn, revealHeld, currentRevealKey, lodInputNodes, revealMapStamp, awaitingFirstFit, measuredViewportSize]);
 
   /**
    * Story 1.9 (Phase 2): fits the viewport to show every Node in a `found`
@@ -10316,6 +10784,10 @@ export function CodeMap({
    */
   const fitViewToPath = useCallback(
     (path: string[]) => {
+      // P4-7d: a route through a Node Revealed doesn't draw is fitted on Full.
+      if (routeThroughFullMapRef.current(path, { kind: 'fit', ids: path })) {
+        return;
+      }
       const instance = reactFlowInstanceRef.current;
       if (!instance) {
         console.warn('CodeMap: tracePath found a path but the ReactFlow instance is not ready yet.');
@@ -10407,6 +10879,57 @@ export function CodeMap({
   useEffect(() => {
     showNeighborsImplRef.current = showNeighborsImpl;
   }, [showNeighborsImpl]);
+
+  // P4-7d: replays a navigation that switched to Full (`routeThroughFullMapRef`)
+  // once Full is laid out — after the view effects above restored the Full
+  // viewport, and after `navigateToNodeImplRef` is synced (both declared
+  // earlier, so they run first in the same commit).
+  useEffect(() => {
+    if (revealDrawn) {
+      return;
+    }
+    const pending = pendingFullNavigationRef.current;
+    if (pending === null) {
+      return;
+    }
+    pendingFullNavigationRef.current = null;
+    replayingFullNavigationRef.current = true;
+    try {
+      switch (pending.kind) {
+        case 'navigate':
+          navigateToNodeImplRef.current(pending.id);
+          break;
+        case 'history':
+          if (centerOnNode(pending.id)) {
+            setHistory((previous) =>
+              previous.stack[pending.index] === pending.id ? { ...previous, index: pending.index } : previous,
+            );
+          }
+          break;
+        case 'fit':
+          fitViewToPath([...pending.ids]);
+          break;
+      }
+    } finally {
+      replayingFullNavigationRef.current = false;
+    }
+  }, [revealDrawn, flowNodesById, centerOnNode, fitViewToPath]);
+  // Review round 1: the switch status line clears itself after
+  // `REVEAL_SWITCH_STATUS_MS`, and on any mode change.
+  useEffect(() => {
+    if (revealSwitchStatus === null) {
+      return undefined;
+    }
+    const timer = setTimeout(() => setRevealSwitchStatus(null), REVEAL_SWITCH_STATUS_MS);
+    return () => clearTimeout(timer);
+  }, [revealSwitchStatus]);
+  const revealStatusModeRef = useRef(mode);
+  useEffect(() => {
+    if (revealStatusModeRef.current !== mode) {
+      revealStatusModeRef.current = mode;
+      setRevealSwitchStatus(null);
+    }
+  }, [mode]);
 
   /**
    * The shared "run a trace, apply the result" round trip (Story 1.9, Phase
@@ -10757,6 +11280,10 @@ export function CodeMap({
       diffIds.current += 1;
     };
   }, []);
+  // P4-7d: a map Node the Revealed view doesn't draw (`undefined` in Full,
+  // where every map Node is drawn).
+  const revealHiddenMapNode = (id: string): CodeMapNode | undefined =>
+    revealDrawn && fetchState.status === 'ready' ? fetchState.nodes.find((node) => node.id === id) : undefined;
   useEffect(() => {
     const decision = decidePendingFocus({
       pendingFocusNodeId,
@@ -10764,7 +11291,9 @@ export function CodeMap({
       fetchState,
       canvas: surfaces.canvas,
       canvasReady: reactFlowInstanceRef.current !== null && !awaitingFirstFit,
-      resolveMapNode: (id) => mapNodeOf(flowNodesById.get(id)),
+      // P4-7d: in Revealed, a Node it doesn't draw is still on the map —
+      // `navigateToNode` switches to Full to reach it.
+      resolveMapNode: (id) => mapNodeOf(flowNodesById.get(id)) ?? revealHiddenMapNode(id),
     });
     if (decision.kind === 'none' || decision.kind === 'wait') {
       return;
@@ -10827,6 +11356,7 @@ export function CodeMap({
     pendingFocusNodeId,
     section,
     fetchState,
+    revealDrawn,
     surfaces.canvas,
     awaitingFirstFit,
     canvasInitCount,
@@ -11379,9 +11909,34 @@ export function CodeMap({
                 Risk numbers unchanged
                 <span className="visually-hidden">: {SHOW_FOLDED_KINDS_HINT}</span>
               </span>
+              {/* P4-7d: "Revealed / Full map" — Code Map mode only (PR Review
+                  always renders Full; Health Audit has no canvas). The status
+                  line is always mounted with it, so its text is announced:
+                  the listing's loading line, or the switch to Full a
+                  navigation to a hidden Node made. */}
+              {mode === 'codeMap' && (
+                <>
+                  <RevealViewToggle view={revealView} onChange={changeRevealView} />
+                  <p className="code-map__reveal-status" role="status">
+                    {revealStatus}
+                  </p>
+                </>
+              )}
             </Panel>
           </ReactFlow>
         </CodeMapCanvasFrame>
+      )}
+
+      {/* P4-7d: a Revealed listing with no candidates, or a failed one — the
+          shared Actionable Notice with "Show full map", over the canvas that
+          has nothing to draw. Never an empty canvas without it. */}
+      {surfaces.canvas && revealDrawn && isCanvasRevealNotice(revealNotice) && (
+        <div className="code-map__notice code-map__notice--reveal">
+          <RevealListingNotice
+            notice={revealNotice}
+            onShowFullMap={() => changeRevealView('full')}
+          />
+        </div>
       )}
 
       {/* P0-2b: `pathTraceInput`, NOT `canvas` — search stays reachable in
