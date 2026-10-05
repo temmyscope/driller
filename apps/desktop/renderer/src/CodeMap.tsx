@@ -154,9 +154,21 @@ import {
   revealStatusText,
   revealViewRequestForToggle,
   applyRevealTransition,
-  collapseNode,
-  expandNode,
+  announcementSteps,
+  canGoBack,
+  canGoForward,
   expandStub,
+  formatRevealAnnouncement,
+  formatRevealHistoryAnnouncement,
+  historyMove,
+  historyWithoutEntry,
+  historyWithoutReveals,
+  planRevealDrill,
+  REVEAL_STEP_STALE_TEXT,
+  revealFocusRescue,
+  pushHistoryEntry,
+  restoreRevealSnapshot,
+  revealDrillKey,
   REVEAL_LAYER_CAP,
   revealAuxCards,
   revealCrossSectionNote,
@@ -167,6 +179,11 @@ import {
   revealStubText,
   type RevealDrillGraph,
   type HeldReveal,
+  type HistoryEntry,
+  type HistoryMove,
+  type NavigationHistory,
+  type RevealHistoryEntry,
+  type RevealStep,
   type RevealAuxCard,
   type RevealDrillControl,
   type RevealNotice,
@@ -659,13 +676,9 @@ const PAN_QUANTIZE_RATIO = 0.25;
 // rather than growing without bound.
 const MAX_EXPANDED_CLUSTER_IDS = 500;
 
-// Defensive cap on the Back/Forward `history.stack` (review finding, same
-// spirit as `MAX_EXPANDED_CLUSTER_IDS` above) — unlike that Set, unbounded
-// growth here isn't self-trimming on any natural event, so a very long
-// session's worth of traversal would otherwise accumulate forever. Trimmed
-// from the front (oldest entries) once exceeded, with `index` shifted down
-// by the same amount so it keeps pointing at the same logical entry.
-const MAX_HISTORY_LENGTH = 500;
+// The Back/Forward `history.stack` cap (`MAX_HISTORY_LENGTH`, review finding,
+// same spirit as `MAX_EXPANDED_CLUSTER_IDS` above) lives with the pure
+// history update in `revealView.ts` since P4-7f (`pushHistoryEntry`).
 
 // Hard termination guarantee for `resolveZoomToRevealNode`'s halving loop
 // (Story 1.4 Design Notes: reuse `expandCluster`'s own halve-the-
@@ -3187,7 +3200,8 @@ export function CodeMapRevealStubCard({ data }: Pick<NodeProps<CodeMapRevealStub
       role="button"
       aria-label={`${revealStubText(stub.hiddenCount)} of ${stub.parentName}, show the next ${next}`}
       onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
+        // P4-7f: `+` (no Ctrl, Cmd or Alt) expands a stub too.
+        if (event.key === 'Enter' || event.key === ' ' || revealDrillKey(event) === 'expand') {
           event.preventDefault();
           onActivate(stub);
         }
@@ -3234,6 +3248,16 @@ export function CodeMapNodeCard({ data }: Pick<NodeProps<CodeMapFlowNode>, 'data
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
           onActivate(node);
+          return;
+        }
+        // P4-7f: in Revealed only (`onDrill` is set only there, Code Map
+        // mode), `+`/`=` expands and `−`/`-` collapses the focused card —
+        // never with Ctrl, Cmd or Alt held, so app and browser zoom are
+        // untouched. Enter above keeps opening Node detail.
+        const drillKey = onDrill !== undefined ? revealDrillKey(event) : null;
+        if (drillKey !== null) {
+          event.preventDefault();
+          onDrill?.(node, drillKey);
         }
       }}
     >
@@ -8775,6 +8799,57 @@ export function CodeMap({
   // Review round 1: set while a switched navigation is being replayed, so the
   // replay itself doesn't clear the status line it just set.
   const replayingFullNavigationRef = useRef(false);
+  // P4-7f: the Node a Back/Forward over a reveal entry centres on once the
+  // restored state is laid out (`id`, else the step's own `fallbackId`, if
+  // still revealed), and the card that held keyboard focus before it
+  // (review round 1: rescued if the restore removed it).
+  const [revealFocusRequest, setRevealFocusRequest] = useState<{
+    id: string;
+    fallbackId: string;
+    focusedCard: HTMLElement | null;
+  } | null>(null);
+  const historyBackButtonRef = useRef<HTMLButtonElement | null>(null);
+  // P4-7f: the latest drill or Back/Forward announcement in the Panel's one
+  // status line. Review round 1: it stays until the next event (a drill, a
+  // navigation, a toggle, a mode change or a reload) — no 8 s clear, unlike
+  // the switch-to-Full message — and an identical text is blanked and set
+  // again on the next frame so it is announced again (`announcementSteps`).
+  const [revealAnnouncement, setRevealAnnouncement] = useState<string | null>(null);
+  const revealAnnouncementRef = useRef<string | null>(null);
+  const revealAnnouncementFrameRef = useRef<number | null>(null);
+  const clearRevealAnnouncement = useCallback(() => {
+    if (revealAnnouncementFrameRef.current !== null) {
+      cancelAnimationFrame(revealAnnouncementFrameRef.current);
+      revealAnnouncementFrameRef.current = null;
+    }
+    revealAnnouncementRef.current = null;
+    setRevealAnnouncement(null);
+  }, []);
+  const announceReveal = useCallback((text: string) => {
+    if (revealAnnouncementFrameRef.current !== null) {
+      cancelAnimationFrame(revealAnnouncementFrameRef.current);
+      revealAnnouncementFrameRef.current = null;
+    }
+    setRevealSwitchStatus(null);
+    const [first, then] = announcementSteps(revealAnnouncementRef.current, text);
+    revealAnnouncementRef.current = first ?? text;
+    setRevealAnnouncement(first ?? text);
+    if (then !== undefined) {
+      revealAnnouncementFrameRef.current = requestAnimationFrame(() => {
+        revealAnnouncementFrameRef.current = null;
+        revealAnnouncementRef.current = then;
+        setRevealAnnouncement(then);
+      });
+    }
+  }, []);
+  useEffect(
+    () => () => {
+      if (revealAnnouncementFrameRef.current !== null) {
+        cancelAnimationFrame(revealAnnouncementFrameRef.current);
+      }
+    },
+    [],
+  );
   // P4-7d: a navigation that switched to Full, replayed once Full is laid out.
   const pendingFullNavigationRef = useRef<PendingFullNavigation | null>(null);
   // P4-7d (review round 1: explicit toggles only — `revealViewRequestForToggle`
@@ -8797,6 +8872,7 @@ export function CodeMap({
   const changeRevealView = useCallback((next: RevealViewMode) => {
     pendingFullNavigationRef.current = null;
     setRevealSwitchStatus(null);
+    clearRevealAnnouncement();
     const { request, saved } = revealViewRequestForToggle({
       from: revealViewRef.current,
       to: next,
@@ -9048,7 +9124,10 @@ export function CodeMap({
   // is the current position within it. Navigating to a new Node (not via
   // Back/Forward) truncates any forward entries past `index` before
   // appending, exactly like a browser's own history stack.
-  const [history, setHistory] = useState<{ stack: string[]; index: number }>({ stack: [], index: -1 });
+  // P4-7f: an entry is a Node (`{kind: 'node', id}`) or one Revealed drill
+  // step (`{kind: 'reveal', before, after, focusId, …}`) — Back undoes the
+  // step, Forward redoes it (`HistoryEntry`, `historyMove`).
+  const [history, setHistory] = useState<NavigationHistory>({ stack: [], index: -1 });
 
   // `navigateToNode` needs `flowNodesById`/`flowNodes` (built later, from
   // this same render's `layoutNodes` call) to resolve a target's laid-out
@@ -9099,6 +9178,7 @@ export function CodeMap({
     revealListingRequests.begin();
     pendingFullNavigationRef.current = null;
     setRevealSwitchStatus(null);
+    clearRevealAnnouncement();
     // Review round 1: an owed view can't apply to another project or section.
     revealViewRequestRef.current = null;
     // P4-4 phase 3b: a "not on the current map" notice belongs to the map it
@@ -10296,33 +10376,71 @@ export function CodeMap({
   // state for the map on screen (`applyRevealTransition`), renderer-local:
   // no Graph Service call, no IPC (AD-14). Never touches what any number
   // reads (`population.riskNodes`/`riskEdges`, adjacency, Path Trace).
-  const applyRevealDrill = useCallback((transition: (state: RevealState, graph: RevealDrillGraph) => RevealState) => {
-    const graph = revealDrillGraphRef.current;
-    const { key, mapStamp } = revealMapRef.current;
-    if (graph === null || graph.edges !== mapStamp) {
-      return;
-    }
-    const applied = applyRevealTransition(revealHeldRef.current, key, (state) => transition(state, graph));
-    if (applied === null) {
-      return;
-    }
-    // P4-7f seam: push the reveal history entry ({before, after}) and the
-    // announcement here — `applied.before`/`applied.after` are immutable.
-    revealHeldRef.current = applied.held;
-    setRevealHeld(applied.held);
-  }, []);
+  // P4-7f: each step pushes exactly one reveal history entry (`before`/
+  // `after` are immutable snapshots that share structure — O(1)) and is
+  // announced in the Panel's one `role="status"` line. A request with nothing
+  // to do (`+` on a leaf) only says so ("No more callees").
+  const applyRevealDrill = useCallback(
+    (
+      focus: { id: string; name: string },
+      plan: (state: RevealState, graph: RevealDrillGraph) => { step: RevealStep; next: RevealState } | { text: string } | null,
+    ) => {
+      const graph = revealDrillGraphRef.current;
+      const { key, mapStamp } = revealMapRef.current;
+      if (graph === null || graph.edges !== mapStamp || key === null) {
+        return;
+      }
+      const outcome: { step: RevealStep | null; text: string | null } = { step: null, text: null };
+      const applied = applyRevealTransition(revealHeldRef.current, key, (state) => {
+        const planned = plan(state, graph);
+        if (planned === null) {
+          return state;
+        }
+        if ('text' in planned) {
+          outcome.text = planned.text;
+          return state;
+        }
+        outcome.step = planned.step;
+        return planned.next;
+      });
+      const step = outcome.step;
+      if (applied === null || step === null) {
+        if (outcome.text !== null) {
+          announceReveal(outcome.text);
+        }
+        return;
+      }
+      revealHeldRef.current = applied.held;
+      setRevealHeld(applied.held);
+      const entry: RevealHistoryEntry = {
+        kind: 'reveal',
+        before: applied.before,
+        after: applied.after,
+        focusId: focus.id,
+        name: focus.name,
+        step,
+        key,
+        mapStamp: applied.held.mapStamp,
+      };
+      setHistory((previous) => pushHistoryEntry(previous, entry));
+      announceReveal(formatRevealAnnouncement(applied.before, applied.after, focus.name, { parentId: focus.id, step }));
+    },
+    [announceReveal],
+  );
   const onRevealDrill = useCallback(
     (node: CodeMapNode, action: RevealDrillControl['kind']) =>
-      applyRevealDrill((state, graph) =>
-        action === 'expand'
-          ? expandNode(state, graph.adjacency, graph.reachById, node.id)
-          : collapseNode(state, node.id),
-      ),
+      applyRevealDrill(node, (state, graph) => {
+        const planned = planRevealDrill(state, graph, node.id, action);
+        return planned.kind === 'step' ? planned : planned.kind === 'none' ? { text: planned.text } : null;
+      }),
     [applyRevealDrill],
   );
   const onActivateRevealStub = useCallback(
     (stub: Extract<RevealAuxCard, { kind: 'more' }>) =>
-      applyRevealDrill((state, graph) => expandStub(state, graph.adjacency, graph.reachById, stub.parentId)),
+      applyRevealDrill({ id: stub.parentId, name: stub.parentName }, (state, graph) => {
+        const next = expandStub(state, graph.adjacency, graph.reachById, stub.parentId);
+        return next === state ? null : { step: 'stub', next };
+      }),
     [applyRevealDrill],
   );
   // A ref card goes to the Node it stands for (drawn, so no switch to Full).
@@ -10374,6 +10492,7 @@ export function CodeMap({
     : null;
   const revealStatus = revealStatusText({
     switchStatus: revealSwitchStatus,
+    announcement: revealAnnouncement,
     notice: revealNotice,
     capText: revealDrawn ? revealCapText(revealHeld, currentRevealKey) : null,
   });
@@ -10530,6 +10649,10 @@ export function CodeMap({
       }
       revealHeldRef.current = outcome.held;
       setRevealHeld(outcome.held);
+      // P4-7f: a listing that lands replaces the state every reveal snapshot
+      // was taken from (a refresh rebases the drill), so no reveal entry
+      // survives it — Back never restores a pre-refresh state.
+      setHistory((previous) => historyWithoutReveals(previous));
     };
     if (isDevFixtureMode) {
       // A synthetic fixture has no Graph Service map to list candidates from.
@@ -10550,6 +10673,10 @@ export function CodeMap({
     () => false,
   );
   routeThroughFullMapRef.current = (ids, action) => {
+    // P4-7f review round 1: any navigation (not a replay) ends a drill announcement.
+    if (!replayingFullNavigationRef.current) {
+      clearRevealAnnouncement();
+    }
     if (!revealDrawn || fetchState.status !== 'ready') {
       // Review round 1: the next navigation clears the switch status line —
       // but not the replay of the navigation that set it.
@@ -10856,33 +10983,12 @@ export function CodeMap({
   // Pure history-stack update (no side effects — safe under React's dev-
   // mode double-invocation of state updaters): truncates any forward
   // entries past the current position before appending, exactly like a
-  // browser's own history stack.
-  const pushHistory = useCallback((id: string) => {
-    setHistory((previous) => {
-      const truncated = previous.stack.slice(0, previous.index + 1);
-      // Review fix: two navigations resolving to the same Node back-to-back
-      // (an edge and an affordance both pointing at the same neighbor, or a
-      // duplicate click) would otherwise push a second identical entry,
-      // making a single Back click look like it did nothing. A no-op
-      // navigation leaves history exactly as-is — including any forward
-      // entries past it, the same way a browser doesn't clear forward
-      // history just because you "navigated" to the page you're already on.
-      if (truncated[truncated.length - 1] === id) {
-        return previous;
-      }
-      let nextStack = [...truncated, id];
-      let nextIndex = nextStack.length - 1;
-      // Review fix: unlike `expandedClusterIds`, nothing here naturally
-      // trims stale entries — cap and trim from the front (oldest first),
-      // shifting `index` down by the same amount so it keeps pointing at
-      // the same logical (now-renumbered) entry.
-      if (nextStack.length > MAX_HISTORY_LENGTH) {
-        const overflow = nextStack.length - MAX_HISTORY_LENGTH;
-        nextStack = nextStack.slice(overflow);
-        nextIndex -= overflow;
-      }
-      return { stack: nextStack, index: nextIndex };
-    });
+  // browser's own history stack. Review fixes kept in `pushHistoryEntry`:
+  // a navigation to the Node already current is a no-op (forward entries
+  // kept), and the stack is capped at `MAX_HISTORY_LENGTH`, oldest first.
+  // P4-7f: it takes the entry union; a reveal entry is never deduped.
+  const pushHistory = useCallback((entry: HistoryEntry) => {
+    setHistory((previous) => pushHistoryEntry(previous, entry));
   }, []);
 
   const navigateToNodeImpl = useCallback(
@@ -10891,7 +10997,7 @@ export function CodeMap({
         return;
       }
       if (centerOnNode(id)) {
-        pushHistory(id);
+        pushHistory({ kind: 'node', id });
       }
     },
     [centerOnNode, pushHistory],
@@ -10903,6 +11009,56 @@ export function CodeMap({
   useEffect(() => {
     navigateToNodeImplRef.current = navigateToNodeImpl;
   }, [navigateToNodeImpl]);
+
+  // P4-7f: Back/Forward over a reveal entry — restores the snapshot into the
+  // held state (renderer-local: no IPC, never a re-listing), switches to
+  // Revealed if Full is shown, centres on the step's Node once it is laid out
+  // (if still revealed), and says what happened in the Panel's status line.
+  // A snapshot that isn't for the map on screen is never applied: the stale
+  // reveal entries leave history instead (`restoreRevealSnapshot`).
+  const applyRevealHistoryMove = useCallback(
+    (move: Extract<HistoryMove, { kind: 'reveal' }>) => {
+      const { key, mapStamp } = revealMapRef.current;
+      const expected = move.how === 'redo' ? move.entry.before : move.entry.after;
+      if (mode !== 'codeMap') {
+        // Review round 1: never touched from PR Review (`skipReveals`).
+        return;
+      }
+      const restored = restoreRevealSnapshot(revealHeldRef.current, key, move.entry, expected, move.restore);
+      if (restored === null) {
+        // Review round 1: only this step leaves history, and it says so.
+        console.warn('CodeMap: a reveal history step is not for the map on screen — dropped from history.');
+        setHistory((previous) => historyWithoutEntry(previous, move.entry));
+        announceReveal(REVEAL_STEP_STALE_TEXT);
+        return;
+      }
+      const active = document.activeElement;
+      const focusedCard =
+        active instanceof HTMLElement && active.closest('.react-flow__node') !== null ? active : null;
+      revealHeldRef.current = restored;
+      setRevealHeld(restored);
+      const at = move.how === 'undo' ? move.index + 1 : move.index;
+      setHistory((previous) => (previous.stack[at] === move.entry ? { ...previous, index: move.index } : previous));
+      pendingFullNavigationRef.current = null;
+      if (revealViewRef.current !== 'revealed') {
+        // Like an explicit toggle, keep the Full viewport to come back to —
+        // but ask for no fit: the centring below moves the view.
+        fullViewportRef.current = revealViewRequestForToggle({
+          from: revealViewRef.current,
+          to: 'revealed',
+          key,
+          mapStamp,
+          viewport: reactFlowInstanceRef.current?.getViewport() ?? null,
+          saved: fullViewportRef.current,
+        }).saved;
+        setExpandedClusterIds(new Set());
+        setRevealView('revealed');
+      }
+      setRevealFocusRequest({ id: move.centerId, fallbackId: move.entry.focusId, focusedCard });
+      announceReveal(formatRevealHistoryAnnouncement(move.how, move.entry));
+    },
+    [mode, announceReveal],
+  );
 
   const handleEdgeClick: EdgeMouseHandler<FlowEdge> = useCallback(
     (_event, edge) => {
@@ -10926,15 +11082,19 @@ export function CodeMap({
   // `centerOnNode` — they never call `navigateToNode`/`pushHistory`, which
   // would truncate-and-append a fresh entry and make Forward permanently
   // unreachable after every Back.
+  // P4-7f: a reveal entry goes through `applyRevealHistoryMove` instead —
+  // Back undoes the step (its `before`), Forward redoes it (its `after`).
   const goBack = useCallback(() => {
-    if (history.index <= 0) {
+    const move = historyMove(history, 'back', { skipReveals: mode !== 'codeMap' });
+    if (move.kind === 'reveal') {
+      applyRevealHistoryMove(move);
       return;
     }
-    const nextIndex = history.index - 1;
-    const id = history.stack[nextIndex];
-    if (id === undefined) {
+    if (move.kind !== 'center') {
       return;
     }
+    const nextIndex = move.index;
+    const id = move.id;
     if (routeThroughFullMapRef.current([id], { kind: 'history', id, index: nextIndex })) {
       return;
     }
@@ -10948,17 +11108,19 @@ export function CodeMap({
       return;
     }
     setHistory((previous) => ({ ...previous, index: nextIndex }));
-  }, [history, centerOnNode]);
+  }, [history, centerOnNode, applyRevealHistoryMove, mode]);
 
   const goForward = useCallback(() => {
-    if (history.index >= history.stack.length - 1) {
+    const move = historyMove(history, 'forward', { skipReveals: mode !== 'codeMap' });
+    if (move.kind === 'reveal') {
+      applyRevealHistoryMove(move);
       return;
     }
-    const nextIndex = history.index + 1;
-    const id = history.stack[nextIndex];
-    if (id === undefined) {
+    if (move.kind !== 'center') {
       return;
     }
+    const nextIndex = move.index;
+    const id = move.id;
     if (routeThroughFullMapRef.current([id], { kind: 'history', id, index: nextIndex })) {
       return;
     }
@@ -10967,7 +11129,7 @@ export function CodeMap({
       return;
     }
     setHistory((previous) => ({ ...previous, index: nextIndex }));
-  }, [history, centerOnNode]);
+  }, [history, centerOnNode, applyRevealHistoryMove, mode]);
 
   // FIX-1: the map's measured size — this component's ResizeObserver first,
   // then `@xyflow/react`'s store — or 0×0 when neither has measured yet.
@@ -11229,9 +11391,10 @@ export function CodeMap({
           break;
         case 'history':
           if (centerOnNode(pending.id)) {
-            setHistory((previous) =>
-              previous.stack[pending.index] === pending.id ? { ...previous, index: pending.index } : previous,
-            );
+            setHistory((previous) => {
+              const entry = previous.stack[pending.index];
+              return entry?.kind === 'node' && entry.id === pending.id ? { ...previous, index: pending.index } : previous;
+            });
           }
           break;
         case 'fit':
@@ -11242,6 +11405,53 @@ export function CodeMap({
       replayingFullNavigationRef.current = false;
     }
   }, [revealDrawn, flowNodesById, centerOnNode, fitViewToPath]);
+  // P4-7f: after a Back/Forward over a reveal entry, centre on its Node once
+  // the restored state is laid out — only if it is still revealed, and only
+  // while Revealed is drawn (PR Review never moves for it).
+  useEffect(() => {
+    if (revealFocusRequest === null) {
+      return;
+    }
+    setRevealFocusRequest(null);
+    if (!revealDrawn) {
+      return;
+    }
+    const { id, fallbackId, focusedCard } = revealFocusRequest;
+    const centreId = flowNodesById.has(id) ? id : flowNodesById.has(fallbackId) ? fallbackId : null;
+    if (centreId !== null) {
+      centerOnNode(centreId);
+    }
+    // Review round 1: a restore that removed the keyboard-focused card moves
+    // focus to the step's Node card if shown, else the Back button.
+    const stepCard =
+      canvasElement?.querySelector<HTMLElement>(`.react-flow__node[data-id="${CSS.escape(fallbackId)}"] .code-map__node`) ??
+      null;
+    switch (
+      revealFocusRescue({
+        focusWasOnCard: focusedCard !== null,
+        focusedCardStillShown: focusedCard?.isConnected === true,
+        stepCardShown: stepCard !== null,
+      })
+    ) {
+      case 'step-card':
+        stepCard?.focus({ preventScroll: true });
+        break;
+      case 'back-button':
+        historyBackButtonRef.current?.focus();
+        break;
+      case 'none':
+        break;
+    }
+  }, [revealFocusRequest, revealDrawn, flowNodesById, centerOnNode, canvasElement]);
+  // P4-7f: a reveal step belongs to one map fetch — a new fetch (a refresh)
+  // drops the reveal entries taken on another one (node entries stay: Node
+  // ids are content-stable across re-index). A section switch, Retry or
+  // project change already clears all of history (`loadCodeMap`).
+  useEffect(() => {
+    setHistory((previous) =>
+      historyWithoutReveals(previous, (entry) => entry.key === currentRevealKey && entry.mapStamp === revealMapStamp),
+    );
+  }, [currentRevealKey, revealMapStamp]);
   // Review round 1: the switch status line clears itself after
   // `REVEAL_SWITCH_STATUS_MS`, and on any mode change.
   useEffect(() => {
@@ -11256,8 +11466,9 @@ export function CodeMap({
     if (revealStatusModeRef.current !== mode) {
       revealStatusModeRef.current = mode;
       setRevealSwitchStatus(null);
+      clearRevealAnnouncement();
     }
-  }, [mode]);
+  }, [mode, clearRevealAnnouncement]);
 
   /**
    * The shared "run a trace, apply the result" round trip (Story 1.9, Phase
@@ -12491,13 +12702,19 @@ export function CodeMap({
         // narrow-map layout, where this drops below the search row; its
         // wide-map placement (top-right) is absolute, so order doesn't move it.
         <div className="code-map__history-toolbar" role="toolbar" aria-label="Map traversal history">
-          <button type="button" onClick={goBack} disabled={history.index <= 0} aria-label="Back">
+          <button
+            type="button"
+            ref={historyBackButtonRef}
+            onClick={goBack}
+            disabled={!canGoBack(history, { skipReveals: mode !== 'codeMap' })}
+            aria-label="Back"
+          >
             ← Back
           </button>
           <button
             type="button"
             onClick={goForward}
-            disabled={history.index >= history.stack.length - 1}
+            disabled={!canGoForward(history, { skipReveals: mode !== 'codeMap' })}
             aria-label="Forward"
           >
             Forward →

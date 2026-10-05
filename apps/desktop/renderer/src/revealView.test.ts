@@ -66,6 +66,7 @@ import {
   revealStubCardId,
   revealStubText,
 } from './revealView';
+import { formatRevealAnnouncement, NO_MORE_CALLEES_TEXT, NOTHING_TO_COLLAPSE_TEXT, planRevealDrill } from './revealView';
 
 function candidate(id: string, reach: number, reason: EntryCandidate['reason'] = { kind: 'no-callers' }): EntryCandidate {
   return { id, name: id.slice(id.lastIndexOf(':') + 1), file: 'src/entry.ts', startLine: 1, endLine: 5, reach, reason };
@@ -1272,5 +1273,111 @@ describe('P4-7e review round 1: computeReachById by component', () => {
     // AD-14's ~150 ms, with margin for CI noise; the measured numbers are recorded in the spec.
     assert.ok(hubMs < 300, `200-callee expand took ${hubMs.toFixed(1)} ms`);
     assert.ok(twoLayersMs < 300, `12-callee two-layer expand took ${twoLayersMs.toFixed(1)} ms`);
+  });
+});
+
+describe('P4-7f: formatRevealAnnouncement', () => {
+  it('"Revealed 3 callees of handleRequest in 2 layers" (path-trace-basic)', () => {
+    const { graph, start } = ptb();
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'handleRequest');
+    assert.equal(formatRevealAnnouncement(start, after, 'handleRequest'), 'Revealed 3 callees of handleRequest in 2 layers');
+  });
+
+  it('one layer names no layer count; one callee is singular', () => {
+    const graph = revealDrillGraphFor(null, ['a', 'b'].map(mapNode), [edge('a', 'b')]);
+    const start = initialRevealState(found([candidate('a', 1)]));
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'a');
+    assert.equal(formatRevealAnnouncement(start, after, 'a'), 'Revealed 1 callee of a');
+  });
+
+  it('a capped reveal names the hidden count: "Revealed 30 of 45 callees of hub; 15 more"', () => {
+    const { graph, start } = hubGraph(45);
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'hub');
+    assert.equal(formatRevealAnnouncement(start, after, 'hub'), 'Revealed 30 of 45 callees of hub; 15 more');
+    assert.equal(
+      formatRevealAnnouncement(start, after, 'hub', { parentId: 'hub', step: 'expand' }),
+      'Revealed 30 of 45 callees of hub; 15 more',
+    );
+  });
+
+  it('review round 1: a stub step says "Showed 30 more callees of X; 15 more" (no tail when none are left)', () => {
+    const { graph: g75, start: s75 } = hubGraph(75);
+    const once = expandNode(s75, g75.adjacency, g75.reachById, 'hub');
+    const twice = expandStub(once, g75.adjacency, g75.reachById, 'hub');
+    assert.equal(formatRevealAnnouncement(once, twice, 'hub', { parentId: 'hub', step: 'stub' }), 'Showed 30 more callees of hub; 15 more');
+    const thrice = expandStub(twice, g75.adjacency, g75.reachById, 'hub');
+    assert.equal(formatRevealAnnouncement(twice, thrice, 'hub', { parentId: 'hub', step: 'stub' }), 'Showed 15 more callees of hub');
+  });
+
+  it('review round 1: a capped expand counts only the Node’s own stub — a child’s stub is not in "N more"', () => {
+    // root → k (one child, so two layers open); k has 40 callees → k's own stub of 10.
+    const nodes = [mapNode('root'), mapNode('k')];
+    const edges = [edge('root', 'k')];
+    for (let i = 0; i < 40; i += 1) {
+      nodes.push(mapNode(`g${String(i).padStart(2, '0')}`));
+      edges.push(edge('k', `g${String(i).padStart(2, '0')}`));
+    }
+    const graph = revealDrillGraphFor(null, nodes, edges);
+    const start = initialRevealState(found([candidate('root', 41)]));
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'root');
+    assert.ok(after.entries.some((entry) => entry.kind === 'more' && entry.parentId === 'k'));
+    assert.equal(
+      formatRevealAnnouncement(start, after, 'root', { parentId: 'root', step: 'expand' }),
+      'Revealed 31 callees of root in 2 layers',
+    );
+  });
+
+  it('"Collapsed X, hid N Nodes"', () => {
+    const { graph, start } = ptb();
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'handleRequest');
+    assert.equal(formatRevealAnnouncement(after, collapseNode(after, 'handleRequest'), 'handleRequest'), 'Collapsed handleRequest, hid 3 Nodes');
+  });
+});
+
+describe('P4-7f: planRevealDrill (the button and `+`/`−`)', () => {
+  it('`+` on a Node with callees to reveal expands it', () => {
+    const { graph, start } = ptb();
+    const plan = planRevealDrill(start, graph, 'handleRequest', 'expand');
+    assert.equal(plan.kind, 'step');
+    assert.ok(plan.kind === 'step');
+    assert.equal(plan.step, 'expand');
+    assert.deepEqual(plan.next, expandNode(start, graph.adjacency, graph.reachById, 'handleRequest'));
+  });
+
+  it('`+` on a leaf, or a Node whose callees are all shown, only says "No more callees"', () => {
+    const { graph, start } = ptb();
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'handleRequest');
+    const deeper = expandNode(after, graph.adjacency, graph.reachById, 'repository');
+    assert.deepEqual(planRevealDrill(deeper, graph, 'cacheLookup', 'expand'), { kind: 'none', text: NO_MORE_CALLEES_TEXT });
+    assert.deepEqual(planRevealDrill(after, graph, 'serviceB', 'expand'), { kind: 'none', text: NO_MORE_CALLEES_TEXT });
+    assert.equal(NO_MORE_CALLEES_TEXT, 'No more callees');
+  });
+
+  it('`+` on an unexpanded Node whose callees are all shown elsewhere says "No more callees" (no refs-only step)', () => {
+    const graph = revealDrillGraphFor(null, ['a', 'b'].map(mapNode), [edge('a', 'b')]);
+    const start = initialRevealState(found([candidate('a', 1), candidate('b', 0)]));
+    assert.equal(revealDrillControls(start, graph.adjacency).has('a'), false, 'no button either');
+    assert.deepEqual(planRevealDrill(start, graph, 'a', 'expand'), { kind: 'none', text: NO_MORE_CALLEES_TEXT });
+  });
+
+  it('`+` on an expanded Node with a stub shows the stub’s next callees; without one, "No more callees"', () => {
+    const { graph, start } = hubGraph(45);
+    const once = expandNode(start, graph.adjacency, graph.reachById, 'hub');
+    const plan = planRevealDrill(once, graph, 'hub', 'expand');
+    assert.ok(plan.kind === 'step');
+    assert.equal(plan.step, 'stub');
+    assert.equal(plan.next.revealed.size, 46);
+    assert.deepEqual(planRevealDrill(plan.next, graph, 'hub', 'expand'), { kind: 'none', text: NO_MORE_CALLEES_TEXT });
+  });
+
+  it('`−` collapses an expanded Node; on one with nothing beneath, "Nothing to collapse"; an unrevealed id is ignored', () => {
+    const { graph, start } = ptb();
+    const after = expandNode(start, graph.adjacency, graph.reachById, 'handleRequest');
+    const plan = planRevealDrill(after, graph, 'handleRequest', 'collapse');
+    assert.ok(plan.kind === 'step');
+    assert.equal(plan.step, 'collapse');
+    assert.deepEqual(plan.next, collapseNode(after, 'handleRequest'));
+    assert.deepEqual(planRevealDrill(start, graph, 'handleRequest', 'collapse'), { kind: 'none', text: NOTHING_TO_COLLAPSE_TEXT });
+    assert.deepEqual(planRevealDrill(start, graph, 'cacheLookup', 'expand'), { kind: 'ignore' });
   });
 });

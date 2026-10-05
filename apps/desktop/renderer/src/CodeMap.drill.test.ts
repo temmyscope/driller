@@ -372,13 +372,11 @@ describe('the hook wiring (source pins)', () => {
   it('a drill step is renderer-local: applied to the held state, never through window.driller', () => {
     const body = sliceFrom('const applyRevealDrill = useCallback(', 'const revealCanvas = useMemo(');
     assert.doesNotMatch(body, /window\.driller/);
-    assert.match(body, /applyRevealTransition\(revealHeldRef\.current, key, \(state\) => transition\(state, graph\)\)/);
-    assert.match(body, /if \(graph === null \|\| graph\.edges !== mapStamp\) \{\s*return;/);
+    // P4-7f: the transition is planned against the held state (`planRevealDrill`).
+    assert.match(body, /applyRevealTransition\(revealHeldRef\.current, key, \(state\) => \{\s*const planned = plan\(state, graph\);/);
+    assert.match(body, /if \(graph === null \|\| graph\.edges !== mapStamp \|\| key === null\) \{\s*return;/);
     assert.match(body, /revealHeldRef\.current = applied\.held;\s*setRevealHeld\(applied\.held\);/);
-    assert.match(
-      body,
-      /action === 'expand'\s*\? expandNode\(state, graph\.adjacency, graph\.reachById, node\.id\)\s*: collapseNode\(state, node\.id\)/,
-    );
+    assert.match(body, /const planned = planRevealDrill\(state, graph, node\.id, action\);/);
     assert.match(body, /expandStub\(state, graph\.adjacency, graph\.reachById, stub\.parentId\)/);
     // A ref goes to its target through the existing navigation.
     assert.match(body, /\(ref: Extract<RevealAuxCard, \{ kind: 'ref' \}>\) => navigateToNode\(ref\.targetId\)/);

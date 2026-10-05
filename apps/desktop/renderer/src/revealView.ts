@@ -469,12 +469,17 @@ export function revealCapText(held: HeldReveal | null, key: string | null): stri
  */
 export function revealStatusText(input: {
   switchStatus: string | null;
+  /** P4-7f: the latest drill or Back/Forward announcement (`''` while blanked to repeat it). */
+  announcement?: string | null;
   notice: RevealNotice;
   capText: string | null;
 }): string {
-  const { switchStatus, notice, capText } = input;
+  const { switchStatus, announcement = null, notice, capText } = input;
   if (switchStatus !== null) {
     return switchStatus;
+  }
+  if (announcement !== null) {
+    return announcement;
   }
   if (notice !== null) {
     return notice.kind === 'loading' ? notice.text : notice.sentence;
@@ -1361,6 +1366,434 @@ export function applyRevealTransition(
     return after === listing.previous
       ? null
       : { held: { ...current, listing: { ...listing, previous: after } }, before: listing.previous, after };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// P4-7f: drill steps in Back/Forward history, the keyboard, and announcements
+// ---------------------------------------------------------------------------
+
+/** Which drill step a reveal history entry records (for its Back wording). */
+export type RevealStep = 'expand' | 'collapse' | 'stub';
+
+/**
+ * One Back/Forward history entry (renderer-local and ephemeral, AD-2):
+ *  - `node`: a traversal to a map Node — Back/Forward re-centre on it, as
+ *    before P4-7f;
+ *  - `reveal`: one drill step — Back restores `before`, Forward `after`
+ *    (immutable `RevealState` snapshots that share structure, so a push is
+ *    O(1)). `focusId` is the Node it was taken on (the expanded or collapsed
+ *    Node, or the stub's parent), `name` that Node's name for the
+ *    announcement. `key` and `mapStamp` are the project/section and map
+ *    fetch it was taken on: a reveal entry never outlives them
+ *    (`historyWithoutReveals`).
+ */
+export type HistoryEntry =
+  | { kind: 'node'; id: string }
+  | {
+      kind: 'reveal';
+      before: RevealState;
+      after: RevealState;
+      focusId: string;
+      name: string;
+      step: RevealStep;
+      key: string;
+      mapStamp: readonly CodeMapEdge[];
+    };
+
+export type RevealHistoryEntry = Extract<HistoryEntry, { kind: 'reveal' }>;
+
+/** The Back/Forward history: the entries in order, and the current one (`-1`: before the first). */
+export interface NavigationHistory {
+  stack: readonly HistoryEntry[];
+  index: number;
+}
+
+/**
+ * Defensive cap on `history.stack` (review finding, Story 1.4): nothing trims
+ * it naturally, so the oldest entries — node and reveal alike — are dropped
+ * once it is exceeded, with `index` shifted down to keep pointing at the same
+ * logical entry.
+ */
+export const MAX_HISTORY_LENGTH = 500;
+
+/** Whether `id` is a render-only reveal card's id (a ref or a stub) — never a Node id. */
+export function isRevealCardId(id: string): boolean {
+  return id.startsWith('reveal:');
+}
+
+/**
+ * The history after a navigation or a drill step (pure — safe under React's
+ * dev-mode double-invocation of state updaters). Forward entries past
+ * `index` are truncated first, like a browser's history. A node entry equal
+ * to the current last one is a no-op (`previous` unchanged, forward entries
+ * kept); a reveal entry is never deduped (two identical expands are two
+ * steps). A render-only card id is never a node entry. Capped at
+ * `MAX_HISTORY_LENGTH`, oldest first.
+ */
+export function pushHistoryEntry(previous: NavigationHistory, entry: HistoryEntry): NavigationHistory {
+  if (entry.kind === 'node' && isRevealCardId(entry.id)) {
+    return previous;
+  }
+  const truncated = previous.stack.slice(0, previous.index + 1);
+  const last = truncated[truncated.length - 1];
+  if (entry.kind === 'node' && last?.kind === 'node' && last.id === entry.id) {
+    return previous;
+  }
+  let stack = [...truncated, entry];
+  let index = stack.length - 1;
+  if (stack.length > MAX_HISTORY_LENGTH) {
+    const overflow = stack.length - MAX_HISTORY_LENGTH;
+    stack = stack.slice(overflow);
+    index -= overflow;
+  }
+  return { stack, index };
+}
+
+/**
+ * The history without the reveal entries `keep` rejects (by default, all of
+ * them) — for a new map fetch or a re-listing, after which no snapshot is
+ * the state on screen. `index` moves to the kept entry at or before it (`-1`
+ * when there is none). Node entries left adjacent and equal are merged, as a
+ * push would have. `previous` itself when nothing is dropped.
+ */
+export function historyWithoutReveals(
+  previous: NavigationHistory,
+  keep: (entry: RevealHistoryEntry) => boolean = () => false,
+): NavigationHistory {
+  if (!previous.stack.some((entry) => entry.kind === 'reveal' && !keep(entry))) {
+    return previous;
+  }
+  const stack: HistoryEntry[] = [];
+  let index = -1;
+  previous.stack.forEach((entry, at) => {
+    const last = stack[stack.length - 1];
+    const dropped =
+      (entry.kind === 'reveal' && !keep(entry)) ||
+      (entry.kind === 'node' && last?.kind === 'node' && last.id === entry.id);
+    if (!dropped) {
+      stack.push(entry);
+    }
+    if (at <= previous.index) {
+      index = stack.length - 1;
+    }
+  });
+  return { stack, index };
+}
+
+/**
+ * Review round 1: `skipReveals` — outside Code Map mode (PR Review), Back and
+ * Forward step past reveal entries to the nearest node entry and never touch
+ * the held Code Map reveal state; with no node entry that way, no move.
+ */
+export interface HistoryMoveOptions {
+  skipReveals?: boolean;
+}
+
+/** Whether Back can move: a node entry needs one before it; a reveal entry can always be undone (Code Map mode). */
+export function canGoBack(history: NavigationHistory, options: HistoryMoveOptions = {}): boolean {
+  return historyMove(history, 'back', options).kind !== 'none';
+}
+
+/** Whether Forward can move. */
+export function canGoForward(history: NavigationHistory, options: HistoryMoveOptions = {}): boolean {
+  return historyMove(history, 'forward', options).kind !== 'none';
+}
+
+/**
+ * What one Back or Forward does:
+ *  - `center`: a node entry — re-centre on `id` (today's behaviour), moving to `index`;
+ *  - `reveal`: set the reveal state to `restore`, switch to Revealed if needed
+ *    and centre on `centerId`, moving to `index`. `how`:
+ *    `undo` — Back off a reveal entry restores its `before` and lands on the
+ *    entry before it: `centerId` is that entry's Node (a node entry's id, a
+ *    reveal entry's `focusId`), or the step's own Node at the start;
+ *    `redo` — Forward onto a reveal entry restores its `after`;
+ *    `return` — Back from a node entry onto a reveal entry shows that step's
+ *    view again (its `after`, already the state on screen);
+ *    for both, `centerId` is the step's `focusId`;
+ *  - `none`: at either end (or, skipping reveals, no node entry that way).
+ */
+export type RevealHistoryHow = 'undo' | 'redo' | 'return';
+
+export type HistoryMove =
+  | { kind: 'none' }
+  | { kind: 'center'; id: string; index: number }
+  | {
+      kind: 'reveal';
+      how: RevealHistoryHow;
+      entry: RevealHistoryEntry;
+      restore: RevealState;
+      index: number;
+      centerId: string;
+    };
+
+export function historyMove(
+  history: NavigationHistory,
+  direction: 'back' | 'forward',
+  options: HistoryMoveOptions = {},
+): HistoryMove {
+  if (options.skipReveals === true) {
+    const step = direction === 'back' ? -1 : 1;
+    for (let index = history.index + step; index >= 0 && index < history.stack.length; index += step) {
+      const entry = history.stack[index];
+      if (entry?.kind === 'node') {
+        return { kind: 'center', id: entry.id, index };
+      }
+    }
+    return { kind: 'none' };
+  }
+  if (direction === 'back') {
+    const current = history.stack[history.index];
+    if (current?.kind === 'reveal') {
+      const landing = history.stack[history.index - 1];
+      const centerId = landing === undefined ? current.focusId : landing.kind === 'node' ? landing.id : landing.focusId;
+      return { kind: 'reveal', how: 'undo', entry: current, restore: current.before, index: history.index - 1, centerId };
+    }
+    if (history.index <= 0) {
+      return { kind: 'none' };
+    }
+  } else if (history.index >= history.stack.length - 1) {
+    return { kind: 'none' };
+  }
+  const index = direction === 'back' ? history.index - 1 : history.index + 1;
+  const target = history.stack[index];
+  if (target === undefined) {
+    return { kind: 'none' };
+  }
+  if (target.kind === 'node') {
+    return { kind: 'center', id: target.id, index };
+  }
+  return {
+    kind: 'reveal',
+    how: direction === 'back' ? 'return' : 'redo',
+    entry: target,
+    restore: target.after,
+    index,
+    centerId: target.focusId,
+  };
+}
+
+/** Review round 1: the history without one stale reveal entry (index and equal neighbours as `historyWithoutReveals`). */
+export function historyWithoutEntry(previous: NavigationHistory, entry: RevealHistoryEntry): NavigationHistory {
+  return historyWithoutReveals(previous, (candidate) => candidate !== entry);
+}
+
+/** Review round 1: the status line when a history step can't be restored on the map on screen. */
+export const REVEAL_STEP_STALE_TEXT = 'That step no longer applies to this map';
+
+/**
+ * Review round 1: where keyboard focus goes after a Back/Forward over a
+ * reveal entry — only when focus was on a canvas card that the restored
+ * view removed: the step's Node card if it is shown, else the Back button.
+ */
+export function revealFocusRescue(input: {
+  focusWasOnCard: boolean;
+  focusedCardStillShown: boolean;
+  stepCardShown: boolean;
+}): 'none' | 'step-card' | 'back-button' {
+  if (!input.focusWasOnCard || input.focusedCardStillShown) {
+    return 'none';
+  }
+  return input.stepCardShown ? 'step-card' : 'back-button';
+}
+
+/**
+ * Review round 1: how the one status line says `next` so it is always
+ * announced — an identical text is blanked first (`''`) and set again on the
+ * next frame, so the live region's DOM changes.
+ */
+export function announcementSteps(current: string | null, next: string): readonly string[] {
+  return current === next ? ['', next] : [next];
+}
+
+/**
+ * Restores a reveal history snapshot into the held state (no IPC, no
+ * re-listing): only for the project/section and map fetch the entry was
+ * taken on, and only when the state drawn now is the one the step left
+ * (`expected`) or already `restore`. `null` otherwise — a stale entry, never
+ * applied over another map's state.
+ */
+export function restoreRevealSnapshot(
+  held: HeldReveal | null,
+  key: string | null,
+  entry: Pick<RevealHistoryEntry, 'key' | 'mapStamp'>,
+  expected: RevealState,
+  restore: RevealState,
+): HeldReveal | null {
+  const current = key === null ? null : heldRevealFor(held, key);
+  if (current === null || entry.key !== key || entry.mapStamp !== current.mapStamp) {
+    return null;
+  }
+  const listing = current.listing;
+  if (listing.status === 'ready') {
+    if (listing.state === restore) {
+      return current;
+    }
+    return listing.state === expected ? { ...current, listing: { ...listing, state: restore } } : null;
+  }
+  if (listing.status === 'loading' && listing.previous !== null) {
+    if (listing.previous === restore) {
+      return current;
+    }
+    return listing.previous === expected ? { ...current, listing: { ...listing, previous: restore } } : null;
+  }
+  return null;
+}
+
+/** The status line for `+` on a Node with nothing more to reveal (frozen spec). */
+export const NO_MORE_CALLEES_TEXT = 'No more callees';
+
+/** The status line for `−` on a Node with nothing revealed beneath it. */
+export const NOTHING_TO_COLLAPSE_TEXT = 'Nothing to collapse';
+
+/**
+ * What a drill request on a revealed Node does — from its card's
+ * expand/collapse button, or `+`/`−` on the focused card:
+ *  - `expand` on a Node with callees not yet revealed anywhere expands it;
+ *    on an expanded Node with a "+N more callees" stub, it shows the stub's
+ *    next callees; otherwise it does nothing but say "No more callees";
+ *  - `collapse` on an expanded Node collapses it; otherwise it does nothing
+ *    but say "Nothing to collapse";
+ *  - `ignore` for a Node not revealed.
+ */
+export type RevealDrillPlan =
+  | { kind: 'step'; step: RevealStep; next: RevealState }
+  | { kind: 'none'; text: string }
+  | { kind: 'ignore' };
+
+export function planRevealDrill(
+  state: RevealState,
+  graph: Pick<RevealDrillGraph, 'adjacency' | 'reachById'>,
+  id: string,
+  action: RevealDrillControl['kind'],
+): RevealDrillPlan {
+  if (!state.revealed.has(id)) {
+    return { kind: 'ignore' };
+  }
+  const expanded = isExpanded(state, id);
+  if (action === 'collapse') {
+    return expanded ? { kind: 'step', step: 'collapse', next: collapseNode(state, id) } : { kind: 'none', text: NOTHING_TO_COLLAPSE_TEXT };
+  }
+  if (expanded) {
+    const hasStub = state.entries.some((entry) => entry.kind === 'more' && entry.parentId === id);
+    if (hasStub) {
+      const next = expandStub(state, graph.adjacency, graph.reachById, id);
+      return next === state ? { kind: 'none', text: NO_MORE_CALLEES_TEXT } : { kind: 'step', step: 'stub', next };
+    }
+    return { kind: 'none', text: NO_MORE_CALLEES_TEXT };
+  }
+  const fresh = calleesOf(graph.adjacency, id).some((callee) => !state.revealed.has(callee));
+  if (!fresh) {
+    return { kind: 'none', text: NO_MORE_CALLEES_TEXT };
+  }
+  const next = expandNode(state, graph.adjacency, graph.reachById, id);
+  return next === state ? { kind: 'none', text: NO_MORE_CALLEES_TEXT } : { kind: 'step', step: 'expand', next };
+}
+
+const plural = (count: number, one: string, many: string = `${one}s`): string => `${count} ${count === 1 ? one : many}`;
+
+/**
+ * The announcement for one drill step (EXPERIENCE.md: every reveal and
+ * collapse named in the one `role="status"` line), from the two snapshots.
+ * With `step` (review round 1 wording, for founder sign-off):
+ *  - expand: "Revealed 3 callees of handleRequest in 2 layers" (the layer
+ *    count only when more than one); capped, counting only the Node's own
+ *    stub: "Revealed 30 of 45 callees of X; 15 more";
+ *  - stub: "Showed 30 more callees of X; 15 more" (no "; N more" when none
+ *    are left);
+ *  - collapse: "Collapsed X, hid 7 Nodes".
+ * Without `step`, a step that removes entries is a collapse and one that
+ * adds them an expand. `parentId` is the Node the step was taken on (its own
+ * stub); without it, every new stub counts.
+ */
+export function formatRevealAnnouncement(
+  before: RevealState,
+  after: RevealState,
+  name: string,
+  context: { parentId?: string; step?: RevealStep } = {},
+): string {
+  const step = context.step ?? (after.entries.length < before.entries.length ? 'collapse' : 'expand');
+  if (step === 'collapse') {
+    const hid = before.revealed.size - after.revealed.size;
+    return hid > 0 ? `Collapsed ${name}, hid ${plural(hid, 'Node')}` : `Collapsed ${name}`;
+  }
+  const previous = new Set(before.entries);
+  const depths = new Set<number>();
+  let added = 0;
+  let hidden = 0;
+  for (const entry of after.entries) {
+    if (entry.kind === 'node' && !before.revealed.has(entry.id)) {
+      added += 1;
+      depths.add(entry.depth);
+    } else if (
+      entry.kind === 'more' &&
+      !previous.has(entry) &&
+      (context.parentId === undefined || entry.parentId === context.parentId)
+    ) {
+      hidden += entry.hiddenCount;
+    }
+  }
+  if (added === 0) {
+    return `No new callees of ${name}: the rest are shown above`;
+  }
+  const more = hidden > 0 ? `; ${hidden} more` : '';
+  if (step === 'stub') {
+    return `Showed ${added} more ${added === 1 ? 'callee' : 'callees'} of ${name}${more}`;
+  }
+  const layers = depths.size > 1 ? ` in ${depths.size} layers` : '';
+  return hidden > 0
+    ? `Revealed ${added} of ${plural(added + hidden, 'callee')} of ${name}${layers}${more}`
+    : `Revealed ${plural(added, 'callee')} of ${name}${layers}`;
+}
+
+const STEP_GERUND: Record<RevealStep, string> = {
+  expand: 'expanding',
+  collapse: 'collapsing',
+  stub: 'showing more callees of',
+};
+
+/**
+ * The announcement for a Back/Forward over a reveal entry:
+ *  - `undo`: "Back: restored the view before expanding X";
+ *  - `redo`: "Forward: " + the step's own announcement;
+ *  - `return`: "Back: returned to X in the Revealed view".
+ */
+export function formatRevealHistoryAnnouncement(how: RevealHistoryHow, entry: RevealHistoryEntry): string {
+  switch (how) {
+    case 'undo':
+      return `Back: restored the view before ${STEP_GERUND[entry.step]} ${entry.name}`;
+    case 'redo':
+      return `Forward: ${formatRevealAnnouncement(entry.before, entry.after, entry.name, {
+        parentId: entry.focusId,
+        step: entry.step,
+      })}`;
+    case 'return':
+      return `Back: returned to ${entry.name} in the Revealed view`;
+  }
+}
+
+/**
+ * Whether a key press on a focused card is the drill's `+` (expand) or `−`
+ * (collapse) — never with Ctrl, Cmd or Alt held (app and browser zoom), and
+ * never an auto-repeat of a held key (review round 1).
+ */
+export function revealDrillKey(event: {
+  key: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  repeat?: boolean;
+}): RevealDrillControl['kind'] | null {
+  if (event.ctrlKey || event.metaKey || event.altKey || event.repeat === true) {
+    return null;
+  }
+  if (event.key === '+' || event.key === '=') {
+    return 'expand';
+  }
+  if (event.key === '-' || event.key === '−') {
+    return 'collapse';
   }
   return null;
 }

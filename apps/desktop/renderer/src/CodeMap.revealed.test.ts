@@ -440,7 +440,7 @@ describe('the toggle', () => {
     );
     assert.match(
       codeMapSrc,
-      /const revealStatus = revealStatusText\(\{\s*switchStatus: revealSwitchStatus,\s*notice: revealNotice,\s*capText: revealDrawn \? revealCapText\(revealHeld, currentRevealKey\) : null,\s*\}\);/,
+      /const revealStatus = revealStatusText\(\{\s*switchStatus: revealSwitchStatus,\s*announcement: revealAnnouncement,\s*notice: revealNotice,\s*capText: revealDrawn \? revealCapText\(revealHeld, currentRevealKey\) : null,\s*\}\);/,
     );
     // The only role="status" for Revealed: the notices carry none.
     assert.equal(codeMapSrc.match(/className="code-map__reveal-status" role="status"/g)?.length, 1);
