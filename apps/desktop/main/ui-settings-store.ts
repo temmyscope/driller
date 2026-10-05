@@ -5,8 +5,9 @@
  * per-project "Show types & modules" canvas toggle). A corrupted file or
  * an unwritable `userData` directory falls back to an in-memory store for
  * the session (same discipline as project-scope-settings.ts). P4-4i adds
- * `activeSectionByProject`, the last Section bar selection per project. All
- * validation and caching live in ui-settings.ts.
+ * `activeSectionByProject`, the last Section bar selection per project; P4-7g
+ * adds `entryPinsByProject`, the Nodes pinned as entry points per project
+ * (AD-5 "Entry pins"). All validation and caching live in ui-settings.ts.
  */
 
 import Store from 'electron-store';
@@ -14,9 +15,11 @@ import Store from 'electron-store';
 import { DEFAULT_ZOOM_FACTOR } from './app-menu';
 import {
   createActiveSectionSetting,
+  createEntryPinsSetting,
   createShowFoldedKindsSetting,
   createUiSettings,
   type ActiveSectionBackingStore,
+  type EntryPinsBackingStore,
   type ShowFoldedKindsBackingStore,
   type UiSettingsBackingStore,
 } from './ui-settings';
@@ -27,12 +30,19 @@ interface UiSettingsSchema {
   showFoldedKindsByProject: Record<string, boolean>;
   /** P4-4i: each project's last selected section (no entry = `all`). */
   activeSectionByProject: Record<string, string>;
+  /** P4-7g: each project's pinned entry-point Node ids, in pin order (no entry = none). */
+  entryPinsByProject: Record<string, string[]>;
 }
 
 function openStore(): Store<UiSettingsSchema> {
   return new Store<UiSettingsSchema>({
     name: 'driller-ui-settings',
-    defaults: { zoomFactor: DEFAULT_ZOOM_FACTOR, showFoldedKindsByProject: {}, activeSectionByProject: {} },
+    defaults: {
+      zoomFactor: DEFAULT_ZOOM_FACTOR,
+      showFoldedKindsByProject: {},
+      activeSectionByProject: {},
+      entryPinsByProject: {},
+    },
   });
 }
 
@@ -105,6 +115,23 @@ function createActiveSectionBackingStore(): ActiveSectionBackingStore {
   };
 }
 
+function createEntryPinsBackingStore(): EntryPinsBackingStore {
+  const store = getSharedStore();
+  if (store !== null) {
+    return {
+      get: () => store.get('entryPinsByProject'),
+      set: (value) => store.set('entryPinsByProject', value),
+    };
+  }
+  let inMemory: unknown = {};
+  return {
+    get: () => inMemory,
+    set: (value) => {
+      inMemory = value;
+    },
+  };
+}
+
 export const uiSettings = createUiSettings(createBackingStore());
 
 /** P4-2 phase 3c: the per-project "Show types & modules" canvas toggle. */
@@ -112,3 +139,6 @@ export const showFoldedKindsSetting = createShowFoldedKindsSetting(createShowFol
 
 /** P4-4i: the last Section bar selection per project. */
 export const activeSectionSetting = createActiveSectionSetting(createActiveSectionBackingStore());
+
+/** P4-7g: the Nodes pinned as entry points, per project (AD-5 "Entry pins"). */
+export const entryPinsSetting = createEntryPinsSetting(createEntryPinsBackingStore());

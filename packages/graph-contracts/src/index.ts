@@ -558,6 +558,13 @@ export const ENTRY_CANDIDATE_MAX = 12;
 /** P4-7: at most this many `calledAtLoadBy` files are named in a candidate's `reason.loadedBy`. */
 export const ENTRY_CANDIDATE_LOADED_BY_MAX = 3;
 
+/**
+ * P4-7g (AD-5 "Entry pins"): at most this many Nodes can be pinned as entry
+ * points per project. The UI setting refuses a pin past it ("Pin limit (50)
+ * reached"), and a hand-edited stored list is read back capped to it.
+ */
+export const ENTRY_PINS_MAX = 50;
+
 /** The structural Node shape `listEntryCandidates` reads — any `CodeMapNode` fits. */
 export type EntryCandidateInputNode = Pick<CodeMapNode, 'id' | 'name' | 'file' | 'startLine' | 'endLine' | 'calledAtLoadBy'>;
 
@@ -566,8 +573,9 @@ export type EntryCandidateInputNode = Pick<CodeMapNode, 'id' | 'name' | 'file' |
  * it reaches forward over `ENTRY_CALLER_EDGE_KINDS` in the given Nodes and
  * edges, itself excluded — exactly what a full drill from it reveals.
  *
- * `reason` is a discriminated union on `kind` so a later phase can add
- * `{kind: 'pinned'}` without breaking consumers. `'no-callers'`: no other
+ * `reason` is a discriminated union on `kind`. `'pinned'` (P4-7g): the
+ * engineer pinned it as an entry point — listed first, in pin order, whatever
+ * its callers or reach (its `reach` is still the real one). `'no-callers'`: no other
  * map Node calls or uses it in indexed code. `loadedBy` names (sorted, at
  * most `ENTRY_CANDIDATE_LOADED_BY_MAX`) the files whose folded top-level
  * code calls or uses it (`CodeMapNode.calledAtLoadBy`), and
@@ -582,27 +590,40 @@ export interface EntryCandidate {
   startLine: number;
   endLine: number;
   reach: number;
-  reason: { kind: 'no-callers'; loadedBy?: string[]; loadedByTotal?: number };
+  reason: { kind: 'no-callers'; loadedBy?: string[]; loadedByTotal?: number } | { kind: 'pinned' };
 }
 
 /**
  * P4-7 (AD-13 (f)): the entry-candidate listing's explicit result state.
- *  - `'found'`: `candidates` ranked by reach (highest first), then `id`
- *    ascending, at most `ENTRY_CANDIDATE_MAX`; `totalQualifying` is how many
- *    qualified before the cap.
- *  - `'none'`: no Node qualifies (fully cyclic code, or every root reaches
- *    fewer than `ENTRY_CANDIDATE_MIN_REACH` Nodes) — never "the code has no
- *    way in".
+ *  - `'found'`: the pinned candidates first, in pin order (P4-7g), then the
+ *    heuristic ones ranked by reach (highest first), then `id` ascending, at
+ *    most `ENTRY_CANDIDATE_MAX` of those; `totalQualifying` is how many
+ *    qualified before the cap (the pinned ones included).
+ *  - `'none'`: no Node qualifies and none is pinned (fully cyclic code, or
+ *    every root reaches fewer than `ENTRY_CANDIDATE_MIN_REACH` Nodes) —
+ *    never "the code has no way in".
+ *  - `hiddenPinIds` (P4-7g, on `found` and `none`, present only when not
+ *    empty): pinned ids not among the given Nodes, in pin order — never shown
+ *    as a candidate. The pin itself is kept (AD-5 "Entry pins").
  *  - `'error'`: the listing couldn't be attempted (the transport's guards);
  *    `listEntryCandidates` itself never produces it.
  *  - `UnknownSectionResult`: a `section` outside the allowlist (AD-13
  *    "(f) per section"); the transport produces it, never the pure function.
  */
 export type EntryCandidatesResult =
-  | { status: 'found'; candidates: EntryCandidate[]; totalQualifying: number }
-  | { status: 'none' }
+  | { status: 'found'; candidates: EntryCandidate[]; totalQualifying: number; hiddenPinIds?: string[] }
+  | { status: 'none'; hiddenPinIds?: string[] }
   | { status: 'error'; message: string }
   | UnknownSectionResult;
+
+/**
+ * P4-7g: `listEntryCandidates`' options. `pinnedIds`: the engineer's pins,
+ * in pin order (AD-5 "Entry pins"); a repeated id counts once, at its first
+ * place.
+ */
+export interface EntryCandidatesOptions {
+  pinnedIds?: readonly string[];
+}
 
 /**
  * P4-7: the adjacency a candidate's reach is counted on, and the one a
@@ -833,6 +854,7 @@ function ranksAhead(a: { id: string; reach: number }, b: { id: string; reach: nu
 export function listEntryCandidatesWithWork(
   nodes: EntryCandidateInputNode[],
   edges: PathTraceEdge[],
+  options: EntryCandidatesOptions = {},
 ): { result: EntryCandidatesResult; roots: number; exactReachWalks: string[] } {
   const adjacency = entryReachAdjacency(nodes, edges);
   const nodesById = new Map<string, EntryCandidateInputNode>();
@@ -849,14 +871,57 @@ export function listEntryCandidatesWithWork(
     }
   });
   const exactReachWalks: string[] = [];
-  if (roots.length === 0) {
-    return { result: { status: 'none' }, roots: 0, exactReachWalks };
+  let reachIndex: EntryReachIndex | undefined;
+  const getReachIndex = (): EntryReachIndex =>
+    (reachIndex ??= new EntryReachIndex(
+      ordered.map((node) => node.id),
+      adjacency.forward,
+    ));
+
+  // P4-7g: the pins first, in pin order, each with its real reach — kept
+  // whatever its callers or reach. A pin not among `nodes` is hidden.
+  const pinned: EntryCandidate[] = [];
+  const pinnedIds = new Set<string>();
+  const hiddenPinIds: string[] = [];
+  const pins = options.pinnedIds ?? [];
+  if (pins.length > 0) {
+    const indexOfId = new Map<string, number>();
+    ordered.forEach((node, index) => indexOfId.set(node.id, index));
+    const seenPins = new Set<string>();
+    for (const id of pins) {
+      if (seenPins.has(id)) {
+        continue;
+      }
+      seenPins.add(id);
+      const index = indexOfId.get(id);
+      if (index === undefined) {
+        hiddenPinIds.push(id);
+        continue;
+      }
+      const node = ordered[index]!;
+      pinnedIds.add(id);
+      pinned.push({
+        id,
+        name: node.name,
+        file: node.file,
+        startLine: node.startLine,
+        endLine: node.endLine,
+        reach: getReachIndex().reach(index),
+        reason: { kind: 'pinned' },
+      });
+    }
   }
-  const reachIndex = new EntryReachIndex(
-    ordered.map((node) => node.id),
-    adjacency.forward,
-  );
-  const bounds = reachIndex.reachUpperBounds();
+  const hidden = hiddenPinIds.length > 0 ? { hiddenPinIds } : {};
+
+  if (roots.length === 0) {
+    const result: EntryCandidatesResult =
+      pinned.length === 0
+        ? { status: 'none', ...hidden }
+        : { status: 'found', candidates: pinned, totalQualifying: pinned.length, ...hidden };
+    return { result, roots: 0, exactReachWalks };
+  }
+  const bounds = getReachIndex().reachUpperBounds();
+  const walks = getReachIndex();
   const idOf = (index: number): string => ordered[index]!.id;
   roots.sort((a, b) => bounds[b]! - bounds[a]! || (idOf(a) < idOf(b) ? -1 : idOf(a) > idOf(b) ? 1 : 0));
 
@@ -869,17 +934,21 @@ export function listEntryCandidatesWithWork(
       break;
     }
     const node = ordered[root]!;
+    // P4-7g: a pinned Node is listed once, as pinned — never again here.
+    if (pinnedIds.has(node.id)) {
+      continue;
+    }
     if (ranking && ranked.length === ENTRY_CANDIDATE_MAX && !ranksAhead({ id: node.id, reach: bound }, ranked[ranked.length - 1]!)) {
       ranking = false;
     }
     if (!ranking) {
-      if (reachIndex.reach(root, ENTRY_CANDIDATE_MIN_REACH) >= ENTRY_CANDIDATE_MIN_REACH) {
+      if (walks.reach(root, ENTRY_CANDIDATE_MIN_REACH) >= ENTRY_CANDIDATE_MIN_REACH) {
         totalQualifying += 1;
       }
       continue;
     }
     exactReachWalks.push(node.id);
-    const reach = reachIndex.reach(root);
+    const reach = walks.reach(root);
     if (reach < ENTRY_CANDIDATE_MIN_REACH) {
       continue;
     }
@@ -902,8 +971,11 @@ export function listEntryCandidatesWithWork(
       ranked.pop();
     }
   }
+  const candidates = [...pinned, ...ranked];
   const result: EntryCandidatesResult =
-    totalQualifying === 0 ? { status: 'none' } : { status: 'found', candidates: ranked, totalQualifying };
+    candidates.length === 0
+      ? { status: 'none', ...hidden }
+      : { status: 'found', candidates, totalQualifying: pinned.length + totalQualifying, ...hidden };
   return { result, roots: roots.length, exactReachWalks };
 }
 
@@ -921,10 +993,21 @@ export function listEntryCandidatesWithWork(
  * `ENTRY_CANDIDATE_MAX` can still change, otherwise only until it reaches
  * `ENTRY_CANDIDATE_MIN_REACH` Nodes (`listEntryCandidatesWithWork`).
  *
+ * P4-7g: `options.pinnedIds` (the engineer's pins, AD-5 "Entry pins") come
+ * first, in pin order, with `reason: {kind: 'pinned'}` and their real reach,
+ * whatever their callers or reach; the heuristic candidates follow, without
+ * the pinned ids, still at most `ENTRY_CANDIDATE_MAX`. Pins alone make the
+ * result `found`. A pinned id not among `nodes` is never a candidate: it is
+ * listed in `hiddenPinIds`.
+ *
  * Pure (Always): no I/O, no dependency on any other `@driller/` package.
  */
-export function listEntryCandidates(nodes: EntryCandidateInputNode[], edges: PathTraceEdge[]): EntryCandidatesResult {
-  return listEntryCandidatesWithWork(nodes, edges).result;
+export function listEntryCandidates(
+  nodes: EntryCandidateInputNode[],
+  edges: PathTraceEdge[],
+  options: EntryCandidatesOptions = {},
+): EntryCandidatesResult {
+  return listEntryCandidatesWithWork(nodes, edges, options).result;
 }
 
 // ---------------------------------------------------------------------------

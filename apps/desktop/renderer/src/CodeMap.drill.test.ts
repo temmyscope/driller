@@ -402,7 +402,7 @@ describe('the hook wiring (source pins)', () => {
   it('a refresh’s listing keeps the drill (the drill graph is passed to the reply rule)', () => {
     assert.match(
       codeMapSrc,
-      /drillGraph:\s*started\.listing\.status === 'loading' && started\.listing\.previous !== null\s*\? revealDrillGraphFor\(revealDrillGraphRef\.current, mapNodes, mapStamp\)\s*: null,/,
+      /const drillGraph =\s*started\.listing\.status === 'loading' && started\.listing\.previous !== null\s*\? revealDrillGraphFor\(revealDrillGraphRef\.current, mapNodes, mapStamp\)\s*: null;[\s\S]{0,700}?drillGraph,\s*\}\);/,
     );
   });
 });

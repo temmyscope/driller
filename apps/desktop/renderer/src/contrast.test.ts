@@ -201,6 +201,8 @@ const CONTROLS = [
   '.code-map__blast-radius-stepper-controls button',
   '.code-map__source-open-in-editor',
   '.code-map__node-detail-regenerate',
+  // P4-7g: Node detail's pin toggle.
+  '.code-map__node-detail-pin',
 ];
 
 // Clickable or interactive-looking surfaces that are cards or frames, not

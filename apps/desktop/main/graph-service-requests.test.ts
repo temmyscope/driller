@@ -14,14 +14,23 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
-import type { CloudBackend, EntryCandidatesResult, GraphServiceListEntryCandidatesRequest } from '@driller/ipc-contracts';
+import type {
+  CloudBackend,
+  DiagnosticLogEntry,
+  EntryCandidatesResult,
+  GraphServiceListEntryCandidatesRequest,
+} from '@driller/ipc-contracts';
 
 import {
   buildBackendSwitchedRequest,
   buildIndexRequest,
   buildListEntryCandidatesRequest,
+  buildSetEntryPinsRequest,
   cloudKeyField,
   createEntryCandidatesRelay,
+  createEntryPinMissingLogger,
+  hiddenPinIdsOf,
+  isEntryPinsMissingMessage,
   isListEntryCandidatesResultMessage,
   parseListEntryCandidatesArgs,
   toValidatedEntryCandidatesResult,
@@ -336,7 +345,10 @@ describe('P4-7c: index.ts uses the relay (source)', () => {
 
   it('for the IPC handler, replies and exit', () => {
     assert.match(src, /IpcChannels\.entryCandidatesList,\s*\(_event, projectPath: unknown, sectionInput: unknown\): Promise<EntryCandidatesResult> => \{\s*const args = parseListEntryCandidatesArgs\(projectPath, sectionInput\);\s*return args\.ok \? requestListEntryCandidates\(args\) : Promise\.resolve\(args\.result\);/);
-    assert.match(src, /return entryCandidatesRelay\.request\(args\);/);
+    assert.match(
+      src,
+      /return entryCandidatesRelay\.request\(args\)\.then\(\(result\) => \{\s*logMissingEntryPins\(args\.projectPath, hiddenPinIdsOf\(result\)\);\s*return result;/,
+    );
     assert.match(src, /if \(isListEntryCandidatesResultMessage\(message\)\) \{\s*entryCandidatesRelay\.settleReply\(message\.requestId, message\.result, message\.section\);/);
     assert.match(src, /entryCandidatesRelay\.settleAll\('Graph Service exited before the entry candidates could be listed\.'\);/);
   });
@@ -346,6 +358,85 @@ describe('P4-7c: index.ts uses the relay (source)', () => {
     assert.match(
       preload,
       /listEntryCandidates: \(projectPath: string, section\?: string\)[^=]*=>\s*section === undefined\s*\? ipcRenderer\.invoke\(IpcChannels\.entryCandidatesList, projectPath\)\s*: ipcRenderer\.invoke\(IpcChannels\.entryCandidatesList, projectPath, section\)/,
+    );
+  });
+});
+
+describe('P4-7g: entry pins over the main → Graph Service boundary', () => {
+  it('the index request carries the pins in pin order, and omits them when there are none', () => {
+    const { decrypt } = countingDecrypt(undefined);
+    assert.deepEqual(
+      buildIndexRequest({ projectPath: '/repo/a', activeBackend: 'local', includedPaths: [], decrypt, entryPins: ['z', 'a'] }),
+      { type: 'graphService:index', path: '/repo/a', activeBackend: 'local', entryPins: ['z', 'a'] },
+    );
+    for (const entryPins of [undefined, []]) {
+      const request = buildIndexRequest({ projectPath: '/repo/a', activeBackend: 'local', includedPaths: [], decrypt, entryPins });
+      assert.equal('entryPins' in request, false);
+    }
+  });
+
+  it('buildSetEntryPinsRequest copies the stored pins', () => {
+    const pins = ['b', 'a'];
+    const request = buildSetEntryPinsRequest('/repo/a', pins);
+    assert.deepEqual(request, { type: 'graphService:setEntryPins', projectPath: '/repo/a', pinnedIds: ['b', 'a'] });
+    pins.push('c');
+    assert.deepEqual(request.pinnedIds, ['b', 'a']);
+  });
+
+  it('a listing reply with malformed hiddenPinIds is an explicit error; well-formed ones pass through', () => {
+    const malformed = { status: 'error', message: 'Malformed entry-candidates reply.' };
+    assert.deepEqual(toValidatedEntryCandidatesResult({ status: 'none', hiddenPinIds: 'x' }), malformed);
+    assert.deepEqual(toValidatedEntryCandidatesResult({ status: 'found', candidates: [], totalQualifying: 0, hiddenPinIds: [3] }), malformed);
+    const ok = { status: 'none', hiddenPinIds: ['gone'] };
+    assert.equal(toValidatedEntryCandidatesResult(ok), ok);
+  });
+
+  it('logs each missing pin once per session (per project), as entry-pin-missing with its project', () => {
+    const entries: DiagnosticLogEntry[] = [];
+    const log = createEntryPinMissingLogger({ append: (entry) => entries.push(entry), now: () => new Date('2026-10-05T00:00:00.000Z') });
+    log('/repo/a', hiddenPinIdsOf({ status: 'found', candidates: [], totalQualifying: 0, hiddenPinIds: ['gone', 'also'] }));
+    log('/repo/a', hiddenPinIdsOf({ status: 'none', hiddenPinIds: ['gone'] }));
+    log('/repo/a', hiddenPinIdsOf({ status: 'found', candidates: [], totalQualifying: 0 }));
+    log('/repo/a', hiddenPinIdsOf({ status: 'error', message: 'x' }));
+    // Review round 1: the Graph Service's report after an index goes through the same once-per-session set.
+    log('/repo/a', ['also']);
+    const at = '2026-10-05T00:00:00.000Z';
+    assert.deepEqual(entries, [
+      { eventType: 'entry-pin-missing', timestamp: at, projectPath: '/repo/a', nodeId: 'gone' },
+      { eventType: 'entry-pin-missing', timestamp: at, projectPath: '/repo/a', nodeId: 'also' },
+    ]);
+    log('/repo/b', ['gone']);
+    assert.equal(entries.length, 3, 'another project logs its own');
+  });
+
+  it('isEntryPinsMissingMessage accepts only a well-formed report', () => {
+    assert.equal(isEntryPinsMissingMessage({ type: 'graphService:entryPinsMissing', projectPath: '/p', nodeIds: ['a'] }), true);
+    for (const bad of [
+      null,
+      { type: 'graphService:entryPinsMissing', projectPath: '', nodeIds: ['a'] },
+      { type: 'graphService:entryPinsMissing', projectPath: '/p', nodeIds: [3] },
+      { type: 'graphService:entryPinsMissing', projectPath: '/p' },
+      { type: 'other', projectPath: '/p', nodeIds: [] },
+    ]) {
+      assert.equal(isEntryPinsMissingMessage(bad), false);
+    }
+  });
+
+  it('index.ts: get/set handlers, the post to the Graph Service on set, and the pins on the index request (source)', () => {
+    const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+    assert.match(src, /IpcChannels\.settingsGetEntryPins, \(_event, projectPath: unknown\): string\[\] =>\s*handleGetEntryPins\(entryPinsSetting, projectPath\)/);
+    assert.match(
+      src,
+      /handleSetEntryPins\(entryPinsSetting, projectPath, nodeId, pinned, \(storedPath, pinnedIds\) => \{[\s\S]{0,200}graphService\.postMessage\(buildSetEntryPinsRequest\(storedPath, pinnedIds\)\)/,
+    );
+    assert.match(src, /entryPins: entryPinsSetting\.get\(projectPath\),/);
+    assert.match(src, /const logMissingEntryPins = createEntryPinMissingLogger\(\{ append: appendDiagnosticLogEntry \}\);/);
+    assert.match(src, /if \(isEntryPinsMissingMessage\(message\)\) \{\s*logMissingEntryPins\(message\.projectPath, message\.nodeIds\);/);
+    const preload = readFileSync(fileURLToPath(new URL('../preload/index.ts', import.meta.url)), 'utf8');
+    assert.match(preload, /getEntryPins: \(projectPath: string\): Promise<string\[\]> =>\s*ipcRenderer\.invoke\(IpcChannels\.settingsGetEntryPins, projectPath\)/);
+    assert.match(
+      preload,
+      /setEntryPins: \(projectPath: string, nodeId: string, pinned: boolean\): Promise<EntryPinUpdateResult> =>\s*ipcRenderer\.invoke\(IpcChannels\.settingsSetEntryPins, projectPath, nodeId, pinned\)/,
     );
   });
 });

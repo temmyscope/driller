@@ -13,6 +13,7 @@ import {
   ENTRY_CANDIDATE_LOADED_BY_MAX,
   ENTRY_CANDIDATE_MAX,
   ENTRY_CANDIDATE_MIN_REACH,
+  ENTRY_PINS_MAX,
   type EntryCandidateInputNode,
   type EntryCandidatesResult,
   entryReachAdjacency,
@@ -507,5 +508,123 @@ describe('listEntryCandidates pruning skips work it can prove unnecessary (P4-7)
     // 11 a, zz, mm and 5 b qualify; lo (reach 2) does not.
     assert.equal(result.totalQualifying, 18);
     assert.deepEqual(result, referenceEntryCandidates(graph.nodes, graph.edges));
+  });
+});
+
+describe('listEntryCandidates with pins (P4-7g)', () => {
+  const pinsOf = (pinnedIds: readonly string[]) => listEntryCandidates(PATH_TRACE_BASIC.nodes, PATH_TRACE_BASIC.edges, { pinnedIds });
+
+  it('pin serviceB: it comes first, pinned, with its real reach (2), then handleRequest', () => {
+    const result = pinsOf(['serviceB']);
+    assert.deepEqual(result, {
+      status: 'found',
+      candidates: [
+        { id: 'serviceB', name: 'serviceB', file: 'src/serviceB.ts', startLine: 1, endLine: 2, reach: 2, reason: { kind: 'pinned' } },
+        { id: 'handleRequest', name: 'handleRequest', file: 'src/handleRequest.ts', startLine: 1, endLine: 2, reach: 4, reason: { kind: 'no-callers' } },
+      ],
+      totalQualifying: 2,
+    });
+  });
+
+  it('pins come in pin order, never sorted by id or reach', () => {
+    // reach: utilB.helper 0, serviceB 2, cacheLookup 1 — pin order wins.
+    assert.deepEqual(candidateIds(pinsOf(['utilB.helper', 'serviceB', 'cacheLookup'])), [
+      'utilB.helper',
+      'serviceB',
+      'cacheLookup',
+      'handleRequest',
+    ]);
+    assert.deepEqual(candidateIds(pinsOf(['cacheLookup', 'serviceB'])), ['cacheLookup', 'serviceB', 'handleRequest']);
+  });
+
+  it('a pinned heuristic candidate is listed once, as pinned', () => {
+    const result = pinsOf(['handleRequest']);
+    assert.ok(result.status === 'found');
+    assert.deepEqual(
+      result.candidates.map((candidate) => [candidate.id, candidate.reason.kind]),
+      [['handleRequest', 'pinned']],
+    );
+    assert.equal(result.totalQualifying, 1);
+  });
+
+  it('a repeated pin counts once, at its first place', () => {
+    assert.deepEqual(candidateIds(pinsOf(['serviceB', 'serviceA', 'serviceB'])), ['serviceB', 'serviceA', 'handleRequest']);
+  });
+
+  it('a pin is kept below the reach bar and with callers', () => {
+    // utilA.helper reaches 0 and repository has callers: both listed.
+    const result = pinsOf(['utilA.helper', 'repository']);
+    assert.ok(result.status === 'found');
+    assert.deepEqual(
+      result.candidates.map((candidate) => [candidate.id, candidate.reach]),
+      [
+        ['utilA.helper', 0],
+        ['repository', 1],
+        ['handleRequest', 4],
+      ],
+    );
+  });
+
+  it('heuristic candidates still cap at ENTRY_CANDIDATE_MAX after the pins, skipping the pinned ones', () => {
+    const roots = merge(...Array.from({ length: 20 }, (_, index) => chain(`r${String(index).padStart(2, '0')}`, 3 + index)));
+    // r19 (reach 22) is the top heuristic candidate; pinned, it isn't repeated below.
+    const result = listEntryCandidates(roots.nodes, roots.edges, { pinnedIds: ['r19', 'r00.1'] });
+    assert.ok(result.status === 'found');
+    const ids = result.candidates.map((candidate) => candidate.id);
+    assert.deepEqual(ids.slice(0, 2), ['r19', 'r00.1']);
+    assert.equal(ids.length, 2 + ENTRY_CANDIDATE_MAX);
+    assert.deepEqual(ids.slice(2), Array.from({ length: ENTRY_CANDIDATE_MAX }, (_, i) => `r${String(18 - i).padStart(2, '0')}`));
+    assert.equal(ids.filter((id) => id === 'r19').length, 1);
+    // 2 pinned + 19 other qualifying roots.
+    assert.equal(result.totalQualifying, 21);
+  });
+
+  it('pins alone make the result found (a cyclic graph)', () => {
+    const cyclic = { nodes: nodes('a', 'b', 'c'), edges: [edge('a', 'b'), edge('b', 'c'), edge('c', 'a')] };
+    assert.deepEqual(listEntryCandidates(cyclic.nodes, cyclic.edges), { status: 'none' });
+    const result = listEntryCandidates(cyclic.nodes, cyclic.edges, { pinnedIds: ['b'] });
+    assert.deepEqual(result, {
+      status: 'found',
+      candidates: [{ id: 'b', name: 'b', file: 'src/b.ts', startLine: 1, endLine: 2, reach: 2, reason: { kind: 'pinned' } }],
+      totalQualifying: 1,
+    });
+    // Everything under the reach bar, too.
+    const small = { nodes: nodes('x', 'y'), edges: [edge('x', 'y')] };
+    assert.deepEqual(candidateIds(listEntryCandidates(small.nodes, small.edges, { pinnedIds: ['y'] })), ['y']);
+  });
+
+  it('a pin not among the Nodes is hidden, never a candidate; listed in hiddenPinIds in pin order', () => {
+    const result = pinsOf(['gone2', 'serviceB', 'gone1', 'gone2']);
+    assert.ok(result.status === 'found');
+    assert.deepEqual(candidateIds(result), ['serviceB', 'handleRequest']);
+    assert.deepEqual(result.hiddenPinIds, ['gone2', 'gone1']);
+    const cyclic = { nodes: nodes('a', 'b'), edges: [edge('a', 'b'), edge('b', 'a')] };
+    assert.deepEqual(listEntryCandidates(cyclic.nodes, cyclic.edges, { pinnedIds: ['ghost'] }), {
+      status: 'none',
+      hiddenPinIds: ['ghost'],
+    });
+    assert.deepEqual(listEntryCandidates([], [], { pinnedIds: ['ghost'] }), { status: 'none', hiddenPinIds: ['ghost'] });
+  });
+
+  it('no pins (absent or empty) is byte-identical to the unpinned result', () => {
+    const plain = listEntryCandidates(PATH_TRACE_BASIC.nodes, PATH_TRACE_BASIC.edges);
+    assert.equal(JSON.stringify(pinsOf([])), JSON.stringify(plain));
+    assert.equal(JSON.stringify(listEntryCandidates(PATH_TRACE_BASIC.nodes, PATH_TRACE_BASIC.edges, {})), JSON.stringify(plain));
+  });
+
+  it('the pin order, not the input order, decides; shuffled Nodes and edges give the same result', () => {
+    const expected = pinsOf(['cacheLookup', 'serviceA']);
+    for (let seed = 1; seed <= 5; seed += 1) {
+      assert.deepEqual(
+        listEntryCandidates(shuffled(PATH_TRACE_BASIC.nodes, seed), shuffled(PATH_TRACE_BASIC.edges, seed + 7), {
+          pinnedIds: ['cacheLookup', 'serviceA'],
+        }),
+        expected,
+      );
+    }
+  });
+
+  it('ENTRY_PINS_MAX is 50', () => {
+    assert.equal(ENTRY_PINS_MAX, 50);
   });
 });

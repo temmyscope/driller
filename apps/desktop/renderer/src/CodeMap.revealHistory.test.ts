@@ -573,7 +573,8 @@ describe('CodeMap source: history wiring', () => {
       codeMapSrc,
       /historyWithoutReveals\(previous, \(entry\) => entry\.key === currentRevealKey && entry\.mapStamp === revealMapStamp\),\s*\);\s*\}, \[currentRevealKey, revealMapStamp\]\);/,
     );
-    assert.match(codeMapSrc, /setRevealHeld\(outcome\.held\);[\s\S]{0,400}?setHistory\(\(previous\) => historyWithoutReveals\(previous\)\);/);
+    // P4-7g review round 1: except a pin change's listing on the same fetch, which rebases them.
+    assert.match(codeMapSrc, /setRevealHeld\(outcome\.held\);[\s\S]{0,2200}?setHistory\(\(previous\) => historyWithoutReveals\(previous\)\);/);
   });
 
   it('founder decision (sections): a section switch reloads through loadCodeMap, which clears history with the reveal state', () => {

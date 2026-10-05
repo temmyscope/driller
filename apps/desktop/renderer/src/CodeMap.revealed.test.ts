@@ -544,10 +544,14 @@ describe('CodeMap source: the listing fetch and its guard', () => {
 
   it('fetches with the section of the map on screen, once per map fetch', () => {
     assert.ok(start >= 0);
-    assert.match(body, /if \(!needsRevealListing\(revealHeldRef\.current, currentRevealKey, revealMapStamp\)\) \{\s*return;/);
+    // P4-7g: and once per pins revision (a pin change on the same map).
+    assert.match(body, /if \(!needsRevealListing\(revealHeldRef\.current, currentRevealKey, revealMapStamp, entryPinsRevision\)\) \{\s*return;/);
     assert.match(body, /window\.driller\.listEntryCandidates\(projectPath, requestedSection \?\? undefined\)/);
     assert.match(codeMapSrc, /const revealMapStamp = fetchState\.status === 'ready' \? fetchState\.edges : null;/);
-    assert.match(body, /\}, \[revealDrawn, projectPath, revealMapStamp, revealSection, currentRevealKey, revealListingRequests, isDevFixtureMode\]\);/);
+    assert.match(
+      body,
+      /\}, \[\s*revealDrawn,\s*projectPath,\s*revealMapStamp,\s*revealSection,\s*currentRevealKey,\s*revealListingRequests,\s*isDevFixtureMode,\s*entryPinsRevision,\s*\]\);/,
+    );
     // A dev-fixture session has no Graph Service map: an explicit error, never a listing of another map.
     assert.match(body, /if \(isDevFixtureMode\) \{\s*\/\/[^\n]*\n\s*settle\(\{ status: 'error', message: DEV_FIXTURE_NO_ENTRY_CANDIDATES \}\);\s*return;/);
   });

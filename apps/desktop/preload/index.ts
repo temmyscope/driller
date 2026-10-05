@@ -14,6 +14,7 @@ import {
   type ClearCloudApiKeyResult,
   type BlastRadiusExpansionResult,
   type EntryCandidatesResult,
+  type EntryPinUpdateResult,
   type CloudBackend,
   type CodeMapResult,
   type DiagnosticLogEntry,
@@ -198,6 +199,13 @@ const drillerApi: DrillerApi = {
 
   setActiveSection: (projectPath: string, section: string | null): Promise<string | null> =>
     ipcRenderer.invoke(IpcChannels.settingsSetActiveSection, projectPath, section),
+
+  // P4-7g (AD-5 "Entry pins").
+  getEntryPins: (projectPath: string): Promise<string[]> =>
+    ipcRenderer.invoke(IpcChannels.settingsGetEntryPins, projectPath),
+
+  setEntryPins: (projectPath: string, nodeId: string, pinned: boolean): Promise<EntryPinUpdateResult> =>
+    ipcRenderer.invoke(IpcChannels.settingsSetEntryPins, projectPath, nodeId, pinned),
 
   regenerateNode: (nodeId: string): Promise<RegenerateNodeResult> =>
     ipcRenderer.invoke(IpcChannels.nodeRegenerate, nodeId),

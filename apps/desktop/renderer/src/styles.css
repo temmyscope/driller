@@ -3512,6 +3512,58 @@ code,
   cursor: default;
 }
 
+/* P4-7g: Node detail's "⚑ Pin as entry point" toggle — the regenerate
+   chip's quiet outline; pressed, it takes the accent (the glyph and the
+   label "Unpin entry point" carry the state, never colour alone). */
+.code-map__node-detail-pin {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 0;
+  border: 1px solid var(--border-control);
+  background: transparent;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.code-map__node-detail-pin:hover:not(:disabled) {
+  border-color: var(--text-mute);
+  color: var(--text-dim);
+}
+
+.code-map__node-detail-pin--pinned {
+  color: var(--accent);
+}
+
+.code-map__node-detail-pin:disabled {
+  border-style: dashed;
+  cursor: default;
+}
+
+.code-map__node-detail-pin:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Review round 1: the visible state beside the stable-label toggle. */
+.code-map__node-detail-pin-state {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.code-map__node-detail-pin-status {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.code-map__node-detail-pin-status:empty {
+  display: none;
+}
+
 .code-map__node-detail-section .actionable-notice {
   margin-top: 8px;
 }

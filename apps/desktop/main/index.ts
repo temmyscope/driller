@@ -36,6 +36,7 @@ import {
   type DiffScopeResult,
   type EditorPreference,
   type EntryCandidatesResult,
+  type EntryPinUpdateResult,
   type GitDetectionResult,
   type GraphServiceCodeMapMessage,
   type GraphServiceComputeDiffScopeResultMessage,
@@ -43,6 +44,7 @@ import {
   type GraphServiceExpandBlastRadiusResultMessage,
   type GraphServiceGetCodeMapRequest,
   type GraphServiceListEntryCandidatesResultMessage,
+  type GraphServiceEntryPinsMissingMessage,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRetryModelRequest,
@@ -91,7 +93,11 @@ import { detectGitRepo } from './git-detect';
 import {
   buildBackendSwitchedRequest,
   buildIndexRequest,
+  buildSetEntryPinsRequest,
   createEntryCandidatesRelay,
+  createEntryPinMissingLogger,
+  hiddenPinIdsOf,
+  isEntryPinsMissingMessage,
   isListEntryCandidatesResultMessage,
   parseListEntryCandidatesArgs,
   type ParsedListEntryCandidatesArgs,
@@ -112,11 +118,13 @@ import { getProjectScope, setProjectScope } from './project-scope-settings';
 import { listRecentProjects, recordProjectOpened } from './settings';
 import {
   handleGetActiveSection,
+  handleGetEntryPins,
   handleGetShowFoldedKinds,
   handleSetActiveSection,
+  handleSetEntryPins,
   handleSetShowFoldedKinds,
 } from './ui-settings';
-import { activeSectionSetting, showFoldedKindsSetting, uiSettings } from './ui-settings-store';
+import { activeSectionSetting, entryPinsSetting, showFoldedKindsSetting, uiSettings } from './ui-settings-store';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -317,8 +325,16 @@ const entryCandidatesRelay = createEntryCandidatesRelay({
 function requestListEntryCandidates(
   args: Extract<ParsedListEntryCandidatesArgs, { ok: true }>,
 ): Promise<EntryCandidatesResult> {
-  return entryCandidatesRelay.request(args);
+  return entryCandidatesRelay.request(args).then((result) => {
+    logMissingEntryPins(args.projectPath, hiddenPinIdsOf(result));
+    return result;
+  });
 }
+
+// P4-7g (AD-5 "Entry pins", AD-21): a pinned Node a listing hid (not on the
+// indexed map) is logged locally, once per pinned id per session; the pin is
+// kept.
+const logMissingEntryPins = createEntryPinMissingLogger({ append: appendDiagnosticLogEntry });
 
 // Story 3.2 (Phase 1): correlates each in-flight `blastRadius:expand`
 // request to its eventual Graph Service reply — mirrors
@@ -841,6 +857,7 @@ function spawnGraphService(): void {
         | GraphServiceExpandBlastRadiusResultMessage
         | GraphServiceDiffScopeCarryResultMessage
         | GraphServiceListEntryCandidatesResultMessage
+        | GraphServiceEntryPinsMissingMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -883,6 +900,12 @@ function spawnGraphService(): void {
       // P4-4 phase 3b: validated at the process boundary.
       if (isDiffScopeCarryResultMessage(message)) {
         diffScopeCarryRelay.settleReply(message.requestId, message.result);
+        return;
+      }
+      // P4-7g review round 1: missing pins the Graph Service found when it
+      // cached a new map (after an index), logged once per session too.
+      if (isEntryPinsMissingMessage(message)) {
+        logMissingEntryPins(message.projectPath, message.nodeIds);
         return;
       }
       // P4-7c: validated at the process boundary by the relay.
@@ -1012,6 +1035,8 @@ function sendIndexRequest(projectPath: string): void {
       activeBackend: backendConfig.activeBackend,
       includedPaths,
       decrypt: getDecryptedCloudApiKey,
+      // P4-7g: the project's pins, so the first listing already ranks them.
+      entryPins: entryPinsSetting.get(projectPath),
     }),
   );
 }
@@ -2046,6 +2071,31 @@ function registerIpcHandlers(): void {
     IpcChannels.settingsSetActiveSection,
     (_event, projectPath: unknown, section: unknown): string | null =>
       handleSetActiveSection(activeSectionSetting, projectPath, section),
+  );
+
+  // P4-7g (AD-5 "Entry pins"): the Nodes pinned as entry points, per project
+  // — same thin delegation and untyped-arg discipline. What was stored is
+  // handed to the Graph Service at once (it ignores another project's), so
+  // the renderer's next listing, and the MCP tool, rank the new pins.
+  ipcMain.handle(IpcChannels.settingsGetEntryPins, (_event, projectPath: unknown): string[] =>
+    handleGetEntryPins(entryPinsSetting, projectPath),
+  );
+
+  ipcMain.handle(
+    IpcChannels.settingsSetEntryPins,
+    (_event, projectPath: unknown, nodeId: unknown, pinned: unknown): EntryPinUpdateResult =>
+      handleSetEntryPins(entryPinsSetting, projectPath, nodeId, pinned, (storedPath, pinnedIds) => {
+        if (graphService && !isGraphServiceShuttingDown) {
+          try {
+            graphService.postMessage(buildSetEntryPinsRequest(storedPath, pinnedIds));
+          } catch (error) {
+            console.error(
+              'Failed to send the entry pins to the Graph Service.',
+              error instanceof Error ? error.message : 'Unknown error',
+            );
+          }
+        }
+      }),
   );
 
   ipcMain.handle(

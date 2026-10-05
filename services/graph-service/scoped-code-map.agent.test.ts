@@ -238,9 +238,9 @@ describe('P4-4 phase 2b: MCP without section is unchanged', () => {
     }
   });
 
-  it('the version is 1.9.0 (P4-7c), and the descriptions state the section rules', () => {
+  it('the version is 1.10.0 (P4-7g), and the descriptions state the section rules', () => {
     assert.ok(mcp);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.9.0');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.10.0');
     const tools = registerTools();
     for (const name of ['lookup_node', 'trace_path', 'expand_blast_radius', 'compute_diff_scope']) {
       const description = tools.get(name)?.config.description ?? '';

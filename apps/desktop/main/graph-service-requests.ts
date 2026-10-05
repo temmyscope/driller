@@ -14,9 +14,12 @@
 
 import type {
   CloudBackend,
+  DiagnosticLogEntry,
   EntryCandidatesResult,
   GraphServiceBackendSwitchedRequest,
+  GraphServiceEntryPinsMissingMessage,
   GraphServiceIndexRequest,
+  GraphServiceSetEntryPinsRequest,
   GraphServiceListEntryCandidatesRequest,
   GraphServiceListEntryCandidatesResultMessage,
 } from '@driller/ipc-contracts';
@@ -60,17 +63,30 @@ export interface IndexRequestDeps {
   activeBackend: CloudBackend;
   includedPaths: readonly string[];
   decrypt: DecryptCloudKey;
+  /** P4-7g: the project's pins (AD-5 "Entry pins"), in pin order. */
+  entryPins?: readonly string[];
 }
 
-/** The `graphService:index` request; `includedPaths` is omitted when empty. */
+/** The `graphService:index` request; `includedPaths` and `entryPins` are omitted when empty. */
 export function buildIndexRequest(deps: IndexRequestDeps): GraphServiceIndexRequest {
+  const entryPins = deps.entryPins ?? [];
   return {
     type: 'graphService:index',
     path: deps.projectPath,
     activeBackend: deps.activeBackend,
     ...cloudKeyField(deps.activeBackend, deps.decrypt),
     ...(deps.includedPaths.length > 0 ? { includedPaths: [...deps.includedPaths] } : {}),
+    ...(entryPins.length > 0 ? { entryPins: [...entryPins] } : {}),
   };
+}
+
+/**
+ * P4-7g: the `graphService:setEntryPins` message main posts after the
+ * renderer's pins were stored — the stored list, in pin order. The Graph
+ * Service applies it only for the project it is indexing or has indexed.
+ */
+export function buildSetEntryPinsRequest(projectPath: string, pinnedIds: readonly string[]): GraphServiceSetEntryPinsRequest {
+  return { type: 'graphService:setEntryPins', projectPath, pinnedIds: [...pinnedIds] };
 }
 
 export interface BackendSwitchedRequestDeps {
@@ -161,6 +177,15 @@ export function toValidatedEntryCandidatesResult(result: unknown): EntryCandidat
     status === 'found' &&
     (!Array.isArray((result as { candidates?: unknown }).candidates) ||
       typeof (result as { totalQualifying?: unknown }).totalQualifying !== 'number')
+  ) {
+    return malformed;
+  }
+  // P4-7g: a listing's hidden pins, when present, are ids (main logs them).
+  const { hiddenPinIds } = result as { hiddenPinIds?: unknown };
+  if (
+    (status === 'found' || status === 'none') &&
+    hiddenPinIds !== undefined &&
+    (!Array.isArray(hiddenPinIds) || !hiddenPinIds.every((id) => typeof id === 'string'))
   ) {
     return malformed;
   }
@@ -291,5 +316,64 @@ export function isListEntryCandidatesResultMessage(
     message !== null &&
     (message as { type?: unknown }).type === 'graphService:listEntryCandidatesResult' &&
     typeof (message as { requestId?: unknown }).requestId === 'number'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// P4-7g (AD-5 "Entry pins", AD-21): a pinned Node missing from the map.
+// ---------------------------------------------------------------------------
+
+/**
+ * Main logs each pinned id found missing from the map — a listing's
+ * `hiddenPinIds` (relayed `entryCandidates:list` replies) or the Graph
+ * Service's `graphService:entryPinsMissing` after it cached a new map (review
+ * round 1: so an index alone is enough) — once per session, per project, to
+ * the local diagnostic log: `{eventType: 'entry-pin-missing', timestamp,
+ * projectPath, nodeId}`. Never transmitted (AD-21, AD-16), and the stored
+ * pin is kept: the Node may return. `append` never rejects
+ * (`appendDiagnosticLogEntry`); a failed write is not retried.
+ */
+export function createEntryPinMissingLogger(deps: {
+  append: (entry: DiagnosticLogEntry) => unknown;
+  now?: () => Date;
+}): (projectPath: string, nodeIds: readonly string[]) => void {
+  const logged = new Set<string>();
+  return (projectPath, nodeIds) => {
+    for (const nodeId of nodeIds) {
+      if (typeof nodeId !== 'string') {
+        continue;
+      }
+      const key = JSON.stringify([projectPath, nodeId]);
+      if (logged.has(key)) {
+        continue;
+      }
+      logged.add(key);
+      void deps.append({
+        eventType: 'entry-pin-missing',
+        timestamp: (deps.now?.() ?? new Date()).toISOString(),
+        projectPath,
+        nodeId,
+      });
+    }
+  };
+}
+
+/** A listing's hidden pins (`[]` for any other state). */
+export function hiddenPinIdsOf(result: EntryCandidatesResult): readonly string[] {
+  return result.status === 'found' || result.status === 'none' ? (result.hiddenPinIds ?? []) : [];
+}
+
+/** True for a well-formed `graphService:entryPinsMissing` message (review round 1). */
+export function isEntryPinsMissingMessage(message: unknown): message is GraphServiceEntryPinsMissingMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  const { type, projectPath, nodeIds } = message as Record<string, unknown>;
+  return (
+    type === 'graphService:entryPinsMissing' &&
+    typeof projectPath === 'string' &&
+    projectPath.length > 0 &&
+    Array.isArray(nodeIds) &&
+    nodeIds.every((id) => typeof id === 'string')
   );
 }

@@ -97,6 +97,8 @@ export type {
 export {
   BLAST_RADIUS_DEFAULT_HOPS,
   CROSS_SECTION_CALLS_MAX,
+  // P4-7g: the per-project pin cap — main's setting and Node detail's "Pin limit (50) reached".
+  ENTRY_PINS_MAX,
   FOLDED_TYPE_IPC_MAX_USED_BY,
   SIMILAR_TO_MAX_ENTRIES,
   SIMILAR_TO_MIN_JACCARD,
@@ -303,7 +305,57 @@ export interface GraphServiceIndexRequest {
    * no restriction, see `ProjectScopeConfig`'s own doc comment.
    */
   includedPaths?: string[];
+  /**
+   * P4-7g (AD-5 "Entry pins"): this project's pinned Node ids, in pin order,
+   * read from the UI settings store at the moment this request is sent — the
+   * Graph Service ranks them first in `listEntryCandidates`, for the IPC
+   * channel and the MCP tool alike (FR-15). Omitted when there are none.
+   * Later changes arrive as `GraphServiceSetEntryPinsRequest`.
+   */
+  entryPins?: string[];
 }
+
+/**
+ * P4-7g (AD-5 "Entry pins"): main sends this after the renderer changes a
+ * project's pins (`settings:setEntryPins`) — `pinnedIds` is what the store
+ * now holds, in pin order. The Graph Service applies it only when
+ * `projectPath` is the project it is indexing or has indexed (otherwise
+ * ignored), and drops its entry-candidate memos so the next listing ranks
+ * the new pins. Posts nothing back.
+ */
+export interface GraphServiceSetEntryPinsRequest {
+  type: 'graphService:setEntryPins';
+  projectPath: string;
+  pinnedIds: string[];
+}
+
+/**
+ * P4-7g review round 1: the Graph Service's report, when it caches a new
+ * whole-scope map (the fetch after an index, or any refetch), of the pinned
+ * ids that are not on it — so main logs a missing pin once per session even
+ * when no listing is asked for (AD-21, local only). Posted only when there
+ * is at least one.
+ */
+export interface GraphServiceEntryPinsMissingMessage {
+  type: 'graphService:entryPinsMissing';
+  projectPath: string;
+  nodeIds: string[];
+}
+
+/**
+ * P4-7g review round 1: the reply to `setEntryPins` — one id pinned or
+ * unpinned by main against the list it has stored (never a whole list from
+ * the renderer, which could be stale).
+ *  - `'stored'`: `pins` is the stored list now, in pin order;
+ *  - `'limit'`: pinning would pass `ENTRY_PINS_MAX`; nothing changed, `pins`
+ *    is the stored list;
+ *  - `'error'`: nothing changed (a malformed call, or the stored pins could
+ *    not be read — main never overwrites a list it hasn't read).
+ */
+export type EntryPinUpdateResult =
+  | { status: 'stored'; pins: string[] }
+  | { status: 'limit'; pins: string[] }
+  | { status: 'error'; message: string };
 
 /**
  * Message main sends to ask the Graph Service subprocess to switch its
@@ -934,19 +986,35 @@ export interface GraphServicePathTraceResultMessage {
 // ---------------------------------------------------------------------------
 
 /** One local-only diagnostic log entry — never transmitted anywhere (AD-21). */
-export type DiagnosticLogEntry = {
-  eventType: 'path-trace-dismissed';
-  /** ISO-8601 timestamp of the dismissal. */
-  timestamp: string;
-  /** The Path Trace query that produced the dismissed result. */
-  query: string;
-  /**
-   * The dismissed result's status — matches the AC's explicit list
-   * (`found`/`no-path-found`/`ambiguous`); Dismiss never renders for
-   * `searching`/`idle`/`error`, so no other value ever reaches this field.
-   */
-  resultStatus: 'found' | 'no-path-found' | 'ambiguous';
-};
+export type DiagnosticLogEntry =
+  | {
+      eventType: 'path-trace-dismissed';
+      /** ISO-8601 timestamp of the dismissal. */
+      timestamp: string;
+      /** The Path Trace query that produced the dismissed result. */
+      query: string;
+      /**
+       * The dismissed result's status — matches the AC's explicit list
+       * (`found`/`no-path-found`/`ambiguous`); Dismiss never renders for
+       * `searching`/`idle`/`error`, so no other value ever reaches this field.
+       */
+      resultStatus: 'found' | 'no-path-found' | 'ambiguous';
+    }
+  | {
+      /**
+       * P4-7g (AD-5 "Entry pins"): a pinned Node is not on the indexed map
+       * (an entry-candidate listing's `hiddenPinIds`) — hidden, never shown,
+       * and the stored pin kept. Written by main, relaying the listing, once
+       * per pinned id per session; never sent by the renderer (the
+       * `diagnostic:log` channel accepts only `path-trace-dismissed`).
+       */
+      eventType: 'entry-pin-missing';
+      /** ISO-8601 timestamp of the listing (or the map fetch after an index) that found it missing. */
+      timestamp: string;
+      /** P4-7g review round 1: the project the pin belongs to (local only, AD-21). */
+      projectPath: string;
+      nodeId: string;
+    };
 
 // ---------------------------------------------------------------------------
 // Story 1.10 (Phase 1): external editor preference (AD-23).
@@ -1398,6 +1466,9 @@ export const IpcChannels = {
   settingsSetShowFoldedKinds: 'settings:setShowFoldedKinds',
   settingsGetActiveSection: 'settings:getActiveSection',
   settingsSetActiveSection: 'settings:setActiveSection',
+  // P4-7g: AD-5 "Entry pins".
+  settingsGetEntryPins: 'settings:getEntryPins',
+  settingsSetEntryPins: 'settings:setEntryPins',
   prBotRunIngestion: 'prBot:runIngestion',
   nodeRegenerate: 'node:regenerate',
   pathTrace: 'path:trace',
@@ -1631,6 +1702,21 @@ export interface DrillerApi {
    * project's entry — the string `"all"` is never stored for it.
    */
   setActiveSection: (projectPath: string, section: string | null) => Promise<string | null>;
+  /**
+   * P4-7g (AD-5 "Entry pins"): one project's pinned Node ids, in pin order —
+   * `[]` when none are stored (or the store can't be read). Never rejects
+   * for a malformed path: that reads as `[]`.
+   */
+  getEntryPins: (projectPath: string) => Promise<string[]>;
+  /**
+   * P4-7g (review round 1): pins (`pinned: true`, appended — pin order) or
+   * unpins one Node of one project, applied by main to the list it has
+   * stored, and resolves with the outcome (`EntryPinUpdateResult`). Main
+   * also hands a stored list to the Graph Service, so the next
+   * `listEntryCandidates` (and the MCP tool) ranks the pins first. Never
+   * rejects for a malformed call: that is an `error` result.
+   */
+  setEntryPins: (projectPath: string, nodeId: string, pinned: boolean) => Promise<EntryPinUpdateResult>;
   /**
    * Runs one PR-bot's ingestion pass against `projectPath` (Story 2.3, Phase
    * 2) — this phase's only entry point (Never: "Any UI trigger, entry

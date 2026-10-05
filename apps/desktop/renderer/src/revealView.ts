@@ -217,8 +217,24 @@ function reachPhrase(reach: number): string {
   return `reaches ${reach} Node${reach === 1 ? '' : 's'}`;
 }
 
-/** A candidate's reason, without the load-time files: "no callers in indexed code · reaches N Nodes". */
+/** P4-7g: whether the engineer pinned this candidate (AD-5 "Entry pins"). */
+export function isPinnedCandidate(candidate: EntryCandidate): boolean {
+  return candidate.reason.kind === 'pinned';
+}
+
+/** P4-7g: a pinned candidate's badge text, after its "⚑" glyph (EXPERIENCE.md: "⚑ pinned by you"). */
+export const PINNED_BADGE_TEXT = 'pinned by you';
+
+/**
+ * A candidate's reason, without the load-time files: "no callers in indexed
+ * code · reaches N Nodes". P4-7g: a pinned candidate's badge says "⚑ pinned
+ * by you" instead of the heuristic reason, so its reason is only its real
+ * reach, still qualified: "reaches N Nodes in indexed code".
+ */
 export function formatCandidateReason(candidate: EntryCandidate): string {
+  if (isPinnedCandidate(candidate)) {
+    return `${reachPhrase(candidate.reach)} in indexed code`;
+  }
   return `no callers in indexed code · ${reachPhrase(candidate.reach)}`;
 }
 
@@ -227,15 +243,26 @@ export function formatCandidateReason(candidate: EntryCandidate): string {
  * at most 3, sorted) and how many more there are, or `null` when none.
  */
 export function candidateLoadedBy(candidate: EntryCandidate): { files: readonly string[]; more: number } | null {
-  const files = candidate.reason.loadedBy ?? [];
+  const { reason } = candidate;
+  if (reason.kind !== 'no-callers') {
+    return null;
+  }
+  const files = reason.loadedBy ?? [];
   if (files.length === 0) {
     return null;
   }
-  return { files, more: Math.max(0, (candidate.reason.loadedByTotal ?? files.length) - files.length) };
+  return { files, more: Math.max(0, (reason.loadedByTotal ?? files.length) - files.length) };
 }
 
-/** The whole reason line as text: the reason, plus "· run at load by a.ts, b.ts and 2 more" when present. */
+/**
+ * The whole reason line as text: the reason, plus "· run at load by a.ts,
+ * b.ts and 2 more" when present. P4-7g: a pinned candidate's line starts
+ * with its badge text: "pinned by you · reaches N Nodes in indexed code".
+ */
 export function formatCandidateReasonLine(candidate: EntryCandidate): string {
+  if (isPinnedCandidate(candidate)) {
+    return `${PINNED_BADGE_TEXT} · ${formatCandidateReason(candidate)}`;
+  }
   const loadedBy = candidateLoadedBy(candidate);
   const base = formatCandidateReason(candidate);
   if (loadedBy === null) {
@@ -245,9 +272,16 @@ export function formatCandidateReasonLine(candidate: EntryCandidate): string {
   return `${base} · run at load by ${loadedBy.files.join(', ')}${more}`;
 }
 
-/** A candidate card's accessible-name suffix: ", entry candidate, reaches N Nodes" — or `''` for any other card. */
+/**
+ * A candidate card's accessible-name suffix: ", entry candidate, reaches N
+ * Nodes" — P4-7g: ", pinned entry point, reaches N Nodes" for a pinned one —
+ * or `''` for any other card.
+ */
 export function candidateAriaSuffix(candidate: EntryCandidate | undefined): string {
-  return candidate === undefined ? '' : `, entry candidate, ${reachPhrase(candidate.reach)}`;
+  if (candidate === undefined) {
+    return '';
+  }
+  return `, ${isPinnedCandidate(candidate) ? 'pinned entry point' : 'entry candidate'}, ${reachPhrase(candidate.reach)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +295,14 @@ export function candidateAriaSuffix(candidate: EntryCandidate | undefined): stri
  * blocked on the listing.
  */
 export type RevealListing =
-  | { status: 'loading'; previous: RevealState | null }
-  | { status: 'ready'; state: RevealState; totalQualifying: number }
+  /** P4-7g review round 1: `previousTotal` — the previous ready listing's `totalQualifying`, when there was one. */
+  | { status: 'loading'; previous: RevealState | null; previousTotal?: number }
+  /**
+   * P4-7g review round 1: `pinsListingFailed` — a pin change's re-listing on
+   * the same map fetch failed (its message): the state drawn before stays,
+   * a status line says so, and the next show of Revealed retries.
+   */
+  | { status: 'ready'; state: RevealState; totalQualifying: number; pinsListingFailed?: string }
   | { status: 'none' }
   | { status: 'error'; message: string };
 
@@ -276,7 +316,24 @@ export type RevealListing =
 export interface HeldReveal {
   key: string;
   mapStamp: readonly CodeMapEdge[];
+  /**
+   * P4-7g: the pins revision the listing was asked for (`0`, the default,
+   * when absent). A pin or unpin bumps the renderer's revision, so the map
+   * on screen owes a new listing — kept like a refresh (the previous state
+   * stays drawn, and its drill is carried over).
+   */
+  pinsRevision?: number;
   listing: RevealListing;
+}
+
+/** P4-7g: a held state's pins revision (`0` when it carries none). */
+function pinsRevisionOf(held: HeldReveal): number {
+  return held.pinsRevision ?? 0;
+}
+
+/** P4-7g: the `pinsRevision` field to store — absent for `0`, so a state with no pin change is the P4-7d shape exactly. */
+function pinsRevisionField(pinsRevision: number): { pinsRevision?: number } {
+  return pinsRevision === 0 ? {} : { pinsRevision };
 }
 
 /** The held state's key: one project and one section (`null` = the whole scope). */
@@ -292,18 +349,35 @@ export function heldRevealFor(held: HeldReveal | null, key: string): HeldReveal 
 /**
  * Whether the map on screen (`key`, `mapStamp`) still needs a listing: none
  * held for it, one for an earlier fetch, or a failed one (so coming back to
- * Revealed retries it — e.g. after "The map is refreshing…").
+ * Revealed retries it — e.g. after "The map is refreshing…"). P4-7g: or one
+ * asked for before the latest pin change (`pinsRevision`).
  */
-export function needsRevealListing(held: HeldReveal | null, key: string, mapStamp: readonly CodeMapEdge[]): boolean {
+export function needsRevealListing(
+  held: HeldReveal | null,
+  key: string,
+  mapStamp: readonly CodeMapEdge[],
+  pinsRevision = 0,
+): boolean {
   const current = heldRevealFor(held, key);
-  return current === null || current.mapStamp !== mapStamp || current.listing.status === 'error';
+  return (
+    current === null ||
+    current.mapStamp !== mapStamp ||
+    pinsRevisionOf(current) !== pinsRevision ||
+    current.listing.status === 'error' ||
+    (current.listing.status === 'ready' && current.listing.pinsListingFailed !== undefined)
+  );
 }
 
-/** The held state while a listing for (`key`, `mapStamp`) is in flight: a refresh keeps the previous state drawn. */
+/**
+ * The held state while a listing for (`key`, `mapStamp`, `pinsRevision`) is
+ * in flight: a refresh — or, P4-7g, a pin change — keeps the previous state
+ * drawn.
+ */
 export function startRevealListing(
   held: HeldReveal | null,
   key: string,
   mapStamp: readonly CodeMapEdge[],
+  pinsRevision = 0,
 ): HeldReveal {
   const current = heldRevealFor(held, key);
   const previous =
@@ -314,7 +388,20 @@ export function startRevealListing(
         : current.listing.status === 'loading'
           ? current.listing.previous
           : null;
-  return { key, mapStamp, listing: { status: 'loading', previous } };
+  const previousTotal =
+    current === null
+      ? undefined
+      : current.listing.status === 'ready'
+        ? current.listing.totalQualifying
+        : current.listing.status === 'loading'
+          ? current.listing.previousTotal
+          : undefined;
+  return {
+    key,
+    mapStamp,
+    ...pinsRevisionField(pinsRevision),
+    listing: { status: 'loading', previous, ...(previous !== null && previousTotal !== undefined ? { previousTotal } : {}) },
+  };
 }
 
 /** A settled listing (never `unknown-section`, which the caller hands to the section fallback). */
@@ -357,12 +444,31 @@ export function revealListingReplyOutcome(input: {
    * still on the map stay, vanished ones go with their subtrees.
    */
   drillGraph?: RevealDrillGraph | null;
+  /** P4-7g: the pins revision the listing was asked for (default `0`). */
+  pinsRevision?: number;
+  /**
+   * P4-7g review round 1: the listing is for the map fetch the drawn state
+   * was listed for (a pin change, not a refresh): a failed one keeps that
+   * state drawn, with a status line, instead of the error notice.
+   */
+  sameFetch?: boolean;
 }): RevealReplyOutcome {
-  const { isLatest, requestedSection, currentSection, held, key, mapStamp, result, drillGraph = null } = input;
+  const {
+    isLatest,
+    requestedSection,
+    currentSection,
+    held,
+    key,
+    mapStamp,
+    result,
+    drillGraph = null,
+    pinsRevision = 0,
+    sameFetch = false,
+  } = input;
   if (!isLatest || requestedSection !== currentSection) {
     return { kind: 'ignore' };
   }
-  if (held === null || held.key !== key || held.mapStamp !== mapStamp) {
+  if (held === null || held.key !== key || held.mapStamp !== mapStamp || pinsRevisionOf(held) !== pinsRevision) {
     return { kind: 'ignore' };
   }
   if (result.status === 'unknown-section') {
@@ -370,13 +476,35 @@ export function revealListingReplyOutcome(input: {
   }
   const listing = revealListingOf(result);
   const previous = held.listing.status === 'loading' ? held.listing.previous : null;
+  const revision = pinsRevisionField(pinsRevision);
+  if (listing.status === 'error' && sameFetch && previous !== null && held.listing.status === 'loading') {
+    return {
+      kind: 'apply',
+      held: {
+        key,
+        mapStamp,
+        ...revision,
+        listing: {
+          status: 'ready',
+          state: previous,
+          totalQualifying: held.listing.previousTotal ?? previous.candidates.length,
+          pinsListingFailed: listing.message,
+        },
+      },
+    };
+  }
   if (listing.status === 'ready' && previous !== null && drillGraph !== null && drillGraph.edges === mapStamp) {
     return {
       kind: 'apply',
-      held: { key, mapStamp, listing: { ...listing, state: refreshRevealState(previous, listing.state, drillGraph) } },
+      held: {
+        key,
+        mapStamp,
+        ...revision,
+        listing: { ...listing, state: refreshRevealState(previous, listing.state, drillGraph) },
+      },
     };
   }
-  return { kind: 'apply', held: { key, mapStamp, listing } };
+  return { kind: 'apply', held: { key, mapStamp, ...revision, listing } };
 }
 
 /**
@@ -423,7 +551,14 @@ export type RevealNotice =
   | { kind: 'error'; tone: 'error'; sentence: string }
   | { kind: 'stale'; tone: 'error'; sentence: string }
   | { kind: 'loading'; text: string }
+  /** P4-7g review round 1: a status-line-only notice (never over the canvas). */
+  | { kind: 'status'; text: string }
   | null;
+
+/** P4-7g review round 1: the status line when a pin change's re-listing failed and the previous candidates stay. */
+export function pinsListingFailedText(message: string): string {
+  return `Couldn’t update the entry candidates after the pin change (${message}); showing the previous ones.`;
+}
 
 export function revealNoticeFor(held: HeldReveal | null, key: string | null, drawnCount: number): RevealNotice {
   const current = key === null ? null : heldRevealFor(held, key);
@@ -438,7 +573,12 @@ export function revealNoticeFor(held: HeldReveal | null, key: string | null, dra
     case 'error':
       return { kind: 'error', tone: 'error', sentence: `Couldn’t list entry candidates: ${current.listing.message}` };
     case 'ready':
-      return drawnCount === 0 ? { kind: 'stale', tone: 'error', sentence: ENTRY_CANDIDATES_NOT_ON_MAP_SENTENCE } : null;
+      if (drawnCount === 0) {
+        return { kind: 'stale', tone: 'error', sentence: ENTRY_CANDIDATES_NOT_ON_MAP_SENTENCE };
+      }
+      return current.listing.pinsListingFailed === undefined
+        ? null
+        : { kind: 'status', text: pinsListingFailedText(current.listing.pinsListingFailed) };
   }
 }
 
@@ -457,7 +597,14 @@ export function revealCapText(held: HeldReveal | null, key: string | null): stri
   }
   const shown = current.listing.state.candidates.length;
   const total = current.listing.totalQualifying;
-  return total > shown ? `Showing ${shown} of ${total} candidates (most reach first)` : null;
+  if (total <= shown) {
+    return null;
+  }
+  // P4-7g review round 1: pins sit outside the heuristic count.
+  const pinned = current.listing.state.candidates.filter(isPinnedCandidate).length;
+  return pinned === 0
+    ? `Showing ${shown} of ${total} candidates (most reach first)`
+    : `Showing ${pinned} pinned + ${shown - pinned} of ${total - pinned} candidates (most reach first)`;
 }
 
 /**
@@ -482,7 +629,7 @@ export function revealStatusText(input: {
     return announcement;
   }
   if (notice !== null) {
-    return notice.kind === 'loading' ? notice.text : notice.sentence;
+    return notice.kind === 'loading' || notice.kind === 'status' ? notice.text : notice.sentence;
   }
   return capText ?? '';
 }
@@ -585,7 +732,19 @@ export function revealViewRequestForToggle(input: {
  * view since Revealed last fitted. A first listing is fitted by the toggle's
  * own request or by the first fit.
  */
-export function revealRefitOnListing(input: { revealDrawn: boolean; hadPrevious: boolean; userMoved: boolean }): boolean {
+export function revealRefitOnListing(input: {
+  revealDrawn: boolean;
+  hadPrevious: boolean;
+  userMoved: boolean;
+  /**
+   * P4-7g: the listing was for the same map fetch as the state it replaces
+   * (a pin change, not a refresh) — the view never moves for it.
+   */
+  sameFetch?: boolean;
+}): boolean {
+  if (input.sameFetch === true) {
+    return false;
+  }
   return input.revealDrawn && input.hadPrevious && !input.userMoved;
 }
 
@@ -1480,6 +1639,62 @@ export function historyWithoutReveals(
     }
   });
   return { stack, index };
+}
+
+
+/**
+ * P4-7g review round 1: a pin change's listing landed on the same map fetch
+ * — rebase the reveal steps instead of dropping them all. Each step's
+ * `before`/`after` snapshot is rebased the way the drawn state was
+ * (`rebase`, i.e. `refreshRevealState` onto the new candidates), memoized by
+ * snapshot identity and seeded with `previous` → `landed`, so consecutive
+ * steps still chain (one step's `after` is the next one's `before`) and
+ * `restoreRevealSnapshot`'s identity checks keep holding. A step is dropped
+ * only when it no longer applies: its Node isn't revealed on both sides any
+ * more (e.g. an unpinned candidate left with its subtree), or the rebased
+ * step changes nothing. Steps for another key or map fetch are left to the
+ * stale-step purge.
+ */
+export function rebaseRevealHistory(
+  history: NavigationHistory,
+  input: {
+    key: string;
+    mapStamp: readonly CodeMapEdge[];
+    previous: RevealState;
+    landed: RevealState;
+    rebase: (state: RevealState) => RevealState;
+  },
+): NavigationHistory {
+  const { key, mapStamp, previous, landed, rebase } = input;
+  const memo = new Map<RevealState, RevealState>([[previous, landed]]);
+  const rebased = (state: RevealState): RevealState => {
+    let next = memo.get(state);
+    if (next === undefined) {
+      next = rebase(state);
+      memo.set(state, next);
+    }
+    return next;
+  };
+  const kept = new Set<HistoryEntry>();
+  const stack = history.stack.map((entry): HistoryEntry => {
+    if (entry.kind !== 'reveal' || entry.key !== key || entry.mapStamp !== mapStamp) {
+      kept.add(entry);
+      return entry;
+    }
+    const before = rebased(entry.before);
+    const after = rebased(entry.after);
+    const applies =
+      before !== after &&
+      before.revealed.has(entry.focusId) &&
+      after.revealed.has(entry.focusId) &&
+      JSON.stringify(before.entries) !== JSON.stringify(after.entries);
+    const next: HistoryEntry = { ...entry, before, after };
+    if (applies) {
+      kept.add(next);
+    }
+    return next;
+  });
+  return historyWithoutReveals({ stack, index: history.index }, (entry) => kept.has(entry));
 }
 
 /**

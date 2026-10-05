@@ -397,7 +397,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.9.0';
+export const MCP_SERVER_VERSION = '1.10.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -508,11 +508,13 @@ export const LIST_ENTRY_CANDIDATES_DESCRIPTION =
   "List candidate entry points of the project's Code Map: where to start reading. This is a heuristic over indexed code, never a claim that a Node is the program's entry point: a candidate is a Code Map Node with no caller among the Code Map's in-scope Nodes (indexed code within the indexing scope), ranked by how many Nodes it reaches. " +
   "A caller is another Code Map Node with a CALLS or USAGE edge into it: USAGE counts as a caller (so a component rendered through JSX is not a candidate), IMPORTS does not, and a self-call is ignored. Load-time calls from a file's top level (main(), app.whenReady().then(createWindow), ipcMain.handle(channel, handler)) do NOT count as callers, because that is how programs start: they are named in the reason instead. " +
   `'reach' is the number of distinct Nodes the candidate reaches forward over CALLS and USAGE edges, itself excluded. Nodes reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} are dropped. ` +
-  `Returns an explicit result state: {status: 'found', candidates, totalQualifying}, candidates ordered by reach (highest first) then id, at most ${ENTRY_CANDIDATE_MAX}, with 'totalQualifying' counting every qualifying Node before that cap; {status: 'none'} when no Node qualifies (for example fully cyclic code, or every root reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} Nodes), which means no qualifying Node, NOT that the code has no entry point; or {status: 'error', message}. ` +
-  "Each candidate is {id, name, file, startLine, endLine, reach, reason}. Reason kinds: 'no-callers' (no Code Map Node calls or uses it in indexed code); when files' top-level code calls or uses it at load time, the reason also carries 'loadedBy' " +
+  "Nodes the engineer pinned as entry points in the driller app come first, in the order they were pinned, whatever their callers or reach (each with its real reach). " +
+  `Returns an explicit result state: {status: 'found', candidates, totalQualifying, hiddenPinIds?}, the pinned candidates first, then the others ordered by reach (highest first) then id, at most ${ENTRY_CANDIDATE_MAX} of those, with 'totalQualifying' counting the pinned ones plus every other qualifying Node before that cap; {status: 'none', hiddenPinIds?} when no Node qualifies and none is pinned (for example fully cyclic code, or every root reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} Nodes), which means no qualifying Node, NOT that the code has no entry point; or {status: 'error', message}. ` +
+  "'hiddenPinIds' (present only when not empty) lists pinned Node ids that are not on the Code Map (for example renamed or deleted, or out of scope): they are never candidates. " +
+  "Each candidate is {id, name, file, startLine, endLine, reach, reason}. Reason kinds: 'pinned' (the engineer pinned it as an entry point); 'no-callers' (no Code Map Node calls or uses it in indexed code); when files' top-level code calls or uses it at load time, a 'no-callers' reason also carries 'loadedBy' " +
   `(those files, sorted, at most ${ENTRY_CANDIDATE_LOADED_BY_MAX}) and 'loadedByTotal' (how many there are). ` +
   "Test code is never a candidate and never counted in reach. The result is the exact same EntryCandidatesResult the human-facing UI gets for the identical request. " +
-  "With 'section', candidates and reach are computed from that section's own Nodes and the edges between them, never by filtering the whole-scope result: a Node whose only callers are in another section is a candidate in its own section, and 'loadedBy' names only files inside the section. " +
+  "With 'section', candidates and reach are computed from that section's own Nodes and the edges between them, never by filtering the whole-scope result: a Node whose only callers are in another section is a candidate in its own section, and 'loadedBy' names only files inside the section. A pinned Node in another section is not listed there (nor in 'hiddenPinIds'). " +
   SECTION_RULE_DESCRIPTION;
 
 /**
@@ -692,6 +694,9 @@ export function startMcpServer(
   // same-repository sections only.
   // P4-7c (1.9.0): the new `list_entry_candidates` tool (AD-13 (f)), with
   // the same optional `section`. Additive: no existing tool changes.
+  // P4-7g (1.10.0): `list_entry_candidates` ranks the engineer's pins first
+  // (reason kind 'pinned') and may carry `hiddenPinIds`. Without pins its
+  // result is byte-for-byte 1.9.0's.
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
   registerLookupNodeTool(

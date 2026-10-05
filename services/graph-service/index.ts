@@ -158,6 +158,8 @@ import type {
   GraphServiceRegenerateNodeResultMessage,
   GraphServiceRetryModelRequest,
   GraphServiceRunIngestionRequest,
+  GraphServiceSetEntryPinsRequest,
+  GraphServiceEntryPinsMissingMessage,
   GraphServiceRunIngestionResultMessage,
   GraphServiceShutdownRequest,
   GraphServiceStatusMessage,
@@ -705,6 +707,75 @@ let activeEntryCandidates: EntryCandidatesResult | undefined;
 let entryCandidatesSectionMemo: { source: ActiveRawCodeMap; results: Map<string, EntryCandidatesResult> } | undefined;
 
 /**
+ * P4-7g (AD-5 "Entry pins", FR-15): the engineer's pins for one project, in
+ * pin order — from the `graphService:index` request (`entryPins`), then from
+ * each `graphService:setEntryPins` for that project. Read by
+ * `computeEntryCandidatesResult` only when it is for the project listed, so
+ * the IPC channel and the MCP tool rank the same pins first. A change drops
+ * both entry-candidate memos (`handleSetEntryPinsRequest`).
+ */
+let activeEntryPins: { projectPath: string; pinnedIds: readonly string[] } | undefined;
+
+/** Tests only: the pins the next listing ranks first. */
+export function peekEntryPinsForTests(): { projectPath: string; pinnedIds: readonly string[] } | undefined {
+  return activeEntryPins;
+}
+
+/**
+ * P4-7g: applies a `graphService:setEntryPins` — only for the project being
+ * indexed or last indexed (`activeIndexPath`; another project's pins are
+ * ignored, never applied), and drops the whole-scope and per-section
+ * entry-candidate memos, so the next listing (IPC or MCP) ranks the new pins
+ * rather than a stale ranking.
+ */
+function handleSetEntryPinsRequest(projectPath: string, pinnedIds: readonly string[]): void {
+  if (projectPath !== activeIndexPath) {
+    return;
+  }
+  activeEntryPins = { projectPath, pinnedIds: [...pinnedIds] };
+  activeEntryCandidates = undefined;
+  entryCandidatesSectionMemo = undefined;
+}
+
+/**
+ * P4-7g review round 1: posts `graphService:entryPinsMissing` with the pins
+ * for `projectPath` that are not among `nodes` (the whole-scope map just
+ * cached) — nothing when there are none. Main logs each once per session.
+ */
+function reportMissingEntryPins(projectPath: string, nodes: readonly CodeMapNode[]): void {
+  if (activeEntryPins === undefined || activeEntryPins.projectPath !== projectPath || activeEntryPins.pinnedIds.length === 0) {
+    return;
+  }
+  const onMap = new Set(nodes.map((node) => node.id));
+  const missing = activeEntryPins.pinnedIds.filter((id) => !onMap.has(id));
+  if (missing.length > 0) {
+    const message: GraphServiceEntryPinsMissingMessage = { type: 'graphService:entryPinsMissing', projectPath, nodeIds: missing };
+    process.parentPort?.postMessage(message);
+  }
+}
+
+/**
+ * P4-7g: the pins a section's listing passes on (AD-5 "Entry pins", founder
+ * decision 2026-10-04 — proposed): a pin on a Node in another section of the
+ * map is not shown in this one, and is not a missing pin either, so it is
+ * left out; a pin in the section is ranked; a pin on no Node of the
+ * whole-scope map at all stays in, so the listing reports it in
+ * `hiddenPinIds` (logged once by main).
+ */
+function sectionEntryPins(
+  pins: readonly string[],
+  sectionNodes: readonly CodeMapNode[],
+  wholeScopeNodes: readonly CodeMapNode[],
+): string[] {
+  if (pins.length === 0) {
+    return [];
+  }
+  const inSection = new Set(sectionNodes.map((node) => node.id));
+  const onMap = new Set(wholeScopeNodes.map((node) => node.id));
+  return pins.filter((id) => inSection.has(id) || !onMap.has(id));
+}
+
+/**
  * Tests only: the ranking `computeEntryCandidatesResult` runs —
  * `listEntryCandidates` unless a test swaps it (to count calls, to throw, or
  * to start a re-index mid-compute). Never reassigned outside tests.
@@ -750,6 +821,11 @@ export function peekEntryCandidatesMemoForTests(): {
  * ~0.1–0.55 s on the 50k-Node synthetic worst case, P4-7b), so the Graph
  * Service handles other requests before and after it, never during.
  *
+ * P4-7g: the project's pins (`activeEntryPins`) are ranked first, in pin
+ * order; with a section, only the pins in that section (or on no Node of
+ * the map at all, which come back as `hiddenPinIds`) — `sectionEntryPins`.
+ * A pin change drops both memos.
+ *
  * Guards mirror `computeBlastRadiusExpansionResult` (same messages): no
  * indexed map, another project, and a generation change during the compute
  * (results discarded, never memoized). Never throws. Review round 1: and,
@@ -780,6 +856,8 @@ export function computeEntryCandidatesResult(projectPath: string, section?: stri
       return MAP_REFRESHING_RESULT;
     }
     const generationId = activeSummaryGenerationId;
+    // P4-7g: the pins for this project, ranked first (IPC and MCP alike).
+    const pins = activeEntryPins !== undefined && activeEntryPins.projectPath === projectRoot ? activeEntryPins.pinnedIds : [];
 
     let result: EntryCandidatesResult;
     let memoize: (computed: EntryCandidatesResult) => void;
@@ -787,7 +865,7 @@ export function computeEntryCandidatesResult(projectPath: string, section?: stri
       if (activeEntryCandidates !== undefined) {
         return activeEntryCandidates;
       }
-      result = entryCandidatesLister(nodes, edges);
+      result = entryCandidatesLister(nodes, edges, { pinnedIds: pins });
       memoize = (computed) => {
         activeEntryCandidates = computed;
       };
@@ -808,7 +886,9 @@ export function computeEntryCandidatesResult(projectPath: string, section?: stri
         return memoized;
       }
       const graph = buildSectionCallGraph(source.raw, keepFile);
-      result = entryCandidatesLister(graph.nodes, graph.edges);
+      result = entryCandidatesLister(graph.nodes, graph.edges, {
+        pinnedIds: sectionEntryPins(pins, graph.nodes, nodes),
+      });
       memoize = (computed) => {
         memo.results.set(section, computed);
       };
@@ -1559,6 +1639,36 @@ function isIndexRequest(data: unknown): data is GraphServiceIndexRequest {
     (cloudApiKey === undefined || typeof cloudApiKey === 'string') &&
     (includedPaths === undefined ||
       (Array.isArray(includedPaths) && includedPaths.every((entry) => typeof entry === 'string')))
+    // P4-7g review round 1: `entryPins` never rejects the request — invalid
+    // ids are dropped (`sanitizeEntryPins`).
+  );
+}
+
+/**
+ * P4-7g review round 1: the index request's `entryPins`, keeping only
+ * non-empty string ids (first place of a repeated one) — a malformed pin
+ * list never blocks indexing.
+ */
+export function sanitizeEntryPins(entryPins: unknown): string[] {
+  if (!Array.isArray(entryPins)) {
+    return [];
+  }
+  return [...new Set(entryPins.filter((id): id is string => typeof id === 'string' && id.length > 0))];
+}
+
+/** P4-7g: an array of non-empty strings (pinned Node ids). */
+function isIdList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((id) => typeof id === 'string' && id.length > 0);
+}
+
+/** P4-7g: true for a `graphService:setEntryPins` message — a non-empty `projectPath` and an id list. */
+function isSetEntryPinsRequest(data: unknown): data is GraphServiceSetEntryPinsRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, projectPath, pinnedIds } = data as Record<string, unknown>;
+  return (
+    type === 'graphService:setEntryPins' && typeof projectPath === 'string' && projectPath.length > 0 && isIdList(pinnedIds)
   );
 }
 
@@ -1647,8 +1757,12 @@ async function handleIndexRequest(
   projectPath: string,
   backendConfig: { activeBackend: CloudBackend; cloudApiKey?: string },
   includedPaths: readonly string[],
+  entryPins: readonly string[] = [],
 ): Promise<void> {
   activeIndexPath = projectPath;
+  // P4-7g: this request carries the project's pins as main read them just
+  // now; a later `graphService:setEntryPins` for it replaces them.
+  activeEntryPins = { projectPath, pinnedIds: [...entryPins] };
   // P2-1: this request carries the scope main read just now, so any override
   // saved during an earlier attempt is already reflected in it.
   pendingScopeOverride = undefined;
@@ -2957,6 +3071,12 @@ async function startSummaryGenerationForProject(
     entryCandidatesSectionMemo = undefined;
   }
   activeRawCodeMap = nextRawCodeMap;
+  // P4-7g review round 1: a new whole-scope map for the project (the fetch
+  // after an index, or a refetch) reports the pins not on it, so main logs a
+  // missing pin even when no listing is asked for.
+  if (nextRawCodeMap !== undefined && projectRoot !== undefined) {
+    reportMissingEntryPins(projectRoot, nodes);
+  }
 
   if (activeGenerationRunId === generationId) {
     // Already generating for this exact index generation — see
@@ -3458,7 +3578,14 @@ process.parentPort?.on('message', (event) => {
         cloudApiKey: event.data.cloudApiKey,
       },
       event.data.includedPaths ?? [],
+      sanitizeEntryPins((event.data as { entryPins?: unknown }).entryPins),
     );
+    return;
+  }
+  if (!isShuttingDown && isSetEntryPinsRequest(event.data)) {
+    // P4-7g: synchronous on receipt, so a listing main relays after it
+    // ranks the new pins.
+    handleSetEntryPinsRequest(event.data.projectPath, event.data.pinnedIds);
     return;
   }
   if (!isShuttingDown && isScopeChangedRequest(event.data)) {

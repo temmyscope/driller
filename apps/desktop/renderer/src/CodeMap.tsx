@@ -129,9 +129,22 @@ import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } fro
 import { useModalLayer } from './useModalLayer';
 import { SECTION_SWITCH_UNAVAILABLE_HINT, selectedSectionTabId } from './SectionBar';
 import {
+  loadEntryPins,
+  PIN_BUTTON_TEXT,
+  pinSaveOutcome,
+  planPinToggle,
+  PIN_LIMIT_TEXT,
+  saveEntryPin,
+} from './entryPins';
+import {
   candidateAriaSuffix,
   candidateLoadedBy,
   candidatesById,
+  isPinnedCandidate,
+  PINNED_BADGE_TEXT,
+  initialRevealState,
+  rebaseRevealHistory,
+  refreshRevealState,
   drawnRevealState,
   formatCandidateReason,
   hiddenNavigationTarget,
@@ -3020,10 +3033,21 @@ export function NodeRiskSignalSections({
  */
 export function CandidateReasonLine({ candidate }: { candidate: EntryCandidate }) {
   const loadedBy = candidateLoadedBy(candidate);
+  // P4-7g: a pinned candidate says "⚑ pinned by you" instead of the
+  // heuristic reason (glyph plus text, never colour alone); its reach stays.
+  const pinned = isPinnedCandidate(candidate);
   return (
-    <p className="code-map__node-candidate">
+    <p className={`code-map__node-candidate${pinned ? ' code-map__node-candidate--pinned' : ''}`}>
       <span className="code-map__node-candidate-badge">
-        <span aria-hidden="true">◎</span> candidate
+        {pinned ? (
+          <>
+            <span aria-hidden="true">⚑</span> {PINNED_BADGE_TEXT}
+          </>
+        ) : (
+          <>
+            <span aria-hidden="true">◎</span> candidate
+          </>
+        )}
       </span>{' '}
       <span className="code-map__node-candidate-reason">
         · {formatCandidateReason(candidate)}
@@ -6955,6 +6979,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   uses: 'code-map-node-detail-uses-heading',
   similar: 'code-map-node-detail-similar-heading',
   crossSectionCalls: 'code-map-node-detail-cross-section-calls-heading',
+  entryPin: 'code-map-node-detail-entry-pin-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -6996,6 +7021,56 @@ export interface NodeDetailBodyProps {
    * section, then its id to select once that map is ready. Defaults to a no-op.
    */
   onSwitchSection?: (section: string, focusNodeId: string) => void;
+  /**
+   * P4-7g (AD-5 "Entry pins"): the "⚑ Pin as entry point" toggle — whether
+   * this Node is pinned, whether a save is in flight, the explicit message
+   * of the last toggle on it (the pin limit, a failed save), and the toggle.
+   * Absent: no "Entry point" section.
+   */
+  entryPin?: EntryPinControl;
+}
+
+/** P4-7g: Node detail's pin toggle (see `NodeDetailBodyProps.entryPin`). */
+export interface EntryPinControl {
+  pinned: boolean;
+  busy: boolean;
+  message: string | null;
+  onToggle: () => void;
+}
+
+/**
+ * P4-7g: Node detail's "Entry point" section — a toggle button, "⚑ Pin as
+ * entry point", with `aria-pressed` (review round 1: one stable label; the
+ * frozen text's "⚑ Unpin entry point" wording is a founder option), a
+ * visible "⚑ pinned by you" note while pinned (glyph plus text, so the
+ * state never rests on colour or the pressed style alone; hidden from
+ * assistive tech, which hears `aria-pressed`), and one `role="status"` line
+ * for its explicit messages ("Pin limit (50) reached…"). Pinning ranks the
+ * Node first among Revealed's entry candidates. Hookless.
+ */
+export function NodeDetailEntryPin({ control }: { control: EntryPinControl }) {
+  return (
+    <>
+      <button
+        type="button"
+        className={`code-map__node-detail-pin${control.pinned ? ' code-map__node-detail-pin--pinned' : ''}`}
+        aria-pressed={control.pinned}
+        disabled={control.busy}
+        onClick={control.onToggle}
+      >
+        <span aria-hidden="true">⚑ </span>
+        {PIN_BUTTON_TEXT}
+      </button>
+      {control.pinned && (
+        <span className="code-map__node-detail-pin-state" aria-hidden="true">
+          {' '}⚑ {PINNED_BADGE_TEXT}
+        </span>
+      )}
+      <p className="code-map__node-detail-pin-status" role="status">
+        {control.message ?? ''}
+      </p>
+    </>
+  );
 }
 
 const RESOLVE_NO_MAP_NODE = (): undefined => undefined;
@@ -8203,6 +8278,7 @@ export function NodeDetailBody({
   onOpenType = NAVIGATE_NOWHERE,
   mapSection = null,
   onSwitchSection = SWITCH_NOWHERE,
+  entryPin,
 }: NodeDetailBodyProps) {
   const ids = NODE_DETAIL_SECTION_HEADING_IDS;
   const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
@@ -8359,6 +8435,16 @@ export function NodeDetailBody({
             graphServiceAvailable={graphServiceAvailable}
             onSwitchSection={onSwitchSection}
           />
+        </section>
+      )}
+      {/* P4-7g: pin or unpin this Node as an entry point (AD-5 "Entry
+          pins"); pins rank first among Revealed's entry candidates. */}
+      {entryPin !== undefined && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.entryPin}>
+          <h3 id={ids.entryPin} className="code-map__node-detail-label">
+            Entry point
+          </h3>
+          <NodeDetailEntryPin control={entryPin} />
         </section>
       )}
       <section className="code-map__node-detail-section" aria-labelledby={ids.staleness}>
@@ -8772,6 +8858,66 @@ export function CodeMap({
       );
     },
     [projectPath, showFoldedKindsRequests],
+  );
+  // P4-7g (AD-5 "Entry pins"): this project's pins, in pin order, as main
+  // stored them — read on a project change, written whole on every toggle in
+  // Node detail. `entryPinsRevision` counts the changes main stored this
+  // session: each one owes Revealed a new listing (the Graph Service already
+  // ranks the new pins). `entryPinMessage` is the last toggle's explicit
+  // message, for the Node it was on.
+  // Review round 1: `null` until this project's read lands — the toggle is
+  // disabled meanwhile, so no change is ever based on a list not yet read.
+  const [entryPins, setEntryPins] = useState<readonly string[] | null>(null);
+  const entryPinsRef = useRef<readonly string[] | null>(null);
+  entryPinsRef.current = entryPins;
+  const [entryPinsRevision, setEntryPinsRevision] = useState(0);
+  const [entryPinMessage, setEntryPinMessage] = useState<{ nodeId: string; text: string } | null>(null);
+  const [entryPinBusy, setEntryPinBusy] = useState(false);
+  const entryPinRequests = useRef(createLatestRequestGuard()).current;
+  useEffect(() => {
+    const requestId = entryPinRequests.begin();
+    setEntryPins(null);
+    setEntryPinMessage(null);
+    setEntryPinBusy(false);
+    void loadEntryPins(projectPath, (path) => window.driller.getEntryPins(path)).then((pins) => {
+      if (pins !== null && entryPinRequests.isLatest(requestId)) {
+        setEntryPins(pins);
+      }
+    });
+  }, [projectPath, entryPinRequests]);
+  const toggleEntryPin = useCallback(
+    (nodeId: string) => {
+      const previous = entryPinsRef.current;
+      if (projectPath === null || previous === null) {
+        return;
+      }
+      const plan = planPinToggle(previous, nodeId);
+      if (plan.kind === 'limit') {
+        setEntryPinMessage({ nodeId, text: PIN_LIMIT_TEXT });
+        return;
+      }
+      const requestId = entryPinRequests.begin();
+      setEntryPinBusy(true);
+      setEntryPinMessage(null);
+      // Review round 1: one id, applied by main to the list it stored.
+      void saveEntryPin(projectPath, nodeId, plan.pinned, (path, id, pinned) =>
+        window.driller.setEntryPins(path, id, pinned),
+      ).then((result) => {
+        if (!entryPinRequests.isLatest(requestId)) {
+          return;
+        }
+        const outcome = pinSaveOutcome({ previous, result });
+        setEntryPinBusy(false);
+        setEntryPins(outcome.pins);
+        setEntryPinMessage(outcome.message === null ? null : { nodeId, text: outcome.message });
+        if (outcome.changed) {
+          // Main has handed the stored pins to the Graph Service before
+          // replying, so the listing this owes already ranks them.
+          setEntryPinsRevision((revision) => revision + 1);
+        }
+      });
+    },
+    [projectPath, entryPinRequests],
   );
   // P4-7d: the "Revealed / Full map" view — renderer-session state, default
   // Full, reset to Full on a project change (never persisted: Ask First).
@@ -10589,18 +10735,29 @@ export function CodeMap({
     if (!revealDrawn || projectPath === null || revealMapStamp === null || currentRevealKey === null) {
       return;
     }
-    if (!needsRevealListing(revealHeldRef.current, currentRevealKey, revealMapStamp)) {
+    if (!needsRevealListing(revealHeldRef.current, currentRevealKey, revealMapStamp, entryPinsRevision)) {
       return;
     }
     const key = currentRevealKey;
     const mapStamp = revealMapStamp;
     const mapNodes = revealMapNodesRef.current;
     const requestedSection = revealSection;
+    const pinsRevision = entryPinsRevision;
+    // P4-7g: a re-listing for the map fetch already held is a pin change,
+    // not a refresh — it never moves the view.
+    const sameFetch = revealHeldRef.current?.key === key && revealHeldRef.current.mapStamp === mapStamp;
     const requestId = revealListingRequests.begin();
-    const started = startRevealListing(revealHeldRef.current, key, mapStamp);
+    const started = startRevealListing(revealHeldRef.current, key, mapStamp, pinsRevision);
     revealHeldRef.current = started;
     setRevealHeld(started);
     const settle = (result: EntryCandidatesResult) => {
+      // P4-7e: a refresh keeps what was drilled, pruned to the new map.
+      // P4-7g: a pin change does too — the new candidates in column 0,
+      // the drill beneath those still listed kept.
+      const drillGraph =
+        started.listing.status === 'loading' && started.listing.previous !== null
+          ? revealDrillGraphFor(revealDrillGraphRef.current, mapNodes, mapStamp)
+          : null;
       const outcome = revealListingReplyOutcome({
         isLatest: revealListingRequests.isLatest(requestId),
         requestedSection,
@@ -10609,11 +10766,9 @@ export function CodeMap({
         key,
         mapStamp,
         result,
-        // P4-7e: a refresh keeps what was drilled, pruned to the new map.
-        drillGraph:
-          started.listing.status === 'loading' && started.listing.previous !== null
-            ? revealDrillGraphFor(revealDrillGraphRef.current, mapNodes, mapStamp)
-            : null,
+        pinsRevision,
+        sameFetch,
+        drillGraph,
       });
       if (outcome.kind === 'ignore') {
         return;
@@ -10643,12 +10798,39 @@ export function CodeMap({
           revealDrawn: revealDrawnRef.current,
           hadPrevious: started.listing.status === 'loading' && started.listing.previous !== null,
           userMoved: revealUserMovedRef.current,
+          sameFetch,
         })
       ) {
         revealViewRequestRef.current = { target: 'revealed', key, mapStamp };
       }
+      const settledFrom = revealHeldRef.current;
       revealHeldRef.current = outcome.held;
       setRevealHeld(outcome.held);
+      const landed = outcome.held.listing;
+      const drawnBefore =
+        settledFrom !== null && settledFrom.listing.status === 'loading' ? settledFrom.listing.previous : null;
+      if (landed.status === 'ready' && landed.pinsListingFailed !== undefined) {
+        // P4-7g review round 1: a failed pin-change listing kept the drawn
+        // state as it was, so every reveal step still applies.
+        return;
+      }
+      if (sameFetch && landed.status === 'ready' && drawnBefore !== null && drillGraph !== null && drillGraph.edges === mapStamp) {
+        // P4-7g review round 1: a pin change on the same map rebases the
+        // reveal steps the way it rebased the drawn state; only the steps
+        // that no longer apply leave history.
+        const graph = drillGraph;
+        const fresh = initialRevealState({ status: 'found', candidates: landed.state.candidates, totalQualifying: 0 });
+        setHistory((previous) =>
+          rebaseRevealHistory(previous, {
+            key,
+            mapStamp,
+            previous: drawnBefore,
+            landed: landed.state,
+            rebase: (state) => refreshRevealState(state, fresh, graph),
+          }),
+        );
+        return;
+      }
       // P4-7f: a listing that lands replaces the state every reveal snapshot
       // was taken from (a refresh rebases the drill), so no reveal entry
       // survives it — Back never restores a pre-refresh state.
@@ -10662,7 +10844,16 @@ export function CodeMap({
     window.driller.listEntryCandidates(projectPath, requestedSection ?? undefined).then(settle, (error: unknown) =>
       settle({ status: 'error', message: error instanceof Error ? error.message : String(error) }),
     );
-  }, [revealDrawn, projectPath, revealMapStamp, revealSection, currentRevealKey, revealListingRequests, isDevFixtureMode]);
+  }, [
+    revealDrawn,
+    projectPath,
+    revealMapStamp,
+    revealSection,
+    currentRevealKey,
+    revealListingRequests,
+    isDevFixtureMode,
+    entryPinsRevision,
+  ]);
 
   // P4-7d: a navigation to a Node Revealed doesn't draw switches to Full
   // (keeping the reveal state), says so, and replays once Full is laid out —
@@ -12881,6 +13072,17 @@ export function CodeMap({
               // through App and selects the callee on the new map.
               mapSection={fetchState.status === 'ready' ? (fetchState.section ?? null) : null}
               onSwitchSection={handleSwitchSectionFromDetail}
+              // P4-7g: pin or unpin this Node as an entry point.
+              entryPin={
+                projectPath === null
+                  ? undefined
+                  : {
+                      pinned: entryPins?.includes(nodeDetail.node.id) ?? false,
+                      busy: entryPinBusy || entryPins === null,
+                      message: entryPinMessage?.nodeId === nodeDetail.node.id ? entryPinMessage.text : null,
+                      onToggle: () => toggleEntryPin(nodeDetail.node.id),
+                    }
+              }
             />
             {typeGone && typeDetail.status === 'closed' && <TypeGoneNotice />}
             {/* P0-1: the one-click source action this panel's IA row

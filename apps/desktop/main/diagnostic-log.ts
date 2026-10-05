@@ -10,10 +10,12 @@
  *
  * Never transmitted anywhere — no network call exists in this module, and
  * none should ever be added (AD-21, AD-16). `DiagnosticLogEntry` is a
- * discriminated union on `eventType`; this phase implements exactly one
- * member, `'path-trace-dismissed'`, designed so a future Epic 2 Risk
- * Overlay event type can extend the union and reuse this same sink without
- * redefining this one (Boundaries & Constraints).
+ * discriminated union on `eventType`; Story 1.9 implemented its first
+ * member, `'path-trace-dismissed'`, designed so later event types extend the
+ * union and reuse this same sink without redefining it (Boundaries &
+ * Constraints). P4-7g adds `'entry-pin-missing'` (AD-5 "Entry pins"): a
+ * pinned Node a listing hid, written by main itself
+ * (`createEntryPinMissingLogger`), never accepted from the renderer.
  */
 
 import { promises as fs } from 'node:fs';

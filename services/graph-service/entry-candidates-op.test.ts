@@ -540,9 +540,9 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(src.slice(start, end), /\n {2}registerListEntryCandidatesTool\(server\);/);
   });
 
-  it('the tool: name, version 1.9.0, the description’s promises, and its input rules', () => {
+  it('the tool: name, version 1.10.0, the description’s promises, and its input rules', () => {
     assert.ok(mcp);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.9.0');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.10.0');
     const tool = registerTool();
     assert.equal(tool.name, 'list_entry_candidates');
     const description = tool.config.description ?? '';
@@ -550,8 +550,11 @@ describe('P4-7c: IPC and MCP parity', () => {
     // Review round 1: "indexed code" means the in-scope Code Map.
     assert.match(description, /no caller among the Code Map's in-scope Nodes \(indexed code within the indexing scope\)/);
     assert.match(description, /never a claim that a Node is the program's entry point/);
-    assert.match(description, /\{status: 'none'\} when no Node qualifies .* which means no qualifying Node, NOT that the code has no entry point/);
-    assert.match(description, /Reason kinds: 'no-callers'/);
+    assert.match(description, /\{status: 'none', hiddenPinIds\?\} when no Node qualifies and none is pinned .* which means no qualifying Node, NOT that the code has no entry point/);
+    assert.match(description, /Reason kinds: 'pinned' \(the engineer pinned it as an entry point\); 'no-callers'/);
+    // P4-7g: pins first, in pin order; hidden pins named.
+    assert.match(description, /pinned as entry points in the driller app come first, in the order they were pinned/);
+    assert.match(description, /'hiddenPinIds' \(present only when not empty\) lists pinned Node ids that are not on the Code Map/);
     assert.match(description, /'loadedBy'/);
     assert.match(description, /USAGE counts as a caller/);
     assert.match(description, /Load-time calls from a file's top level .* do NOT count as callers/);
@@ -565,5 +568,181 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.equal(schema.safeParse({ projectPath: PROJECT, section: 'api' }).success, true);
     assert.equal(schema.safeParse({ projectPath: PROJECT, section: '' }).success, false, "'' is rejected, as on every tool");
     assert.equal(schema.safeParse({ projectPath: 42 }).success, false);
+  });
+});
+
+describe('P4-7g: pins in the Graph Service', () => {
+  /** Posts an index request carrying `entryPins` and waits for it to finish. */
+  async function indexWithPins(entryPins: string[]): Promise<void> {
+    const from = posted.length;
+    send({ type: 'graphService:index', path: PROJECT, activeBackend: 'local', entryPins });
+    await waitFor(
+      () => posted.slice(from).find((m) => m.type === undefined && (m.state === 'indexed' || m.state === 'error')),
+      'the index to finish',
+    );
+  }
+  const setPins = (projectPath: string, pinnedIds: string[]) => send({ type: 'graphService:setEntryPins', projectPath, pinnedIds });
+  const reasons = (result: EntryCandidatesResult) =>
+    result.status === 'found' ? result.candidates.map((c) => [c.id, c.reason.kind]) : [];
+
+  after(async () => {
+    // Leave no pins for the next file's state (the harness is per file, but be tidy).
+    setPins(PROJECT, []);
+  });
+
+  it('the index request carries the pins: the first listing ranks them first, in pin order', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    await indexWithPins(['api.serviceB', 'api.helper1']);
+    assert.deepEqual(indexModule.peekEntryPinsForTests(), { projectPath: PROJECT, pinnedIds: ['api.serviceB', 'api.helper1'] });
+    setScope(['api', 'web']);
+    await requestMap();
+    const result = indexModule.computeEntryCandidatesResult(PROJECT);
+    assert.deepEqual(reasons(result), [
+      ['api.serviceB', 'pinned'],
+      ['api.helper1', 'pinned'],
+      ['web.render', 'no-callers'],
+      ['api.handleRequest', 'no-callers'],
+    ]);
+    assert.equal(candidate(result, 'api.serviceB')?.reach, 2);
+    assert.equal(candidate(result, 'api.helper1')?.reach, 0);
+    const reply = await requestMap();
+    assert.deepEqual(
+      indexModule.computeEntryCandidatesResult(PROJECT),
+      listEntryCandidates(reply.nodes, reply.edges, { pinnedIds: ['api.serviceB', 'api.helper1'] }),
+    );
+  });
+
+  it('a pin change drops the memo: the next listing ranks the new pins, never the stale ranking', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    const module = indexModule;
+    await indexWithPins([]);
+    setScope(['api', 'web']);
+    await requestMap();
+    const before = module.computeEntryCandidatesResult(PROJECT);
+    module.computeEntryCandidatesResult(PROJECT, 'api');
+    assert.deepEqual(ids(before), ['web.render', 'api.handleRequest']);
+    assert.equal(module.computeEntryCandidatesResult(PROJECT), before, 'memoized');
+    setPins(PROJECT, ['api.cacheLookup']);
+    assert.equal(module.peekEntryCandidatesMemoForTests().whole, undefined, 'whole-scope memo dropped');
+    assert.equal(module.peekEntryCandidatesMemoForTests().sections, undefined, 'section memo dropped');
+    assert.deepEqual(ids(module.computeEntryCandidatesResult(PROJECT)), ['api.cacheLookup', 'web.render', 'api.handleRequest']);
+    assert.deepEqual(ids(module.computeEntryCandidatesResult(PROJECT, 'api')), ['api.cacheLookup', 'api.handleRequest', 'api.cron']);
+    // Unpinning restores the heuristic ranking.
+    setPins(PROJECT, []);
+    assert.deepEqual(module.computeEntryCandidatesResult(PROJECT), before);
+  });
+
+  it('setEntryPins for another project is ignored: no pins applied, no memo dropped', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    const module = indexModule;
+    await indexWithPins(['api.serviceA']);
+    setScope(['api', 'web']);
+    await requestMap();
+    const before = module.computeEntryCandidatesResult(PROJECT);
+    setPins('/somewhere/else', ['api.serviceB']);
+    assert.deepEqual(module.peekEntryPinsForTests(), { projectPath: PROJECT, pinnedIds: ['api.serviceA'] });
+    assert.equal(module.computeEntryCandidatesResult(PROJECT), before);
+    assert.deepEqual(ids(before), ['api.serviceA', 'web.render', 'api.handleRequest']);
+    // Malformed messages are ignored as well.
+    send({ type: 'graphService:setEntryPins', projectPath: PROJECT, pinnedIds: [3] });
+    send({ type: 'graphService:setEntryPins', projectPath: PROJECT });
+    assert.deepEqual(module.peekEntryPinsForTests(), { projectPath: PROJECT, pinnedIds: ['api.serviceA'] });
+  });
+
+  it('a missing pin is hidden and reported, never a candidate; in a section, a pin elsewhere on the map is neither', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    const module = indexModule;
+    await indexWithPins(['api.renamedAway', 'web.header', 'api.serviceB']);
+    setScope(['api', 'web']);
+    await requestMap();
+    const whole = module.computeEntryCandidatesResult(PROJECT);
+    assert.deepEqual(ids(whole), ['web.header', 'api.serviceB', 'web.render', 'api.handleRequest']);
+    assert.ok(whole.status === 'found');
+    assert.deepEqual(whole.hiddenPinIds, ['api.renamedAway']);
+    // In api: web.header is on the map but in web — not shown, not missing.
+    const api = module.computeEntryCandidatesResult(PROJECT, 'api');
+    assert.deepEqual(ids(api), ['api.serviceB', 'api.handleRequest', 'api.cron']);
+    assert.ok(api.status === 'found');
+    assert.deepEqual(api.hiddenPinIds, ['api.renamedAway']);
+    const web = module.computeEntryCandidatesResult(PROJECT, 'web');
+    assert.deepEqual(ids(web), ['web.header', 'web.render']);
+    assert.ok(web.status === 'found' && web.hiddenPinIds?.join() === 'api.renamedAway');
+    // A pin outside the indexing scope (lib) is not on the map: hidden.
+    setPins(PROJECT, ['lib.tool']);
+    const reply = await requestMap();
+    const unpinned = listEntryCandidates(reply.nodes, reply.edges);
+    assert.ok(unpinned.status === 'found');
+    assert.deepEqual(module.computeEntryCandidatesResult(PROJECT), { ...unpinned, hiddenPinIds: ['lib.tool'] });
+    // Pins are never removed by the Graph Service.
+    assert.deepEqual(module.peekEntryPinsForTests()?.pinnedIds, ['lib.tool']);
+  });
+
+  it('cyclic project + one pin: found with the pin only', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    harness.__harnessFixtureOverride = CYCLIC;
+    try {
+      await indexWithPins(['api.c']);
+      setScope([]);
+      await requestMap();
+      assert.deepEqual(reasons(indexModule.computeEntryCandidatesResult(PROJECT)), [['api.c', 'pinned']]);
+    } finally {
+      harness.__harnessFixtureOverride = FIXTURE;
+    }
+    await indexWithPins([]);
+    setScope(['api', 'web']);
+    await requestMap();
+  });
+
+  it('IPC and MCP rank the pins identically (parity), with and without a section', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    await indexWithPins(['api.repository']);
+    setScope(['api', 'web']);
+    await requestMap();
+    setPins(PROJECT, ['web.footer', 'api.repository', 'api.gone']);
+    for (const section of [undefined, 'api', 'web']) {
+      const ipc = await viaIpc(PROJECT, section);
+      const text = await viaMcp({ projectPath: PROJECT, ...(section === undefined ? {} : { section }) });
+      assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(ipc.result)), String(section));
+      const result = JSON.parse(text) as EntryCandidatesResult;
+      assert.equal(result.status === 'found' ? result.candidates[0]?.reason.kind : undefined, 'pinned', String(section));
+    }
+    const whole = JSON.parse(await viaMcp({ projectPath: PROJECT })) as EntryCandidatesResult;
+    assert.deepEqual(ids(whole).slice(0, 2), ['web.footer', 'api.repository']);
+    setPins(PROJECT, []);
+  });
+
+  it('review round 1: invalid ids in the index request are dropped, never rejecting the index', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    const from = posted.length;
+    send({ type: 'graphService:index', path: PROJECT, activeBackend: 'local', entryPins: ['api.serviceB', 3, '', null, 'api.serviceB', 'api.cron'] });
+    await waitFor(
+      () => posted.slice(from).find((m) => m.type === undefined && (m.state === 'indexed' || m.state === 'error')),
+      'the index to finish',
+    );
+    assert.equal(posted.slice(from).some((m) => m.type === undefined && m.state === 'indexed'), true, 'indexed');
+    assert.deepEqual(indexModule.peekEntryPinsForTests(), { projectPath: PROJECT, pinnedIds: ['api.serviceB', 'api.cron'] });
+    assert.deepEqual(indexModule.sanitizeEntryPins('api.x'), []);
+    // A non-array is no pins, still indexed.
+    await indexWithPins('nope' as unknown as string[]);
+    assert.deepEqual(indexModule.peekEntryPinsForTests()?.pinnedIds, []);
+  });
+
+  it('review round 1: the map fetched after an index reports the pins not on it (once per fetch; main dedupes)', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    await indexWithPins(['api.renamedAway', 'api.serviceB', 'lib.tool']);
+    setScope(['api', 'web']);
+    const from = posted.length;
+    await requestMap();
+    const reports = posted.slice(from).filter((m) => m.type === 'graphService:entryPinsMissing');
+    assert.deepEqual(
+      reports.map((m) => [m.projectPath, (m as unknown as { nodeIds: string[] }).nodeIds]),
+      [[PROJECT, ['api.renamedAway', 'lib.tool']]],
+    );
+    // No pins missing: nothing posted.
+    await indexWithPins(['api.serviceB']);
+    const quiet = posted.length;
+    await requestMap();
+    assert.equal(posted.slice(quiet).some((m) => m.type === 'graphService:entryPinsMissing'), false);
+    setPins(PROJECT, []);
   });
 });

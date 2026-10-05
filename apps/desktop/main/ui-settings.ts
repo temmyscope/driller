@@ -15,6 +15,8 @@
  * on every launch.
  */
 
+import { ENTRY_PINS_MAX, type EntryPinUpdateResult } from '@driller/ipc-contracts';
+
 import { DEFAULT_ZOOM_FACTOR, parseStoredZoomFactor } from './app-menu';
 import { normalizePathForComparison } from './project-path';
 
@@ -361,4 +363,236 @@ export function handleSetActiveSection(
     return setting.get(projectPath);
   }
   return setting.set(projectPath, section);
+}
+
+// ---------------------------------------------------------------------------
+// P4-7g: the Nodes pinned as entry points, per project (AD-5 "Entry pins").
+// ---------------------------------------------------------------------------
+
+/** The raw persisted `{projectPath: nodeIds}` record, as stored — untrusted. */
+export interface EntryPinsBackingStore {
+  get(): unknown;
+  set(value: Record<string, string[]>): void;
+}
+
+export interface EntryPinsSetting {
+  /** `projectPath`'s pinned Node ids, in pin order — `[]` when unset, invalid or unreadable. */
+  get(projectPath: string): string[];
+  /**
+   * Stores `nodeIds` (in pin order; a repeated id kept at its first place)
+   * for `projectPath` and returns what is now in effect. More than
+   * `ENTRY_PINS_MAX` distinct ids is refused: nothing is stored and the
+   * current pins are returned. An empty list removes the project's entry.
+   */
+  set(projectPath: string, nodeIds: readonly string[]): string[];
+  /**
+   * Review round 1: pins (appended) or unpins `nodeId` against the list
+   * stored for `projectPath` — never a whole list from a caller that may
+   * hold a stale one. A pin past `ENTRY_PINS_MAX` is `limit` (nothing
+   * changed). While the store can't be read, `error`: a list that was never
+   * read is never overwritten.
+   */
+  update(projectPath: string, nodeId: string, pinned: boolean): EntryPinUpdateResult;
+}
+
+/** Review round 1: the explicit refusal while the stored pins can't be read. */
+export const ENTRY_PINS_UNREADABLE_MESSAGE = 'The stored entry pins couldn’t be read, so nothing was changed.';
+
+/** Distinct non-empty strings of `values`, first place kept. */
+function distinctIds(values: readonly unknown[]): { ids: string[]; dropped: boolean } {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  let dropped = false;
+  for (const value of values) {
+    if (typeof value !== 'string' || value.length === 0 || seen.has(value)) {
+      dropped = true;
+      continue;
+    }
+    seen.add(value);
+    ids.push(value);
+  }
+  return { ids, dropped };
+}
+
+/**
+ * The pins are remembered per project in the UI settings store (AD-5,
+ * "Entry pins"), with the same discipline as `createShowFoldedKindsSetting`
+ * and `createActiveSectionSetting`: keys normalised with
+ * `normalizePathForComparison`, and no write until one read has succeeded
+ * (changes made meanwhile wait in memory and are merged in once a read
+ * succeeds; a read failure is logged once; a failed write keeps the value in
+ * memory for the session).
+ *
+ * The record is hand-editable JSON, so it is read defensively: a non-object
+ * reads as empty; a value that is not an array reads as no pins; a non-string
+ * or empty id and a repeated id are dropped; a list longer than
+ * `ENTRY_PINS_MAX` keeps its first `ENTRY_PINS_MAX`. Anything dropped is
+ * warned about once. A pin whose Node is gone is never removed here — the
+ * Node may return after a scope change or a re-index.
+ */
+export function createEntryPinsSetting(store: EntryPinsBackingStore, log: UiSettingsLog = console): EntryPinsSetting {
+  let persisted: Map<string, string[]> | undefined;
+  // `[]` = removed, waiting to be merged in.
+  const unsaved = new Map<string, string[]>();
+  let readFailureLogged = false;
+  // Review round 1: projects whose stored list was cut to `ENTRY_PINS_MAX`
+  // on read — saving it drops the rest for good, which is warned about.
+  const cutOnRead = new Set<string>();
+
+  /** Reads the record once; `false` while the store can't be read. */
+  const ensureRead = (): boolean => {
+    if (persisted !== undefined) {
+      return true;
+    }
+    let raw: unknown;
+    try {
+      raw = store.get();
+    } catch (error) {
+      if (!readFailureLogged) {
+        readFailureLogged = true;
+        log.error('Failed to read the entry pins; keeping changes in memory.', errorMessage(error));
+      }
+      return false;
+    }
+    persisted = new Map();
+    let corrupt = false;
+    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+      for (const [projectPath, value] of Object.entries(raw)) {
+        if (!Array.isArray(value)) {
+          corrupt = true;
+          continue;
+        }
+        const { ids, dropped } = distinctIds(value);
+        if (dropped || ids.length > ENTRY_PINS_MAX) {
+          corrupt = true;
+        }
+        if (ids.length > 0) {
+          const key = normalizePathForComparison(projectPath);
+          persisted.set(key, ids.slice(0, ENTRY_PINS_MAX));
+          if (ids.length > ENTRY_PINS_MAX) {
+            cutOnRead.add(key);
+          }
+        }
+      }
+    } else if (raw !== undefined) {
+      corrupt = true;
+    }
+    if (corrupt) {
+      log.warn('Ignoring invalid persisted entry pins.');
+    }
+    return true;
+  };
+
+  const write = (): void => {
+    const record: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+    for (const [key, ids] of persisted ?? []) {
+      record[key] = [...ids];
+    }
+    for (const key of cutOnRead) {
+      if (key in record) {
+        log.warn(`Saving the entry pins drops those past the first ${ENTRY_PINS_MAX} for one project.`);
+      }
+    }
+    cutOnRead.clear();
+    try {
+      store.set({ ...record });
+    } catch (error) {
+      log.error('Failed to persist the entry pins.', errorMessage(error));
+    }
+  };
+
+  const current = (key: string): string[] => {
+    const pending = unsaved.get(key);
+    if (pending !== undefined) {
+      return [...pending];
+    }
+    return ensureRead() ? [...(persisted?.get(key) ?? [])] : [];
+  };
+
+  const storeIds = (key: string, ids: string[]): string[] => {
+    unsaved.set(key, ids);
+    if (!ensureRead() || persisted === undefined) {
+      return [...ids];
+    }
+    for (const [pendingKey, pendingIds] of unsaved) {
+      if (pendingIds.length === 0) {
+        persisted.delete(pendingKey);
+      } else {
+        persisted.set(pendingKey, pendingIds);
+      }
+    }
+    unsaved.clear();
+    write();
+    return [...ids];
+  };
+
+  return {
+    get: (projectPath) => current(normalizePathForComparison(projectPath)),
+    set: (projectPath, nodeIds) => {
+      const key = normalizePathForComparison(projectPath);
+      const { ids } = distinctIds(nodeIds);
+      if (ids.length > ENTRY_PINS_MAX) {
+        return current(key);
+      }
+      return storeIds(key, ids);
+    },
+    update: (projectPath, nodeId, pinned) => {
+      if (!ensureRead()) {
+        return { status: 'error', message: ENTRY_PINS_UNREADABLE_MESSAGE };
+      }
+      const key = normalizePathForComparison(projectPath);
+      const stored = current(key);
+      if (pinned === stored.includes(nodeId)) {
+        return { status: 'stored', pins: stored };
+      }
+      if (pinned && stored.length >= ENTRY_PINS_MAX) {
+        return { status: 'limit', pins: stored };
+      }
+      const next = pinned ? [...stored, nodeId] : stored.filter((id) => id !== nodeId);
+      return { status: 'stored', pins: storeIds(key, next) };
+    },
+  };
+}
+
+/**
+ * P4-7g: the `settings:getEntryPins` IPC handler's logic. The argument
+ * crosses the contextBridge untyped: a missing or empty project path reads
+ * as no pins, without touching the store.
+ */
+export function handleGetEntryPins(setting: EntryPinsSetting, projectPath: unknown): string[] {
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return [];
+  }
+  return setting.get(projectPath);
+}
+
+/**
+ * P4-7g (review round 1): the `settings:setEntryPins` IPC handler's logic —
+ * one id pinned or unpinned by main against its stored list. The arguments
+ * cross the contextBridge untyped: a missing or empty project path or Node
+ * id, or a non-boolean `pinned`, is an explicit `error` and stores nothing.
+ * When a list was stored, `onStored` gets the project path and that list
+ * (main hands it to the Graph Service).
+ */
+export function handleSetEntryPins(
+  setting: EntryPinsSetting,
+  projectPath: unknown,
+  nodeId: unknown,
+  pinned: unknown,
+  onStored: (projectPath: string, pinnedIds: string[]) => void = () => {},
+): EntryPinUpdateResult {
+  if (
+    typeof projectPath !== 'string' ||
+    projectPath.length === 0 ||
+    typeof nodeId !== 'string' ||
+    nodeId.length === 0 ||
+    typeof pinned !== 'boolean'
+  ) {
+    return { status: 'error', message: 'Invalid entry pin request.' };
+  }
+  const result = setting.update(projectPath, nodeId, pinned);
+  if (result.status === 'stored') {
+    onStored(projectPath, [...result.pins]);
+  }
+  return result;
 }
