@@ -209,6 +209,7 @@ const found = (candidates: EntryCandidate[]): Extract<EntryCandidatesResult, { s
   status: 'found',
   candidates,
   totalQualifying: candidates.length,
+  relations: [],
 });
 const nodeIdsOf = (held: HeldReveal) =>
   held.listing.status === 'ready' ? held.listing.state.entries.filter((e) => e.kind === 'node').map((e) => (e.kind === 'node' ? e.id : '')) : [];

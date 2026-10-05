@@ -102,6 +102,7 @@ const found = (candidates: EntryCandidate[]): Extract<EntryCandidatesResult, { s
   status: 'found',
   candidates,
   totalQualifying: candidates.length,
+  relations: [],
 });
 
 // The `path-trace-basic` fixture's one candidate (P4-7b): handleRequest, reach 4.

@@ -206,7 +206,7 @@ describe('the wiring (source pins)', () => {
     assert.match(codeMapSrc, /if \(landed\.status === 'ready' && landed\.pinsListingFailed !== undefined\) \{[\s\S]{0,200}return;/);
     assert.match(
       codeMapSrc,
-      /if \(sameFetch && landed\.status === 'ready' && drawnBefore !== null && drillGraph !== null && drillGraph\.edges === mapStamp\) \{[\s\S]{0,400}rebaseRevealHistory\(previous, \{\s*key,\s*mapStamp,\s*previous: drawnBefore,\s*landed: landed\.state,\s*rebase: \(state\) => refreshRevealState\(state, fresh, graph\),/,
+      /if \(sameFetch && landed\.status === 'ready' && drawnBefore !== null && drillGraph !== null && drillGraph\.edges === mapStamp\) \{[\s\S]{0,600}rebaseRevealHistory\(previous, \{\s*key,\s*mapStamp,\s*previous: drawnBefore,\s*landed: landed\.state,\s*rebase: \(state\) => refreshRevealState\(state, fresh, graph\),/,
     );
     assert.match(codeMapSrc, /setHistory\(\(previous\) => historyWithoutReveals\(previous\)\);/);
   });

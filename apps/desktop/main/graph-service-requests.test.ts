@@ -150,6 +150,7 @@ const FOUND: EntryCandidatesResult = {
     },
   ],
   totalQualifying: 1,
+  relations: [],
 };
 
 function okArgs(projectPath: unknown, section?: unknown) {
@@ -386,17 +387,34 @@ describe('P4-7g: entry pins over the main → Graph Service boundary', () => {
   it('a listing reply with malformed hiddenPinIds is an explicit error; well-formed ones pass through', () => {
     const malformed = { status: 'error', message: 'Malformed entry-candidates reply.' };
     assert.deepEqual(toValidatedEntryCandidatesResult({ status: 'none', hiddenPinIds: 'x' }), malformed);
-    assert.deepEqual(toValidatedEntryCandidatesResult({ status: 'found', candidates: [], totalQualifying: 0, hiddenPinIds: [3] }), malformed);
+    assert.deepEqual(
+      toValidatedEntryCandidatesResult({ status: 'found', candidates: [], totalQualifying: 0, relations: [], hiddenPinIds: [3] }),
+      malformed,
+    );
     const ok = { status: 'none', hiddenPinIds: ['gone'] };
+    assert.equal(toValidatedEntryCandidatesResult(ok), ok);
+  });
+
+  it('P4-7h: a found reply without well-formed relations is an explicit error; well-formed ones pass through', () => {
+    const malformed = { status: 'error', message: 'Malformed entry-candidates reply.' };
+    const base = { status: 'found', candidates: [], totalQualifying: 0 };
+    for (const relations of [undefined, 'x', [null], [{ a: 'x', b: 'y' }], [{ a: 'x', b: 2, sharedReach: 1 }], [{ a: 'x', b: 'y', sharedReach: '1' }], [{ a: 'x', b: 'y', sharedReach: 0 }], [{ a: 'x', b: 'y', sharedReach: 1.5 }], [{ a: 'x', b: 'y', sharedReach: -2 }], [{ a: 'x', b: 'x', sharedReach: 1 }]]) {
+      assert.deepEqual(
+        toValidatedEntryCandidatesResult(relations === undefined ? base : { ...base, relations }),
+        malformed,
+        JSON.stringify(relations),
+      );
+    }
+    const ok = { ...base, relations: [{ a: 'x', b: 'y', sharedReach: 2 }] };
     assert.equal(toValidatedEntryCandidatesResult(ok), ok);
   });
 
   it('logs each missing pin once per session (per project), as entry-pin-missing with its project', () => {
     const entries: DiagnosticLogEntry[] = [];
     const log = createEntryPinMissingLogger({ append: (entry) => entries.push(entry), now: () => new Date('2026-10-05T00:00:00.000Z') });
-    log('/repo/a', hiddenPinIdsOf({ status: 'found', candidates: [], totalQualifying: 0, hiddenPinIds: ['gone', 'also'] }));
+    log('/repo/a', hiddenPinIdsOf({ status: 'found', candidates: [], totalQualifying: 0, relations: [], hiddenPinIds: ['gone', 'also'] }));
     log('/repo/a', hiddenPinIdsOf({ status: 'none', hiddenPinIds: ['gone'] }));
-    log('/repo/a', hiddenPinIdsOf({ status: 'found', candidates: [], totalQualifying: 0 }));
+    log('/repo/a', hiddenPinIdsOf({ status: 'found', candidates: [], totalQualifying: 0, relations: [] }));
     log('/repo/a', hiddenPinIdsOf({ status: 'error', message: 'x' }));
     // Review round 1: the Graph Service's report after an index goes through the same once-per-session set.
     log('/repo/a', ['also']);

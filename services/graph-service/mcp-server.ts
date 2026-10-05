@@ -73,6 +73,7 @@ import {
   SIMILAR_TO_MAX_ENTRIES,
   SIMILAR_TO_MIN_JACCARD,
   TESTED_BY_MAX_TESTS,
+  type EntryCandidatesResult,
   type FoldedModule,
   type FoldedType,
   type NodeLookupResult,
@@ -397,7 +398,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-export const MCP_SERVER_VERSION = '1.10.0';
+export const MCP_SERVER_VERSION = '1.11.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -500,6 +501,13 @@ export function registerExpandBlastRadiusTool(server: Pick<McpServer, 'registerT
 }
 
 /**
+ * P4-7h (founder decision 2026-10-05): at most this many `relations` go to
+ * agents — the strongest pairs (the listing is already sorted strongest
+ * first). The renderer, over IPC, keeps every pair.
+ */
+export const AGENT_ENTRY_RELATIONS_MAX = 50;
+
+/**
  * P4-7c: the `list_entry_candidates` tool's description — exported so a test
  * pins what it promises (a heuristic over indexed code, what `none` means,
  * the reason kinds, and which callers count).
@@ -509,13 +517,34 @@ export const LIST_ENTRY_CANDIDATES_DESCRIPTION =
   "A caller is another Code Map Node with a CALLS or USAGE edge into it: USAGE counts as a caller (so a component rendered through JSX is not a candidate), IMPORTS does not, and a self-call is ignored. Load-time calls from a file's top level (main(), app.whenReady().then(createWindow), ipcMain.handle(channel, handler)) do NOT count as callers, because that is how programs start: they are named in the reason instead. " +
   `'reach' is the number of distinct Nodes the candidate reaches forward over CALLS and USAGE edges, itself excluded. Nodes reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} are dropped. ` +
   "Nodes the engineer pinned as entry points in the driller app come first, in the order they were pinned, whatever their callers or reach (each with its real reach). " +
-  `Returns an explicit result state: {status: 'found', candidates, totalQualifying, hiddenPinIds?}, the pinned candidates first, then the others ordered by reach (highest first) then id, at most ${ENTRY_CANDIDATE_MAX} of those, with 'totalQualifying' counting the pinned ones plus every other qualifying Node before that cap; {status: 'none', hiddenPinIds?} when no Node qualifies and none is pinned (for example fully cyclic code, or every root reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} Nodes), which means no qualifying Node, NOT that the code has no entry point; or {status: 'error', message}. ` +
+  `Returns an explicit result state: {status: 'found', candidates, totalQualifying, relations, relationsTotal, hiddenPinIds?}, the pinned candidates first, then the others ordered by reach (highest first) then id, at most ${ENTRY_CANDIDATE_MAX} of those, with 'totalQualifying' counting the pinned ones plus every other qualifying Node before that cap; {status: 'none', hiddenPinIds?} when no Node qualifies and none is pinned (for example fully cyclic code, or every root reaching fewer than ${ENTRY_CANDIDATE_MIN_REACH} Nodes), which means no qualifying Node, NOT that the code has no entry point; or {status: 'error', message}. ` +
+  "'relations' lists, for each pair of listed candidates (pinned ones included) whose forward reach overlaps, {a, b, sharedReach}: a < b by id, and sharedReach the number of Nodes both reach over CALLS and USAGE edges, neither of the two counted. It is a shared-reach count, NOT a call: neither candidate calls the other because of it. Pairs with no common Node are left out (never a 0); sorted by sharedReach (highest first), then a, then b; [] with one candidate. " +
+  `Only the ${AGENT_ENTRY_RELATIONS_MAX} strongest pairs are returned here; 'relationsTotal' is how many pairs there are (the human-facing UI gets them all). With 'section', it uses that section's own reach. ` +
   "'hiddenPinIds' (present only when not empty) lists pinned Node ids that are not on the Code Map (for example renamed or deleted, or out of scope): they are never candidates. " +
   "Each candidate is {id, name, file, startLine, endLine, reach, reason}. Reason kinds: 'pinned' (the engineer pinned it as an entry point); 'no-callers' (no Code Map Node calls or uses it in indexed code); when files' top-level code calls or uses it at load time, a 'no-callers' reason also carries 'loadedBy' " +
   `(those files, sorted, at most ${ENTRY_CANDIDATE_LOADED_BY_MAX}) and 'loadedByTotal' (how many there are). ` +
-  "Test code is never a candidate and never counted in reach. The result is the exact same EntryCandidatesResult the human-facing UI gets for the identical request. " +
+  "Test code is never a candidate and never counted in reach. The result is the exact same EntryCandidatesResult the human-facing UI gets for the identical request, except that 'relations' is cut to the strongest pairs (with 'relationsTotal'). " +
   "With 'section', candidates and reach are computed from that section's own Nodes and the edges between them, never by filtering the whole-scope result: a Node whose only callers are in another section is a candidate in its own section, and 'loadedBy' names only files inside the section. A pinned Node in another section is not listed there (nor in 'hiddenPinIds'). " +
   SECTION_RULE_DESCRIPTION;
+
+/**
+ * P4-7h: `computeEntryCandidatesResult`'s result as the `list_entry_candidates`
+ * tool returns it — a `found` result's `relations` cut to the first
+ * `AGENT_ENTRY_RELATIONS_MAX` and `relationsTotal` (how many pairs there
+ * were) after them; every other result, and every other field, unchanged.
+ */
+export function toAgentEntryCandidatesResult(result: EntryCandidatesResult): EntryCandidatesResult {
+  if (result.status !== 'found') {
+    return result;
+  }
+  const { hiddenPinIds, ...rest } = result;
+  return {
+    ...rest,
+    relations: result.relations.slice(0, AGENT_ENTRY_RELATIONS_MAX),
+    relationsTotal: result.relations.length,
+    ...(hiddenPinIds === undefined ? {} : { hiddenPinIds }),
+  };
+}
 
 /**
  * Registers the `list_entry_candidates` tool (P4-7c, AD-13 (f)) on `server`
@@ -536,7 +565,9 @@ export function registerListEntryCandidatesTool(server: Pick<McpServer, 'registe
       }),
     },
     // `section` passed through (`undefined` when omitted — the whole scope).
-    async ({ projectPath, section }) => jsonToolResult(computeEntryCandidatesResult(projectPath, section)),
+    // P4-7h: the same result, its relations cut for agents.
+    async ({ projectPath, section }) =>
+      jsonToolResult(toAgentEntryCandidatesResult(computeEntryCandidatesResult(projectPath, section))),
   );
 }
 
@@ -697,6 +728,13 @@ export function startMcpServer(
   // P4-7g (1.10.0): `list_entry_candidates` ranks the engineer's pins first
   // (reason kind 'pinned') and may carry `hiddenPinIds`. Without pins its
   // result is byte-for-byte 1.9.0's.
+  // P4-7h (1.11.0): `list_entry_candidates`' `found` result gains
+  // `relations` (the shared reach between listed candidates; `[]` with one
+  // candidate) — additive for a client that reads fields; a client comparing
+  // the `found` result's exact shape will see the new field. Founder decision
+  // (2026-10-05): agents get the 50 strongest pairs plus `relationsTotal`
+  // (IPC keeps every pair) — still 1.11.0, since the 1.1x series is
+  // unreleased.
   const server = new McpServer({ name: 'driller-code-map', version: MCP_SERVER_VERSION });
 
   registerLookupNodeTool(

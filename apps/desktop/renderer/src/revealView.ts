@@ -21,6 +21,7 @@ import {
   type CodeMapEdge,
   type CodeMapNode,
   type EntryCandidate,
+  type EntryCandidateRelation,
   type EntryCandidatesResult,
 } from '@driller/ipc-contracts';
 
@@ -68,27 +69,41 @@ export type RevealEntry =
  * (`entries`: nodes, refs and stubs). Immutable: every transition returns a
  * new state and never edits the one it was given (P4-7f's history keeps
  * before/after snapshots).
+ *
+ * P4-7h: `relations` is the listing's shared reach between its candidates
+ * (`found.relations`), carried with them — a drill step never changes it,
+ * only a new listing does. Render-only (`relationEdges`): never an edge of
+ * the map, never fed into adjacency, risk, Path Trace or LOD.
  */
 export interface RevealState {
   candidates: EntryCandidate[];
   revealed: ReadonlyMap<string, RevealedEntry>;
   entries: readonly RevealEntry[];
+  relations: readonly EntryCandidateRelation[];
 }
 
-/** P4-7e: a state from its candidates and entries — `revealed` indexes the `node` entries (the first one per id). */
-export function revealStateOf(candidates: EntryCandidate[], entries: readonly RevealEntry[]): RevealState {
+/**
+ * P4-7e: a state from its candidates and entries — `revealed` indexes the
+ * `node` entries (the first one per id). P4-7h: `relations` goes with the
+ * candidates (`[]` when omitted); a transition passes its state's own on.
+ */
+export function revealStateOf(
+  candidates: EntryCandidate[],
+  entries: readonly RevealEntry[],
+  relations: readonly EntryCandidateRelation[] = [],
+): RevealState {
   const revealed = new Map<string, RevealedEntry>();
   for (const entry of entries) {
     if (entry.kind === 'node' && !revealed.has(entry.id)) {
       revealed.set(entry.id, { depth: entry.depth, parentId: entry.parentId });
     }
   }
-  return { candidates, revealed, entries };
+  return { candidates, revealed, entries, relations };
 }
 
-export const EMPTY_REVEAL_STATE: RevealState = { candidates: [], revealed: new Map(), entries: [] };
+export const EMPTY_REVEAL_STATE: RevealState = { candidates: [], revealed: new Map(), entries: [], relations: [] };
 
-/** The start state for a `found` listing: every candidate revealed, in column 0. */
+/** The start state for a `found` listing: every candidate revealed, in column 0, with the listing's relations. */
 export function initialRevealState(result: Extract<EntryCandidatesResult, { status: 'found' }>): RevealState {
   return revealStateOf(
     result.candidates,
@@ -99,7 +114,161 @@ export function initialRevealState(result: Extract<EntryCandidatesResult, { stat
       parentId: null,
       reach: candidate.reach,
     })),
+    result.relations,
   );
+}
+
+/**
+ * P4-7h: one drawn shared-reach edge, from the active (focused or hovered)
+ * candidate to one of its strongest partners — never a call edge. `rank` is
+ * the partner's place (0 = strongest), which sets how far its arc swings
+ * out (`sharedReachArc`). `label` is the visible text ("shares N"),
+ * `ariaLabel` the accessible name ("`a` and `b` both reach N Nodes in
+ * indexed code").
+ */
+export interface RevealRelationEdge {
+  id: string;
+  source: string;
+  target: string;
+  sharedReach: number;
+  rank: number;
+  label: string;
+  ariaLabel: string;
+}
+
+/** P4-7h: every shared-reach edge id starts with this; no Node id or real edge id does. */
+export const SHARED_REACH_EDGE_ID_PREFIX = 'shared-reach:';
+
+/**
+ * P4-7h (founder decision 2026-10-05): at most this many "shares N" edges are
+ * drawn — the active candidate's strongest partners. Every pair stays in
+ * Node detail's "Shares reach" list (`formatSharedReachList`).
+ */
+export const SHARED_REACH_DRAWN_MAX = 3;
+
+/** P4-7h: a shared-reach edge's visible label — text, never colour or width alone. */
+export function sharedReachLabel(sharedReach: number): string {
+  return `shares ${sharedReach}`;
+}
+
+/** P4-7h: a shared-reach edge's accessible name, qualified "in indexed code". */
+export function sharedReachAriaLabel(aName: string, bName: string, sharedReach: number): string {
+  return `${aName} and ${bName} both reach ${sharedReach} Node${sharedReach === 1 ? '' : 's'} in indexed code`;
+}
+
+/**
+ * P4-7h: the Revealed legend's two lines — each a glyph (shown, but hidden
+ * from assistive tech) and its text: the shared-reach edge, and P4-7e's ref
+ * connector, so the two styles are never confused.
+ */
+export const REVEAL_EDGE_LEGEND: readonly { kind: 'shared-reach' | 'ref'; glyph: string; text: string }[] = [
+  { kind: 'shared-reach', glyph: '···', text: 'shares N: candidates reaching common Nodes (focus or hover a candidate)' },
+  { kind: 'ref', glyph: '- -', text: 'shown above: a callee already revealed' },
+];
+
+/** P4-7h: one candidate that shares reach with another, and how much. */
+export interface SharedReachPartner {
+  id: string;
+  name: string;
+  sharedReach: number;
+}
+
+/**
+ * P4-7h: every candidate shown in `state` that shares reach with candidate
+ * `id`, strongest first (then id) — `[]` when `id` isn't a shown candidate
+ * or shares nothing. Only column-0 candidates count (a drill never removes
+ * one); a relation under 1 or naming one Node twice is ignored.
+ */
+export function sharedReachPartners(state: RevealState, id: string): SharedReachPartner[] {
+  const shown = new Map(
+    state.candidates
+      .filter((candidate) => state.revealed.get(candidate.id)?.depth === 0)
+      .map((candidate) => [candidate.id, candidate.name]),
+  );
+  if (!shown.has(id)) {
+    return [];
+  }
+  const partners: SharedReachPartner[] = [];
+  for (const relation of state.relations) {
+    if (relation.a === relation.b || relation.sharedReach < 1 || (relation.a !== id && relation.b !== id)) {
+      continue;
+    }
+    const partnerId = relation.a === id ? relation.b : relation.a;
+    const name = shown.get(partnerId);
+    if (name !== undefined) {
+      partners.push({ id: partnerId, name, sharedReach: relation.sharedReach });
+    }
+  }
+  return partners.sort(
+    (left, right) => right.sharedReach - left.sharedReach || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+  );
+}
+
+/**
+ * P4-7h: Node detail's one-line list of a candidate's partners — "Shares
+ * reach with: b (3), c (1) — Nodes both reach in indexed code" — or that it
+ * shares none. Every pair, never capped (only the canvas is).
+ */
+export function formatSharedReachList(partners: readonly SharedReachPartner[]): string {
+  if (partners.length === 0) {
+    return 'Shares reach with no other candidate in indexed code.';
+  }
+  return `Shares reach with: ${partners.map((partner) => `${partner.name} (${partner.sharedReach})`).join(', ')} — Nodes both reach in indexed code.`;
+}
+
+/**
+ * P4-7h (founder decision 2026-10-05): the render-only shared-reach edges
+ * for the active candidate (`activeId`: the focused or hovered card) — at
+ * most `SHARED_REACH_DRAWN_MAX`, to its strongest partners. None when
+ * nothing is active or `activeId` isn't a shown candidate. The canvas still
+ * drops an edge whose card is clustered away (`withSharedReachEdges`).
+ */
+export function relationEdges(state: RevealState, activeId: string | null): RevealRelationEdge[] {
+  if (activeId === null) {
+    return [];
+  }
+  const activeName = state.candidates.find((candidate) => candidate.id === activeId)?.name ?? activeId;
+  return sharedReachPartners(state, activeId)
+    .slice(0, SHARED_REACH_DRAWN_MAX)
+    .map((partner, rank) => ({
+      id: `${SHARED_REACH_EDGE_ID_PREFIX}${JSON.stringify([activeId, partner.id])}`,
+      source: activeId,
+      target: partner.id,
+      sharedReach: partner.sharedReach,
+      rank,
+      label: sharedReachLabel(partner.sharedReach),
+      ariaLabel: sharedReachAriaLabel(activeName, partner.name, partner.sharedReach),
+    }));
+}
+
+/** P4-7h: how far (px) the strongest partner's arc swings left of column 0, and the extra per rank. */
+export const SHARED_REACH_ARC_OFFSET = 90;
+export const SHARED_REACH_ARC_STEP = 100;
+
+/**
+ * P4-7h: a shared-reach edge's route. Candidates all sit in column 0, so the
+ * edge leaves the active card's left side, swings out into the empty gutter
+ * left of column 0 and comes back into the partner's left side: a cubic
+ * whose two control points sit `offset` left of the column (`offset` grows
+ * with `rank`). Its label sits at the arc's apex (the curve at t = 0.5,
+ * `0.75 × offset` left of the column), so labels never sit on a card, and
+ * the up to three labels sit at distinct distances, never on each other.
+ * `leftX` is column 0's left edge; `sourceY`/`targetY` the two cards'
+ * middles.
+ */
+export function sharedReachArc(
+  leftX: number,
+  sourceY: number,
+  targetY: number,
+  rank: number,
+): { path: string; labelX: number; labelY: number } {
+  const offset = SHARED_REACH_ARC_OFFSET + SHARED_REACH_ARC_STEP * rank;
+  const controlX = leftX - offset;
+  return {
+    path: `M ${leftX},${sourceY} C ${controlX},${sourceY} ${controlX},${targetY} ${leftX},${targetY}`,
+    labelX: leftX - 0.75 * offset,
+    labelY: (sourceY + targetY) / 2,
+  };
 }
 
 /** P4-7e: a ref card's canvas id — never a Node id (no Node id starts with `reveal:`). */
@@ -1120,7 +1289,7 @@ export function expandNode(
       revealChildren(entries, revealedIds, adjacency, reachById, childId, at.depth + 2);
     }
   }
-  return entries.length === state.entries.length ? state : revealStateOf(state.candidates, entries);
+  return entries.length === state.entries.length ? state : revealStateOf(state.candidates, entries, state.relations);
 }
 
 /** The callees of `parentId` already represented beneath it (a child card or a ref). */
@@ -1158,7 +1327,7 @@ export function expandStub(
   const entries = state.entries.filter((entry) => entry !== stub);
   const revealedIds = new Set(state.revealed.keys());
   revealChildren(entries, revealedIds, adjacency, reachById, parentId, stub.depth, representedUnder(state, parentId));
-  return revealStateOf(state.candidates, entries);
+  return revealStateOf(state.candidates, entries, state.relations);
 }
 
 /**
@@ -1230,7 +1399,7 @@ export function collapseNode(state: RevealState, id: string): RevealState {
       }
     }
   }
-  return revealStateOf(state.candidates, entries);
+  return revealStateOf(state.candidates, entries, state.relations);
 }
 
 /**
@@ -1298,7 +1467,7 @@ export function pruneRevealState(
   const completed = adjacency === undefined ? entries : completeExpandedParents(entries, depthOf, adjacency);
   const unchanged =
     completed.length === state.entries.length && completed.every((entry, i) => entry === state.entries[i]);
-  return unchanged ? state : revealStateOf(state.candidates, completed);
+  return unchanged ? state : revealStateOf(state.candidates, completed, state.relations);
 }
 
 /**
@@ -1376,7 +1545,7 @@ export function refreshRevealState(previous: RevealState, fresh: RevealState, gr
   const carried = previous.entries.filter((entry) =>
     entry.kind === 'node' ? entry.parentId !== null && !candidateIds.has(entry.id) : true,
   );
-  const merged = revealStateOf(fresh.candidates, [...fresh.entries, ...carried]);
+  const merged = revealStateOf(fresh.candidates, [...fresh.entries, ...carried], fresh.relations);
   return pruneRevealState(merged, graph.adjacency.validNodeIds, graph.adjacency);
 }
 

@@ -48,23 +48,29 @@ function generate(fanout: number, kinds: readonly PathTraceEdge['kind'][]) {
   return { nodes, edges };
 }
 
+// P4-7h: `pins` pins that many Nodes (spread over the graph) — with 50, the
+// most candidates `relations` can pair (50 + 12).
 const SHAPES = [
-  { label: 'dev-fixture mix (CALLS/IMPORTS/USAGE), fan-out 3', fanout: 3, kinds: ['CALLS', 'IMPORTS', 'USAGE'] as const },
-  { label: 'CALLS+USAGE only, fan-out 3', fanout: 3, kinds: ['CALLS', 'USAGE'] as const },
-  { label: 'CALLS+USAGE only, fan-out 4', fanout: 4, kinds: ['CALLS', 'USAGE'] as const },
+  { label: 'dev-fixture mix (CALLS/IMPORTS/USAGE), fan-out 3', fanout: 3, kinds: ['CALLS', 'IMPORTS', 'USAGE'] as const, pins: 0 },
+  { label: 'CALLS+USAGE only, fan-out 3', fanout: 3, kinds: ['CALLS', 'USAGE'] as const, pins: 0 },
+  { label: 'CALLS+USAGE only, fan-out 4', fanout: 4, kinds: ['CALLS', 'USAGE'] as const, pins: 0 },
+  { label: 'CALLS+USAGE only, fan-out 4, 50 pins', fanout: 4, kinds: ['CALLS', 'USAGE'] as const, pins: 50 },
 ];
 
 for (const shape of SHAPES) {
   const { nodes, edges } = generate(shape.fanout, shape.kinds);
+  const pinnedIds = Array.from({ length: shape.pins }, (_, index) => nodes[NODE_COUNT - 1 - index * 997]!.id);
   const timings: number[] = [];
   let summary = '';
   for (let run = 0; run < RUNS; run += 1) {
     const start = performance.now();
-    const { result, exactReachWalks, roots } = listEntryCandidatesWithWork(nodes, edges);
+    const { result, exactReachWalks, roots } = listEntryCandidatesWithWork(nodes, edges, { pinnedIds });
     timings.push(performance.now() - start);
     summary =
       result.status === 'found'
-        ? `roots ${roots}, qualifying ${result.totalQualifying}, top reach ${result.candidates[0]!.reach}, exact walks ${exactReachWalks.length}`
+        ? `roots ${roots}, qualifying ${result.totalQualifying}, top reach ${result.candidates[0]!.reach}, exact walks ${exactReachWalks.length}` +
+          // P4-7h: absent on code before relations (a baseline run).
+          ('relations' in result ? `, relations ${(result as { relations: unknown[] }).relations.length}` : '')
         : result.status;
   }
   const sorted = [...timings].sort((a, b) => a - b);

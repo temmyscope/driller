@@ -47,6 +47,8 @@ const OPERATION_RESULT_TYPES = [
   // P4-7 (AD-13 (f)): the entry-candidate listing.
   'EntryCandidatesResult',
   'EntryCandidate',
+  // P4-7h: the shared reach between two listed candidates (`found.relations`).
+  'EntryCandidateRelation',
 ] as const;
 
 /** Graph shapes moved with the result types in P4-6: their structural dependencies, plus `CodeMapEdge`/`CodeMapEdgeKind` beside `CodeMapNode`. */

@@ -79,6 +79,7 @@ export type {
   BlastRadiusExpansionResult,
   EntryCandidatesResult,
   EntryCandidate,
+  EntryCandidateRelation,
   NodeLookupResult,
   CoverageSummaryResult,
   UnknownSectionResult,

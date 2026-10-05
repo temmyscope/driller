@@ -60,6 +60,10 @@
   --llm-violet: #b48ce0;
   --stale-yellow: #d9c65a;
   --trace-cyan: #4fd8e0;
+  /* P4-7h: the shared-reach edge's own stroke — a muted periwinkle, apart
+     from the accent, trace cyan and the border greys of real edges and the
+     ref connector. */
+  --shared-reach-edge: #9aa6e0;
   --healthy: #2f9e6e;
   /* P4-2 phase 3a: Node detail's fine print (the "Tested by" rows use the
      same values literally). */
@@ -1828,6 +1832,63 @@ code,
   /* Review round 1: decoration, never clicked through to a Node. */
   pointer-events: none;
   cursor: default;
+}
+
+/* P4-7h: Revealed's shared-reach edge — drawn only for the hovered or
+   focused candidate (at most 3), as an arc through the gutter left of
+   column 0 (`SharedReachEdge`). A derived fact about reach, never a call:
+   its own token and a round-dotted stroke, apart from the ref connector's
+   dashes and every real edge; its "shares N" label carries the meaning
+   (never the colour alone); never clicked through to a Node. */
+.code-map__edge--shared-reach {
+  pointer-events: none;
+  cursor: default;
+}
+
+.code-map__edge--shared-reach .react-flow__edge-path {
+  stroke: var(--shared-reach-edge);
+  stroke-width: 1.5;
+  stroke-dasharray: 0.5 4;
+  stroke-linecap: round;
+  opacity: 0.85;
+}
+
+.code-map__edge--shared-reach .react-flow__edge-text {
+  fill: var(--text);
+  font-size: 10px;
+}
+
+.code-map__edge--shared-reach .react-flow__edge-textbg {
+  fill: var(--panel);
+}
+
+/* P4-7h: the Revealed Panel's edge legend; each glyph drawn in its edge's
+   own stroke colour (the text names it, so colour is never alone). */
+.code-map__reveal-legend {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-width: 16rem;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.code-map__reveal-legend-glyph {
+  display: inline-block;
+  min-width: 1.6em;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.code-map__reveal-legend-glyph--shared-reach {
+  color: var(--shared-reach-edge);
+}
+
+.code-map__node-detail-shared-reach {
+  margin: 0;
+  font-size: var(--detail-fine-size);
+  line-height: var(--detail-fine-leading);
+  color: var(--text);
 }
 
 .code-map__node-affordance--drill[aria-expanded='true'] {

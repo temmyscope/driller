@@ -254,6 +254,7 @@ describe('layoutNodes in Revealed', () => {
       status: 'found',
       candidates: [{ id: 'hub', name: 'hub', file: 'src/a.ts', startLine: 1, endLine: 9, reach: 45, reason: { kind: 'no-callers' } }],
       totalQualifying: 1,
+      relations: [],
     });
     const state = expandNode(start, graph.adjacency, graph.reachById, 'hub');
     return { nodes, graph, state };

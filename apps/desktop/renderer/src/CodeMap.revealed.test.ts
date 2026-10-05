@@ -282,7 +282,7 @@ describe('Full map equals the frozen HEAD output (review round 1)', () => {
 
 describe('Revealed lays out exactly the revealed ids', () => {
   it('path-trace-basic: one candidate card in column 0; lodInputNodes = the revealed ids at layeredLayout positions', () => {
-    const state = initialRevealState({ status: 'found', candidates: [HANDLE_REQUEST], totalQualifying: 1 });
+    const state = initialRevealState({ status: 'found', candidates: [HANDLE_REQUEST], totalQualifying: 1, relations: [] });
     const population = canvasPopulation(FETCH, foldedCanvasElements(NODES, [TYPE], []), true);
     const drawn = revealedPopulation(population, state);
     const positions = layeredLayout(state);
@@ -456,7 +456,7 @@ describe('the none/error/stale notice', () => {
     mapStamp: stamp,
     listing: {
       status: 'ready' as const,
-      state: initialRevealState({ status: 'found', candidates: [HANDLE_REQUEST], totalQualifying: 1 }),
+      state: initialRevealState({ status: 'found', candidates: [HANDLE_REQUEST], totalQualifying: 1, relations: [] }),
       totalQualifying: 1,
     },
   };

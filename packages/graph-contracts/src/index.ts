@@ -594,6 +594,24 @@ export interface EntryCandidate {
 }
 
 /**
+ * P4-7h: two listed candidates that reach common Nodes. `sharedReach` is the
+ * size of the intersection of their forward reach sets (over
+ * `ENTRY_CALLER_EDGE_KINDS`, as `EntryCandidate.reach` counts them), neither
+ * candidate included — a derived fact about real reach in indexed code,
+ * never a call edge: no Node calls another because of it.
+ *
+ * One per unordered pair of listed candidates (pins included) with
+ * `sharedReach ≥ 1` — a pair with no common Node has no relation, never a 0
+ * one. `a < b` by id (code unit). `found.relations` is sorted by
+ * `sharedReach` descending, then `a`, then `b`.
+ */
+export interface EntryCandidateRelation {
+  a: string;
+  b: string;
+  sharedReach: number;
+}
+
+/**
  * P4-7 (AD-13 (f)): the entry-candidate listing's explicit result state.
  *  - `'found'`: the pinned candidates first, in pin order (P4-7g), then the
  *    heuristic ones ranked by reach (highest first), then `id` ascending, at
@@ -602,6 +620,8 @@ export interface EntryCandidate {
  *  - `'none'`: no Node qualifies and none is pinned (fully cyclic code, or
  *    every root reaches fewer than `ENTRY_CANDIDATE_MIN_REACH` Nodes) —
  *    never "the code has no way in".
+ *  - `relations` (P4-7h, on `found`): the shared reach between the listed
+ *    candidates — see `EntryCandidateRelation`. `[]` with one candidate.
  *  - `hiddenPinIds` (P4-7g, on `found` and `none`, present only when not
  *    empty): pinned ids not among the given Nodes, in pin order — never shown
  *    as a candidate. The pin itself is kept (AD-5 "Entry pins").
@@ -611,7 +631,20 @@ export interface EntryCandidate {
  *    "(f) per section"); the transport produces it, never the pure function.
  */
 export type EntryCandidatesResult =
-  | { status: 'found'; candidates: EntryCandidate[]; totalQualifying: number; hiddenPinIds?: string[] }
+  | {
+      status: 'found';
+      candidates: EntryCandidate[];
+      totalQualifying: number;
+      relations: EntryCandidateRelation[];
+      /**
+       * P4-7h (founder decision 2026-10-05): the Agent-Facing tool's
+       * payload only — `relations` there is cut to the strongest pairs and
+       * this is how many there were. Never set by `listEntryCandidates` or
+       * over IPC, where `relations` holds every pair.
+       */
+      relationsTotal?: number;
+      hiddenPinIds?: string[];
+    }
   | { status: 'none'; hiddenPinIds?: string[] }
   | { status: 'error'; message: string }
   | UnknownSectionResult;
@@ -676,6 +709,8 @@ class EntryReachIndex {
   private readonly visitedStamp: Uint32Array;
   private readonly queue: Int32Array;
   private stamp = 0;
+  /** P4-7h: the queue's end after the last walk — its reached Nodes are `queue[1 .. lastTail)`. */
+  private lastTail = 1;
 
   /** `ids` must be unique; edges to an id outside them are dropped (the adjacency has none). */
   constructor(ids: readonly string[], forward: Map<string, string[]>) {
@@ -719,13 +754,29 @@ class EntryReachIndex {
           queue[tail] = next;
           tail += 1;
           if (tail - 1 >= limit) {
+            this.lastTail = tail;
             return limit;
           }
         }
       }
       head += 1;
     }
+    this.lastTail = tail;
     return tail - 1;
+  }
+
+  /**
+   * P4-7h: the Nodes the last `reach` walk found, `root` excluded — that
+   * walk's own queue, copied, so a listed candidate's reach set costs no
+   * second walk. Complete only after a walk without `limit`.
+   */
+  lastReachSet(): Int32Array {
+    return this.queue.slice(1, this.lastTail);
+  }
+
+  /** P4-7h: the Node count — a reach-set bitset's width. */
+  get size(): number {
+    return this.offsets.length - 1;
   }
 
   /**
@@ -826,6 +877,69 @@ class EntryReachIndex {
   }
 }
 
+/** The number of set bits in a 32-bit word. */
+function popCount32(word: number): number {
+  let bits = word - ((word >>> 1) & 0x55555555);
+  bits = (bits & 0x33333333) + ((bits >>> 2) & 0x33333333);
+  bits = (bits + (bits >>> 4)) & 0x0f0f0f0f;
+  return Math.imul(bits, 0x01010101) >>> 24;
+}
+
+/**
+ * P4-7h: the listed candidates' `EntryCandidateRelation`s, from the reach
+ * sets their own ranking walks found (`reachSets`, Node indices; no second
+ * walk). Each set becomes a bitset over the `nodeCount` Nodes, and a pair's
+ * `sharedReach` is the popcount of the AND of the two — O(pairs × V/32),
+ * whatever the sets' sizes (at most `ENTRY_PINS_MAX + ENTRY_CANDIDATE_MAX`
+ * candidates). A reach set never holds its own candidate, so neither end of
+ * a pair is ever counted in its intersection.
+ */
+function candidateRelations(
+  candidates: readonly EntryCandidate[],
+  reachSets: ReadonlyMap<string, Int32Array>,
+  nodeCount: number,
+): EntryCandidateRelation[] {
+  if (candidates.length < 2) {
+    return [];
+  }
+  const words = (nodeCount + 31) >>> 5;
+  const bitsets = candidates.map((candidate) => {
+    const bits = new Uint32Array(words);
+    // Non-null: every listed candidate's set is kept (pins and ranked alike).
+    for (const node of reachSets.get(candidate.id)!) {
+      const word = node >>> 5;
+      bits[word] = bits[word]! | (1 << (node & 31));
+    }
+    return bits;
+  });
+  const relations: EntryCandidateRelation[] = [];
+  for (let first = 0; first < candidates.length; first += 1) {
+    const firstBits = bitsets[first]!;
+    for (let second = first + 1; second < candidates.length; second += 1) {
+      const secondBits = bitsets[second]!;
+      let sharedReach = 0;
+      for (let word = 0; word < words; word += 1) {
+        sharedReach += popCount32(firstBits[word]! & secondBits[word]!);
+      }
+      if (sharedReach === 0) {
+        continue;
+      }
+      const firstId = candidates[first]!.id;
+      const secondId = candidates[second]!.id;
+      relations.push(
+        firstId < secondId
+          ? { a: firstId, b: secondId, sharedReach }
+          : { a: secondId, b: firstId, sharedReach },
+      );
+    }
+  }
+  return relations.sort(
+    (left, right) =>
+      right.sharedReach - left.sharedReach ||
+      (left.a < right.a ? -1 : left.a > right.a ? 1 : left.b < right.b ? -1 : left.b > right.b ? 1 : 0),
+  );
+}
+
 /** `true` when `a` ranks ahead of `b`: higher reach, then lower `id` by code unit. */
 function ranksAhead(a: { id: string; reach: number }, b: { id: string; reach: number }): boolean {
   return a.reach > b.reach || (a.reach === b.reach && a.id < b.id);
@@ -882,6 +996,9 @@ export function listEntryCandidatesWithWork(
   // whatever its callers or reach. A pin not among `nodes` is hidden.
   const pinned: EntryCandidate[] = [];
   const pinnedIds = new Set<string>();
+  // P4-7h: each listed candidate's reach set, from its own walk (see
+  // `candidateRelations`) — kept only while it is listed.
+  const reachSets = new Map<string, Int32Array>();
   const hiddenPinIds: string[] = [];
   const pins = options.pinnedIds ?? [];
   if (pins.length > 0) {
@@ -900,13 +1017,15 @@ export function listEntryCandidatesWithWork(
       }
       const node = ordered[index]!;
       pinnedIds.add(id);
+      const reach = getReachIndex().reach(index);
+      reachSets.set(id, getReachIndex().lastReachSet());
       pinned.push({
         id,
         name: node.name,
         file: node.file,
         startLine: node.startLine,
         endLine: node.endLine,
-        reach: getReachIndex().reach(index),
+        reach,
         reason: { kind: 'pinned' },
       });
     }
@@ -917,7 +1036,13 @@ export function listEntryCandidatesWithWork(
     const result: EntryCandidatesResult =
       pinned.length === 0
         ? { status: 'none', ...hidden }
-        : { status: 'found', candidates: pinned, totalQualifying: pinned.length, ...hidden };
+        : {
+            status: 'found',
+            candidates: pinned,
+            totalQualifying: pinned.length,
+            relations: candidateRelations(pinned, reachSets, getReachIndex().size),
+            ...hidden,
+          };
     return { result, roots: 0, exactReachWalks };
   }
   const bounds = getReachIndex().reachUpperBounds();
@@ -966,16 +1091,28 @@ export function listEntryCandidatesWithWork(
     while (position > 0 && ranksAhead(candidate, ranked[position - 1]!)) {
       position -= 1;
     }
+    if (position >= ENTRY_CANDIDATE_MAX) {
+      // Ranks below a full list: it would be inserted and popped at once.
+      continue;
+    }
     ranked.splice(position, 0, candidate);
+    // P4-7h: the walk just done is this candidate's — keep its reach set.
+    reachSets.set(candidate.id, walks.lastReachSet());
     if (ranked.length > ENTRY_CANDIDATE_MAX) {
-      ranked.pop();
+      reachSets.delete(ranked.pop()!.id);
     }
   }
   const candidates = [...pinned, ...ranked];
   const result: EntryCandidatesResult =
     candidates.length === 0
       ? { status: 'none', ...hidden }
-      : { status: 'found', candidates, totalQualifying: pinned.length + totalQualifying, ...hidden };
+      : {
+          status: 'found',
+          candidates,
+          totalQualifying: pinned.length + totalQualifying,
+          relations: candidateRelations(candidates, reachSets, walks.size),
+          ...hidden,
+        };
   return { result, roots: roots.length, exactReachWalks };
 }
 
@@ -999,6 +1136,10 @@ export function listEntryCandidatesWithWork(
  * the pinned ids, still at most `ENTRY_CANDIDATE_MAX`. Pins alone make the
  * result `found`. A pinned id not among `nodes` is never a candidate: it is
  * listed in `hiddenPinIds`.
+ *
+ * P4-7h: `found.relations` is the shared reach between every pair of listed
+ * candidates (pins included), from the reach sets their ranking walks
+ * already found (`EntryCandidateRelation`) — no second walk per candidate.
  *
  * Pure (Always): no I/O, no dependency on any other `@driller/` package.
  */

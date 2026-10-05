@@ -91,7 +91,7 @@ const KEY = revealKey('/p', null);
 
 function ptbHeld(): { held: HeldReveal; start: RevealState; graph: ReturnType<typeof revealDrillGraphFor> } {
   const graph = revealDrillGraphFor(null, PTB_NODES, PTB_EDGES);
-  const start = initialRevealState({ status: 'found', candidates: [candidate('handleRequest', 4)], totalQualifying: 1 });
+  const start = initialRevealState({ status: 'found', candidates: [candidate('handleRequest', 4)], totalQualifying: 1, relations: [] });
   return { held: { key: KEY, mapStamp: PTB_EDGES, listing: { status: 'ready', state: start, totalQualifying: 1 } }, start, graph };
 }
 
@@ -302,7 +302,7 @@ describe('restoreRevealSnapshot: never another map’s state', () => {
     const entry = reveal(applied.before, applied.after);
     assert.equal(restoreRevealSnapshot(applied.held, revealKey('/p', 'api'), entry, applied.after, start), null, 'another section');
     assert.equal(restoreRevealSnapshot(applied.held, KEY, { ...entry, mapStamp: [] }, applied.after, start), null, 'another fetch');
-    assert.equal(restoreRevealSnapshot(held, KEY, entry, applied.after, initialRevealState({ status: 'found', candidates: [], totalQualifying: 0 })), null, 'a state the step never left');
+    assert.equal(restoreRevealSnapshot(held, KEY, entry, applied.after, initialRevealState({ status: 'found', candidates: [], totalQualifying: 0, relations: [] })), null, 'a state the step never left');
   });
 
   it('a refresh’s previous state still drawn while loading is restored in place', () => {

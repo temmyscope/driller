@@ -180,6 +180,27 @@ export function toValidatedEntryCandidatesResult(result: unknown): EntryCandidat
   ) {
     return malformed;
   }
+  // P4-7h: a found listing's relations are {a, b, sharedReach} — two
+  // different ids and a whole count of at least 1 (never a 0 overlap). The
+  // renderer draws and lists them, so a malformed one is never passed on.
+  if (status === 'found') {
+    const { relations } = result as { relations?: unknown };
+    if (
+      !Array.isArray(relations) ||
+      !relations.every(
+        (relation: unknown) =>
+          typeof relation === 'object' &&
+          relation !== null &&
+          typeof (relation as { a?: unknown }).a === 'string' &&
+          typeof (relation as { b?: unknown }).b === 'string' &&
+          (relation as { a: unknown }).a !== (relation as { b?: unknown }).b &&
+          Number.isInteger((relation as { sharedReach?: unknown }).sharedReach) &&
+          ((relation as { sharedReach: number }).sharedReach) >= 1,
+      )
+    ) {
+      return malformed;
+    }
+  }
   // P4-7g: a listing's hidden pins, when present, are ids (main logs them).
   const { hiddenPinIds } = result as { hiddenPinIds?: unknown };
   if (

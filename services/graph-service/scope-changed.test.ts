@@ -757,8 +757,8 @@ describe('graphService:scopeChanged through index.ts', () => {
       const { MCP_SERVER_VERSION, registerLookupNodeTool } = await import('./mcp-server');
       const { deriveLiveNode } = await import('./live-node');
       // P4-4 phase 2b: bumped again for the optional `section`; P4-7c: and
-      // again for `list_entry_candidates`.
-      assert.equal(MCP_SERVER_VERSION, '1.10.0');
+      // again for `list_entry_candidates`; P4-7g/P4-7h: pins, then relations.
+      assert.equal(MCP_SERVER_VERSION, '1.11.0');
       let handler: ((args: { nodeId: string }) => Promise<{ content: { text: string }[] }>) | undefined;
       let description = '';
       registerLookupNodeTool(

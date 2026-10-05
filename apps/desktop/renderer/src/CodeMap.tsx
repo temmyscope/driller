@@ -63,9 +63,10 @@
  * the shared `ActionableNotice` shape (P1-7).
  */
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FocusEvent, type FormEvent, type ReactNode } from 'react';
 import {
   Background,
+  BaseEdge,
   Controls,
   Handle,
   Panel,
@@ -73,6 +74,7 @@ import {
   ReactFlow,
   type Edge as FlowEdge,
   type EdgeMouseHandler,
+  type EdgeProps,
   type Node as FlowNode,
   type NodeMouseHandler,
   type NodeProps,
@@ -190,6 +192,14 @@ import {
   revealDrillGraphFor,
   revealRefText,
   revealStubText,
+  formatSharedReachList,
+  relationEdges,
+  REVEAL_EDGE_LEGEND,
+  SHARED_REACH_EDGE_ID_PREFIX,
+  sharedReachArc,
+  sharedReachPartners,
+  type RevealRelationEdge,
+  type SharedReachPartner,
   type RevealDrillGraph,
   type HeldReveal,
   type HistoryEntry,
@@ -2324,9 +2334,87 @@ export function revealRefConnectorEdges(auxCards: readonly RevealAuxCard[]): Flo
 /** P4-7e: every ref connector's id starts with this; no real edge's does (`toFlowEdges` ids start with a Node id). */
 const REVEAL_CONNECTOR_ID_PREFIX = 'reveal-connector:';
 
-/** P4-7e review round 1: whether a canvas edge is a ref connector — `handleEdgeClick` ignores those. */
+/**
+ * P4-7e review round 1: whether a canvas edge is a Revealed decoration —
+ * a ref connector, or (P4-7h) a shared-reach edge — never a Node pair, so
+ * `handleEdgeClick` ignores it: no navigation, no history entry.
+ */
 export function isRevealConnectorEdgeId(id: string): boolean {
-  return id.startsWith(REVEAL_CONNECTOR_ID_PREFIX);
+  return id.startsWith(REVEAL_CONNECTOR_ID_PREFIX) || id.startsWith(SHARED_REACH_EDGE_ID_PREFIX);
+}
+
+/** P4-7h: a shared-reach edge's `data`: its partner rank (the arc's swing) and its label. */
+export interface SharedReachEdgeData extends Record<string, unknown> {
+  rank: number;
+  label: string;
+}
+
+/**
+ * P4-7h: Revealed's "shares N" edges for the active candidate
+ * (`relationEdges`: at most `SHARED_REACH_DRAWN_MAX`), drawn by
+ * `SharedReachEdge` with their own class — never a `CodeMapEdgeKind`'s —
+ * and an accessible name ("a and b both reach N Nodes in indexed code").
+ * A derived fact about real reach, never a call edge: not selectable or
+ * focusable, never clicked through (`isRevealConnectorEdgeId`), and added
+ * apart from every map edge (`withSharedReachEdges`), so never in
+ * `callEdgesOf`, a Path Trace highlight, or adjacency.
+ */
+export function sharedReachFlowEdges(edges: readonly RevealRelationEdge[]): FlowEdge[] {
+  return edges.map((edge) => {
+    const data: SharedReachEdgeData = { rank: edge.rank, label: edge.label };
+    return {
+      id: edge.id,
+      type: 'sharedReach',
+      source: edge.source,
+      target: edge.target,
+      data,
+      ariaLabel: edge.ariaLabel,
+      className: 'code-map__edge code-map__edge--shared-reach',
+      selectable: false,
+      focusable: false,
+    };
+  });
+}
+
+/**
+ * P4-7h: the shared-reach edge — an arc through the empty gutter left of
+ * column 0 (`sharedReachArc`), from the active card's left side to the
+ * partner's, its "shares N" label at the apex. Both cards are candidates in
+ * column 0, so the partner's left handle (`targetX`) is the column's left
+ * edge for both. Hookless.
+ */
+export function SharedReachEdge({ id, sourceY, targetX, targetY, data }: EdgeProps<FlowEdge<SharedReachEdgeData>>) {
+  const rank = data?.rank ?? 0;
+  const arc = sharedReachArc(targetX, sourceY, targetY, rank);
+  return (
+    <BaseEdge
+      id={id}
+      path={arc.path}
+      label={data?.label}
+      labelX={arc.labelX}
+      labelY={arc.labelY}
+      labelBgPadding={[4, 2]}
+      labelBgBorderRadius={2}
+    />
+  );
+}
+
+const edgeTypes = { sharedReach: SharedReachEdge };
+
+/**
+ * P4-7h: the canvas edges plus the shared-reach ones whose two cards are
+ * drawn (not clustered away) — never threaded through the path or
+ * changed-source highlight or the cluster re-anchoring: they are not map
+ * edges. Returns `edges` itself when there are none, so a hover with
+ * nothing to draw doesn't change the edge list.
+ */
+export function withSharedReachEdges(
+  edges: FlowEdge[],
+  sharedReachEdges: readonly FlowEdge[],
+  visibleNodeIds: ReadonlySet<string>,
+): FlowEdge[] {
+  const drawn = sharedReachEdges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target));
+  return drawn.length === 0 ? edges : edges.concat(drawn);
 }
 
 /**
@@ -3083,6 +3171,34 @@ type PendingFullNavigation =
  * group, the active one `aria-pressed`. Code Map mode only (the caller
  * gates it). Hookless.
  */
+/**
+ * P4-7h: the Revealed Panel's edge legend — the shared-reach edge and P4-7e's
+ * ref connector, each a glyph in its own stroke (hidden from assistive
+ * tech, which reads the text) and its text. Hookless.
+ */
+export function RevealEdgeLegend() {
+  return (
+    <ul className="code-map__reveal-legend" aria-label="Revealed edges">
+      {REVEAL_EDGE_LEGEND.map((line) => (
+        <li key={line.kind}>
+          <span aria-hidden="true" className={`code-map__reveal-legend-glyph code-map__reveal-legend-glyph--${line.kind}`}>
+            {line.glyph}
+          </span>{' '}
+          {line.text}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** P4-7h: the canvas Node id an element sits in (React Flow's `data-id` on the Node wrapper), or `null`. */
+export function canvasNodeIdOf(target: EventTarget | null): string | null {
+  if (typeof Element === 'undefined' || !(target instanceof Element)) {
+    return null;
+  }
+  return target.closest('.react-flow__node')?.getAttribute('data-id') ?? null;
+}
+
 export function RevealViewToggle({
   view,
   onChange,
@@ -6980,6 +7096,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   similar: 'code-map-node-detail-similar-heading',
   crossSectionCalls: 'code-map-node-detail-cross-section-calls-heading',
   entryPin: 'code-map-node-detail-entry-pin-heading',
+  sharedReach: 'code-map-node-detail-shared-reach-heading',
   staleness: 'code-map-node-detail-staleness-heading',
   location: 'code-map-node-detail-location-heading',
 } as const;
@@ -7028,6 +7145,13 @@ export interface NodeDetailBodyProps {
    * Absent: no "Entry point" section.
    */
   entryPin?: EntryPinControl;
+  /**
+   * P4-7h: when this Node is an entry candidate shown in Revealed, every
+   * other shown candidate it shares reach with, strongest first
+   * (`sharedReachPartners`) — the accessible, uncapped form of the canvas's
+   * "shares N" edges, which draw at most three. Absent: no section.
+   */
+  sharedReach?: readonly SharedReachPartner[];
 }
 
 /** P4-7g: Node detail's pin toggle (see `NodeDetailBodyProps.entryPin`). */
@@ -8279,6 +8403,7 @@ export function NodeDetailBody({
   mapSection = null,
   onSwitchSection = SWITCH_NOWHERE,
   entryPin,
+  sharedReach,
 }: NodeDetailBodyProps) {
   const ids = NODE_DETAIL_SECTION_HEADING_IDS;
   const signalsVisible = hasVisibleRiskSignals(node.riskSignals, toggles);
@@ -8445,6 +8570,16 @@ export function NodeDetailBody({
             Entry point
           </h3>
           <NodeDetailEntryPin control={entryPin} />
+        </section>
+      )}
+      {/* P4-7h: every candidate this one shares reach with — one line of
+          text, read only when the engineer opens a candidate's detail. */}
+      {sharedReach !== undefined && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.sharedReach}>
+          <h3 id={ids.sharedReach} className="code-map__node-detail-label">
+            Shared reach
+          </h3>
+          <p className="code-map__node-detail-shared-reach">{formatSharedReachList(sharedReach)}</p>
         </section>
       )}
       <section className="code-map__node-detail-section" aria-labelledby={ids.staleness}>
@@ -10609,6 +10744,8 @@ export function CodeMap({
     const auxCards = revealAuxCards(state, (id) => nameById.get(id), revealDrillGraph.adjacency);
     return {
       population: drawn,
+      // P4-7h: the drawn state, for the shared-reach edges and Node detail's list.
+      state,
       positionOf: (id: string, index: number) =>
         positions.get(id) ?? layoutPosition(index, canvasGridSize(drawn.mapNodes.length, drawn.foldedNodes.length)),
       candidates: candidatesById(state),
@@ -10819,7 +10956,8 @@ export function CodeMap({
         // reveal steps the way it rebased the drawn state; only the steps
         // that no longer apply leave history.
         const graph = drillGraph;
-        const fresh = initialRevealState({ status: 'found', candidates: landed.state.candidates, totalQualifying: 0 });
+        const { candidates, relations } = landed.state;
+        const fresh = initialRevealState({ status: 'found', candidates, totalQualifying: 0, relations: [...relations] });
         setHistory((previous) =>
           rebaseRevealHistory(previous, {
             key,
@@ -11018,9 +11156,9 @@ export function CodeMap({
   // P0-2b: likewise skipped in Health Audit Mode — see `lodResult` above.
   // Without this, every flow node and the whole `flowEdges` filter/map pass
   // would still be built for a canvas that never mounts.
-  const { renderedNodes, renderedEdges } = useMemo(() => {
+  const { renderedNodes, renderedEdges, renderedVisibleIds } = useMemo(() => {
     if (mode === 'healthAudit') {
-      return { renderedNodes: EMPTY_FLOW_NODES, renderedEdges: EMPTY_FLOW_EDGES };
+      return { renderedNodes: EMPTY_FLOW_NODES, renderedEdges: EMPTY_FLOW_EDGES, renderedVisibleIds: EMPTY_ID_SET };
     }
     const visibleNodeIds = new Set(lodResult.fullNodeIds);
     const nodes: CodeMapAnyFlowNode[] = [];
@@ -11099,7 +11237,7 @@ export function CodeMap({
       pathHighlight,
     });
 
-    return { renderedNodes: nodes, renderedEdges: edges };
+    return { renderedNodes: nodes, renderedEdges: edges, renderedVisibleIds: visibleNodeIds };
   }, [
     mode,
     lodResult,
@@ -11113,6 +11251,41 @@ export function CodeMap({
     contractDependentsById,
     renderChangedIds,
   ]);
+
+  // P4-7h (founder decision 2026-10-05): the "shares N" edges are drawn only
+  // for the hovered — else the keyboard-focused — candidate card, to its
+  // strongest partners (at most 3). Separate from the node memos above, so a
+  // hover never re-lays out or re-measures a card: only this short edge list
+  // changes. Only candidate ids are ever stored, so hovering other cards
+  // doesn't re-render.
+  const [hoveredCandidateId, setHoveredCandidateId] = useState<string | null>(null);
+  const [focusedCandidateId, setFocusedCandidateId] = useState<string | null>(null);
+  const revealCandidatesRef = useRef<ReadonlyMap<string, EntryCandidate> | null>(null);
+  revealCandidatesRef.current = revealCanvas?.candidates ?? null;
+  const handleNodeMouseEnter: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback((_event, flowNode) => {
+    if (revealCandidatesRef.current?.has(flowNode.id) === true) {
+      setHoveredCandidateId(flowNode.id);
+    }
+  }, []);
+  const handleNodeMouseLeave: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback((_event, flowNode) => {
+    setHoveredCandidateId((current) => (current === flowNode.id ? null : current));
+  }, []);
+  const handleCanvasFocus = useCallback((event: FocusEvent<HTMLDivElement>) => {
+    const id = canvasNodeIdOf(event.target);
+    setFocusedCandidateId(id !== null && revealCandidatesRef.current?.has(id) === true ? id : null);
+  }, []);
+  const handleCanvasBlur = useCallback(() => setFocusedCandidateId(null), []);
+  const sharedReachEdges = useMemo(
+    () =>
+      revealCanvas === null
+        ? EMPTY_FLOW_EDGES
+        : sharedReachFlowEdges(relationEdges(revealCanvas.state, hoveredCandidateId ?? focusedCandidateId)),
+    [revealCanvas, hoveredCandidateId, focusedCandidateId],
+  );
+  const canvasEdges = useMemo(
+    () => withSharedReachEdges(renderedEdges, sharedReachEdges, renderedVisibleIds),
+    [renderedEdges, sharedReachEdges, renderedVisibleIds],
+  );
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(
     (_event, flowNode) => {
@@ -12500,8 +12673,14 @@ export function CodeMap({
           <ReactFlow<CodeMapAnyFlowNode>
             style={{ width: '100%', height: '100%', visibility: awaitingFirstFit ? 'hidden' : undefined }}
             nodes={renderedNodes}
-            edges={renderedEdges}
+            edges={canvasEdges}
             nodeTypes={nodeTypes}
+            // P4-7h: the shared-reach arc, and the cards that show it.
+            edgeTypes={edgeTypes}
+            onNodeMouseEnter={handleNodeMouseEnter}
+            onNodeMouseLeave={handleNodeMouseLeave}
+            onFocus={handleCanvasFocus}
+            onBlur={handleCanvasBlur}
             onNodeClick={handleNodeClick}
             // Story 1.4, FR4: clicking an edge re-centers the map on the
             // connected Node without leaving map context — additive to
@@ -12650,6 +12829,8 @@ export function CodeMap({
                   <p className="code-map__reveal-status" role="status">
                     {revealStatus}
                   </p>
+                  {/* P4-7h: the shared-reach edge's legend, Revealed only. */}
+                  {revealDrawn && <RevealEdgeLegend />}
                 </>
               )}
             </Panel>
@@ -13082,6 +13263,12 @@ export function CodeMap({
                       message: entryPinMessage?.nodeId === nodeDetail.node.id ? entryPinMessage.text : null,
                       onToggle: () => toggleEntryPin(nodeDetail.node.id),
                     }
+              }
+              // P4-7h: a candidate's shared reach, while Revealed draws it.
+              sharedReach={
+                revealCanvas?.candidates.has(nodeDetail.node.id) === true
+                  ? sharedReachPartners(revealCanvas.state, nodeDetail.node.id)
+                  : undefined
               }
             />
             {typeGone && typeDetail.status === 'closed' && <TypeGoneNotice />}

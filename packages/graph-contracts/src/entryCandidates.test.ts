@@ -100,6 +100,7 @@ describe('listEntryCandidates (P4-7 phase 1a)', () => {
         },
       ],
       totalQualifying: 1,
+      relations: [],
     });
   });
 
@@ -127,6 +128,7 @@ describe('listEntryCandidates (P4-7 phase 1a)', () => {
         },
       ],
       totalQualifying: 1,
+      relations: [],
     });
   });
 
@@ -285,9 +287,10 @@ function referenceEntryCandidates(graphNodes: EntryCandidateInputNode[], graphEd
   if (qualifying.length === 0) {
     return { status: 'none' };
   }
+  const listed = qualifying.slice(0, 12);
   return {
     status: 'found',
-    candidates: qualifying.slice(0, 12).map(({ graphNode, reach }) => {
+    candidates: listed.map(({ graphNode, reach }) => {
       const loadedBy = [...new Set(graphNode.calledAtLoadBy ?? [])].sort();
       return {
         id: graphNode.id,
@@ -300,7 +303,48 @@ function referenceEntryCandidates(graphNodes: EntryCandidateInputNode[], graphEd
       };
     }),
     totalQualifying: qualifying.length,
+    relations: referenceRelations(
+      forwardOnly,
+      listed.map(({ graphNode }) => graphNode.id),
+    ),
   };
+}
+
+/**
+ * P4-7h: the reference relations, built independently: every unordered pair
+ * of `ids`, each candidate's reach set walked again here with the
+ * string-keyed `blastRadiusNodeIds`, intersected as plain `Set`s with both
+ * candidates removed, zero overlaps dropped, sorted by count then ids.
+ */
+function referenceRelations(forwardOnly: BidirectionalAdjacency, ids: readonly string[]) {
+  const reachOf = new Map(ids.map((id) => [id, blastRadiusNodeIds(forwardOnly, id, Number.MAX_SAFE_INTEGER)]));
+  const relations: { a: string; b: string; sharedReach: number }[] = [];
+  for (const first of ids) {
+    for (const second of ids) {
+      if (!(first < second)) {
+        continue;
+      }
+      const sharedReach = [...reachOf.get(first)!].filter(
+        (id) => id !== first && id !== second && reachOf.get(second)!.has(id),
+      ).length;
+      if (sharedReach > 0) {
+        relations.push({ a: first, b: second, sharedReach });
+      }
+    }
+  }
+  return relations.sort((x, y) => y.sharedReach - x.sharedReach || (x.a < y.a ? -1 : x.a > y.a ? 1 : x.b < y.b ? -1 : 1));
+}
+
+/** P4-7h: the forward-only CALLS/USAGE map `referenceRelations` walks, built from the raw edges. */
+function referenceForward(graphNodes: EntryCandidateInputNode[], graphEdges: PathTraceEdge[]): BidirectionalAdjacency {
+  const ids = new Set(graphNodes.map((graphNode) => graphNode.id));
+  const forward = new Map<string, string[]>();
+  for (const graphEdge of graphEdges) {
+    if ((graphEdge.kind === 'CALLS' || graphEdge.kind === 'USAGE') && ids.has(graphEdge.source) && ids.has(graphEdge.target)) {
+      forward.set(graphEdge.source, [...(forward.get(graphEdge.source) ?? []), graphEdge.target]);
+    }
+  }
+  return { validNodeIds: ids, forward, backward: new Map() };
 }
 
 /** A seeded pseudo-random source (LCG), so a failure reproduces. */
@@ -523,6 +567,8 @@ describe('listEntryCandidates with pins (P4-7g)', () => {
         { id: 'handleRequest', name: 'handleRequest', file: 'src/handleRequest.ts', startLine: 1, endLine: 2, reach: 4, reason: { kind: 'no-callers' } },
       ],
       totalQualifying: 2,
+      // P4-7h: handleRequest reaches serviceB; the two share repository and cacheLookup.
+      relations: [{ a: 'handleRequest', b: 'serviceB', sharedReach: 2 }],
     });
   });
 
@@ -587,6 +633,7 @@ describe('listEntryCandidates with pins (P4-7g)', () => {
       status: 'found',
       candidates: [{ id: 'b', name: 'b', file: 'src/b.ts', startLine: 1, endLine: 2, reach: 2, reason: { kind: 'pinned' } }],
       totalQualifying: 1,
+      relations: [],
     });
     // Everything under the reach bar, too.
     const small = { nodes: nodes('x', 'y'), edges: [edge('x', 'y')] };
@@ -626,5 +673,167 @@ describe('listEntryCandidates with pins (P4-7g)', () => {
 
   it('ENTRY_PINS_MAX is 50', () => {
     assert.equal(ENTRY_PINS_MAX, 50);
+  });
+});
+
+describe('listEntryCandidates relations: shared reach between candidates (P4-7h)', () => {
+  const relationsOf = (result: EntryCandidatesResult) => {
+    assert.ok(result.status === 'found');
+    return result.status === 'found' ? result.relations : [];
+  };
+
+  it('two candidates reaching {r, c} and {r, x}: one relation, sharedReach 1 (the intersection, not the union)', () => {
+    const graph = { nodes: nodes('A', 'B', 'r', 'c', 'x'), edges: [edge('A', 'r'), edge('A', 'c'), edge('B', 'r'), edge('B', 'x')] };
+    assert.deepEqual(relationsOf(listEntryCandidates(graph.nodes, graph.edges, { pinnedIds: ['A', 'B'] })), [
+      { a: 'A', b: 'B', sharedReach: 1 },
+    ]);
+  });
+
+  it('disjoint reach: no relation for that pair — never a sharedReach 0 entry', () => {
+    const graph = merge(chain('p', 3), chain('q', 4));
+    const result = listEntryCandidates(graph.nodes, graph.edges);
+    assert.deepEqual(candidateIds(result), ['q', 'p']);
+    assert.deepEqual(relationsOf(result), []);
+  });
+
+  it('one candidate reaches the other: neither end is counted, only the other common Nodes', () => {
+    // A -> m -> B -> {s1, s2}, and A -> s3. B is pinned: reach(A) = {m, B, s1,
+    // s2, s3}, reach(B) = {s1, s2} — B itself is not in the intersection.
+    const graph = {
+      nodes: nodes('A', 'm', 'B', 's1', 's2', 's3'),
+      edges: [edge('A', 'm'), edge('m', 'B'), edge('B', 's1'), edge('B', 's2'), edge('A', 's3')],
+    };
+    const result = listEntryCandidates(graph.nodes, graph.edges, { pinnedIds: ['B'] });
+    assert.deepEqual(candidateIds(result), ['B', 'A']);
+    assert.deepEqual(relationsOf(result), [{ a: 'A', b: 'B', sharedReach: 2 }]);
+  });
+
+  it('two candidates reaching each other (a cycle): a candidate is never in its own reach, so neither counts', () => {
+    // a <-> b, both -> c and d: reach(a) = {b, c, d}, reach(b) = {a, c, d}.
+    const graph = {
+      nodes: nodes('a', 'b', 'c', 'd'),
+      edges: [edge('a', 'b'), edge('b', 'a'), edge('a', 'c'), edge('b', 'c'), edge('a', 'd'), edge('b', 'd')],
+    };
+    assert.deepEqual(relationsOf(listEntryCandidates(graph.nodes, graph.edges, { pinnedIds: ['b', 'a'] })), [
+      { a: 'a', b: 'b', sharedReach: 2 },
+    ]);
+  });
+
+  it('only one candidate: relations []', () => {
+    assert.deepEqual(relationsOf(listEntryCandidates(PATH_TRACE_BASIC.nodes, PATH_TRACE_BASIC.edges)), []);
+  });
+
+  it('one relation per unordered pair, a < b by id whatever the listing order, sorted by count then a then b', () => {
+    // Pins in reverse id order. z, y, x and w all reach s1; z and y also s2, s3.
+    const graph = {
+      nodes: nodes('z', 'y', 'x', 'w', 's1', 's2', 's3', 'lone'),
+      edges: [
+        edge('z', 's1'),
+        edge('z', 's2'),
+        edge('z', 's3'),
+        edge('y', 's1'),
+        edge('y', 's2'),
+        edge('y', 's3'),
+        edge('x', 's1'),
+        edge('w', 's1'),
+      ],
+    };
+    const result = listEntryCandidates(graph.nodes, graph.edges, { pinnedIds: ['z', 'y', 'x', 'w', 'lone'] });
+    assert.deepEqual(relationsOf(result), [
+      { a: 'y', b: 'z', sharedReach: 3 },
+      { a: 'w', b: 'x', sharedReach: 1 },
+      { a: 'w', b: 'y', sharedReach: 1 },
+      { a: 'w', b: 'z', sharedReach: 1 },
+      { a: 'x', b: 'y', sharedReach: 1 },
+      { a: 'x', b: 'z', sharedReach: 1 },
+    ]);
+  });
+
+  it('shuffled Nodes and edges give identical relations', () => {
+    let withRelations = 0;
+    for (let graphSeed = 1; graphSeed <= 10; graphSeed += 1) {
+      const graph = merge(randomGraph(graphSeed, 70, 160), PATH_TRACE_BASIC);
+      const pinnedIds = ['n3', 'n5', 'serviceB'];
+      const expected = listEntryCandidates(graph.nodes, graph.edges, { pinnedIds });
+      assert.ok(expected.status === 'found');
+      withRelations += expected.relations.length > 0 ? 1 : 0;
+      for (let seed = 1; seed <= 3; seed += 1) {
+        const result = listEntryCandidates(shuffled(graph.nodes, seed), shuffled(graph.edges, seed + 3), { pinnedIds });
+        assert.ok(result.status === 'found');
+        assert.deepEqual(result.relations, expected.relations);
+      }
+    }
+    assert.equal(withRelations, 10);
+  });
+
+  it('pins and the 12 capped candidates are all related, matching the independent reference on random graphs', () => {
+    let withRelations = 0;
+    for (let seed = 1; seed <= 60; seed += 1) {
+      const graph = randomGraph(seed, 70, 160);
+      const pinnedIds = [`n${seed % 70}`, `n${(seed * 7) % 70}`, 'ghost'];
+      const result = listEntryCandidates(graph.nodes, graph.edges, { pinnedIds });
+      if (result.status !== 'found') {
+        continue;
+      }
+      assert.deepEqual(
+        result.relations,
+        referenceRelations(
+          referenceForward(graph.nodes, graph.edges),
+          result.candidates.map((candidate) => candidate.id),
+        ),
+        `seed ${seed}`,
+      );
+      withRelations += result.relations.length > 0 ? 1 : 0;
+    }
+    assert.ok(withRelations >= 30, `${withRelations} graphs had relations`);
+  });
+
+  it('relations reuse the ranking walks: the exact walks are the same with or without relations to compute', () => {
+    // 14 roots all sharing one tail: 12 listed, 66 relations, and only the
+    // ranking's own walks (no second walk per candidate).
+    const tail = chain('tail', 5);
+    const graph = merge(tail, {
+      nodes: nodes(...Array.from({ length: 14 }, (_, index) => `root${String(index).padStart(2, '0')}`)),
+      edges: Array.from({ length: 14 }, (_, index) => edge(`root${String(index).padStart(2, '0')}`, 'tail')),
+    });
+    const { result, exactReachWalks } = listEntryCandidatesWithWork(graph.nodes, graph.edges);
+    assert.ok(result.status === 'found');
+    assert.equal(result.candidates.length, ENTRY_CANDIDATE_MAX);
+    assert.equal(exactReachWalks.length, ENTRY_CANDIDATE_MAX);
+    assert.equal(result.relations.length, (ENTRY_CANDIDATE_MAX * (ENTRY_CANDIDATE_MAX - 1)) / 2);
+    assert.ok(result.relations.every((relation) => relation.sharedReach === 6));
+  });
+
+  it('bit 31 of a word (the sign bit) and the first bits of the next words count like any other', () => {
+    // Unshuffled, so each Node's index is its place: p 0, q 1, leafK K + 2.
+    const leaves = Array.from({ length: 70 }, (_, index) => `leaf${String(index).padStart(2, '0')}`);
+    const at = (index: number) => leaves[index - 2]!;
+    const graph = {
+      nodes: nodes('p', 'q', ...leaves),
+      edges: [
+        // Shared: indices 31 (bit 31 of word 0), 63 (bit 31 of word 1) and 64 (bit 0 of word 2).
+        ...[31, 63, 64, 2].map((index) => edge('p', at(index))),
+        ...[31, 63, 64, 3].map((index) => edge('q', at(index))),
+      ],
+    };
+    assert.deepEqual(relationsOf(listEntryCandidates(graph.nodes, graph.edges)), [{ a: 'p', b: 'q', sharedReach: 3 }]);
+    // Only bit 31 shared.
+    const signOnly = { nodes: graph.nodes, edges: [...[31, 2, 4].map((i) => edge('p', at(i))), ...[31, 3, 5].map((i) => edge('q', at(i)))] };
+    assert.deepEqual(relationsOf(listEntryCandidates(signOnly.nodes, signOnly.edges)), [{ a: 'p', b: 'q', sharedReach: 1 }]);
+  });
+
+  it('a Node count past one bitset word, and Nodes at word boundaries, are counted exactly', () => {
+    // 100 leaves; p reaches leaves 0–63, q reaches 31–99: 33 shared (31..63).
+    const leaves = Array.from({ length: 100 }, (_, index) => `leaf${String(index).padStart(3, '0')}`);
+    const graph = {
+      nodes: nodes('p', 'q', ...leaves),
+      edges: [
+        ...leaves.slice(0, 64).map((leaf) => edge('p', leaf)),
+        ...leaves.slice(31).map((leaf) => edge('q', leaf)),
+      ],
+    };
+    assert.deepEqual(relationsOf(listEntryCandidates(shuffled(graph.nodes, 4), graph.edges)), [
+      { a: 'p', b: 'q', sharedReach: 33 },
+    ]);
   });
 });

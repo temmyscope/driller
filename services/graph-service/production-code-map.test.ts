@@ -305,6 +305,7 @@ describe('fetchProductionCodeMap', () => {
         },
       ],
       totalQualifying: 1,
+      relations: [],
     });
   });
 });

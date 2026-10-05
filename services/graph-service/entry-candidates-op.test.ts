@@ -460,6 +460,47 @@ describe('P4-7c: with a section (founder decision 2026-10-04)', () => {
     assert.deepEqual(reply.nodes.find((n) => n.id === 'api.handleRequest')?.calledAtLoadBy, ['api/start.ts']);
   });
 
+  it("P4-7h: relations come from the section's own reach sets, never the whole-scope relations filtered", { timeout: 20_000 }, async () => {
+    assert.ok(indexModule);
+    setScope(['api', 'web']);
+    await requestMap();
+    // Whole scope: web.render reaches serviceA, repository and cacheLookup
+    // through api.cron; so does api.handleRequest. A cross-section pair.
+    const whole = indexModule.computeEntryCandidatesResult(PROJECT);
+    assert.ok(whole.status === 'found');
+    assert.deepEqual(whole.relations, [{ a: 'api.handleRequest', b: 'web.render', sharedReach: 3 }]);
+    // api: cron is a candidate there (its caller is in web), sharing the same three.
+    const api = indexModule.computeEntryCandidatesResult(PROJECT, 'api');
+    assert.ok(api.status === 'found');
+    assert.deepEqual(api.relations, [{ a: 'api.cron', b: 'api.handleRequest', sharedReach: 3 }]);
+    // web: one candidate, nothing to relate.
+    const web = indexModule.computeEntryCandidatesResult(PROJECT, 'web');
+    assert.ok(web.status === 'found');
+    assert.deepEqual(web.relations, []);
+    // The MCP tool returns the same relations (FR-15).
+    const viaTool = JSON.parse(await viaMcp({ projectPath: PROJECT, section: 'api' }));
+    assert.deepEqual(viaTool.relations, api.relations);
+    assert.equal(viaTool.relationsTotal, 1);
+    // Over IPC the renderer gets every pair and no relationsTotal.
+    const ipc = (await viaIpc(PROJECT, 'api')).result as EntryCandidatesResult;
+    assert.ok(ipc.status === 'found' && ipc.relationsTotal === undefined);
+  });
+
+  it('P4-7h founder decision: agents get the 50 strongest pairs plus relationsTotal; other results untouched', () => {
+    assert.ok(mcp);
+    assert.equal(mcp.AGENT_ENTRY_RELATIONS_MAX, 50);
+    const relations = Array.from({ length: 60 }, (_, index) => ({ a: `a${String(index).padStart(2, '0')}`, b: 'z', sharedReach: 100 - index }));
+    const found: EntryCandidatesResult = { status: 'found', candidates: [], totalQualifying: 0, relations, hiddenPinIds: ['gone'] };
+    const capped = mcp.toAgentEntryCandidatesResult(found);
+    assert.deepEqual(capped, { status: 'found', candidates: [], totalQualifying: 0, relations: relations.slice(0, 50), relationsTotal: 60, hiddenPinIds: ['gone'] });
+    assert.deepEqual(Object.keys(capped), ['status', 'candidates', 'totalQualifying', 'relations', 'relationsTotal', 'hiddenPinIds']);
+    assert.equal(found.relations.length, 60, 'the IPC result is never cut');
+    const few = { status: 'found' as const, candidates: [], totalQualifying: 0, relations: relations.slice(0, 3) };
+    assert.deepEqual(mcp.toAgentEntryCandidatesResult(few), { ...few, relationsTotal: 3 });
+    const none: EntryCandidatesResult = { status: 'none' };
+    assert.equal(mcp.toAgentEntryCandidatesResult(none), none);
+  });
+
   it('unknown-section, the refreshing window, and per-section memo dropped with the raw cache', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const module = indexModule;
@@ -519,8 +560,9 @@ describe('P4-7c: IPC and MCP parity', () => {
         assert.equal(ipc.section, section ?? null);
         const text = await viaMcp({ projectPath: PROJECT, ...(section === undefined ? {} : { section }) });
         // The IPC reply crosses a structured-clone boundary; compare it as the renderer gets it.
-        assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(ipc.result)), `${scope.join(',')} / ${section}`);
-        assert.equal(text, JSON.stringify(indexModule.computeEntryCandidatesResult(PROJECT, section)));
+        // P4-7h: the same result, its relations cut for agents (`toAgentEntryCandidatesResult`).
+        assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(mcp!.toAgentEntryCandidatesResult(ipc.result as EntryCandidatesResult))), `${scope.join(',')} / ${section}`);
+        assert.equal(text, JSON.stringify(mcp!.toAgentEntryCandidatesResult(indexModule.computeEntryCandidatesResult(PROJECT, section))));
       }
     }
     // The acceptance case: found, handleRequest among the candidates, no test Node.
@@ -540,9 +582,9 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(src.slice(start, end), /\n {2}registerListEntryCandidatesTool\(server\);/);
   });
 
-  it('the tool: name, version 1.10.0, the description’s promises, and its input rules', () => {
+  it('the tool: name, version 1.11.0, the description’s promises, and its input rules', () => {
     assert.ok(mcp);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.10.0');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.11.0');
     const tool = registerTool();
     assert.equal(tool.name, 'list_entry_candidates');
     const description = tool.config.description ?? '';
@@ -556,6 +598,12 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(description, /pinned as entry points in the driller app come first, in the order they were pinned/);
     assert.match(description, /'hiddenPinIds' \(present only when not empty\) lists pinned Node ids that are not on the Code Map/);
     assert.match(description, /'loadedBy'/);
+    // P4-7h: relations are named, and are a shared-reach count, not a call.
+    assert.match(description, /'relations' lists, for each pair of listed candidates \(pinned ones included\)/);
+    assert.match(description, /It is a shared-reach count, NOT a call/);
+    assert.match(description, /Pairs with no common Node are left out \(never a 0\)/);
+    assert.match(description, /Only the 50 strongest pairs are returned here; 'relationsTotal' is how many pairs there are/);
+    assert.match(description, /\{status: 'found', candidates, totalQualifying, relations, relationsTotal, hiddenPinIds\?\}/);
     assert.match(description, /USAGE counts as a caller/);
     assert.match(description, /Load-time calls from a file's top level .* do NOT count as callers/);
     assert.match(description, /at most 12/);
@@ -702,7 +750,7 @@ describe('P4-7g: pins in the Graph Service', () => {
     for (const section of [undefined, 'api', 'web']) {
       const ipc = await viaIpc(PROJECT, section);
       const text = await viaMcp({ projectPath: PROJECT, ...(section === undefined ? {} : { section }) });
-      assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(ipc.result)), String(section));
+      assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(mcp!.toAgentEntryCandidatesResult(ipc.result as EntryCandidatesResult))), String(section));
       const result = JSON.parse(text) as EntryCandidatesResult;
       assert.equal(result.status === 'found' ? result.candidates[0]?.reason.kind : undefined, 'pinned', String(section));
     }
