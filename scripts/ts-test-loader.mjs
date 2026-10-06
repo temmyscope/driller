@@ -30,6 +30,20 @@ const RELATIVE_SPECIFIER = /^\.{1,2}\//;
  */
 const CSS_STUB_URL = 'data:text/javascript,export default {};';
 
+/**
+ * P4-8c: Vite replaces `import.meta.env.*` at build time; Node leaves
+ * `import.meta.env` undefined, so a module reading `import.meta.env.DEV`
+ * while it runs (`CodeMap`'s `readFixtureNodeCount`, during mount) would
+ * throw. Defined as a production build would, so dev-only branches are dead
+ * in tests too. Only these three are defined: any other `import.meta.env`
+ * read still fails loudly rather than silently reading `undefined`.
+ */
+const IMPORT_META_ENV_DEFINE = {
+  'import.meta.env.DEV': 'false',
+  'import.meta.env.PROD': 'true',
+  'import.meta.env.MODE': '"test"',
+};
+
 function isFile(url) {
   try {
     return statSync(fileURLToPath(url)).isFile();
@@ -77,6 +91,7 @@ export async function load(url, context, nextLoad) {
     format: 'esm',
     target: 'node20',
     jsx: 'automatic',
+    define: IMPORT_META_ENV_DEFINE,
     sourcefile: path,
     sourcemap: 'inline',
   });

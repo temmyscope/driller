@@ -32,11 +32,15 @@
     "@electron-forge/plugin-fuses": "7.11.2",
     "@electron-forge/plugin-vite": "7.11.2",
     "@electron/fuses": "^1.8.0",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
     "@types/electron-squirrel-startup": "^1.0.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "4.7.0",
     "electron": "43.6.0",
+    "jsdom": "30.1.2",
     "typescript": "5.9.3",
     "vite": "5.4.21"
   }

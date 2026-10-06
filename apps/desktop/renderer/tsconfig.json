@@ -25,6 +25,9 @@
     "bower_components",
     "jspm_packages",
     "src/**/*.test.ts",
-    "src/**/*.test.tsx"
+    "src/**/*.test.tsx",
+    // P4-8c: the DOM test helpers (jsdom environment, fake `window.driller`,
+    // map fixture) — test code, typechecked by `tsconfig.test.json`.
+    "src/test/**"
   ]
 }

@@ -13,7 +13,7 @@
   "compilerOptions": {
     "types": ["node", "vite/client"]
   },
-  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/types/**/*.d.ts"],
+  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/types/**/*.d.ts", "src/test/**/*.ts", "src/test/**/*.tsx"],
   // Overrides the inherited `exclude` (which excludes tests, the opposite of
   // what this config is for) while keeping TypeScript's implicit defaults.
   "exclude": ["node_modules", "bower_components", "jspm_packages"]
