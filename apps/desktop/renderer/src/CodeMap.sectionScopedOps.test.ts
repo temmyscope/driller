@@ -62,12 +62,6 @@ describe('settleSectionScopedReply', () => {
 describe('CodeMap source: the section reaches all three operations', () => {
   const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
 
-  it('the section prop defaults to the whole scope and is mirrored into a ref before any reply settles', () => {
-    // P4-4 phase 3b: the switch and pending-focus props follow it.
-    assert.match(src, /\n {2}section = null,\n {2}onUnknownSection,\n {2}onSwitchSection,\n {2}pendingFocusNodeId = null,\n {2}onPendingFocusConsumed,\n\}: CodeMapProps\)/);
-    assert.match(src, /useLayoutEffect\(\(\) => \{\s*sectionRef\.current = section;\s*\}, \[section\]\);/);
-  });
-
   const calls: [string, RegExp][] = [
     ['tracePath', /\.tracePath\(query, requestedSection \?\? undefined\)/],
     [
@@ -124,13 +118,5 @@ describe('blastRadiusStateOnUnknownSection (P4-4e review round 1)', () => {
       status: 'error',
       message: 'The section "docs" is not in this project\'s included subfolders.',
     });
-  });
-
-  it('the expansion effect applies it', () => {
-    const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-    assert.match(
-      src,
-      /const next = blastRadiusStateOnUnknownSection\(gone, onUnknownSectionRef\.current\);\s*if \(next !== null\) \{\s*setBlastRadiusState\(next\);/,
-    );
   });
 });

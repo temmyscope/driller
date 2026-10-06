@@ -126,3 +126,68 @@ export function syntheticMap({ nodes, fanout = 2 }: { nodes: number; fanout?: nu
     sections: [],
   };
 }
+
+// ---------------------------------------------------------------------------
+// P4-8d: a project with two indexing-scope sections, `api` and `web`
+// ---------------------------------------------------------------------------
+
+/** The sections' own Nodes (two each). `handler` calls `render` across the sections. */
+export const SECTION_NODES = {
+  handler: fn('api/handler.ts', 'handler', 3, 9),
+  validate: fn('api/validate.ts', 'validate', 1, 4),
+  render: fn('web/render.ts', 'render', 2, 8),
+  layout: fn('web/layout.ts', 'layout', 1, 5),
+} as const satisfies Record<string, CodeMapNode>;
+
+export type SectionName = 'api' | 'web';
+
+/** The applied allowlist of the two-section project. */
+export const SECTION_SCOPE: readonly SectionName[] = ['api', 'web'];
+
+/**
+ * The Graph Service's `getCodeMap(section)` reply for the two-section
+ * project: `null` is `all` (all four Nodes, with the cross-section call as a
+ * real edge), a section is its own two Nodes. A section reply carries what
+ * P4-4g adds for it: `handler`'s cross-section call into `web` (on the `api`
+ * map) and the edges each side's filter dropped (`crossSectionEdges`).
+ * `overrides` replace fields of the reply.
+ */
+export function sectionedMap(section: SectionName | null, overrides: Partial<CodeMapOk> = {}): CodeMapOk {
+  const S = SECTION_NODES;
+  const shared = {
+    status: 'ok' as const,
+    hiddenByScope: 0,
+    appliedScope: [...SECTION_SCOPE],
+    foldedTypes: [],
+    foldedModules: [],
+    section,
+    sections: [
+      { path: 'api', nodeCount: 2 },
+      { path: 'web', nodeCount: 2 },
+    ],
+  };
+  const reply: CodeMapOk =
+    section === null
+      ? {
+          ...shared,
+          nodes: [S.handler, S.validate, S.render, S.layout],
+          edges: [calls(S.handler, S.validate), calls(S.handler, S.render), calls(S.render, S.layout)],
+        }
+      : section === 'api'
+        ? {
+            ...shared,
+            nodes: [
+              { ...S.handler, crossSectionCalls: [{ id: S.render.id, name: S.render.name, section: 'web' }], crossSectionCallsTotal: 1 },
+              S.validate,
+            ],
+            edges: [calls(S.handler, S.validate)],
+            crossSectionEdges: [{ section: 'web', outgoing: 1, incoming: 3 }],
+          }
+        : {
+            ...shared,
+            nodes: [S.render, S.layout],
+            edges: [calls(S.render, S.layout)],
+            crossSectionEdges: [{ section: 'api', outgoing: 3, incoming: 1 }],
+          };
+  return structuredClone({ ...reply, ...overrides });
+}

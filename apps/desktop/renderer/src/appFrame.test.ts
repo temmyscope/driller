@@ -932,14 +932,6 @@ describe('App source: the remembered section (P4-4i)', () => {
     return appSrc.slice(from, to);
   }
 
-  it('CodeMap mounts (and fetches) only once the saved section has been read', () => {
-    assert.match(
-      appSrc,
-      /\{sectionRestoreSettled\(sectionRestore, currentProjectPath, sectionRestoreRequests\.isLatest\) && \(\s*<CodeMap\s+projectPath=\{currentProjectPath\}/,
-    );
-    assert.equal((appSrc.match(/<CodeMap\b/g) ?? []).length, 1, 'no other, ungated CodeMap');
-  });
-
   it('the open path reads, validates and restores the section quietly, clearing a stale one', () => {
     const effect = body('const requestId = sectionRestoreRequests.begin();', '}, [currentProjectPath, sectionRestoreRequests, commitSectionShell]);');
     assert.match(effect, /if \(currentProjectPath === null\) \{\s*return;\s*\}/);
@@ -951,17 +943,6 @@ describe('App source: the remembered section (P4-4i)', () => {
     // Pending focus is never applied from a restored section.
     assert.match(effect, /setPendingSectionFocus\(null\);\s*setSectionRestore\(\{ projectPath, requestId \}\);/);
     assert.match(effect, /savedSectionRef\.current = read\.section;\s*launchSectionRef\.current = read\.section;/);
-  });
-
-  it('every section transition goes through the saving path', () => {
-    const transition = body('const transitionSectionShell = useCallback(', '[commitSectionShell, rememberSectionForCurrentProject],');
-    assert.match(transition, /const remember = sectionToRemember\(previous, next, map, savedSectionRef\.current\);/);
-    assert.match(transition, /if \(remember !== undefined\) \{\s*rememberSectionForCurrentProject\(remember\);/);
-    const remember = body('const rememberSectionForCurrentProject = useCallback(', '}, []);');
-    assert.match(remember, /savedSectionRef\.current = next;/);
-    assert.match(remember, /rememberSection\(projectPath, next, \(path, value\) => window\.driller\.setActiveSection\(path, value\)\)/);
-    // Only the commit itself touches the state setter.
-    assert.equal((appSrc.match(/setSectionShell\(/g) ?? []).length, 1);
   });
 
   it('the unknown-section fallback is silent on the launch path only', () => {
@@ -981,11 +962,6 @@ describe('App source: the remembered section (P4-4i)', () => {
     assert.ok(revalidate >= 0 && refetch > revalidate);
     assert.match(handler, /setPendingSectionFocus\(null\);/);
   });
-
-  it('Settings reports the saved allowlist', () => {
-    const settingsSrc = readFileSync(fileURLToPath(new URL('./Settings.tsx', import.meta.url)), 'utf8');
-    assert.match(settingsSrc, /onProjectScopeApplied\(result\.config\.includedPaths\);/);
-  });
 });
 
 describe('P4-4i review round 1', () => {
@@ -1001,33 +977,9 @@ describe('P4-4i review round 1', () => {
     assert.deepEqual(scopeThrew, { section: null, clear: false });
   });
 
-  it('App: CodeMap still mounts if restoring the section fails', () => {
-    const from = appSrc.indexOf('const requestId = sectionRestoreRequests.begin();');
-    const effect = appSrc.slice(from, appSrc.indexOf('}, [currentProjectPath, sectionRestoreRequests, commitSectionShell]);', from));
-    assert.match(
-      effect,
-      /\}\)\.catch\(\(error: unknown\) => \{[\s\S]*commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setSectionRestore\(\{ projectPath, requestId \}\);/,
-    );
-  });
-
   it('isDifferentProjectOpen: another project resets; re-selecting the open one does not', () => {
     assert.equal(isDifferentProjectOpen(null, '/p'), true, 'first open');
     assert.equal(isDifferentProjectOpen('/a', '/p'), true);
     assert.equal(isDifferentProjectOpen('/p', '/p'), false);
-  });
-
-  it('App: an open from Recent Projects resets mode and section (the early status-filter ref is not the guard)', () => {
-    assert.match(
-      appSrc,
-      /if \(isDifferentProjectOpen\(openProjectPathRef\.current, result\.project\.path\)\) \{[\s\S]{0,600}commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);/,
-    );
-    assert.match(appSrc, /currentProjectPathRef\.current = result\.project\.path;\s*openProjectPathRef\.current = result\.project\.path;/);
-    assert.match(appSrc, /currentProjectPathRef\.current = null;\s*openProjectPathRef\.current = null;/);
-    // `handleOpenRecent` sets only the status-filter ref early.
-    const from = appSrc.indexOf('const handleOpenRecent = useCallback(');
-    const openRecent = appSrc.slice(from, appSrc.indexOf('[applyOpenResult, reportUnexpectedError],', from));
-    assert.match(openRecent, /currentProjectPathRef\.current = path;/);
-    assert.doesNotMatch(openRecent, /openProjectPathRef/);
-    assert.equal((appSrc.match(/openProjectPathRef\.current = /g) ?? []).length, 2, 'set only on an applied open and on Close');
   });
 });

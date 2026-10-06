@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelStatusMessage } from '@driller/ipc-contracts';
-import { createFakeDrillerApi, INSTALL_NEEDS_DOM_ENV } from './fakeDrillerApi';
+import { createFakeDrillerApi, deferred, INSTALL_NEEDS_DOM_ENV } from './fakeDrillerApi';
 import { pathTraceBasicMap } from './mapFixture';
 
 describe('createFakeDrillerApi', () => {
@@ -92,5 +92,29 @@ describe('createFakeDrillerApi', () => {
 
   it('install() refuses to run without the DOM environment', () => {
     assert.throws(() => createFakeDrillerApi().install(), { message: INSTALL_NEEDS_DOM_ENV });
+  });
+});
+
+describe('deferred (P4-8d)', () => {
+  it('settles only when the test says so, in the order it says', async () => {
+    const first = deferred<string>();
+    const second = deferred<string>();
+    const fake = createFakeDrillerApi({ getActiveSection: (path) => (path === '/a' ? first.promise : second.promise) });
+    const settled: string[] = [];
+    const a = fake.api.getActiveSection('/a').then((value) => settled.push(`a:${value}`));
+    const b = fake.api.getActiveSection('/b').then((value) => settled.push(`b:${value}`));
+    await Promise.resolve();
+    assert.deepEqual(settled, []);
+    second.resolve('web');
+    await b;
+    first.resolve('api');
+    await a;
+    assert.deepEqual(settled, ['b:web', 'a:api']);
+  });
+
+  it('rejects with the given error', async () => {
+    const pending = deferred<string>();
+    pending.reject(new Error('read failed'));
+    await assert.rejects(pending.promise, { message: 'read failed' });
   });
 });

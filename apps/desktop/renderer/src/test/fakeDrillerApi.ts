@@ -224,3 +224,25 @@ export function createFakeDrillerApi(initialStubs: DrillerStubs = {}): FakeDrill
   };
   return fake;
 }
+
+/**
+ * P4-8d: a promise a test settles by hand — for a stub whose reply must
+ * land later, or out of order with another (`getCodeMap` for two sections).
+ * Settle it inside React's `act` (or before a `waitFor`/`findBy…`), like any
+ * other reply that updates the UI.
+ */
+export interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+export function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}

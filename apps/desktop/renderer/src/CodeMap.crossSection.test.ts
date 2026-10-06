@@ -384,15 +384,6 @@ describe('switchSectionFromDetail', () => {
     });
     assert.deepEqual(calls, ['close', 'switch web web/r.ts#render']);
   });
-
-  it('CodeMap wires the panel to it, with the map section, and remembers the callee name', () => {
-    assert.match(codeMapSrc, /mapSection=\{fetchState\.status === 'ready' \? \(fetchState\.section \?\? null\) : null\}/);
-    assert.match(codeMapSrc, /onSwitchSection=\{handleSwitchSectionFromDetail\}/);
-    const start = codeMapSrc.indexOf('const handleSwitchSectionFromDetail = useCallback(');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('[closeNodeDetail, onSwitchSection]', start));
-    assert.match(body, /crossSectionTargetRef\.current = \{ id: focusNodeId/);
-    assert.match(body, /switchSectionFromDetail\(targetSection, focusNodeId, \{ closeNodeDetail, onSwitchSection \}\)/);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -499,27 +490,6 @@ describe('App switches through the Section bar path (source)', () => {
     assert.match(body, /setPendingSectionFocus\(null\);/);
   });
 
-  it('hands CodeMap the switch, the one-shot pending Node and its consumer', () => {
-    assert.match(appSrc, /onSwitchSection=\{handleSwitchSection\}/);
-    assert.match(appSrc, /pendingFocusNodeId=\{pendingFocusNodeIdFor\(pendingSectionFocus, section\)\}/);
-    assert.match(appSrc, /onPendingFocusConsumed=\{handlePendingFocusConsumed\}/);
-  });
-
-  it('renders the footer line as a polite status above the footer bar', () => {
-    const line = appSrc.indexOf('<p className="app__cross-section-line" role="status">');
-    const bar = appSrc.indexOf('<footer className="app__footerbar"');
-    assert.ok(line >= 0 && bar > line);
-    assert.match(appSrc, /\{nextCrossSectionLine\}\s*<\/p>/);
-  });
-
-  it('holds the line through a pending switch or reload (review round 1)', () => {
-    assert.match(
-      appSrc,
-      /nextFooterCrossSectionLine\(crossSectionLine, frameMapFor\(frameMap, currentProjectPath\), sectionShell\.pending\)/,
-    );
-    assert.match(appSrc, /if \(nextCrossSectionLine !== crossSectionLine\) \{\s*setCrossSectionLine\(nextCrossSectionLine\);/);
-  });
-
   it('the unknown-section fallback drops a pending focus (review round 1)', () => {
     const start = appSrc.indexOf('const handleUnknownSection = useCallback(');
     const body = appSrc.slice(start, appSrc.indexOf('}, []);', start));
@@ -559,11 +529,6 @@ describe('crossSectionEdges plumbing', () => {
     const state = mapFooterState({ ...(ready('api') as Extract<FetchState, { status: 'ready' }>), crossSectionEdges: EDGES });
     assert.deepEqual(state.status === 'ready' ? state.crossSectionEdges : null, EDGES);
   });
-
-  it('every fetch site keeps the field', () => {
-    assert.equal(codeMapSrc.match(/crossSectionEdges: result\.crossSectionEdges/g)?.length, 2);
-    assert.match(codeMapSrc, /crossSectionEdges: outcome\.crossSectionEdges/);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -599,11 +564,6 @@ describe('prReviewSwitchFocusTarget', () => {
 });
 
 describe('focus wiring (source)', () => {
-  it('the card wait falls back to the canvas wrapper, which can take focus', () => {
-    assert.match(codeMapSrc, /switch \(cardFocusStep\(card !== null, frames\)\) \{/);
-    assert.match(codeMapSrc, /case 'focus-canvas':\s*canvasElement\?\.focus\(\{ preventScroll: true \}\);/);
-    assert.match(codeMapSrc, /<div className="code-map__canvas" ref=\{canvasRef\} style=\{\{ height: CODE_MAP_CANVAS_HEIGHT \}\} tabIndex=\{-1\}>/);
-  });
 
   it('Health Audit: the selected Section bar tab is focused before Node detail opens (its opener)', () => {
     const start = codeMapSrc.indexOf("case 'open-detail': {");
@@ -621,10 +581,6 @@ describe('focus wiring (source)', () => {
     const start = codeMapSrc.indexOf('const dismissCrossSectionMiss = useCallback(');
     const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [fetchState, section]);', start));
     assert.match(body, /setCrossSectionMiss\(null\);[\s\S]*document\.getElementById\(tabId\)\?\.focus\(\);/);
-  });
-
-  it('the miss notice also shows with no Path Trace wrapper (an empty section)', () => {
-    assert.match(codeMapSrc, /\{!surfaces\.pathTraceInput && crossSectionMiss !== null && \(/);
   });
 
   it('PR Review\'s switch remembers its section and focuses by prReviewSwitchFocusTarget', () => {

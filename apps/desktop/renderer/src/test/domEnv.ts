@@ -10,7 +10,9 @@
  * type-only or unused named import can be erased by the compiler, so only
  * the bare form is guaranteed to run first. Named imports from this module
  * (`cleanupAfterEach`, …) go in a second import. For the same reason this
- * module imports nothing from React or Testing Library at the top level.
+ * module imports nothing from React or Testing Library at the top level
+ * (P4-8d: only a dynamic import at its very end, after the DOM is installed,
+ * to configure Testing Library — see "React's pending work").
  *
  * Isolation: `node --test` runs each test file in its own process, so the
  * globals installed here never reach the hookless test files.
@@ -24,8 +26,8 @@
  * - the browser APIs jsdom lacks that React Flow and the app need:
  *   `ResizeObserver` (controllable: nothing fires until a test calls
  *   `resizeObservers.resizeAll`), `DOMMatrixReadOnly`, `offsetWidth`/
- *   `offsetHeight` (see "Sizes"), `getClientRects`, `getBBox`, `matchMedia`
- *   and `scrollIntoView`;
+ *   `offsetHeight` (see "Sizes"), `getClientRects`, `getBoundingClientRect`,
+ *   `getBBox`, `matchMedia` and `scrollIntoView`;
  * - `IS_REACT_ACT_ENVIRONMENT`, so React routes updates through `act`;
  * - `window.driller`, which throws until a fake is installed
  *   (`createFakeDrillerApi(...).install()`).
@@ -51,6 +53,17 @@
  * `URL`, `Blob`, `fetch`, `structuredClone` — so e.g. a Node `AbortSignal`
  * passed to a jsdom `addEventListener` may be rejected. Use jsdom's
  * (`window.AbortController`) when one has to cross over.
+ *
+ * P4-8d additions:
+ * - `waitFor`/`findBy…` keep the act environment off until React's queued
+ *   scheduler tasks have run (`drainPendingImmediates`), so a big render
+ *   finishing after the wait never warns "not wrapped in act(...)".
+ * - `cleanupAfterEach` lets a React Flow animated move still running finish
+ *   (at most `ANIMATION_SETTLE_MS`), then interrupts it, before the unmount —
+ *   a test that fails mid-move can't hold its file open.
+ * - Never `assert.equal`/`strictEqual` two DOM elements: on failure
+ *   `node:assert` diffs both jsdom object graphs, which takes minutes and
+ *   looks like a hang. Use `assertSameElement(actual, expected, what)`.
  *
  * Each test, via `afterEach(cleanupAfterEach)`, fails when it:
  * - left an unstubbed `window.driller` call (made during the test or its
@@ -206,6 +219,19 @@ Object.defineProperty(domWindow.Element.prototype, 'getClientRects', {
   value(this: Element): DOMRectList {
     const rects: DOMRectReadOnly[] = isRendered(this) ? [rect(sizeOf(this).width, sizeOf(this).height)] : [];
     return Object.assign(rects, { item: (index: number) => rects[index] ?? null }) as unknown as DOMRectList;
+  },
+});
+
+// P4-8d: React Flow's pan/zoom caches its pane's extent from
+// `getBoundingClientRect` at mount, and d3-zoom interpolates every animated
+// move (`setCenter`/`setViewport` with a `duration`) over it. jsdom's 0×0
+// made each animated step's zoom NaN. Same size as `getClientRects`, at the
+// origin (there is no layout).
+Object.defineProperty(domWindow.Element.prototype, 'getBoundingClientRect', {
+  configurable: true,
+  value(this: Element): DOMRect {
+    const { width, height } = isRendered(this) ? sizeOf(this) : { width: 0, height: 0 };
+    return rect(width, height) as DOMRect;
   },
 });
 
@@ -394,6 +420,60 @@ if (typeof domWindow.matchMedia !== 'function') {
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 // ---------------------------------------------------------------------------
+// P4-8d: React's pending work. React's scheduler runs renders, commits and
+// passive effects in `setImmediate` tasks, and yields every ~5 ms, so a big
+// render (a 300-Node map) continues in later tasks. Testing Library's
+// `waitFor`/`findBy…` turn `IS_REACT_ACT_ENVIRONMENT` off while they wait
+// and back on one `setTimeout(0)` after the condition passes — which can be
+// before React's queued tasks have run. Those tasks then update state with
+// the act environment on and outside `act`: an "not wrapped in act(...)"
+// warning, which fails the test (seen on Node 22, where the timing differs).
+// So every `setImmediate` still pending is counted (the scheduler captures
+// `setImmediate` when it loads, after this module ran), and `waitFor` drains
+// them before it turns the act environment back on (see the end of this file).
+// ---------------------------------------------------------------------------
+
+const nodeSetImmediate = globalThis.setImmediate;
+const nodeClearImmediate = globalThis.clearImmediate;
+const pendingImmediates = new Set<NodeJS.Immediate>();
+
+const trackedSetImmediate = <TArgs extends unknown[]>(callback: (...args: TArgs) => void, ...args: TArgs): NodeJS.Immediate => {
+  const handle: NodeJS.Immediate = nodeSetImmediate(() => {
+    pendingImmediates.delete(handle);
+    callback(...args);
+  });
+  pendingImmediates.add(handle);
+  return handle;
+};
+globalThis.setImmediate = Object.assign(trackedSetImmediate, {
+  __promisify__: nodeSetImmediate.__promisify__,
+}) as typeof setImmediate;
+globalThis.clearImmediate = ((handle: NodeJS.Immediate | undefined) => {
+  if (handle !== undefined) {
+    pendingImmediates.delete(handle);
+  }
+  nodeClearImmediate(handle);
+}) as typeof clearImmediate;
+
+/** At most this many task turns per drain: a render that keeps rescheduling itself can't hang a test. */
+const MAX_DRAIN_TURNS = 1_000;
+
+/**
+ * Lets every pending `setImmediate` task (React's scheduler: renders,
+ * commits, passive effects) run, including the ones those schedule, up to
+ * `MAX_DRAIN_TURNS` turns. Returns whether the queue emptied.
+ */
+export async function drainPendingImmediates(): Promise<boolean> {
+  for (let turn = 0; turn < MAX_DRAIN_TURNS; turn += 1) {
+    if (pendingImmediates.size === 0) {
+      return true;
+    }
+    await new Promise<void>((resolve) => nodeSetImmediate(resolve));
+  }
+  return pendingImmediates.size === 0;
+}
+
+// ---------------------------------------------------------------------------
 // window.driller: the installed fake, or a loud error. `fakeDrillerApi.ts`'s
 // `install()` fills the slot (it can't import this module: non-DOM tests
 // import the fake too).
@@ -485,6 +565,7 @@ export async function cleanupAfterEach(): Promise<void> {
   // Imported here, not at the top: see the header.
   const { cleanup } = await import('@testing-library/react');
   const problems: string[] = [];
+  await finishViewportAnimations();
   try {
     cleanup();
     // Anything a test appended by hand (RTL removes only its own containers).
@@ -506,6 +587,104 @@ export async function cleanupAfterEach(): Promise<void> {
   if (problems.length > 0) {
     throw new Error(problems.join('\n'));
   }
+}
+
+// ---------------------------------------------------------------------------
+// P4-8d: React Flow's animated moves (`setCenter`/`setViewport` with a
+// `duration`: d3 transitions driven by this window's animation frames).
+// ---------------------------------------------------------------------------
+
+/** How long `cleanupAfterEach` lets a running animation finish before it stops it. React Flow's moves take 300 ms. */
+export const ANIMATION_SETTLE_MS = 500;
+
+/** The elements a d3 transition is scheduled or running on (d3 keeps it in `__transition`). */
+export function animatingElements(): Element[] {
+  return [...document.querySelectorAll('*')].filter((element) => '__transition' in element);
+}
+
+/**
+ * Before the unmount: lets a viewport animation still running (a test that
+ * passed without waiting for it, or failed mid-move) finish, for at most
+ * `ANIMATION_SETTLE_MS`, then interrupts whatever is left. Otherwise the
+ * move would update the next test's tree — or, past the last test, d3 would
+ * wait forever for a frame from the closed window, holding the file's
+ * process open until the runner's 240 s limit. The act environment is off
+ * meanwhile, as in `waitFor`: these updates belong to no test step.
+ */
+async function finishViewportAnimations(): Promise<void> {
+  if (animatingElements().length === 0) {
+    return;
+  }
+  const previous = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = false;
+  try {
+    const deadline = performance.now() + ANIMATION_SETTLE_MS;
+    while (animatingElements().length > 0 && performance.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    }
+    const left = animatingElements();
+    if (left.length > 0) {
+      const { interrupt } = await import('d3-transition');
+      for (const element of left) {
+        interrupt(element);
+      }
+    }
+    await drainPendingImmediates();
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previous;
+  }
+}
+
+/**
+ * P4-8d: asserts that `actual` is `expected` (the same element). Use it — or
+ * `assert.ok(a === b, message)` — instead of `assert.equal`/`strictEqual` on
+ * two DOM elements: on failure `node:assert` diffs both jsdom object graphs,
+ * which takes minutes and looks like a hang.
+ */
+export function assertSameElement(actual: Element | null | undefined, expected: Element | null | undefined, what: string): void {
+  if (actual === expected && actual !== null && actual !== undefined) {
+    return;
+  }
+  throw new Error(`${what}: expected ${describeElement(expected)}, got ${describeElement(actual)}`);
+}
+
+function describeElement(element: Element | null | undefined): string {
+  if (element === null || element === undefined) {
+    return String(element);
+  }
+  const label = element.getAttribute('aria-label') ?? element.textContent?.trim().slice(0, 40) ?? '';
+  return `<${element.tagName.toLowerCase()} class="${element.getAttribute('class') ?? ''}"> ${label}`;
+}
+
+// P4-8d: Testing Library's `waitFor`/`findBy…` also drain React's pending
+// tasks before the act environment is turned back on (see "React's pending
+// work" above). Imported dynamically, here at the end, for the reason in the
+// header: everything above has installed the DOM by now.
+{
+  const testingLibrary = await import('@testing-library/react');
+  testingLibrary.configure({
+    // Testing Library's own wrapper, plus the drain: the act environment is
+    // off while waiting, then — after one `setTimeout(0)` (its microtask
+    // drain) and every React task queued meanwhile, repeated until a turn
+    // queues none — back on.
+    asyncWrapper: async (callback) => {
+      const previous = globalThis.IS_REACT_ACT_ENVIRONMENT;
+      globalThis.IS_REACT_ACT_ENVIRONMENT = false;
+      try {
+        const result: unknown = await callback();
+        for (let round = 0; round < MAX_DRAIN_TURNS; round += 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (pendingImmediates.size === 0) {
+            break;
+          }
+          await drainPendingImmediates();
+        }
+        return result;
+      } finally {
+        globalThis.IS_REACT_ACT_ENVIRONMENT = previous;
+      }
+    },
+  });
 }
 
 // The window's timers would keep the test file's process alive once its

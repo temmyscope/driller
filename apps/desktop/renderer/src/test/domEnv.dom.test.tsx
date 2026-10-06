@@ -151,6 +151,21 @@ describe('domEnv: other stand-ins', () => {
     assert.equal(selfNone.getClientRects().length, 0);
   });
 
+  it('getBoundingClientRect (P4-8d): the element’s size when rendered, 0×0 when not', () => {
+    const shown = div();
+    const card = div({ class: 'react-flow__node' });
+    document.body.append(shown, card);
+    const box = shown.getBoundingClientRect();
+    assert.deepEqual([box.x, box.y, box.width, box.height], [0, 0, 1200, 800]);
+    elementSize.set(600, 400);
+    assert.deepEqual([shown.getBoundingClientRect().width, shown.getBoundingClientRect().height], [600, 400]);
+    assert.equal(card.getBoundingClientRect().width, cardSize.width);
+    const hidden = div({ hidden: '' });
+    document.body.append(hidden);
+    assert.equal(div().getBoundingClientRect().width, 0, 'detached');
+    assert.equal(hidden.getBoundingClientRect().height, 0, 'hidden');
+  });
+
   it('lets modalStack’s focusableWithin skip controls that are not rendered', () => {
     const dialog = div();
     dialog.innerHTML = `

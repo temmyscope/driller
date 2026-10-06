@@ -221,17 +221,6 @@ describe('CodeMap source: a switch reloads through the full reset', () => {
   it('the ready map carries the reply section and sections', () => {
     assert.equal(codeMapSrc.match(/section: result\.section,\s*sections: result\.sections,/g)?.length, 2);
   });
-
-  it('the first fit is keyed on the section of the map on screen', () => {
-    assert.match(codeMapSrc, /const shownSection = fetchState\.status === 'ready' \? \(fetchState\.section \?\? null\) : null;/);
-    assert.match(codeMapSrc, /section: shownSection,\s*fittedSection: initialFitRef\.current\.fittedSection,/);
-    assert.match(codeMapSrc, /initialFitRef\.current = completeInitialFit\(projectPath, shownSection\);/);
-  });
-
-  it('the regenerate patch goes through regeneratedNodeForMap, map and panel', () => {
-    assert.match(codeMapSrc, /regeneratedNodeForMap\(candidate, result\.node, mapSection\)/);
-    assert.match(codeMapSrc, /node: regeneratedNodeForMap\(current\.node, result\.node, sectionRef\.current\)/);
-  });
 });
 
 describe('regeneratedNodeForMap (P4-4d review round 1)', () => {
@@ -307,27 +296,9 @@ describe('empty section notice', () => {
     assert.ok(elements.some((element) => element.type === 'code' && textOf(element) === 'api'));
     assert.equal(elements.filter((element) => element.type === 'button').length, 0);
   });
-
-  it('CodeMap passes the map section to it', () => {
-    assert.match(codeMapSrc, /<EmptyMapNotice\s+hiddenByScope=\{fetchState\.hiddenByScope\}\s+appliedScope=\{fetchState\.appliedScope\}\s+section=\{fetchState\.section \?\? null\}/);
-  });
 });
 
 describe('App source: shell state and wiring', () => {
-  it('passes the section and the fallback to CodeMap', () => {
-    assert.match(appSrc, /section=\{section\}\s*onUnknownSection=\{handleUnknownSection\}/);
-    assert.match(appSrc, /transitionSectionShell\(\(current\) => applyUnknownSection\(current, gone, silent\)\)/);
-  });
-
-  it('renders the bar from the reply under the header, gated on 2+ applied entries, enabled only while live', () => {
-    const header = appSrc.indexOf('</header>');
-    const bar = appSrc.search(
-      /<SectionBar\s+sections=\{sectionBarSource\.sections\}\s+section=\{section\}\s+enabled=\{graphServiceLive\}\s+onChange=\{handleSectionChange\}\s*\/>/,
-    );
-    assert.ok(header >= 0 && bar > header);
-    assert.match(appSrc, /const sectionBarShown = showMap && sectionBarSource !== null && showSectionBar\(sectionBarSource\.appliedScope\);/);
-    assert.match(appSrc, /const sectionBarSource = frameSectionBarFor\(frameMap, currentProjectPath\);/);
-  });
 
   it('map reports for the open project settle the section shell', () => {
     assert.match(
@@ -345,10 +316,6 @@ describe('App source: shell state and wiring', () => {
       appSrc,
       /const sectionPanelLabelledBy = sectionBarShown \? selectedSectionTabId\(sectionBarSource\.sections, section\) : undefined;/,
     );
-  });
-
-  it('announces in one always-mounted status region', () => {
-    assert.match(appSrc, /<p className="visually-hidden" role="status">\s*\{sectionShell\.announcement\}\s*<\/p>/);
   });
 
   it('resets the section on a project open (with the mode) and on Close', () => {
