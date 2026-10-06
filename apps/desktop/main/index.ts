@@ -2368,10 +2368,16 @@ function registerIpcHandlers(): void {
 let mainWindowLoaded = false;
 let pendingMenuOpenFolder = false;
 
+// P4-1: in development the packaged icon isn't applied, so point the
+// window (Windows/Linux) and the macOS Dock at the source PNG. Packaged
+// builds get their icon from forge.config.ts.
+const DEV_ICON_PATH = app.isPackaged ? undefined : path.join(app.getAppPath(), 'assets', 'icon', 'icon.png');
+
 const createWindow = (): BrowserWindow => {
   const win = new BrowserWindow({
     width: 1100,
     height: 720,
+    ...(DEV_ICON_PATH && process.platform !== 'darwin' ? { icon: DEV_ICON_PATH } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -2485,6 +2491,7 @@ function installAppMenu(): void {
 }
 
 app.on('ready', () => {
+  if (DEV_ICON_PATH && process.platform === 'darwin') app.dock?.setIcon(DEV_ICON_PATH);
   registerIpcHandlers();
   installAppMenu();
   createWindow();

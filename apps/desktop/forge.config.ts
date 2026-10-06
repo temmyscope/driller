@@ -178,6 +178,9 @@ function vendorExternalDependencies(buildPath: string): void {
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
+    // P4-1: app icon. Forge picks icon.icns (macOS) / icon.ico (Windows);
+    // generated from the founder's icon/logo.png mark.
+    icon: 'assets/icon/icon',
     afterCopy: [
       (buildPath, _electronVersion, _platform, _arch, callback) => {
         try {
@@ -191,10 +194,10 @@ const config: ForgeConfig = {
   },
   rebuildConfig: {},
   makers: [
-    new MakerSquirrel({}),
+    new MakerSquirrel({ setupIcon: 'assets/icon/icon.ico' }),
     new MakerZIP({}, ['darwin']),
-    new MakerRpm({}),
-    new MakerDeb({}),
+    new MakerRpm({ options: { icon: 'assets/icon/icon.png' } }),
+    new MakerDeb({ options: { icon: 'assets/icon/icon.png' } }),
   ],
   plugins: [
     // AD-3: packaging uses Electron Forge with auto-unpack-natives so any
