@@ -15,7 +15,7 @@
     "make": "npm run make --workspace=@driller/desktop",
     "test": "node ./scripts/find-tests.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "lint": "eslint .",
+    "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix"
   },
   "devDependencies": {

@@ -145,6 +145,14 @@ function newTempRoot() {
 /** The run dirs (`npm-test-run-*`) a runner left in `root`. */
 const runDirsIn = (root) => readdirSync(root).filter((name) => name.startsWith('npm-test-run-'));
 
+/**
+ * Node 22's runner applies `--test-timeout` to each file's process as well,
+ * so there a hung test fails its whole file at the timeout and the file's
+ * later tests never run. From Node 24 the timeout ends the test alone.
+ * (P4-8b: checked on 22.23.3, 24.21.0 and 25.6.1.)
+ */
+const timeoutEndsFile = Number(process.versions.node.split('.')[0]) < 24;
+
 const failCount = (output) => Number(output.match(/\bfail (\d+)/)?.[1]);
 
 describe('npm test runner guards (P4-8a)', { concurrency: 4 }, () => {
@@ -164,7 +172,11 @@ describe('npm test runner guards (P4-8a)', { concurrency: 4 }, () => {
     });
     assert.equal(run.code, 1, run.output);
     assert.match(run.output, /test timed out after 1000ms/);
-    assert.match(run.output, /✔ runs after the timed-out test/);
+    if (timeoutEndsFile) {
+      assert.match(run.output, /✖ scripts\/fixtures\/runner\/timeout\.fixture\.mjs/);
+    } else {
+      assert.match(run.output, /✔ runs after the timed-out test/);
+    }
     assert.doesNotMatch(run.output, /exceeded/);
   });
 

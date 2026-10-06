@@ -62,6 +62,21 @@ async function isSettled(promise: Promise<unknown>): Promise<boolean> {
   return settled;
 }
 
+/**
+ * Awaits a request that only its timeout will settle. The requester's timer
+ * is `unref`'d (it must never hold main open), so nothing else keeps the
+ * event loop alive meanwhile; Node 22's test runner then sees a drained loop
+ * and cancels the rest of the file (found by P4-8b's Node 22 run).
+ */
+async function awaitTimeout<T>(promise: Promise<T>): Promise<T> {
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    return await promise;
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
 describe('createCodeMapRequester', () => {
   it('sends the whole scope as null and a section as itself', () => {
     const { requester, sent } = setup();
@@ -162,7 +177,7 @@ describe('createCodeMapRequester', () => {
     const { requester, sent } = setup({ timeoutMs: 10 });
     const api = requester.request('api');
     const web = requester.request('web');
-    assert.deepEqual(await api, {
+    assert.deepEqual(await awaitTimeout(api), {
       status: 'error',
       message: 'Timed out waiting for the Graph Service to respond with the Code Map.',
     });
@@ -321,7 +336,7 @@ describe('routeCodeMapReply (review round 1)', () => {
     const route = (message: Message) => routeCodeMapReply(message, harness.requester, (text) => warnings.push(text));
     const api = harness.requester.request('api');
     const web = harness.requester.request('web');
-    assert.equal((await api).status, 'error', 'api timed out');
+    assert.equal((await awaitTimeout(api)).status, 'error', 'api timed out');
     assert.deepEqual(harness.sent, ['api', 'web']);
     route(okReply('api'));
     route(errorReply('late api failure', 'api'));

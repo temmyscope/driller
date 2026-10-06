@@ -11,7 +11,9 @@
  * runner can never be given different ones.
  *
  * Limits and leak checks (P4-8a), so the gate can't hang or leave a mess:
- * - every test gets `--test-timeout` (`PER_TEST_TIMEOUT_MS`);
+ * - every test gets `--test-timeout` (`PER_TEST_TIMEOUT_MS`); on Node 22
+ *   the runner applies it to each test file's process too, so there it also
+ *   bounds a whole file (Node 24 and later: the test alone);
  * - the whole run gets `SUITE_WALL_LIMIT_MS`, after which the runner's
  *   entire process group is killed (it is spawned detached for that);
  * - the run gets a temp dir of its own (`npm-test-run-*`, set as
