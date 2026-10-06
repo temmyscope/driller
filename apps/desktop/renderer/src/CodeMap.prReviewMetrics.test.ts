@@ -840,10 +840,6 @@ describe('CodeMap source: the divider wiring', () => {
       /className="code-map"\s+id=\{MODAL_FOCUS_FALLBACK_ID\}\s+tabIndex=\{-1\}\s+ref=\{setMapElement\}\s+style=\{codeMapTableHeightStyle\(prReviewMetricsTableProps !== null, metricsTableHeight, mapHeight\)\}/,
     );
   });
-  it('onResize sets the requested height and flushes the deferred canvas size', () => {
-    assert.match(src, /<MetricsTableDivider\s+height=\{metricsTableHeight\}\s+mapHeight=\{mapHeight\}\s+onResize=\{handleMetricsTableResize\}/);
-    assert.match(src, /\(height: number\) => \{\s*setRequestedMetricsTableHeight\(height\);\s*flushCanvasSize\(\);\s*\}/);
-  });
   it('the canvas observer defers while the dragging attribute is on .code-map', () => {
     assert.match(
       src,
@@ -1184,92 +1180,6 @@ describe('styles.css: the cap line and the caption', () => {
     assert.match(caption, /color: var\(--text-mute\);/);
     assert.match(caption, /padding: calc\(6px \+ 0\.35rem\) /);
     assert.match(rule('.code-map__metrics-divider'), /height: 6px;/);
-  });
-});
-
-/**
- * The hooks at the top level of `CodeMap` (2-space indent): each
- * `useEffect`/`useLayoutEffect`/`useCallback`, its name (callbacks only),
- * its text and its dependency list.
- */
-function topLevelHooks(src: string): { name: string | null; text: string; deps: string[] }[] {
-  const lines = src.split('\n');
-  const hooks: { name: string | null; text: string; deps: string[] }[] = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    const start = /^ {2}(?:useEffect\(|useLayoutEffect\(|const (\w+) = useCallback\()/.exec(lines[i]!);
-    if (!start) {
-      continue;
-    }
-    let end = i + 1;
-    while (end < lines.length && !/^ {2}[})]/.test(lines[end]!)) {
-      end += 1;
-    }
-    const text = lines.slice(i, end + 1).join('\n');
-    const deps = /\[([^[\]]*)\],?\s*\);\s*$/.exec(text)?.[1] ?? '';
-    hooks.push({
-      name: start[1] ?? null,
-      text,
-      deps: deps
-        .split(',')
-        .map((d) => d.trim())
-        .filter(Boolean),
-    });
-  }
-  return hooks;
-}
-
-describe('CodeMap source: the affected-row wiring', () => {
-  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-  it('the table and the canvas highlight read one slice', () => {
-    assert.match(
-      src,
-      /const blastRadiusNodeIds = useMemo<ReadonlySet<string>>\(\(\) => \{[\s\S]{0,300}return nodesWithinDepth\(blastRadiusState\.hopDistances, blastRadiusDepth\);\s*\}, \[mode, blastRadiusState, blastRadiusDepth\]\);/,
-    );
-    assert.equal(src.match(/\(distance <= /g)?.length, 1, 'one depth comparison, in nodesWithinDepth');
-  });
-  it('the view gets the blast radius and the depth, re-deriving on a step with no IPC call', () => {
-    const memo = /const prReviewView = useMemo\(\s*\(\) => resolvePrReviewView\(mode, fetchState, diffScopeState, blastRadiusState, blastRadiusDepth\),\s*\[mode, fetchState, diffScopeState, blastRadiusState, blastRadiusDepth\],\s*\);/.exec(src);
-    assert.ok(memo);
-    assert.doesNotMatch(memo[0], /window\.driller|expandBlastRadius|getCodeMap/);
-  });
-  it('the loading caption matches the toolbar wording', () => {
-    assert.ok(src.includes('>\n              Computing blast radius…\n'), 'toolbar wording');
-    // P4-3g: the caption is a template literal now (it may name contracts).
-    assert.match(src, /Computing blast radius…[`"]/, 'caption wording');
-  });
-
-  // Mode switched away and back keeps the same rows at the same depth only
-  // if nothing a mode toggle re-runs resets the blast radius or its depth.
-  const hooks = topLevelHooks(src);
-  const RESETS = ["setBlastRadiusState({ status: 'idle' })", 'setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS)'];
-  it('no hook that depends on `mode` resets the blast radius or its depth, directly or through a callback', () => {
-    const resetting = new Set<string>();
-    const resets = (text: string) =>
-      RESETS.some((r) => text.includes(r)) || [...resetting].some((name) => new RegExp(`\\b${name}\\(`).test(text));
-    // Close over callbacks that call resetting callbacks.
-    for (let grew = true; grew; ) {
-      grew = false;
-      for (const hook of hooks) {
-        if (hook.name !== null && !resetting.has(hook.name) && resets(hook.text)) {
-          resetting.add(hook.name);
-          grew = true;
-        }
-      }
-    }
-    assert.ok(resetting.size >= 3, `found the reset callbacks: ${[...resetting].join(', ')}`);
-    const resettingHooks = hooks.filter((hook) => resets(hook.text));
-    // The project-switch effect plus the reset callbacks and their callers.
-    assert.ok(resettingHooks.some((hook) => hook.name === null && hook.deps.includes('projectPath')));
-    for (const hook of resettingHooks) {
-      assert.ok(!hook.deps.includes('mode'), `${hook.name ?? 'an effect'} resets the blast radius on [${hook.deps.join(', ')}]`);
-    }
-  });
-  it('the auto-trigger effect re-runs on a mode toggle but not on a step, and fires only from idle', () => {
-    const trigger = hooks.filter((hook) => hook.text.includes('.expandBlastRadius('));
-    assert.equal(trigger.length, 1);
-    assert.deepEqual(trigger[0]!.deps, ['mode', 'projectPath', 'diffScopeState', 'blastRadiusState.status', 'graphServiceAvailable']);
-    assert.ok(!trigger[0]!.deps.includes('blastRadiusDepth'));
-    assert.match(trigger[0]!.text, /blastRadiusState\.status !== 'idle'\n\s*\) \{\n\s*return;/);
   });
 });
 
@@ -1636,26 +1546,6 @@ describe('styles.css: the sort buttons and the bars', () => {
   });
 });
 
-describe('CodeMap source: the sort wiring', () => {
-  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-  const hooks = topLevelHooks(src);
-  it('the sort is reset to the default order at every diff-scope reset point, and by no mode-keyed hook', () => {
-    const scopeResets = hooks.filter((hook) => /setDiffScopeState\(\{ status: '(idle|loading)' \}\)/.test(hook.text));
-    assert.equal(scopeResets.length, 4, 'project change, loadCodeMap, refreshCodeMap, handleComputeDiffScope');
-    for (const hook of scopeResets) {
-      assert.ok(hook.text.includes('setPrReviewMetricSort(null);'), hook.name ?? 'the project effect');
-    }
-    assert.equal(src.split('setPrReviewMetricSort(null);').length - 1, 4);
-    for (const hook of hooks.filter((h) => h.text.includes('setPrReviewMetricSort('))) {
-      assert.ok(!hook.deps.includes('mode'), hook.name ?? 'an effect');
-    }
-  });
-  it('the table gets the state and its setter — a sort is local, never a fetch', () => {
-    assert.match(src, /const \[prReviewMetricSort, setPrReviewMetricSort\] = useState<PrReviewMetricSort \| null>\(null\);/);
-    assert.match(src, /sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}/);
-  });
-});
-
 // ---------------------------------------------------------------------------
 // P4-3d review round 1
 // ---------------------------------------------------------------------------
@@ -1748,20 +1638,6 @@ describe('P4-3d review: an active sort persists across a depth step', () => {
     assert.equal(atTwo.length, atOne.length + 1);
     assert.equal(rowIdOf(atTwo[0]!), 'far', 'the new row lands where the sort puts it, not at the end');
     assert.equal(rowIdOf(atOne[0]!), 'src/b.ts::pay');
-  });
-
-  it('nothing a step re-runs resets the sort: the stepper only sets the depth, and no sort reset depends on it', () => {
-    const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-    const steppers = src.match(/onClick=\{\(\) => setBlastRadiusDepth\([^\n]*\)\}/g) ?? [];
-    assert.equal(steppers.length, 2);
-    assert.ok(steppers.every((handler) => !handler.includes('setPrReviewMetricSort')));
-    for (const hook of topLevelHooks(src).filter((h) => h.text.includes('setPrReviewMetricSort('))) {
-      assert.ok(!hook.deps.includes('blastRadiusDepth'), hook.name ?? 'an effect');
-      assert.ok(!hook.deps.includes('blastRadiusState'), hook.name ?? 'an effect');
-    }
-    // Only the four diff-scope resets and the table's onSort set the sort.
-    assert.equal(src.split('setPrReviewMetricSort(').length - 1, 4);
-    assert.equal(src.split('onSort={setPrReviewMetricSort}').length - 1, 1);
   });
 });
 
@@ -2004,15 +1880,6 @@ describe('styles.css: row activation (P4-3e)', () => {
 
   it('the scroll region pads its top, so a focused row clears the sticky header', () => {
     assert.match(block('.code-map__metrics-table'), /scroll-padding-top: 2rem;/);
-  });
-});
-
-describe('CodeMap source: row activation wiring (P4-3e)', () => {
-  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-  it('the one table mount activates through openNodeDetail, never activateNode', () => {
-    assert.equal(src.split('<PrReviewMetricsTable').length - 1, 1);
-    assert.equal(src.split('onActivateNode={openNodeDetail}').length - 1, 2, 'the Health Audit grid and the table');
-    assert.ok(!src.includes('onActivateNode={activateNode}'));
   });
 });
 
@@ -2501,17 +2368,6 @@ describe('styles.css: the contract rows (P4-3g)', () => {
   it('the dependents cell is text-dim; the approximate note is muted', () => {
     assert.match(block('.code-map__metrics-contract-dependents'), /color: var\(--text-dim\);/);
     assert.match(block('.code-map__metrics-contract-note'), /color: var\(--text-mute\);/);
-  });
-});
-
-describe('CodeMap source: the contract rows wiring (P4-3g)', () => {
-  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-  it('the table mount opens a contract through openType, as the toolbar does', () => {
-    assert.match(src, /<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}[^>]*onOpenType=\{openType\}\s+\/>/);
-    assert.match(src, /<PrReviewDiffScopeNoticeRegion[\s\S]{0,600}onOpenType=\{openType\}/);
-  });
-  it('the toolbar contract list is still mounted', () => {
-    assert.match(src, /<ChangedContractList\s/);
   });
 });
 

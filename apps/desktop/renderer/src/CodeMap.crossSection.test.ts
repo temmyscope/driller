@@ -582,15 +582,6 @@ describe('focus wiring (source)', () => {
     const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [fetchState, section]);', start));
     assert.match(body, /setCrossSectionMiss\(null\);[\s\S]*document\.getElementById\(tabId\)\?\.focus\(\);/);
   });
-
-  it('PR Review\'s switch remembers its section and focuses by prReviewSwitchFocusTarget', () => {
-    const start = codeMapSrc.indexOf('const handleSwitchSectionFromPrReview = useCallback(');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('[onSwitchSection]', start));
-    assert.match(body, /prReviewSwitchFocusRef\.current = targetSection;\s*onSwitchSection\(targetSection\);/);
-    assert.match(codeMapSrc, /baseRefFocusable: mode === 'prReview' && input !== null && !input\.disabled,/);
-    assert.match(codeMapSrc, /if \(target === 'base-ref'\) \{\s*input\?\.focus\(\);/);
-    assert.match(codeMapSrc, /ref=\{baseRefInputRef\}/);
-  });
 });
 
 describe('CrossSectionMissNotice is described by its text', () => {
@@ -681,22 +672,10 @@ describe('the carry flow (source)', () => {
     );
   });
 
-  it('while a check runs, the idle line says so', () => {
-    assert.match(codeMapSrc, /\{diffCarryPending !== null\s*\? diffScopeCarryCheckingText\(diffCarryPending\)\s*: 'Enter a base ref/);
-  });
-
   it('unmount moves both request ids on', () => {
     assert.match(
       codeMapSrc,
       /const carryIds = diffCarryRequestIdRef;\s*const diffIds = diffScopeRequestIdRef;\s*return \(\) => \{\s*carryIds\.current \+= 1;\s*diffIds\.current \+= 1;/,
-    );
-  });
-
-  it('runDiffScope is the button\'s own path (the same stale-reply guards)', () => {
-    assert.match(codeMapSrc, /const runDiffScope = useCallback\(\(rawBaseRef: string\) => \{/);
-    assert.match(
-      codeMapSrc,
-      /setDiffCarryNote\(null\);\s*diffCarryRequestIdRef\.current \+= 1;\s*setDiffCarryPending\(null\);\s*runDiffScope\(baseRefInput\);/,
     );
   });
 
@@ -714,10 +693,6 @@ describe('the carry flow (source)', () => {
     const start = codeMapSrc.indexOf('const carry = diffScopeCarryCandidate({ ...diffCarrySourceRef.current, from, to: section });');
     const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [loadCodeMap, section]);', start));
     assert.match(body, /loadCodeMap\(\);\s*if \(carry !== null\) \{\s*startDiffScopeCarryRef\.current\(carry\);/);
-  });
-
-  it('the re-run is announced in the loading line', () => {
-    assert.match(codeMapSrc, /\{diffCarryNote \?\? 'Computing diff scope…'\}/);
   });
 });
 

@@ -119,6 +119,47 @@ describe('domEnv: ResizeObserver', () => {
     assert.deepEqual(seen.slice(3), [[c, 5, 6]]);
     observer.disconnect();
   });
+
+  it('P4-8e: resizeElement fires only the observers of that element, with its new size, leaving elementSize alone', () => {
+    const seen: [string, Element, number, number][] = [];
+    const record = (name: string) =>
+      new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          seen.push([name, entry.target, entry.contentRect.width, entry.contentRect.height]);
+        }
+      });
+    const canvas = div();
+    const other = div();
+    const first = record('first');
+    const second = record('second');
+    first.observe(canvas);
+    first.observe(other);
+    second.observe(other);
+
+    resizeObservers.resizeElement(canvas, 300, 120);
+    assert.deepEqual(seen, [['first', canvas, 300, 120]], 'one entry, for that element only');
+    assert.deepEqual([canvas.offsetWidth, canvas.offsetHeight], [1200, 800], 'elementSize unchanged');
+
+    first.unobserve(canvas);
+    resizeObservers.resizeElement(canvas, 10, 10);
+    assert.equal(seen.length, 1, 'no longer observed: nothing fires');
+    first.disconnect();
+    second.disconnect();
+  });
+});
+
+describe('domEnv: pointer capture (P4-8e)', () => {
+  it('records captures per element and pointer, until released', () => {
+    const a = div();
+    const b = div();
+    assert.equal(a.hasPointerCapture(1), false);
+    a.setPointerCapture(1);
+    assert.equal(a.hasPointerCapture(1), true);
+    assert.equal(a.hasPointerCapture(2), false, 'per pointer');
+    assert.equal(b.hasPointerCapture(1), false, 'per element');
+    a.releasePointerCapture(1);
+    assert.equal(a.hasPointerCapture(1), false);
+  });
 });
 
 describe('domEnv: other stand-ins', () => {

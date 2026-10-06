@@ -24,7 +24,17 @@
  * Ids use a `<file>::<name>` form, not the backend's machine-specific
  * qualified names. Line ranges are the real ones.
  */
-import type { CodeMapEdge, CodeMapNode, CodeMapResult, FoldedModule } from '@driller/ipc-contracts';
+import type {
+  BlastRadiusExpansionResult,
+  ChangedContract,
+  CodeMapEdge,
+  CodeMapNode,
+  CodeMapResult,
+  DiffScopeResult,
+  FoldedModule,
+  FoldedType,
+  RiskSignal,
+} from '@driller/ipc-contracts';
 import { generateSyntheticCodeMap } from '../devFixture';
 
 function fn(file: string, name: string, startLine: number, endLine: number): CodeMapNode {
@@ -190,4 +200,110 @@ export function sectionedMap(section: SectionName | null, overrides: Partial<Cod
             crossSectionEdges: [{ section: 'api', outgoing: 3, incoming: 1 }],
           };
   return structuredClone({ ...reply, ...overrides });
+}
+
+// ---------------------------------------------------------------------------
+// P4-8e: a PR Review over `path-trace-basic` — the diff scope, its blast
+// radius and the metrics the table shows
+// ---------------------------------------------------------------------------
+
+type DeterministicType = 'complexity' | 'blast-radius' | 'test-coverage-gap';
+
+function det(node: CodeMapNode, type: DeterministicType, value: number, severity: 'moderate' | 'severe' = 'moderate'): RiskSignal {
+  return { family: 'deterministic', type, value, severity, location: { file: node.file, startLine: node.startLine, endLine: node.endLine } };
+}
+
+function finding(node: CodeMapNode, severity: 'blocker' | 'major' | 'minor' | 'info', sourceTool: string): RiskSignal {
+  return { family: 'ingested', severity, sourceTool, finding: 'x', location: { file: node.file, startLine: node.startLine, endLine: node.endLine } };
+}
+
+/**
+ * Each Node's risk signals in the PR Review fixture — the values
+ * `CodeMap.prReviewMetrics.test.ts` builds its tables from (complexity 42
+ * severe, blast radius 120 severe, Qodo and CodeRabbit findings, …), spread
+ * so that sorting by complexity or blast radius reorders the default rows.
+ */
+const PR_REVIEW_SIGNALS: Record<keyof typeof FIXTURE_NODES, (node: CodeMapNode) => RiskSignal[]> = {
+  repository: (node) => [
+    det(node, 'complexity', 42, 'severe'),
+    det(node, 'blast-radius', 9),
+    det(node, 'test-coverage-gap', 1),
+    finding(node, 'minor', 'Qodo'),
+    finding(node, 'blocker', 'CodeRabbit'),
+  ],
+  serviceA: (node) => [det(node, 'complexity', 3)],
+  serviceB: (node) => [det(node, 'blast-radius', 120, 'severe')],
+  cacheLookup: (node) => [det(node, 'complexity', 5), det(node, 'blast-radius', 10)],
+  handleRequest: (node) => [det(node, 'complexity', 20, 'severe'), det(node, 'blast-radius', 50)],
+  helperA: (node) => [det(node, 'complexity', 1), det(node, 'blast-radius', 50)],
+  helperB: () => [],
+};
+
+/** The changed contract of the PR Review fixture: `Request`, used by `handleRequest`. */
+export const PR_REVIEW_CONTRACT: ChangedContract = {
+  id: 'types.ts::Request',
+  name: 'Request',
+  kind: 'Interface',
+  file: 'types.ts',
+  dependentCount: 1,
+  dependentIds: [FIXTURE_NODES.handleRequest.id],
+};
+
+const PR_REVIEW_FOLDED_TYPE: FoldedType = {
+  id: PR_REVIEW_CONTRACT.id,
+  name: PR_REVIEW_CONTRACT.name,
+  kind: PR_REVIEW_CONTRACT.kind,
+  file: PR_REVIEW_CONTRACT.file,
+  startLine: 1,
+  endLine: 4,
+  usedBy: [FIXTURE_NODES.handleRequest.id],
+  usedByTotal: 1,
+  usedByKinds: [{ kind: 'Function', count: 1 }],
+  implements: [],
+  implementedBy: [],
+  refersTo: [],
+  referencedByTypes: [],
+};
+
+/**
+ * `path-trace-basic` as PR Review sees it: every Node carries its
+ * `PR_REVIEW_SIGNALS`, and `Request` (the changed contract) is folded off
+ * the map.
+ */
+export function prReviewMap(): CodeMapOk {
+  const map = pathTraceBasicMap();
+  const byId = new Map(Object.entries(FIXTURE_NODES).map(([key, node]) => [node.id, key as keyof typeof FIXTURE_NODES]));
+  return {
+    ...map,
+    nodes: map.nodes.map((node) => ({ ...node, riskSignals: PR_REVIEW_SIGNALS[byId.get(node.id)!](node) })),
+    foldedTypes: [structuredClone(PR_REVIEW_FOLDED_TYPE)],
+  };
+}
+
+/** The diff changed `repository`; `withContract` adds the changed `Request` contract. */
+export function prReviewDiffScope({ withContract = false }: { withContract?: boolean } = {}): DiffScopeResult {
+  return {
+    status: 'resolved',
+    resolvedBaseRef: 'abc123',
+    nodeIds: [FIXTURE_NODES.repository.id],
+    ...(withContract ? { changedContracts: [structuredClone(PR_REVIEW_CONTRACT)] } : {}),
+  };
+}
+
+/**
+ * The blast radius of `repository` (`expandBlastRadius`'s hop distances):
+ * its two callers and `cacheLookup` at 1 hop, `handleRequest` at 2 and
+ * `helperA` at 3. `helperB` is out of reach. Its max depth is 3, so the
+ * stepper starts at `BLAST_RADIUS_DEFAULT_HOPS` (2) and can go both ways.
+ */
+export const PR_REVIEW_HOPS: Readonly<Record<string, number>> = {
+  [FIXTURE_NODES.serviceA.id]: 1,
+  [FIXTURE_NODES.serviceB.id]: 1,
+  [FIXTURE_NODES.cacheLookup.id]: 1,
+  [FIXTURE_NODES.handleRequest.id]: 2,
+  [FIXTURE_NODES.helperA.id]: 3,
+};
+
+export function prReviewBlastRadius(): BlastRadiusExpansionResult {
+  return { status: 'resolved', hopDistances: { ...PR_REVIEW_HOPS } };
 }

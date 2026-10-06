@@ -27,7 +27,9 @@
  *   `ResizeObserver` (controllable: nothing fires until a test calls
  *   `resizeObservers.resizeAll`), `DOMMatrixReadOnly`, `offsetWidth`/
  *   `offsetHeight` (see "Sizes"), `getClientRects`, `getBoundingClientRect`,
- *   `getBBox`, `matchMedia` and `scrollIntoView`;
+ *   `getBBox`, `matchMedia`, `scrollIntoView` and (P4-8e) pointer capture
+ *   (`setPointerCapture`/`hasPointerCapture`/`releasePointerCapture`,
+ *   recorded per element; no capture events are dispatched);
  * - `IS_REACT_ACT_ENVIRONMENT`, so React routes updates through `act`;
  * - `window.driller`, which throws until a fake is installed
  *   (`createFakeDrillerApi(...).install()`).
@@ -53,6 +55,9 @@
  * `URL`, `Blob`, `fetch`, `structuredClone` — so e.g. a Node `AbortSignal`
  * passed to a jsdom `addEventListener` may be rejected. Use jsdom's
  * (`window.AbortController`) when one has to cross over.
+ *
+ * P4-8e: `resizeObservers.resizeElement(target, w, h)` fires only the
+ * observers of one element (`resizeAll` fires every observer).
  *
  * P4-8d additions:
  * - `waitFor`/`findBy…` keep the act environment off until React's queued
@@ -275,6 +280,13 @@ class FakeResizeObserver implements ResizeObserver {
     }
     this.#callback([...this.#targets].map(resizeEntry), this);
   }
+
+  /** P4-8e: fires this observer's callback with `entry` alone, if it observes `target`. */
+  fireFor(target: Element, entry: ResizeObserverEntry): void {
+    if (this.#targets.has(target)) {
+      this.#callback([entry], this);
+    }
+  }
 }
 
 function resizeEntry(target: Element): ResizeObserverEntry {
@@ -299,6 +311,25 @@ export const resizeObservers = {
     elementSize.set(width, height);
     for (const observer of [...liveObservers]) {
       observer.fire();
+    }
+  },
+  /**
+   * P4-8e: one element resized on its own — fires only the live observers
+   * that observe `target`, each with one entry for it at `width`×`height`
+   * (e.g. the canvas frame shrinking while `.code-map` keeps its height).
+   * `elementSize` is unchanged. Call inside `act`.
+   */
+  resizeElement(target: Element, width: number, height: number): void {
+    const box: ResizeObserverSize = { inlineSize: width, blockSize: height };
+    const entry: ResizeObserverEntry = {
+      target,
+      contentRect: rect(width, height),
+      borderBoxSize: [box],
+      contentBoxSize: [box],
+      devicePixelContentBoxSize: [box],
+    };
+    for (const observer of [...liveObservers]) {
+      observer.fireFor(target, entry);
     }
   },
   /** How many observers are observing at least one element. */
@@ -395,6 +426,40 @@ if (!('getBBox' in domWindow.SVGElement.prototype)) {
   Object.defineProperty(domWindow.SVGElement.prototype, 'getBBox', {
     configurable: true,
     value: () => ({ x: 0, y: 0, width: 0, height: 0 }),
+  });
+}
+
+// P4-8e: pointer capture, which jsdom lacks (the PR Review table divider
+// captures the pointer for its drag). Captures are only recorded per element:
+// no `gotpointercapture`/`lostpointercapture` event is dispatched, and events
+// are not retargeted — a test fires the drag's pointer events on the element
+// itself.
+if (!('setPointerCapture' in domWindow.Element.prototype)) {
+  const captures = new WeakMap<Element, Set<number>>();
+  const capturesOf = (element: Element): Set<number> => {
+    const set = captures.get(element) ?? new Set<number>();
+    captures.set(element, set);
+    return set;
+  };
+  Object.defineProperties(domWindow.Element.prototype, {
+    setPointerCapture: {
+      configurable: true,
+      value(this: Element, pointerId: number) {
+        capturesOf(this).add(pointerId);
+      },
+    },
+    hasPointerCapture: {
+      configurable: true,
+      value(this: Element, pointerId: number) {
+        return capturesOf(this).has(pointerId);
+      },
+    },
+    releasePointerCapture: {
+      configurable: true,
+      value(this: Element, pointerId: number) {
+        capturesOf(this).delete(pointerId);
+      },
+    },
   });
 }
 
