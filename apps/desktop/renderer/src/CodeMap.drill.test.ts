@@ -1,8 +1,10 @@
 /**
  * P4-7e: the drill in `CodeMap` — the expand/collapse button on a revealed
- * Node's card, the ref and stub cards (render-only), the ref connector,
- * `layoutNodes`' Revealed extras, and the hook wiring (source pins: the
- * component's hooks can't run under `node --test`).
+ * Node's card, the ref and stub cards (render-only), the ref connector and
+ * `layoutNodes`' Revealed extras, as hookless components.
+ *
+ * P4-8f: the hook wiring is rendered in `CodeMap.drill.dom.test.tsx`; the
+ * one source pin left here (the drill step's wiring) is not in P4-8f's list.
  *
  * What this cannot reach: the live canvas (a real expand on driller/app, the
  * ~150 ms budget, the cards' look) — the P4-7e live check.
@@ -224,23 +226,21 @@ describe('the ref and stub cards', () => {
     ]);
   });
 
-  it('review round 1: a connector is never followed — edge clicks on it are ignored, so no card id enters history', () => {
+  // P4-8f: the pure half of the connector pin (its click handling is rendered in `CodeMap.drill.dom.test.tsx`).
+  it('a connector id is recognised as one; a real edge id is not', () => {
     const [connector] = revealRefConnectorEdges([ref]);
     assert.ok(connector !== undefined && isRevealConnectorEdgeId(connector.id));
     assert.equal(isRevealConnectorEdgeId('src/a.ts::serviceB→src/r.ts::repository:CALLS:0'), false);
-    const start = codeMapSrc.indexOf('const handleEdgeClick: EdgeMouseHandler<FlowEdge> = useCallback(');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('navigateToNode(edgeClickTarget(', start));
-    assert.match(body, /if \(isRevealConnectorEdgeId\(edge\.id\)\) \{\s*return;\s*\}/);
-    const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
-    assert.match(css, /\.code-map__edge--reveal-ref \{[^}]*pointer-events: none;/);
   });
 
-  it('both are registered node types, and styled', () => {
-    assert.match(codeMapSrc, /codeMapRevealRef: CodeMapRevealRefCard,\s*codeMapRevealStub: CodeMapRevealStubCard,/);
+  // P4-8f: the CSS halves of the connector and node-type pins (jsdom applies
+  // no stylesheet); the wiring is rendered in `CodeMap.drill.dom.test.tsx`.
+  it('styles.css: both cards and the connector are styled, and the connector never takes the pointer', () => {
     const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
     for (const selector of ['.code-map__reveal-ref', '.code-map__reveal-stub', '.code-map__edge--reveal-ref']) {
       assert.ok(css.includes(selector), selector);
     }
+    assert.match(css, /\.code-map__edge--reveal-ref \{[^}]*pointer-events: none;/);
   });
 });
 
@@ -352,15 +352,6 @@ describe('layoutNodes in Revealed', () => {
     assert.equal(a.data.crossSectionNote, '↗ Calls 3 Nodes in other sections (not shown in this section)');
     assert.equal('crossSectionNote' in b.data, false);
   });
-
-  it('never counts a stub or ref as a map Node (it is not a codeMapNode card)', () => {
-    const cards = revealedLayout();
-    for (const card of cards) {
-      if (card.type !== 'codeMapNode') {
-        assert.equal('node' in card.data, false);
-      }
-    }
-  });
 });
 
 describe('the hook wiring (source pins)', () => {
@@ -381,29 +372,5 @@ describe('the hook wiring (source pins)', () => {
     assert.match(body, /expandStub\(state, graph\.adjacency, graph\.reachById, stub\.parentId\)/);
     // A ref goes to its target through the existing navigation.
     assert.match(body, /\(ref: Extract<RevealAuxCard, \{ kind: 'ref' \}>\) => navigateToNode\(ref\.targetId\)/);
-  });
-
-  it('the drill graph is the fetched map’s own (its section’s), built only while Revealed is drawn', () => {
-    assert.match(
-      codeMapSrc,
-      /const revealDrillGraph =\s*revealDrawn && fetchState\.status === 'ready'\s*\? revealDrillGraphFor\(revealDrillGraphRef\.current, fetchState\.nodes, fetchState\.edges\)\s*: null;/,
-    );
-  });
-
-  it('the Revealed canvas carries the controls, the ref/stub cards, and draws their connectors', () => {
-    const body = sliceFrom('const revealCanvas = useMemo(', 'const flowNodes = useMemo(');
-    assert.match(body, /controls: revealDrillControls\(state, revealDrillGraph\.adjacency\)/);
-    assert.match(body, /const auxCards = revealAuxCards\(state, \(id\) => nameById\.get\(id\), revealDrillGraph\.adjacency\);/);
-    assert.match(
-      codeMapSrc,
-      /\.\.\.toFlowEdges\(revealCanvas\.population\.canvasEdges\),\s*\.\.\.revealRefConnectorEdges\(revealCanvas\.reveal\.auxCards\),/,
-    );
-  });
-
-  it('a refresh’s listing keeps the drill (the drill graph is passed to the reply rule)', () => {
-    assert.match(
-      codeMapSrc,
-      /const drillGraph =\s*started\.listing\.status === 'loading' && started\.listing\.previous !== null\s*\? revealDrillGraphFor\(revealDrillGraphRef\.current, mapNodes, mapStamp\)\s*: null;[\s\S]{0,700}?drillGraph,\s*\}\);/,
-    );
   });
 });

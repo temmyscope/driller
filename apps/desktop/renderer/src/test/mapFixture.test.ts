@@ -4,15 +4,20 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { BLAST_RADIUS_DEFAULT_HOPS } from '@driller/ipc-contracts';
+import { BLAST_RADIUS_DEFAULT_HOPS, type EntryCandidate } from '@driller/ipc-contracts';
+import { revealDrillGraphFor } from '../revealView';
 import {
+  drillHub,
+  drillMap,
   FIXTURE_NODES,
+  pathTraceBasicListing,
+  pathTraceBasicMap,
   PR_REVIEW_CONTRACT,
   PR_REVIEW_HOPS,
-  pathTraceBasicMap,
   prReviewDiffScope,
   prReviewMap,
   syntheticMap,
+  type CodeMapOk,
 } from './mapFixture';
 
 describe('pathTraceBasicMap', () => {
@@ -71,5 +76,37 @@ describe('the PR Review fixture (P4-8e)', () => {
     const plain = prReviewDiffScope();
     assert.ok(plain.status === 'resolved' && plain.changedContracts === undefined, 'no contract unless asked');
     assert.ok(map.nodes.find((node) => node.id === FIXTURE_NODES.repository.id)!.riskSignals.length > 0);
+  });
+});
+
+describe('P4-8f: the Revealed fixtures', () => {
+  it('each listed reach is the reach the renderer’s drill computes from the same map', () => {
+    const hubs = [drillHub(12, { grandchildren: true }), drillHub(31, { grandchildren: false })];
+    const cases: [CodeMapOk, EntryCandidate[]][] = [
+      [drillMap(hubs), hubs.map((hub) => hub.candidate)],
+      [pathTraceBasicMap(), pathTraceBasicListing().candidates],
+    ];
+    for (const [map, candidates] of cases) {
+      const graph = revealDrillGraphFor(null, map.nodes, map.edges);
+      for (const candidate of candidates) {
+        assert.equal(graph.reachById.get(candidate.id), candidate.reach, candidate.id);
+      }
+      const ids = new Set(map.nodes.map((node) => node.id));
+      assert.equal(ids.size, map.nodes.length, 'no id twice');
+      assert.ok(map.edges.every((edge) => ids.has(edge.source) && ids.has(edge.target)));
+    }
+  });
+
+  it('a hub has exactly its callees (and one leaf each, with grandchildren), every file project-relative', () => {
+    const hub = drillHub(13, { grandchildren: true });
+    const map = drillMap([hub]);
+    assert.equal(hub.callees.length, 13);
+    assert.equal(hub.leaves.length, 13);
+    assert.equal(map.nodes.length, 1 + 13 + 13);
+    assert.equal(map.edges.filter((edge) => edge.source === hub.hub.id).length, 13);
+    assert.equal(drillHub(30, { grandchildren: false }).leaves.length, 0);
+    for (const node of map.nodes) {
+      assert.match(node.file, /^hub13(\/c\d\d)?\.ts$/);
+    }
   });
 });

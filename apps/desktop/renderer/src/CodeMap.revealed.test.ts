@@ -1,12 +1,17 @@
 /**
  * P4-7d: the Revealed start view in `CodeMap` — Full map stays byte-identical
- * (`layoutNodes` with and without `positionOf`), Revealed lays out exactly the
- * revealed ids at `layeredLayout`'s positions, the candidate card, the
- * toggle, the none/error notice, and the hook wiring (source pins: the
- * component's hooks can't run under `node --test`).
+ * (`layoutNodes` with and without `positionOf`, and the frozen HEAD
+ * snapshot), Revealed lays out exactly the revealed ids at `layeredLayout`'s
+ * positions, the candidate card, the toggle and the none/error/stale notice
+ * as hookless components.
  *
- * What this cannot reach: the live canvas (fits, the Panel's placement, the
- * notice over the canvas, a real listing) — the P4-7d live check.
+ * P4-8f: the hook wiring is rendered in `CodeMap.revealed.dom.test.tsx`; the
+ * source pins left here are the listing guard and the unknown-section
+ * hand-off (not in P4-8f's list) and the dev-fixture branch (not renderable
+ * under the test loader).
+ *
+ * What this cannot reach: the live canvas (the Panel's placement, the
+ * notice's stacking, a real listing) — the P4-7d live check.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -183,29 +188,6 @@ describe('Full map is byte-identical (positionOf omitted)', () => {
       assert.ok(omitted.every((flowNode) => !('candidate' in flowNode.data)));
     });
   }
-
-  it('the flowNodes memo takes today’s exact call when revealCanvas is null', () => {
-    const start = codeMapSrc.indexOf('const flowNodes = useMemo(');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('const flowEdges = useMemo(', start));
-    assert.match(
-      body,
-      /revealCanvas === null\s*\? layoutNodes\(\s*population\.riskNodes,\s*activateNode,\s*showNeighbors,\s*openSourceForNode,\s*adjacency,\s*noSummaryBackendAvailable,\s*cloudSelectedNoKey,\s*showDeterministicSignals,\s*showLlmJudgment,\s*showIngestedFindings,\s*renderChangedIds,\s*population\.foldedNodes,\s*activateFoldedNode,\s*contractDependentsById,\s*\)\s*:/,
-    );
-    assert.match(
-      codeMapSrc,
-      /revealCanvas === null\s*\? toFlowEdges\(population\.canvasEdges\)\s*:/,
-    );
-    assert.match(
-      codeMapSrc,
-      /const lodInputNodes = useMemo<LODInputNode\[\]>\(\s*\(\) => flowNodes\.map\(\(flowNode\) => \(\{ id: flowNode\.id, position: flowNode\.position \}\)\),\s*\[flowNodes\],/,
-    );
-  });
-
-  it('revealCanvas is null outside Revealed in Code Map mode (default Full; PR Review renders Full)', () => {
-    assert.match(codeMapSrc, /const \[revealView, setRevealView\] = useState<RevealViewMode>\('full'\);/);
-    assert.match(codeMapSrc, /const revealDrawn = revealView === 'revealed' && mode === 'codeMap';/);
-    assert.match(codeMapSrc, /const revealCanvas = useMemo\(\(\) => \{\s*if \(!revealDrawn \|\| fetchState\.status !== 'ready'\) \{\s*return null;/);
-  });
 });
 
 // Review round 1: the frozen Full-map output of HEAD (46ecf2f, before P4-7d).
@@ -345,15 +327,6 @@ describe('Revealed lays out exactly the revealed ids', () => {
     assert.deepEqual(new Map(lodInput(flowNodes).map((entry) => [entry.id, entry.position])), positions);
     assert.deepEqual(drawn.canvasEdges, [edge('handleRequest', 'serviceA'), edge('handleRequest', 'serviceB')]);
   });
-
-  it('the Revealed branch passes the drawn population, positionOf, candidates and (P4-7e) the drill', () => {
-    assert.match(
-      codeMapSrc,
-      /: layoutNodes\(\s*revealCanvas\.population\.mapNodes,[\s\S]*?revealCanvas\.population\.foldedNodes,\s*activateFoldedNode,\s*contractDependentsById,\s*revealCanvas\.positionOf,\s*revealCanvas\.candidates,\s*revealCanvas\.reveal,\s*\)/,
-    );
-    // Numbers keep reading the full map.
-    assert.match(codeMapSrc, /const callEdges = useMemo\(\(\) => callEdgesOf\(population\.riskEdges\), \[population\]\);/);
-  });
 });
 
 function hostElements(root: unknown): RenderedElement[] {
@@ -432,19 +405,6 @@ describe('the toggle', () => {
     }
     assert.deepEqual(calls, ['revealed', 'full']);
   });
-
-  it('is in the canvas Panel only in Code Map mode, with an always-mounted status line', () => {
-    assert.match(
-      codeMapSrc,
-      /\{mode === 'codeMap' && \(\s*<>\s*<RevealViewToggle view=\{revealView\} onChange=\{changeRevealView\} \/>\s*<p className="code-map__reveal-status" role="status">\s*\{revealStatus\}/,
-    );
-    assert.match(
-      codeMapSrc,
-      /const revealStatus = revealStatusText\(\{\s*switchStatus: revealSwitchStatus,\s*announcement: revealAnnouncement,\s*notice: revealNotice,\s*capText: revealDrawn \? revealCapText\(revealHeld, currentRevealKey\) : null,\s*\}\);/,
-    );
-    // The only role="status" for Revealed: the notices carry none.
-    assert.equal(codeMapSrc.match(/className="code-map__reveal-status" role="status"/g)?.length, 1);
-  });
 });
 
 describe('the none/error/stale notice', () => {
@@ -483,78 +443,11 @@ describe('the none/error/stale notice', () => {
     assert.equal(RevealListingNotice({ notice: null, onShowFullMap: noop }), null);
     assert.equal(RevealListingNotice({ notice: { kind: 'loading', text: '…' }, onShowFullMap: noop }), null);
   });
-
-  it('is rendered over the canvas whenever Revealed has a canvas notice, counting the cards actually drawn', () => {
-    assert.match(
-      codeMapSrc,
-      /\{surfaces\.canvas && revealDrawn && isCanvasRevealNotice\(revealNotice\) && \(\s*<div className="code-map__notice code-map__notice--reveal">\s*<RevealListingNotice\s*notice=\{revealNotice\}\s*onShowFullMap=\{\(\) => changeRevealView\('full'\)\}\s*\/>/,
-    );
-    assert.match(codeMapSrc, /revealNoticeFor\(revealHeld, currentRevealKey, revealCanvas\?\.population\.mapNodes\.length \?\? 0\)/);
-    // One action only (EXPERIENCE.md): no Retry in the Revealed notice.
-    const notice = codeMapSrc.slice(
-      codeMapSrc.indexOf('export function RevealListingNotice('),
-      codeMapSrc.indexOf('export function CodeMapNodeCard('),
-    );
-    assert.equal(notice.match(/<button /g)?.length, 1);
-  });
-});
-
-describe('CodeMap source: review round 1 wiring', () => {
-  it('only an explicit toggle asks for a view, and resets cluster expansions', () => {
-    const start = codeMapSrc.indexOf('const changeRevealView = useCallback((next: RevealViewMode) => {');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, []);', start));
-    assert.match(body, /revealViewRequestForToggle\(\{\s*from: revealViewRef\.current,\s*to: next,/);
-    assert.match(body, /revealViewRequestRef\.current = request;\s*fullViewportRef\.current = saved;/);
-    assert.match(body, /setExpandedClusterIds\(new Set\(\)\);/);
-    // Nothing else writes a view request except a refresh's re-fit and the reload's drop.
-    assert.equal(codeMapSrc.match(/revealViewRequestRef\.current = /g)?.length, 5); // toggle, reload drop, refresh re-fit, apply's drop and done
-    assert.match(codeMapSrc, /revealViewRequestRef\.current = \{ target: 'revealed', key, mapStamp \};/);
-    assert.match(codeMapSrc, /\/\/ Review round 1: an owed view can't apply to another project or section\.\s*revealViewRequestRef\.current = null;/);
-  });
-
-  it('the apply effect goes through decideRevealView and bumps routeFitSeqRef', () => {
-    const start = codeMapSrc.indexOf('const decision = decideRevealView({');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [mode, revealDrawn, revealHeld, currentRevealKey', start));
-    assert.ok(start >= 0);
-    assert.match(body, /codeMapMode: mode === 'codeMap',/);
-    assert.match(body, /if \(decision\.kind === 'drop'\) \{\s*revealViewRequestRef\.current = null;/);
-    assert.match(body, /routeFitSeqRef\.current \+= 1;\s*void instance\.setViewport\(next\);/);
-  });
-
-  it('a refresh re-fits only through revealRefitOnListing; a user gesture marks the view moved', () => {
-    assert.match(codeMapSrc, /revealRefitOnListing\(\{\s*revealDrawn: revealDrawnRef\.current,\s*hadPrevious: started\.listing\.status === 'loading' && started\.listing\.previous !== null,\s*userMoved: revealUserMovedRef\.current,/);
-    assert.match(codeMapSrc, /if \(event\) \{\s*clearRouteClamp\(\);\s*\/\/[^\n]*\n\s*revealUserMovedRef\.current = true;/);
-  });
-
-  it('the first fit stops holding the canvas hidden when Revealed has nothing to draw', () => {
-    assert.match(codeMapSrc, /if \(initialFitRetry >= INITIAL_FIT_MAX_RETRIES \|\| revealEndsFirstFitWait\(revealDrawn, lodInputNodes\.length\)\) \{\s*\/\/[^\n]*\n[^\n]*\n\s*setAwaitingFirstFit\(false\);/);
-  });
-
-  it('the switch status clears on the next navigation (not the replay), a mode change, or after a timeout', () => {
-    assert.match(codeMapSrc, /if \(!replayingFullNavigationRef\.current\) \{\s*setRevealSwitchStatus\(null\);/);
-    assert.match(codeMapSrc, /replayingFullNavigationRef\.current = true;\s*try \{/);
-    assert.match(codeMapSrc, /const timer = setTimeout\(\(\) => setRevealSwitchStatus\(null\), REVEAL_SWITCH_STATUS_MS\);\s*return \(\) => clearTimeout\(timer\);/);
-    assert.match(codeMapSrc, /if \(revealStatusModeRef\.current !== mode\) \{\s*revealStatusModeRef\.current = mode;\s*setRevealSwitchStatus\(null\);/);
-  });
 });
 
 describe('CodeMap source: the listing fetch and its guard', () => {
   const start = codeMapSrc.indexOf('// P4-7d: the entry-candidate listing for the map on screen');
   const body = codeMapSrc.slice(start, codeMapSrc.indexOf('// P4-7d: a navigation to a Node Revealed', start));
-
-  it('fetches with the section of the map on screen, once per map fetch', () => {
-    assert.ok(start >= 0);
-    // P4-7g: and once per pins revision (a pin change on the same map).
-    assert.match(body, /if \(!needsRevealListing\(revealHeldRef\.current, currentRevealKey, revealMapStamp, entryPinsRevision\)\) \{\s*return;/);
-    assert.match(body, /window\.driller\.listEntryCandidates\(projectPath, requestedSection \?\? undefined\)/);
-    assert.match(codeMapSrc, /const revealMapStamp = fetchState\.status === 'ready' \? fetchState\.edges : null;/);
-    assert.match(
-      body,
-      /\}, \[\s*revealDrawn,\s*projectPath,\s*revealMapStamp,\s*revealSection,\s*currentRevealKey,\s*revealListingRequests,\s*isDevFixtureMode,\s*entryPinsRevision,\s*\]\);/,
-    );
-    // A dev-fixture session has no Graph Service map: an explicit error, never a listing of another map.
-    assert.match(body, /if \(isDevFixtureMode\) \{\s*\/\/[^\n]*\n\s*settle\(\{ status: 'error', message: DEV_FIXTURE_NO_ENTRY_CANDIDATES \}\);\s*return;/);
-  });
 
   it('drops out-of-order replies: the latest-request guard and the section on screen', () => {
     assert.match(body, /const requestId = revealListingRequests\.begin\(\);/);
@@ -566,55 +459,13 @@ describe('CodeMap source: the listing fetch and its guard', () => {
     assert.match(body, /onUnknownSectionRef\.current\?\.\(outcome\.section\);/);
   });
 
-  it('a reload or section switch drops the held state and invalidates a listing in flight', () => {
-    const load = codeMapSrc.slice(
-      codeMapSrc.indexOf('const loadCodeMap = useCallback(() => {'),
-      codeMapSrc.indexOf('}, [fixtureNodeCount, clearDiffScopeSync]);'),
-    );
-    assert.match(load, /setRevealHeld\(null\);\s*revealHeldRef\.current = null;\s*revealListingRequests\.begin\(\);/);
-  });
-
-  it('a project change resets the toggle to Full', () => {
-    const effectEnd = codeMapSrc.indexOf("    setRevealView('full');\n  }, [projectPath, clearDiffScopeSync]);");
-    assert.ok(effectEnd >= 0);
+  // P4-8f: kept from the listing-fetch pin, which `CodeMap.revealed.dom.test.tsx`
+  // otherwise replaces. A dev-fixture session can't be rendered under the test
+  // loader (`import.meta.env.DEV` is compiled to `false`, so
+  // `readFixtureNodeCount` never reads `?fixtureNodes=`).
+  it('a dev-fixture session has no Graph Service map: an explicit error, never a listing of another map', () => {
+    assert.ok(start >= 0);
+    assert.match(body, /if \(isDevFixtureMode\) \{\s*\/\/[^\n]*\n\s*settle\(\{ status: 'error', message: DEV_FIXTURE_NO_ENTRY_CANDIDATES \}\);\s*return;/);
   });
 });
 
-describe('CodeMap source: navigating to a hidden Node switches to Full', () => {
-  it('every navigation entry routes through the full-map switch first', () => {
-    assert.match(
-      codeMapSrc,
-      /const navigateToNodeImpl = useCallback\(\s*\(id: string\) => \{\s*if \(routeThroughFullMapRef\.current\(\[id\], \{ kind: 'navigate', id \}\)\) \{\s*return;/,
-    );
-    assert.equal(
-      codeMapSrc.match(/if \(routeThroughFullMapRef\.current\(\[id\], \{ kind: 'history', id, index: nextIndex \}\)\) \{\s*return;/g)
-        ?.length,
-      2,
-    );
-    assert.match(
-      codeMapSrc,
-      /\(path: string\[\]\) => \{\s*\/\/ P4-7d: [^\n]*\n\s*if \(routeThroughFullMapRef\.current\(path, \{ kind: 'fit', ids: path \}\)\) \{\s*return;/,
-    );
-  });
-
-  it('the switch keeps the reveal state, says so in the status line, and replays the navigation on Full', () => {
-    const start = codeMapSrc.indexOf('routeThroughFullMapRef.current = (ids, action) => {');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('\n  };\n', start));
-    assert.match(body, /if \(!revealDrawn \|\| fetchState\.status !== 'ready'\) \{[\s\S]*?return false;\s*\}/);
-    assert.match(
-      body,
-      /pendingFullNavigationRef\.current = action;\s*setRevealSwitchStatus\(revealSwitchMessage\(target\.name\)\);\s*setExpandedClusterIds\(new Set\(\)\);\s*setRevealView\('full'\);/,
-    );
-    assert.doesNotMatch(body, /setRevealHeld/);
-    assert.match(codeMapSrc, /case 'navigate':\s*navigateToNodeImplRef\.current\(pending\.id\);/);
-    assert.match(codeMapSrc, /case 'fit':\s*fitViewToPath\(\[\.\.\.pending\.ids\]\);/);
-  });
-
-  it('a cross-section focus target Revealed doesn’t draw still resolves (then switches)', () => {
-    assert.match(codeMapSrc, /resolveMapNode: \(id\) => mapNodeOf\(flowNodesById\.get\(id\)\) \?\? revealHiddenMapNode\(id\),/);
-    assert.match(
-      codeMapSrc,
-      /const revealHiddenMapNode = \(id: string\): CodeMapNode \| undefined =>\s*revealDrawn && fetchState\.status === 'ready' \? fetchState\.nodes\.find\(\(node\) => node\.id === id\) : undefined;/,
-    );
-  });
-});

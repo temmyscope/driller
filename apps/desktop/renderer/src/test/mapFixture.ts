@@ -31,6 +31,8 @@ import type {
   CodeMapNode,
   CodeMapResult,
   DiffScopeResult,
+  EntryCandidate,
+  EntryCandidatesResult,
   FoldedModule,
   FoldedType,
   RiskSignal,
@@ -306,4 +308,83 @@ export const PR_REVIEW_HOPS: Readonly<Record<string, number>> = {
 
 export function prReviewBlastRadius(): BlastRadiusExpansionResult {
   return { status: 'resolved', hopDistances: { ...PR_REVIEW_HOPS } };
+}
+
+// ---------------------------------------------------------------------------
+// P4-8f: Revealed — entry-candidate listings and drill maps
+// ---------------------------------------------------------------------------
+
+/** One entry candidate for `node`, as `listEntryCandidates` reports it (no callers in indexed code). */
+export function entryCandidate(node: CodeMapNode, reach: number): EntryCandidate {
+  return {
+    id: node.id,
+    name: node.name,
+    file: node.file,
+    startLine: node.startLine,
+    endLine: node.endLine,
+    reach,
+    reason: { kind: 'no-callers' },
+  };
+}
+
+/** A `listEntryCandidates` reply that found candidates. */
+export type FoundListing = Extract<EntryCandidatesResult, { status: 'found' }>;
+
+/** A `found` listing of `candidates` (no shared reach: `relations: []`). */
+export function foundListing(candidates: readonly EntryCandidate[], totalQualifying = candidates.length): FoundListing {
+  return { status: 'found', candidates: structuredClone([...candidates]), totalQualifying, relations: [] };
+}
+
+/** `path-trace-basic`'s listing: `handleRequest`, reaching the other 4 Nodes of its call graph (P4-7b). */
+export function pathTraceBasicListing(): FoundListing {
+  return foundListing([entryCandidate(FIXTURE_NODES.handleRequest, 4)]);
+}
+
+/**
+ * A drill hub's shape: `hub<N>` (`hub<N>.ts`) calls N callees
+ * (`hub<N>/c<k>.ts::hub<N>_c<k>`, k from 01); with `grandchildren`, each
+ * callee calls one leaf of its own (`…_leaf`), so a two-layer reveal has
+ * something to open.
+ */
+export interface DrillHub {
+  readonly hub: CodeMapNode;
+  readonly callees: readonly CodeMapNode[];
+  readonly leaves: readonly CodeMapNode[];
+  /** Its candidate, with the reach its edges give it. */
+  readonly candidate: EntryCandidate;
+}
+
+export function drillHub(size: number, { grandchildren }: { grandchildren: boolean }): DrillHub {
+  const name = `hub${size}`;
+  const hub = fn(`${name}.ts`, name, 1, 9);
+  const callees = Array.from({ length: size }, (_, index) => {
+    const k = String(index + 1).padStart(2, '0');
+    return fn(`${name}/c${k}.ts`, `${name}_c${k}`, 1, 5);
+  });
+  const leaves = grandchildren ? callees.map((callee) => fn(callee.file, `${callee.name}_leaf`, 6, 9)) : [];
+  return { hub, callees, leaves, candidate: entryCandidate(hub, callees.length + leaves.length) };
+}
+
+/**
+ * A map of drill hubs (each a root with no callers in indexed code). The
+ * tests size them from the thresholds (`REVEAL_TWO_LAYER_MAX`,
+ * `REVEAL_LAYER_CAP`) to hit 12, 13, 30 and 31 callees.
+ */
+export function drillMap(hubs: readonly DrillHub[]): CodeMapOk {
+  const nodes = hubs.flatMap(({ hub, callees, leaves }) => [hub, ...callees, ...leaves]);
+  const edges = hubs.flatMap(({ hub, callees, leaves }) => [
+    ...callees.map((callee) => calls(hub, callee)),
+    ...leaves.map((leaf, index) => calls(callees[index]!, leaf)),
+  ]);
+  return structuredClone({
+    status: 'ok',
+    nodes,
+    edges,
+    hiddenByScope: 0,
+    appliedScope: [],
+    foldedTypes: [],
+    foldedModules: [],
+    section: null,
+    sections: [],
+  } satisfies CodeMapOk);
 }
