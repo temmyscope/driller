@@ -12,8 +12,11 @@
  *
  * Limits and leak checks (P4-8a), so the gate can't hang or leave a mess:
  * - every test gets `--test-timeout` (`PER_TEST_TIMEOUT_MS`); on Node 22
- *   the runner applies it to each test file's process too, so there it also
- *   bounds a whole file (Node 24 and later: the test alone);
+ *   the runner applies it to each test file's process too, so there it
+ *   bounds a whole file instead (Node 24 and later: the test alone). The
+ *   larger render-test files take ~11 s locally, so on Node < 24 the
+ *   limit is `PER_FILE_TIMEOUT_MS_NODE22` (the suite wall limit still
+ *   bounds everything);
  * - the whole run gets `SUITE_WALL_LIMIT_MS`, after which the runner's
  *   entire process group is killed (it is spawned detached for that);
  * - the run gets a temp dir of its own (`npm-test-run-*`, set as
@@ -57,6 +60,8 @@ const TEST_PATTERNS = [
 ];
 
 const PER_TEST_TIMEOUT_MS = 20_000;
+const PER_FILE_TIMEOUT_MS_NODE22 = 120_000;
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
 const SUITE_WALL_LIMIT_MS = 240_000;
 
 /** How long a process may take to finish exiting before it counts as leaked. */
@@ -75,7 +80,10 @@ function tightened(limitMs, override) {
   return Number.isInteger(value) && value > 0 ? Math.min(limitMs, value) : limitMs;
 }
 
-const perTestTimeoutMs = tightened(PER_TEST_TIMEOUT_MS, process.env.DRILLER_TEST_TIMEOUT_MS);
+const perTestTimeoutMs = tightened(
+  NODE_MAJOR < 24 ? PER_FILE_TIMEOUT_MS_NODE22 : PER_TEST_TIMEOUT_MS,
+  process.env.DRILLER_TEST_TIMEOUT_MS,
+);
 const suiteWallLimitMs = tightened(SUITE_WALL_LIMIT_MS, process.env.DRILLER_TEST_WALL_LIMIT_MS);
 
 const explicitFiles = process.argv.slice(2);
@@ -239,7 +247,7 @@ const env = {
 delete env.NODE_TEST_CONTEXT;
 
 process.stdout.write(
-  `npm test: ${matches.length} files, ${perTestTimeoutMs / 1000} s per test, ${suiteWallLimitMs / 1000} s for the suite\n`,
+  `npm test: ${matches.length} files, ${perTestTimeoutMs / 1000} s per ${NODE_MAJOR < 24 ? 'file' : 'test'}, ${suiteWallLimitMs / 1000} s for the suite\n`,
 );
 
 const runner = spawn(
