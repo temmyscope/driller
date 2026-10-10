@@ -14,8 +14,6 @@
  * P4-4h live check.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import type { CodeMapNode, CrossSectionCall, DiffScopeResult, SectionChangeCount } from '@driller/ipc-contracts';
@@ -58,8 +56,6 @@ import { mapFooterState } from './appFrame';
 import { resolveRefreshOutcome } from './sessionView';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
-const codeMapSrc = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-const appSrc = readFileSync(fileURLToPath(new URL('./App.tsx', import.meta.url)), 'utf8');
 
 const IDLE_BLAST_RADIUS: BlastRadiusState = { status: 'idle' };
 
@@ -239,18 +235,6 @@ describe('the changed-elsewhere data path', () => {
     );
   });
 
-  it('is rendered beneath the change count, outside its live region, switching through onSwitchSection', () => {
-    const count = codeMapSrc.indexOf('{formatDiffScopeChangeCount(');
-    const line = codeMapSrc.indexOf('<ChangedElsewhereLine', count);
-    assert.ok(count >= 0 && line > count);
-    const closeCount = codeMapSrc.indexOf('</p>', count);
-    assert.ok(closeCount < line, 'the line sits after the count paragraph');
-    const between = codeMapSrc.slice(count, closeCount);
-    assert.match(between, /changedElsewhereAnnouncement\(prReviewChangedInOtherSections\)/);
-    const props = codeMapSrc.slice(line, codeMapSrc.indexOf('/>', line));
-    assert.match(props, /changedInOtherSections=\{prReviewChangedInOtherSections\}/);
-    assert.match(props, /onSwitchSection=\{handleSwitchSectionFromPrReview\}/);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -442,60 +426,6 @@ describe('CrossSectionMissNotice', () => {
   });
 });
 
-describe('CodeMap consumes pendingFocusNodeId (source)', () => {
-  const start = codeMapSrc.indexOf('const decision = decidePendingFocus({');
-  const effect = codeMapSrc.slice(start, codeMapSrc.indexOf('const handleSwitchSectionFromDetail', start));
-
-  it('decides with the section prop, the fetch, the canvas and its first fit', () => {
-    assert.ok(start >= 0);
-    assert.match(effect, /pendingFocusNodeId,\n\s+section,\n\s+fetchState,/);
-    assert.match(effect, /canvasReady: reactFlowInstanceRef\.current !== null && !awaitingFirstFit/);
-    assert.match(effect, /resolveMapNode: \(id\) => mapNodeOf\(flowNodesById\.get\(id\)\)/);
-  });
-
-  it('does nothing until the decision is final, then reports it consumed once', () => {
-    const early = effect.indexOf("if (decision.kind === 'none' || decision.kind === 'wait') {");
-    const consumed = effect.indexOf('onPendingFocusConsumedRef.current?.();');
-    assert.ok(early >= 0 && consumed > early);
-  });
-
-  it('selects through navigateToNode, opens Node detail without a canvas, and says when it is missing', () => {
-    assert.match(effect, /case 'focus': \{\n\s+navigateToNode\(decision\.id\);/);
-    assert.match(effect, /\.focus\(\{ preventScroll: true \}\)/);
-    assert.match(effect, /case 'open-detail':[\s\S]*openNodeDetail\(decision\.node\);/);
-    assert.match(effect, /case 'missing': \{[\s\S]*setCrossSectionMiss\(/);
-  });
-
-  it('a new load clears the missing notice', () => {
-    const load = codeMapSrc.slice(
-      codeMapSrc.indexOf('const loadCodeMap = useCallback(() => {'),
-      codeMapSrc.indexOf('}, [fixtureNodeCount, clearDiffScopeSync]);'),
-    );
-    assert.match(load, /setCrossSectionMiss\(null\);/);
-  });
-});
-
-describe('App switches through the Section bar path (source)', () => {
-  it('handleSwitchSection uses the Section bar\'s transition and keeps the callee', () => {
-    const start = appSrc.indexOf('const handleSwitchSection = useCallback(');
-    assert.ok(start >= 0);
-    const body = appSrc.slice(start, appSrc.indexOf('}, [transitionSectionShell]);', start));
-    assert.match(body, /transitionSectionShell\(\(current\) => applySectionActivated\(current, next\)\);/);
-    assert.match(body, /setPendingSectionFocus\(pendingFocusForSwitch\(next, focusNodeId\)\);/);
-  });
-
-  it('a Section bar tab cancels a pending focus', () => {
-    const start = appSrc.indexOf('const handleSectionChange = useCallback(');
-    const body = appSrc.slice(start, appSrc.indexOf('}, [transitionSectionShell]);', start));
-    assert.match(body, /setPendingSectionFocus\(null\);/);
-  });
-
-  it('the unknown-section fallback drops a pending focus (review round 1)', () => {
-    const start = appSrc.indexOf('const handleUnknownSection = useCallback(');
-    const body = appSrc.slice(start, appSrc.indexOf('}, []);', start));
-    assert.match(body, /setPendingSectionFocus\(null\);/);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // The footer's counts reach App unchanged
@@ -563,26 +493,6 @@ describe('prReviewSwitchFocusTarget', () => {
   });
 });
 
-describe('focus wiring (source)', () => {
-
-  it('Health Audit: the selected Section bar tab is focused before Node detail opens (its opener)', () => {
-    const start = codeMapSrc.indexOf("case 'open-detail': {");
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('return;', start));
-    const tab = body.indexOf('document.getElementById(tabId)?.focus();');
-    const open = body.indexOf('openNodeDetail(decision.node);');
-    assert.ok(tab >= 0 && open > tab);
-  });
-
-  it('a missed callee focuses the notice\'s Dismiss; dismissing focuses the selected tab', () => {
-    assert.match(
-      codeMapSrc,
-      /if \(crossSectionMiss !== null\) \{\s*document\.getElementById\(CROSS_SECTION_MISS_DISMISS_ID\)\?\.focus\(\);/,
-    );
-    const start = codeMapSrc.indexOf('const dismissCrossSectionMiss = useCallback(');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [fetchState, section]);', start));
-    assert.match(body, /setCrossSectionMiss\(null\);[\s\S]*document\.getElementById\(tabId\)\?\.focus\(\);/);
-  });
-});
 
 describe('CrossSectionMissNotice is described by its text', () => {
   it('the Dismiss button carries the id the focus effect uses and is described by the notice', () => {
@@ -651,50 +561,6 @@ describe('diffScopeCarryReplyApplies (stale replies)', () => {
   });
 });
 
-describe('the carry flow (source)', () => {
-  const start = codeMapSrc.indexOf('const startDiffScopeCarry = useCallback(');
-  const body = codeMapSrc.slice(start, codeMapSrc.indexOf('startDiffScopeCarryRef.current = startDiffScopeCarry;', start));
-
-  it('keeps the base ref, marks the check pending, checks it, and settles through applyDiffScopeCarryReply', () => {
-    assert.match(body, /const carryId = \+\+diffCarryRequestIdRef\.current;\s*setBaseRefInput\(carry\.input\);\s*setDiffCarryPending\(carry\);/);
-    assert.match(body, /\.checkDiffScopeCarry\(projectPath, carry\.from, carry\.to, carry\.ref\)/);
-    assert.match(body, /latestCarryId: diffCarryRequestIdRef\.current,\s*carryTo: carry\.to,\s*currentSection: sectionRef\.current,\s*mode: diffCarrySourceRef\.current\.mode,/);
-    assert.match(body, /done: \(\) => setDiffCarryPending\(null\),/);
-    assert.match(body, /rerun: \(\) => \{\s*setDiffCarryNote\(diffScopeCarryAnnouncement\(carry\)\);\s*runDiffScope\(carry\.input\);/);
-    assert.match(body, /reset: \(\) => setBaseRefInput\(''\),/);
-    assert.match(body, /\.catch\(\(error: unknown\) =>\s*settle\(\{ status: 'error'/);
-  });
-
-  it('typing in the base-ref input cancels a check in flight', () => {
-    assert.match(
-      codeMapSrc,
-      /onChange=\{\(event\) => \{[^}]*diffCarryRequestIdRef\.current \+= 1;\s*setDiffCarryPending\(null\);\s*setBaseRefInput\(event\.target\.value\);/,
-    );
-  });
-
-  it('unmount moves both request ids on', () => {
-    assert.match(
-      codeMapSrc,
-      /const carryIds = diffCarryRequestIdRef;\s*const diffIds = diffScopeRequestIdRef;\s*return \(\) => \{\s*carryIds\.current \+= 1;\s*diffIds\.current \+= 1;/,
-    );
-  });
-
-  it('a load or refresh drops a check in flight', () => {
-    const load = codeMapSrc.slice(
-      codeMapSrc.indexOf('const loadCodeMap = useCallback(() => {'),
-      codeMapSrc.indexOf('}, [fixtureNodeCount, clearDiffScopeSync]);'),
-    );
-    assert.match(load, /setDiffCarryNote\(null\);\s*diffCarryRequestIdRef\.current \+= 1;\s*setDiffCarryPending\(null\);/);
-    const refresh = codeMapSrc.slice(codeMapSrc.indexOf('const refreshCodeMap = useCallback(() => {'));
-    assert.match(refresh.slice(0, 2000), /setDiffCarryNote\(null\);\s*diffCarryRequestIdRef\.current \+= 1;\s*setDiffCarryPending\(null\);/);
-  });
-
-  it('the section effect starts the carry after the reset', () => {
-    const start = codeMapSrc.indexOf('const carry = diffScopeCarryCandidate({ ...diffCarrySourceRef.current, from, to: section });');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [loadCodeMap, section]);', start));
-    assert.match(body, /loadCodeMap\(\);\s*if \(carry !== null\) \{\s*startDiffScopeCarryRef\.current\(carry\);/);
-  });
-});
 
 describe('applyDiffScopeCarryReply (carry review: the settle, behaviourally)', () => {
   const base = { carryId: 4, latestCarryId: 4, carryTo: 'api', currentSection: 'api', mode: 'prReview' as const };

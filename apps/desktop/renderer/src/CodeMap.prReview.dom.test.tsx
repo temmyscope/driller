@@ -34,6 +34,12 @@ import {
 
 afterEach(cleanupAfterEach);
 
+/** Never `assert.equal(element, null)`: a failing diff of a jsdom element takes minutes (it looks like a hang). */
+function assertAbsent(element: Element | null | undefined, what: string): void {
+  assert.ok(element === null || element === undefined, `${what} is absent`);
+}
+
+
 /** 8a allows 20 s per test; these finish well under 2 s (doubled under CI, P4-8b's convention). */
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
 const FIND = { timeout: 1_500 };
@@ -386,7 +392,7 @@ describe('PR Review: the sort (replaces the sort-wiring and sort-reset pins)', (
     await waitForRows(DEFAULT_ROWS[2]);
     fireEvent.click(sortButton(/^complexity/));
     fireEvent.click(screen.getByRole('button', { name: 'Retry the map refresh' }));
-    await waitFor(() => assert.equal(table(), null), FIND);
+    await waitFor(() => assertAbsent(table(), 'table()'), FIND);
     await waitFor(() => assert.equal(screen.queryByRole('button', { name: 'Retry the map refresh' }), null), FIND);
     await computeDiffScope('develop');
     await waitForRows(DEFAULT_ROWS[2]);
@@ -420,7 +426,7 @@ describe('PR Review: row activation (replaces the openNodeDetail / openType wiri
     assert.equal(modeRequests, 0);
     assert.ok(table(), 'still PR Review: the table stays');
     fireEvent.click(within(detail).getByRole('button', { name: /close/i }));
-    await waitFor(() => assert.equal(screen.queryByRole('dialog'), null), FIND);
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog'), 'screen.queryByRole(dialog)'), FIND);
     assertSameElement(document.activeElement, button, 'focus after closing Node detail');
     assert.deepEqual(ipcCalls(fake), before, 'opening Node detail asks main for nothing');
   });
@@ -442,7 +448,7 @@ describe('PR Review: row activation (replaces the openNodeDetail / openType wiri
     fireEvent.click(row);
     const detail = await screen.findByRole('dialog', { name: `Node detail: ${N.serviceA.name}` }, FIND);
     fireEvent.click(within(detail).getByRole('button', { name: /close/i }));
-    await waitFor(() => assert.equal(screen.queryByRole('dialog'), null), FIND);
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog'), 'screen.queryByRole(dialog)'), FIND);
 
     fireEvent.click(await findEdge(N.serviceA.id, N.repository.id));
     await waitFor(() => assert.equal(back.hasAttribute('disabled'), false, 'the edge moved on to serviceA'), FIND);
@@ -463,17 +469,69 @@ describe('PR Review: row activation (replaces the openNodeDetail / openType wiri
     fireEvent.click(tableButton);
     const typeDetail = await screen.findByRole('dialog', { name: `Type detail: ${PR_REVIEW_CONTRACT.name}` }, FIND);
     fireEvent.click(within(typeDetail).getByRole('button', { name: /close/i }));
-    await waitFor(() => assert.equal(screen.queryByRole('dialog'), null), FIND);
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog'), 'screen.queryByRole(dialog)'), FIND);
 
     // A click on another cell of the contract row does the same.
     fireEvent.click(table()!.querySelector('tr.code-map__metrics-contract td')!);
     await screen.findByRole('dialog', { name: `Type detail: ${PR_REVIEW_CONTRACT.name}` }, FIND);
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /close/i }));
-    await waitFor(() => assert.equal(screen.queryByRole('dialog'), null), FIND);
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog'), 'screen.queryByRole(dialog)'), FIND);
 
     fireEvent.click(within(screen.getByRole('group', { name: 'Changed contracts' })).getByRole('button', { name }));
     await screen.findByRole('dialog', { name: `Type detail: ${PR_REVIEW_CONTRACT.name}` }, FIND);
     assert.equal(fake.calls.getCodeMap.length, 1, 'the type comes from the map on screen');
+  });
+});
+
+describe('PR Review: where the divider sits, and the map as the focus fallback (P4-8k: replaces the divider-placement and .code-map pins)', () => {
+  it('no divider until there is a table; then one, right before it', BUDGET, async () => {
+    prReviewFake();
+    render(<CodeMap {...props()} />);
+    await waitForMap();
+    assertAbsent(screen.queryByRole('separator', { name: 'Resize metrics table' }), 'no table, no divider');
+    await computeDiffScope();
+    await waitForRows(DEFAULT_ROWS[2]);
+    const dividers = screen.getAllByRole('separator', { name: 'Resize metrics table' });
+    assert.equal(dividers.length, 1);
+    assert.ok(dividers[0]!.nextElementSibling === table(), 'the divider is directly before the table');
+  });
+
+  it('a layer whose opener has gone hands focus back to the map itself', BUDGET, async () => {
+    prReviewFake();
+    const { rerender } = render(<CodeMap {...props()} />);
+    await waitForMap();
+    await computeDiffScope();
+    await waitForRows(DEFAULT_ROWS[2]);
+    const row = within(table()!).getByRole('button', { name: /^serviceA/ });
+    row.focus();
+    fireEvent.click(row);
+    const detail = await screen.findByRole('dialog', { name: `Node detail: ${N.serviceA.name}` }, FIND);
+    // Code Map has no table: the row that opened Node detail is gone.
+    rerender(<CodeMap {...props({ mode: 'codeMap' })} />);
+    await waitFor(() => assertAbsent(table(), 'table()'), FIND);
+    assert.equal(row.isConnected, false);
+    fireEvent.click(within(detail).getByRole('button', { name: /close/i }));
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog'), 'screen.queryByRole(dialog)'), FIND);
+    const map = document.querySelector<HTMLElement>('.code-map');
+    await waitFor(() => assert.ok(map !== null && document.activeElement === map, `.code-map has focus (on ${document.activeElement?.className})`), FIND);
+  });
+});
+
+describe('PR Review: a reload closes the type detail (P4-8k: replaces the loadCodeMap reset pin)', () => {
+  it('a section switch closes an open type detail', BUDGET, async () => {
+    prReviewFake({
+      computeDiffScope: async () => prReviewDiffScope({ withContract: true }),
+      checkDiffScopeCarry: async () => ({ status: 'not-carried' }),
+    });
+    const { rerender } = render(<CodeMap {...props()} />);
+    await waitForMap();
+    await computeDiffScope();
+    const toolbar = await screen.findByRole('group', { name: 'Changed contracts' }, FIND);
+    fireEvent.click(within(toolbar).getByRole('button', { name: `Open the type detail of ${PR_REVIEW_CONTRACT.name}` }));
+    await screen.findByRole('dialog', { name: `Type detail: ${PR_REVIEW_CONTRACT.name}` }, FIND);
+    rerender(<CodeMap {...props({ section: 'api' })} />);
+    await waitForMap();
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog'), 'the type detail is closed'), FIND);
   });
 });
 

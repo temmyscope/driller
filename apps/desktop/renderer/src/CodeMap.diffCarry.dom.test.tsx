@@ -15,7 +15,7 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { env } from 'node:process';
 import { useState } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { CodeMapResult, DiffScopeCarryResult, DiffScopeResult } from '@driller/ipc-contracts';
 import { CodeMap, type CodeMapProps } from './CodeMap';
 import { SectionBar } from './SectionBar';
@@ -109,7 +109,19 @@ function props(overrides: Partial<CodeMapProps> = {}): CodeMapProps {
 }
 
 /** App's side, in miniature: the section is its state; the Section bar and `onSwitchSection` both set it. */
-function Shell({ switches, dataVersion = 0, projectPath = PROJECT }: { switches: string[]; dataVersion?: number; projectPath?: string }) {
+function Shell({
+  switches,
+  dataVersion = 0,
+  projectPath = PROJECT,
+  mode = 'prReview',
+  onDiffScopeSynced = () => {},
+}: {
+  switches: string[];
+  dataVersion?: number;
+  projectPath?: string;
+  mode?: CodeMapProps['mode'];
+  onDiffScopeSynced?: CodeMapProps['onDiffScopeSynced'];
+}) {
   const [section, setSection] = useState<string | null>('web');
   return (
     <>
@@ -119,6 +131,8 @@ function Shell({ switches, dataVersion = 0, projectPath = PROJECT }: { switches:
           projectPath,
           section,
           dataVersion,
+          mode,
+          onDiffScopeSynced,
           onSwitchSection: (next) => {
             switches.push(next);
             setSection(next);
@@ -285,6 +299,145 @@ describe('the diff carry’s status lines (replaces the carry-flow line pins)', 
     assert.deepEqual(statusLines(), ['Computing diff scope…']);
     await act(async () => pending.diffs[1]!.resolve(API_DIFF));
     await waitFor(() => assert.match(statusLines()[0] ?? '', /^Diffed against abc123/), FIND);
+  });
+});
+
+describe('PR Review’s "changed elsewhere" line (P4-8j: replaces the line-placement pin)', () => {
+  it('sits right beneath the change count, outside every live region; the count’s status says it instead', BUDGET, async () => {
+    carryFake();
+    const switches: string[] = [];
+    render(<Shell switches={switches} />);
+    await waitForDrawn([S.render.id, S.layout.id]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Compute diff scope' }));
+    });
+    const line = await screen.findByRole('list', { name: 'Changed in other sections' }, FIND);
+    const count = line.previousElementSibling;
+    assert.ok(count !== null && count.getAttribute('role') === 'status', 'the line follows a status paragraph');
+    assert.match(count.textContent ?? '', /^Diffed against abc123 — 1 changed Node\./, 'that paragraph is the change count');
+    assert.ok(line.closest('[role="status"]') === null, 'the line (and its buttons) is in no live region');
+    assert.ok((count.textContent ?? '').endsWith(' Also changed in api/: 1 changed Node.'), `the count says it (${count.textContent})`);
+    assert.equal(line.textContent, 'api/: 1 changed Node — Switch to api');
+    await act(async () => {
+      fireEvent.click(within(line).getByRole('button', { name: 'Switch to api' }));
+    });
+    assert.deepEqual(switches, ['api']);
+  });
+});
+
+describe('the carry check’s settle (P4-8j: replaces the carry-flow pin)', () => {
+  for (const [what, settle] of [
+    ['an error reply', (reply: Deferred<DiffScopeCarryResult>) => reply.resolve({ status: 'error', message: 'git failed' })],
+    ['a rejected check', (reply: Deferred<DiffScopeCarryResult>) => reply.reject(new Error('IPC down'))],
+  ] as const) {
+    it(`${what} clears the kept base ref and re-runs nothing`, BUDGET, async () => {
+      const { fake, pending } = carryFake();
+      render(<Shell switches={[]} />);
+      await switchToApiWithDiff();
+      await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+      assert.equal(baseRefInput().value, 'main', 'kept while the check runs');
+      await act(async () => settle(pending.carries[0]!));
+      assert.equal(baseRefInput().value, '');
+      assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
+      assert.equal(fake.calls.computeDiffScope.length, 1, 'no re-run');
+    });
+  }
+
+  it('PR Review left before a carried reply: nothing re-runs, and the check is over', BUDGET, async () => {
+    const { fake, pending } = carryFake();
+    const { rerender } = render(<Shell switches={[]} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+    rerender(<Shell switches={[]} mode="codeMap" />);
+    await act(async () => pending.carries[0]!.resolve({ status: 'same-repository' }));
+    assert.equal(fake.calls.computeDiffScope.length, 1, 'no diff is run outside PR Review');
+    rerender(<Shell switches={[]} mode="prReview" />);
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF], 'the check line is gone');
+    assert.equal(fake.calls.computeDiffScope.length, 1);
+  });
+});
+
+describe('what cancels a carry check in flight (P4-8j: replaces the cancel, unmount and reset pins)', () => {
+  it('typing in the base-ref input: the line is the prompt again, and a late carried reply neither re-runs nor touches the text', BUDGET, async () => {
+    const { fake, pending } = carryFake();
+    render(<Shell switches={[]} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+    assert.deepEqual(statusLines(), ['Checking whether main applies in api/…']);
+    fireEvent.change(baseRefInput(), { target: { value: 'dev' } });
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
+    await act(async () => pending.carries[0]!.resolve({ status: 'same-repository' }));
+    assert.equal(baseRefInput().value, 'dev');
+    assert.equal(fake.calls.computeDiffScope.length, 1, 'no re-run');
+    // A late "not carried" would clear the input: it must not either.
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
+  });
+
+  it('typing, then a late "not carried": what was typed stays', BUDGET, async () => {
+    const { pending } = carryFake();
+    render(<Shell switches={[]} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+    fireEvent.change(baseRefInput(), { target: { value: 'dev' } });
+    await act(async () => pending.carries[0]!.resolve({ status: 'not-carried' }));
+    assert.equal(baseRefInput().value, 'dev');
+  });
+
+  it('an unmount: a late carried reply runs no diff', BUDGET, async () => {
+    const { fake, pending } = carryFake();
+    const { unmount } = render(<Shell switches={[]} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+    unmount();
+    await act(async () => pending.carries[0]!.resolve({ status: 'same-repository' }));
+    assert.equal(fake.calls.computeDiffScope.length, 1);
+  });
+
+  it('an unmount: a late diff reply reports no sync time', BUDGET, async () => {
+    const synced: [string | null, number | null][] = [];
+    const { pending } = carryFake();
+    const { unmount } = render(<Shell switches={[]} onDiffScopeSynced={(path, at) => synced.push([path, at])} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+    await act(async () => pending.carries[0]!.resolve({ status: 'same-repository' }));
+    assert.deepEqual(statusLines(), ['Recomputing the diff against main in api/…']);
+    const before = synced.length;
+    unmount();
+    await act(async () => pending.diffs[0]!.resolve(API_DIFF));
+    assert.deepEqual(synced.slice(before), [], 'nothing reported after the unmount');
+  });
+
+  it('a reload (the map’s Retry): the line is the prompt, and the late carried reply re-runs nothing', BUDGET, async () => {
+    const { fake, pending } = carryFake();
+    render(<Shell switches={[]} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.reject(new Error('Graph Service busy')));
+    const retry = await screen.findByRole('button', { name: 'Retry' }, FIND);
+    assert.deepEqual(statusLines(), ['Checking whether main applies in api/…'], 'the check outlives a failed load');
+    await act(async () => {
+      fireEvent.click(retry);
+    });
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
+    await act(async () => pending.maps[1]!.resolve(sectionedMap('api')));
+    // The canvas mounts again after the failed load: let it draw (and fit) before the test ends.
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    await act(async () => pending.carries[0]!.resolve({ status: 'same-repository' }));
+    assert.equal(fake.calls.computeDiffScope.length, 1, 'no re-run');
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
+    assert.deepEqual(fake.calls.checkDiffScopeCarry.length, 1, 'a reload starts no check of its own');
+  });
+
+  it('a refresh (a new data version): the line is the prompt, and the late carried reply re-runs nothing', BUDGET, async () => {
+    const { fake, pending } = carryFake();
+    const { rerender } = render(<Shell switches={[]} />);
+    await switchToApiWithDiff();
+    await act(async () => pending.maps[0]!.resolve(sectionedMap('api')));
+    rerender(<Shell switches={[]} dataVersion={1} />);
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
+    await act(async () => pending.maps[1]!.resolve(sectionedMap('api')));
+    await act(async () => pending.carries[0]!.resolve({ status: 'ref-exists' }));
+    assert.equal(fake.calls.computeDiffScope.length, 1, 'no re-run');
+    assert.deepEqual(statusLines(), [ENTER_BASE_REF]);
   });
 });
 

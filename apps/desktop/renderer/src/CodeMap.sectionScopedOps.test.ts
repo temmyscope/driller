@@ -59,35 +59,6 @@ describe('settleSectionScopedReply', () => {
   });
 });
 
-describe('CodeMap source: the section reaches all three operations', () => {
-  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-
-  const calls: [string, RegExp][] = [
-    ['tracePath', /\.tracePath\(query, requestedSection \?\? undefined\)/],
-    [
-      'computeDiffScope',
-      /\.computeDiffScope\(projectPath, trimmedBaseRef\.length > 0 \? trimmedBaseRef : undefined, requestedSection \?\? undefined\)/,
-    ],
-    ['expandBlastRadius', /\.expandBlastRadius\(projectPath, seedNodeIds, requestedSection \?\? undefined\)/],
-  ];
-  for (const [name, call] of calls) {
-    it(`${name} is sent with the section and settled against the current one`, () => {
-      const at = src.search(call);
-      assert.ok(at >= 0, `${name} passes the section`);
-      assert.equal(src.match(new RegExp(`^\\s+\\.${name}\\(`, 'gm'))?.length, 1, `one ${name} call`);
-      const before = src.slice(Math.max(0, at - 600), at);
-      assert.match(before, /const requestedSection = sectionRef\.current;/, 'captured when the request is sent');
-      const after = src.slice(at, at + 3000);
-      assert.match(after, /settleSectionScopedReply\(reply, requestedSection, sectionRef\.current, \{/);
-      assert.match(
-        after,
-        /unknownSection: \(gone\) => \{[\s\S]{0,900}(onUnknownSectionRef\.current\?\.\(gone\);|blastRadiusStateOnUnknownSection\(gone, onUnknownSectionRef\.current\))/,
-      );
-      assert.match(after, /\.catch\(\(error: unknown\) => \{\s*if \([^)]*RequestIdRef\.current !== requestId \|\| requestedSection !== sectionRef\.current\) \{\s*return;/);
-    });
-  }
-});
-
 describe('preload: the section crosses the bridge only when given', () => {
   const src = readFileSync(fileURLToPath(new URL('../../preload/index.ts', import.meta.url)), 'utf8');
   it('each operation omits the argument for the whole scope and passes it otherwise', () => {

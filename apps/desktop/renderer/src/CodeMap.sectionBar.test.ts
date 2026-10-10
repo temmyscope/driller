@@ -10,8 +10,6 @@
  * (like `CodeMap.sectionScopedOps.test.ts`).
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import type { CodeMapNode, CodeMapResult, SectionNodeCount } from '@driller/ipc-contracts';
@@ -37,17 +35,6 @@ const SECTIONS: SectionNodeCount[] = [
   { path: 'api', nodeCount: 412 },
 ];
 
-const codeMapSrc = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-const appSrc = readFileSync(fileURLToPath(new URL('./App.tsx', import.meta.url)), 'utf8');
-
-/** The body of `const loadCodeMap = useCallback(() => { … }, [...]);`. */
-function loadCodeMapBody(): string {
-  const start = codeMapSrc.indexOf('const loadCodeMap = useCallback(() => {');
-  assert.ok(start >= 0);
-  const end = codeMapSrc.indexOf('}, [fixtureNodeCount, clearDiffScopeSync]);', start);
-  assert.ok(end > start);
-  return codeMapSrc.slice(start, end);
-}
 
 function node(id: string, severity: 'severe' | 'none'): CodeMapNode {
   return {
@@ -170,57 +157,6 @@ describe('Blast Radius unknown-section ends idle on all (P4-4e review (d))', () 
     assert.equal(shell.section, null, 'the shell is on all');
   });
 
-  it('…and that reload is loadCodeMap, keyed on the section, which resets the expansion to idle', () => {
-    // P4-4h (founder decision 2026-10-04): the effect also starts a PR Review carry after the reset.
-    assert.match(
-      codeMapSrc,
-      /useEffect\(\(\) => \{[^}]*const carry = diffScopeCarryCandidate\(\{ \.\.\.diffCarrySourceRef\.current, from, to: section \}\);\s*loadCodeMap\(\);[\s\S]*?\}, \[loadCodeMap, section\]\);/,
-    );
-    const body = loadCodeMapBody();
-    assert.match(body, /setBlastRadiusState\(\{ status: 'idle' \}\);/);
-    assert.match(body, /blastRadiusRequestIdRef\.current \+= 1;/);
-  });
-});
-
-describe('CodeMap source: a switch reloads through the full reset', () => {
-  it('loadCodeMap fetches the section on screen and resets everything a reload resets', () => {
-    const body = loadCodeMapBody();
-    assert.match(body, /const requestedSection = sectionRef\.current;\s*window\.driller\s*\.getCodeMap\(requestedSection \?\? undefined\)/);
-    for (const reset of [
-      /setHistory\(\{ stack: \[\], index: -1 \}\);/,
-      /updateNodeDetail\(\{ status: 'closed' \}\);/,
-      /setTypeDetail\(\{ status: 'closed' \}\);/,
-      /setPathTrace\(\{ status: 'idle' \}\);/,
-      /pathTraceRequestIdRef\.current \+= 1;/,
-      /setBaseRefInput\(''\);/,
-      /setDiffScopeState\(\{ status: 'idle' \}\);/,
-      /clearDiffScopeSync\(\);/,
-      /diffScopeRequestIdRef\.current \+= 1;/,
-    ]) {
-      assert.match(body, reset);
-    }
-  });
-
-  it('an unknown-section load is handed to the fallback before the error state', () => {
-    const body = loadCodeMapBody();
-    const handOff = body.indexOf('if (handOffUnknownSection(result, requestedSection, onUnknownSectionRef.current)) {');
-    const error = body.indexOf("setFetchState({ status: 'error', message: codeMapFailureMessage(result) });");
-    assert.ok(handOff >= 0 && error > handOff);
-  });
-
-  it('a refresh fetches the section and hands an unknown-section reply off too', () => {
-    const start = codeMapSrc.indexOf('const refreshCodeMap = useCallback(() => {');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('}, [isDevFixtureMode, updateNodeDetail, clearDiffScopeSync]);', start));
-    assert.match(body, /const requestedSection = sectionRef\.current;\s*window\.driller\s*\.getCodeMap\(requestedSection \?\? undefined\)/);
-    assert.match(
-      body,
-      /requestId === refreshRequestIdRef\.current &&\s*handOffUnknownSection\(result, requestedSection, onUnknownSectionRef\.current\)\s*\) \{\s*return;/,
-    );
-  });
-
-  it('the ready map carries the reply section and sections', () => {
-    assert.equal(codeMapSrc.match(/section: result\.section,\s*sections: result\.sections,/g)?.length, 2);
-  });
 });
 
 describe('regeneratedNodeForMap (P4-4d review round 1)', () => {
@@ -298,35 +234,3 @@ describe('empty section notice', () => {
   });
 });
 
-describe('App source: shell state and wiring', () => {
-
-  it('map reports for the open project settle the section shell', () => {
-    assert.match(
-      appSrc,
-      /if \(reportPath !== null && reportPath === currentProjectPathRef\.current\) \{\s*transitionSectionShell\(\(current\) => applyMapReportToSectionShell\(current, state\), state\);/,
-    );
-  });
-
-  it('the map region is the tabpanel, labelled by the selected tab, while the bar is shown', () => {
-    assert.match(
-      appSrc,
-      /<section\s+className="app__map"\s+id=\{SECTION_PANEL_ID\}\s+role=\{sectionBarShown \? 'tabpanel' : undefined\}\s+aria-labelledby=\{sectionPanelLabelledBy\}\s+aria-label=\{sectionPanelLabelledBy === undefined \? 'Code Map' : undefined\}/,
-    );
-    assert.match(
-      appSrc,
-      /const sectionPanelLabelledBy = sectionBarShown \? selectedSectionTabId\(sectionBarSource\.sections, section\) : undefined;/,
-    );
-  });
-
-  it('resets the section on a project open (with the mode) and on Close', () => {
-    assert.match(
-      appSrc,
-      /setMode\(wasAlreadyInRecentProjects \? 'codeMap' : 'healthAudit'\);\s*commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);/,
-    );
-    // P4-4 phase 3b: a pending cross-section focus goes with it.
-    assert.match(
-      appSrc,
-      /setMode\('codeMap'\);\s*commitSectionShell\(INITIAL_SECTION_SHELL_STATE\);\s*setPendingSectionFocus\(null\);\s*focusOpenFolderAfterCloseRef/,
-    );
-  });
-});

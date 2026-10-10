@@ -354,23 +354,14 @@ describe('layoutNodes in Revealed', () => {
   });
 });
 
-describe('the hook wiring (source pins)', () => {
-  const sliceFrom = (start: string, end: string) => {
-    const from = codeMapSrc.indexOf(start);
-    assert.ok(from >= 0, start);
-    return codeMapSrc.slice(from, codeMapSrc.indexOf(end, from));
-  };
-
-  it('a drill step is renderer-local: applied to the held state, never through window.driller', () => {
-    const body = sliceFrom('const applyRevealDrill = useCallback(', 'const revealCanvas = useMemo(');
+// P4-8k: kept as a static forbidden-pattern check. The drill's wiring (the
+// held state, the same-fetch guard, the stub and the ref) is asserted by
+// `CodeMap.drill.dom.test.tsx`.
+describe('the drill is renderer-local (forbidden pattern)', () => {
+  it('a drill step never goes through window.driller', () => {
+    const from = codeMapSrc.indexOf('const applyRevealDrill = useCallback(');
+    assert.ok(from >= 0);
+    const body = codeMapSrc.slice(from, codeMapSrc.indexOf('const revealCanvas = useMemo(', from));
     assert.doesNotMatch(body, /window\.driller/);
-    // P4-7f: the transition is planned against the held state (`planRevealDrill`).
-    assert.match(body, /applyRevealTransition\(revealHeldRef\.current, key, \(state\) => \{\s*const planned = plan\(state, graph\);/);
-    assert.match(body, /if \(graph === null \|\| graph\.edges !== mapStamp \|\| key === null\) \{\s*return;/);
-    assert.match(body, /revealHeldRef\.current = applied\.held;\s*setRevealHeld\(applied\.held\);/);
-    assert.match(body, /const planned = planRevealDrill\(state, graph, node\.id, action\);/);
-    assert.match(body, /expandStub\(state, graph\.adjacency, graph\.reachById, stub\.parentId\)/);
-    // A ref goes to its target through the existing navigation.
-    assert.match(body, /\(ref: Extract<RevealAuxCard, \{ kind: 'ref' \}>\) => navigateToNode\(ref\.targetId\)/);
   });
 });

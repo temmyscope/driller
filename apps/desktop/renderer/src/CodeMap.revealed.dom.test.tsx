@@ -129,12 +129,18 @@ function drawnIds(): string[] {
     .sort();
 }
 
-async function waitForDrawn(ids: readonly string[]): Promise<void> {
+async function waitForDrawn(ids: readonly string[]): Promise<void>;
+async function waitForDrawn(wait: { timeout: number }, ids: readonly string[]): Promise<void>;
+async function waitForDrawn(first: readonly string[] | { timeout: number }, second?: readonly string[]): Promise<void> {
+  const [wait, ids] = Array.isArray(first) ? [FIND, first as readonly string[]] : [first as { timeout: number }, second!];
   await waitFor(() => {
     measure();
     assert.deepEqual(drawnIds(), [...ids].sort());
-  }, FIND);
+  }, wait);
 }
+
+/** A drill draws a layered column per step; under load that takes longer than one card query. */
+const DRILL_WAIT = { timeout: 3_000 };
 
 /** A control on a card (drawn and measured first), by role and name. */
 async function findOnCanvas(name: string | RegExp): Promise<HTMLElement> {
@@ -640,6 +646,54 @@ describe('Resets (replaces the reload, section-switch and project-reset pins)', 
     assert.equal(fake.calls.listEntryCandidates.length, 4);
   });
 
+  it('a refresh while a listing is out: the newer listing wins, the older reply landing after it changes nothing (P4-8k)', BUDGET, async () => {
+    const listings = deferredListings();
+    let maps = 0;
+    const fake = revealFake({
+      getCodeMap: async (section) => {
+        maps += 1;
+        return sectionedMap((section ?? null) as SectionName | null);
+      },
+      listEntryCandidates: listings.stub,
+    });
+    const view = (dataVersion: number) => <CodeMap {...props({ projectPath: '/work/two-sections', section: 'api', dataVersion })} />;
+    const { rerender } = render(view(0));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    showRevealed();
+    await waitFor(() => assert.equal(listings.replies.length, 1), FIND);
+    rerender(view(1));
+    await waitFor(() => assert.equal(listings.replies.length, 2), FIND);
+    assert.equal(maps, 2);
+    await act(async () => listings.replies[1]!.resolve(foundListing([entryCandidate(S.validate, 1)])));
+    await waitForDrawn([S.validate.id]);
+    await act(async () => listings.replies[0]!.resolve(foundListing([entryCandidate(S.handler, 1)])));
+    assert.deepEqual(drawnIds(), [S.validate.id]);
+    assert.equal(fake.calls.listEntryCandidates.length, 2);
+  });
+
+  it('a listing whose section is gone: the section asked for goes to the fallback, once, and the notice offers the full map (P4-8k)', BUDGET, async () => {
+    const fake = revealFake({
+      getCodeMap: async (section) => sectionedMap((section ?? null) as SectionName | null),
+      listEntryCandidates: async () => ({ status: 'unknown-section', section: 'echo', knownSections: ['web'] }),
+    });
+    const gone: string[] = [];
+    render(<CodeMap {...props({ projectPath: '/work/two-sections', section: 'api', onUnknownSection: (name) => gone.push(name) })} />);
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    showRevealed();
+    await waitFor(() => assert.deepEqual(gone, ['api']), FIND);
+    const notice = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>('.code-map__notice--reveal');
+      assert.ok(found);
+      return found;
+    }, FIND);
+    assert.deepEqual(within(notice).getAllByRole('button').map((button) => button.textContent), ['Show full map']);
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    });
+    assert.deepEqual(gone, ['api'], 'once');
+    assert.deepEqual(fake.calls.listEntryCandidates, [['/work/two-sections', 'api']]);
+  });
+
   it('a project change resets the view to Full: the whole map, no candidate', BUDGET, async () => {
     const fake = revealFake();
     const { rerender } = await mountFull(fake);
@@ -700,10 +754,18 @@ function assertCentredOn(position: { x: number; y: number }, what: string): void
   );
 }
 
-/** Expands `handleRequest` (two layers: serviceA, serviceB, then repository; serviceB's call to it a ref). */
+/**
+ * Expands `handleRequest` (two layers: serviceA, serviceB, then repository; serviceB's call to it a ref).
+ *
+ * P4-8j: the toggle's fit may still be moving the view when this starts; a
+ * drilled column is culled until it ends, and under a loaded machine that
+ * outlasted the drawn-cards wait once (the flake seen at the old line 711).
+ * So the move settles first, and the drill gets a wait of its own.
+ */
 async function expandHandleRequest(): Promise<void> {
+  await settleViewport();
   fireEvent.click(await findOnCanvas(`Expand 2 callees of ${N.handleRequest.name}`));
-  await waitForDrawn([
+  await waitForDrawn(DRILL_WAIT, [
     N.handleRequest.id,
     N.serviceA.id,
     N.serviceB.id,
@@ -713,7 +775,7 @@ async function expandHandleRequest(): Promise<void> {
 }
 
 describe('Navigating to a Node Revealed doesn’t draw switches to Full (replaces the navigation, switch and cross-section pins)', () => {
-  it('a card’s callee pill: Full, "Showing the full map to reach …", the trace drawn there; the drill is kept for Revealed', BUDGET, async () => {
+  it('a card’s callee pill: Full, "Showing the full map to reach …", the trace drawn there; the drill is kept for Revealed', { timeout: 2 * BUDGET.timeout }, async () => {
     // Wide enough for Revealed's third column at the candidate's zoom (no culling).
     elementSize.set(3000, 2000);
     const fake = revealFake();

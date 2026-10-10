@@ -33,6 +33,12 @@ import { SECTION_NODES, sectionedMap, type SectionName } from './test/mapFixture
 // `cleanupAfterEach` also lets a viewport animation still running finish (bounded) before the unmount.
 afterEach(cleanupAfterEach);
 
+/** Never `assert.equal(element, null)`: a failing diff of a jsdom element takes minutes (it looks like a hang). */
+function assertAbsent(element: Element | null | undefined, what: string): void {
+  assert.ok(element === null || element === undefined, `${what} is absent`);
+}
+
+
 /** 8a allows 20 s per test; these finish well under 2 s (doubled under CI, P4-8b's convention). */
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
 const FIND = { timeout: 1_500 };
@@ -540,6 +546,176 @@ describe('App: cross-section honesty (replaces the P4-4h App source pins)', () =
     await waitForMap(WEB_IDS);
     await settleViewport();
     assertFocused(webTab, 'the web tab');
+  });
+});
+
+/** In `api`: opens `handler`'s Node detail and presses "Switch to web and show render" (web's map waits on `webReply`). */
+async function switchToWebFromDetail(fake: FakeDrillerApi, webReply: Promise<CodeMapResult>): Promise<void> {
+  fake.stub('getCodeMap', (section) => (section === 'web' ? webReply : Promise.resolve(sectionedMap((section ?? null) as SectionName | null))));
+  fireEvent.click(await screen.findByText(S.handler.name, { selector: '.react-flow__node .code-map__node *' }, FIND));
+  const detail = await screen.findByRole('dialog', { name: `Node detail: ${S.handler.name}` }, FIND);
+  fireEvent.click(within(detail).getByRole('button', { name: 'Switch to web and show render' }));
+}
+
+function renderCard(): Element | null {
+  return document.querySelector(`.react-flow__node[data-id="${CSS.escape(S.render.id)}"] .code-map__node`);
+}
+
+/** Moves to the web tab and waits for its map; asserts the render card never takes focus from the tab. */
+async function webByTabKeepsFocus(fake: FakeDrillerApi): Promise<void> {
+  fake.stub('getCodeMap', async (section) => sectionedMap((section ?? null) as SectionName | null));
+  const webTab = tab('web');
+  act(() => webTab.focus());
+  fireEvent.click(webTab);
+  await waitForMap(WEB_IDS);
+  await settleViewport();
+  await act(async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  });
+  assert.ok(document.activeElement !== renderCard(), 'the render card never takes focus');
+  assertFocused(tab('web'), 'the web tab');
+}
+
+describe('App: Node detail’s switch and its pending focus (P4-8l: replaces the App switch-handler pins)', () => {
+  it('goes through the Section bar’s path: announced, then saved once its map lands — and the callee is focused', BUDGET, async () => {
+    const fake = appFake({ saved: 'api' });
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(API_IDS);
+    const webReply = deferred<CodeMapResult>();
+    await switchToWebFromDetail(fake, webReply.promise);
+    await waitFor(() => assert.equal(sectionStatus().textContent, 'Loading section web…'), FIND);
+    assert.equal(selectedTab(), 'web, 2 Nodes');
+    assert.deepEqual(fake.calls.setActiveSection, [], 'not saved while the switch waits');
+    await act(async () => webReply.resolve(sectionedMap('web')));
+    await waitForMap(WEB_IDS);
+    await waitFor(() => assertFocused(renderCard(), 'the render card'), FIND);
+    await waitFor(() => assert.equal(sectionStatus().textContent, 'Showing section web — 2 Nodes'), FIND);
+    assert.deepEqual(fake.calls.setActiveSection, [[PROJECT, 'web']]);
+    await settleViewport();
+  });
+
+  it('a Section bar tab before the callee’s map lands cancels the focus — for good', BUDGET, async () => {
+    const fake = appFake({ saved: 'api' });
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(API_IDS);
+    const webReply = deferred<CodeMapResult>();
+    await switchToWebFromDetail(fake, webReply.promise);
+    fireEvent.click(tab('api'));
+    await waitForMap(API_IDS);
+    await act(async () => webReply.resolve(sectionedMap('web')));
+    await webByTabKeepsFocus(fake);
+  });
+
+  it('the section rejected before the callee’s map lands cancels the focus too', BUDGET, async () => {
+    const fake = appFake({ saved: 'api' });
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(API_IDS);
+    const webReply = deferred<CodeMapResult>();
+    await switchToWebFromDetail(fake, webReply.promise);
+    await act(async () => webReply.resolve({ status: 'unknown-section', section: 'web', knownSections: ['api'] }));
+    await waitFor(() => assert.equal(sectionStatus().textContent, 'web is no longer in the indexing scope — showing all sections'), FIND);
+    await waitForMap(ALL_IDS);
+    await webByTabKeepsFocus(fake);
+  });
+
+  it('a scope save that drops the section cancels the focus as well', BUDGET, async () => {
+    const fake = appFake({
+      saved: 'api',
+      stubs: {
+        getEditorPreference: async () => 'system-default',
+        getPrBotConfig: async () => ({ codeRabbitEnabled: false, qodoEnabled: false }),
+        setProjectScope: async (_projectPath, includedPaths) => ({ config: { includedPaths }, applied: true }),
+      },
+    });
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(API_IDS);
+    const webReply = deferred<CodeMapResult>();
+    await switchToWebFromDetail(fake, webReply.promise);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    const field = await screen.findByRole('textbox', { name: 'Included subfolders' }, FIND);
+    const save = (typed: string) => {
+      fireEvent.change(field, { target: { value: typed } });
+      fireEvent.click(within(field.closest('.settings-panel__field')!).getByRole('button', { name: 'Save' }));
+    };
+    save('api');
+    await waitFor(() => assert.equal(selectedTab(), 'all, 4 Nodes'), FIND);
+    // The section is re-validated first, so the scope save's refetch already asks for all.
+    await waitFor(() => assert.deepEqual(codeMapSections(fake).slice(2), [undefined, undefined]), FIND);
+    await act(async () => webReply.resolve(sectionedMap('web')));
+    save('api, web');
+    await waitFor(() => assert.equal(fake.calls.setProjectScope.length, 2), FIND);
+    fireEvent.click(document.querySelector<HTMLElement>('.settings-panel__close')!);
+    await waitForMap(ALL_IDS);
+    await webByTabKeepsFocus(fake);
+  });
+});
+
+describe('App: the map region and the section shell (P4-8l: replaces the App shell pins)', () => {
+  it('while the bar shows, the map region is the tabpanel, named by the selected tab', BUDGET, async () => {
+    const fake = appFake();
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(ALL_IDS);
+    assert.ok(screen.getByRole('tabpanel', { name: 'all, 4 Nodes' }));
+    assertAbsent(screen.queryByRole('region', { name: 'Code Map' }), 'screen.queryByRole(region, { name: Code Map })');
+    fireEvent.click(tab('api'));
+    await waitForMap(API_IDS);
+    const panel = screen.getByRole('tabpanel', { name: 'api, 2 Nodes' });
+    assert.ok(panel.contains(document.querySelector('.code-map')), 'the panel holds the map');
+    assert.equal(tab('api').getAttribute('aria-controls'), panel.id);
+  });
+
+  it('a restored section is what this session saved: going back to all clears it', BUDGET, async () => {
+    const fake = appFake({ saved: 'api' });
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(API_IDS);
+    fireEvent.click(tab('all'));
+    await waitForMap(ALL_IDS);
+    await waitFor(() => assert.deepEqual(fake.calls.setActiveSection, [[PROJECT, null]]), FIND);
+  });
+
+  it('a read superseded by Close and a reopen is dropped: its late section restores nothing', BUDGET, async () => {
+    const firstRead = deferred<string | null>();
+    const answers = [firstRead.promise, Promise.resolve<string | null>('web')];
+    const fake = appFake({ saved: () => answers.shift() ?? Promise.resolve(null) });
+    render(<App />);
+    await openFolder(fake);
+    reportIndexed(fake);
+    fireEvent.click(screen.getByRole('button', { name: 'Close project' }));
+    await screen.findByRole('button', { name: 'Open a folder' }, FIND);
+    await openAndIndex(fake);
+    await waitForMap(WEB_IDS);
+    await act(async () => firstRead.resolve('api'));
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    });
+    assert.deepEqual(codeMapSections(fake), ['web'], 'the late read fetches nothing');
+    assert.equal(selectedTab(), 'web, 2 Nodes');
+  });
+
+  it('the launch path ends when the restored map lands: a later rejection of that section is said', BUDGET, async () => {
+    let refreshed = false;
+    const fake = appFake({
+      saved: 'api',
+      stubs: {
+        getCodeMap: async (section) =>
+          refreshed && section === 'api'
+            ? { status: 'unknown-section', section: 'api', knownSections: ['web'] }
+            : sectionedMap((section ?? null) as SectionName | null),
+      },
+    });
+    render(<App />);
+    await openAndIndex(fake);
+    await waitForMap(API_IDS);
+    refreshed = true;
+    reportIndexed(fake);
+    await waitFor(() => assert.equal(sectionStatus().textContent, 'api is no longer in the indexing scope — showing all sections'), FIND);
+    await waitForMap(ALL_IDS);
   });
 });
 

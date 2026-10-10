@@ -821,34 +821,6 @@ describe('styles.css: short maps and drags', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Wiring inside the hooked `CodeMap` — pinned on its source text, as it
-// can't be rendered without a DOM.
-// ---------------------------------------------------------------------------
-
-describe('CodeMap source: the divider wiring', () => {
-  const src = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-  it('the divider renders only with the table, directly before it', () => {
-    assert.equal(src.split('<MetricsTableDivider').length - 1, 1);
-    assert.match(
-      src,
-      /\{prReviewMetricsTableProps !== null && \(\s*<>\s*<MetricsTableDivider\s[^>]*\/>\s*<PrReviewMetricsTable\s+\{\.\.\.prReviewMetricsTableProps\}\s+sort=\{prReviewMetricSort\}\s+onSort=\{setPrReviewMetricSort\}\s+onActivateNode=\{openNodeDetail\}\s+onOpenType=\{openType\}\s+\/>\s*<\/>\s*\)\}/,
-    );
-  });
-  it('.code-map carries the height style and the measured ref', () => {
-    assert.match(
-      src,
-      /className="code-map"\s+id=\{MODAL_FOCUS_FALLBACK_ID\}\s+tabIndex=\{-1\}\s+ref=\{setMapElement\}\s+style=\{codeMapTableHeightStyle\(prReviewMetricsTableProps !== null, metricsTableHeight, mapHeight\)\}/,
-    );
-  });
-  it('the canvas observer defers while the dragging attribute is on .code-map', () => {
-    assert.match(
-      src,
-      /el\.parentElement\?\.hasAttribute\(METRICS_TABLE_DRAGGING_ATTRIBUTE\)[\s\S]{0,40}\n\s*if \(canvasResizeEffect\(dragging, committedContainerSizeRef\.current, next\) === 'commit'\)/,
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
 // P4-3c: affected rows by hop, live with the depth stepper, capped at 50
 // ---------------------------------------------------------------------------
 

@@ -449,16 +449,6 @@ describe('CodeMap source: the listing fetch and its guard', () => {
   const start = codeMapSrc.indexOf('// P4-7d: the entry-candidate listing for the map on screen');
   const body = codeMapSrc.slice(start, codeMapSrc.indexOf('// P4-7d: a navigation to a Node Revealed', start));
 
-  it('drops out-of-order replies: the latest-request guard and the section on screen', () => {
-    assert.match(body, /const requestId = revealListingRequests\.begin\(\);/);
-    assert.match(body, /isLatest: revealListingRequests\.isLatest\(requestId\),\s*requestedSection,\s*currentSection: sectionRef\.current,/);
-    assert.match(body, /if \(outcome\.kind === 'ignore'\) \{\s*return;/);
-  });
-
-  it('hands an unknown-section reply to the section fallback', () => {
-    assert.match(body, /onUnknownSectionRef\.current\?\.\(outcome\.section\);/);
-  });
-
   // P4-8f: kept from the listing-fetch pin, which `CodeMap.revealed.dom.test.tsx`
   // otherwise replaces. A dev-fixture session can't be rendered under the test
   // loader (`import.meta.env.DEV` is compiled to `false`, so

@@ -6,8 +6,6 @@
  * bars stay put) and is an owed in-app check.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import type { DiffScopeResult, GraphServiceStatusMessage } from '@driller/ipc-contracts';
@@ -715,7 +713,6 @@ describe('the pending cross-section focus', () => {
 // P4-4i: the remembered section
 // ---------------------------------------------------------------------------
 
-const appSrc = readFileSync(fileURLToPath(new URL('./App.tsx', import.meta.url)), 'utf8');
 
 /** A ready map report for `section`, over the `web`, `api` allowlist by default. */
 function sectionReady(section: string | null, appliedScope: string[] = ['web', 'api']): MapFooterState {
@@ -920,47 +917,6 @@ describe('sectionRestoreSettled (P4-4i)', () => {
       'superseded (Close and reopen)',
     );
     assert.equal(sectionRestoreSettled({ projectPath: '/p', requestId: 1 }, null, latest(1)), false);
-  });
-});
-
-describe('App source: the remembered section (P4-4i)', () => {
-  function body(start: string, end: string): string {
-    const from = appSrc.indexOf(start);
-    assert.ok(from >= 0, start);
-    const to = appSrc.indexOf(end, from);
-    assert.ok(to > from, end);
-    return appSrc.slice(from, to);
-  }
-
-  it('the open path reads, validates and restores the section quietly, clearing a stale one', () => {
-    const effect = body('const requestId = sectionRestoreRequests.begin();', '}, [currentProjectPath, sectionRestoreRequests, commitSectionShell]);');
-    assert.match(effect, /if \(currentProjectPath === null\) \{\s*return;\s*\}/);
-    assert.match(effect, /loadSavedSection\(\s*projectPath,\s*\(path\) => window\.driller\.getActiveSection\(path\),\s*\(path\) => window\.driller\.getProjectScope\(path\),/);
-    assert.match(effect, /if \(!sectionRestoreRequests\.isLatest\(requestId\) \|\| currentProjectPathRef\.current !== projectPath\) \{\s*return;/);
-    assert.match(effect, /if \(read\.clear\) \{\s*void rememberSection\(projectPath, null,/);
-    assert.match(effect, /commitSectionShell\(restoredSectionShell\(read\.section\)\);/);
-    assert.doesNotMatch(effect, /applySectionActivated/, 'a restore is not a switch: no announcement, no PR Review carry');
-    // Pending focus is never applied from a restored section.
-    assert.match(effect, /setPendingSectionFocus\(null\);\s*setSectionRestore\(\{ projectPath, requestId \}\);/);
-    assert.match(effect, /savedSectionRef\.current = read\.section;\s*launchSectionRef\.current = read\.section;/);
-  });
-
-  it('the unknown-section fallback is silent on the launch path only', () => {
-    const handler = body('const handleUnknownSection = useCallback(', '}, [transitionSectionShell]);');
-    assert.match(handler, /const silent = launchSectionRef\.current === gone;/);
-    const mapState = body('const handleMapState = useCallback(', '}, [transitionSectionShell]);');
-    assert.match(mapState, /if \(state\.status === 'ready' && state\.section === launchSectionRef\.current\) \{\s*launchSectionRef\.current = null;/);
-    for (const name of ['handleSectionChange', 'handleSwitchSection']) {
-      assert.match(body(`const ${name} = useCallback(`, '}, [transitionSectionShell]);'), /launchSectionRef\.current = null;/);
-    }
-  });
-
-  it('a scope save re-validates the section before the map refetches', () => {
-    const handler = body('const handleProjectScopeApplied = useCallback(', '[commitSessionMap, transitionSectionShell],');
-    const revalidate = handler.indexOf('transitionSectionShell((current) => applyScopeSavedToSectionShell(current, includedPaths));');
-    const refetch = handler.indexOf('commitSessionMap(applyProjectScopeAppliedToSessionMap(sessionMapRef.current));');
-    assert.ok(revalidate >= 0 && refetch > revalidate);
-    assert.match(handler, /setPendingSectionFocus\(null\);/);
   });
 });
 

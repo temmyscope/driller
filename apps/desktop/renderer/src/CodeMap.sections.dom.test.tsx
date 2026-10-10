@@ -26,7 +26,7 @@ import assert from 'node:assert/strict';
 import { env } from 'node:process';
 import { useState } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import type { CodeMapNode, CodeMapResult } from '@driller/ipc-contracts';
+import type { BlastRadiusExpansionResult, CodeMapNode, CodeMapResult, DiffScopeResult, PathTraceResult } from '@driller/ipc-contracts';
 import {
   CARD_FOCUS_MAX_FRAMES,
   CodeMap,
@@ -41,11 +41,18 @@ import {
   ROUTE_MIN_READABLE_ZOOM,
   type CodeMapProps,
 } from './CodeMap';
+import { SectionBar } from './SectionBar';
 import { createFakeDrillerApi, deferred, type Deferred, type DrillerStubs, type FakeDrillerApi } from './test/fakeDrillerApi';
 import { SECTION_NODES, sectionedMap, syntheticMap, type CodeMapOk, type SectionName } from './test/mapFixture';
 
 // `cleanupAfterEach` also lets a viewport animation still running finish (bounded) before the unmount.
 afterEach(cleanupAfterEach);
+
+/** Never `assert.equal(element, null)`: a failing diff of a jsdom element takes minutes (it looks like a hang). */
+function assertAbsent(element: Element | null | undefined, what: string): void {
+  assert.ok(element === null || element === undefined, `${what} is absent`);
+}
+
 
 /** 8a allows 20 s per test; these finish well under 2 s (doubled under CI, P4-8b's convention). */
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
@@ -394,6 +401,587 @@ describe('CodeMap: switching section from Node detail (replaces the crossSection
     assert.equal(document.getElementById(CROSS_SECTION_MISS_TEXT_ID)?.textContent, `${S.render.id} in web/ — ${NOT_ON_CURRENT_MAP}`);
     await waitFor(() => assertFocused(dismiss, 'Dismiss'), FIND);
     assert.equal(consumed, 1);
+  });
+});
+
+/**
+ * App's side with the real Section bar above `CodeMap`: the section and the
+ * one-shot pending Node are state; a tab, Node detail's switch, or the
+ * test (`control.switchTo`) sets them.
+ */
+function BarShell({
+  initialSection,
+  mode = 'codeMap',
+  onConsumed,
+  control = {},
+}: {
+  initialSection: string | null;
+  mode?: CodeMapProps['mode'];
+  onConsumed: () => void;
+  control?: { switchTo?: (section: string, focusNodeId: string) => void };
+}) {
+  const [section, setSection] = useState<string | null>(initialSection);
+  const [pending, setPending] = useState<string | null>(null);
+  control.switchTo = (next, focusNodeId) => {
+    setSection(next);
+    setPending(focusNodeId);
+  };
+  return (
+    <>
+      <SectionBar
+        sections={sectionedMap('api').sections}
+        section={section}
+        enabled
+        onChange={(next) => {
+          setSection(next);
+          setPending(null);
+        }}
+      />
+      <CodeMap
+        {...props({
+          mode,
+          section,
+          pendingFocusNodeId: pending,
+          onSwitchSection: (next, focusNodeId) => {
+            setSection(next);
+            setPending(focusNodeId ?? null);
+          },
+          onPendingFocusConsumed: () => {
+            onConsumed();
+            setPending(null);
+          },
+        })}
+      />
+    </>
+  );
+}
+
+function selectedTab(): HTMLElement {
+  return screen.getByRole('tab', { selected: true });
+}
+
+/** A drawn card's position (its React Flow wrapper's `translate`) — what `centerOnNode` centres on. */
+function cardPosition(id: string): { x: number; y: number } {
+  const wrapper = document.querySelector<HTMLElement>(`.react-flow__node[data-id="${CSS.escape(id)}"]`);
+  assert.ok(wrapper, `${id} is drawn`);
+  const match = /translate\((-?[\d.]+)px,\s*(-?[\d.]+)px\)/.exec(wrapper.style.transform);
+  assert.ok(match, `${id} has a position`);
+  return { x: Number(match[1]), y: Number(match[2]) };
+}
+
+/** The world point at the centre of the canvas. */
+function viewportCentre(): { x: number; y: number } {
+  const match = /translate\((-?[\d.e-]+)px,\s*(-?[\d.e-]+)px\) scale\(([\d.e-]+)\)/.exec(viewportTransform() ?? '');
+  assert.ok(match, `a viewport transform (${viewportTransform()})`);
+  const [x, y, zoom] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  return { x: (elementSize.width / 2 - x) / zoom, y: (elementSize.height / 2 - y) / zoom };
+}
+
+/** Records every `focus()` call's target and options while `run` runs. */
+async function recordingFocus(run: (calls: { target: HTMLElement; options: FocusOptions | undefined }[]) => Promise<void>): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'focus');
+  assert.ok(original?.value);
+  const calls: { target: HTMLElement; options: FocusOptions | undefined }[] = [];
+  Object.defineProperty(HTMLElement.prototype, 'focus', {
+    configurable: true,
+    writable: true,
+    value(this: HTMLElement, options?: FocusOptions) {
+      calls.push({ target: this, options });
+      return (original.value as (options?: FocusOptions) => void).call(this, options);
+    },
+  });
+  try {
+    await run(calls);
+  } finally {
+    Object.defineProperty(HTMLElement.prototype, 'focus', original);
+  }
+}
+
+describe('CodeMap: the pending Node waits for its map and its first fit (P4-8j: replaces the pending-focus effect pins)', () => {
+  it('while the target map loads nothing is consumed or said; then the view centres on the callee, focused without a scroll, by navigating to it', BUDGET, async () => {
+    const maps = deferredMaps();
+    codeMapFake({ getCodeMap: maps.stub });
+    let consumed = 0;
+    render(<BarShell initialSection="api" onConsumed={() => (consumed += 1)} />);
+    await act(async () => maps.replies[0]!.resolve(sectionedMap('api')));
+    const detail = await openNodeDetail(S.handler.name);
+    await recordingFocus(async (focusCalls) => {
+      fireEvent.click(within(detail).getByRole('button', { name: 'Switch to web and show render' }));
+      // The old (api) map is still the ready one while web's reply is out.
+      for (let turn = 0; turn < 5; turn += 1) {
+        await act(async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        });
+      }
+      assert.equal(consumed, 0, 'nothing consumed while web’s map loads');
+      assertAbsent(screen.queryByRole('button', { name: 'Dismiss' }), 'never "not on the current map" for the old map');
+
+      await act(async () => maps.replies[1]!.resolve(sectionedMap('web')));
+      await waitFor(() => assertFocused(cardOf(S.render.id), 'the render card'), FIND);
+      assert.equal(consumed, 1);
+      const cardFocus = focusCalls.filter((call) => call.target === cardOf(S.render.id));
+      assert.ok(cardFocus.length > 0 && cardFocus.every((call) => call.options?.preventScroll === true), 'focused without scrolling');
+    });
+    await settleViewport();
+    const centre = viewportCentre();
+    const at = cardPosition(S.render.id);
+    assert.ok(Math.abs(centre.x - at.x) < 1e-6 && Math.abs(centre.y - at.y) < 1e-6, `centred on render (${at.x}, ${at.y}), not (${centre.x}, ${centre.y})`);
+    assert.equal(consumed, 1);
+  });
+
+  it('a reload clears the "not on the current map" notice', BUDGET, async () => {
+    codeMapFake({
+      getCodeMap: async (section) =>
+        section === 'web' ? sectionedMap('web', { nodes: [S.layout], edges: [] }) : sectionedMap(section as SectionName),
+    });
+    render(<BarShell initialSection="api" onConsumed={() => {}} />);
+    const detail = await openNodeDetail(S.handler.name);
+    fireEvent.click(within(detail).getByRole('button', { name: 'Switch to web and show render' }));
+    await screen.findByRole('button', { name: 'Dismiss' }, FIND);
+    fireEvent.click(screen.getByRole('tab', { name: /^api/ }));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    assertAbsent(screen.queryByRole('button', { name: 'Dismiss' }), 'screen.queryByRole(button, { name: Dismiss })');
+    assertAbsent(document.getElementById(CROSS_SECTION_MISS_TEXT_ID), 'document.getElementById(CROSS_SECTION_MISS_TEXT_ID)');
+  });
+
+  it('Dismiss hands focus to the selected Section bar tab', BUDGET, async () => {
+    codeMapFake({
+      getCodeMap: async (section) =>
+        section === 'web' ? sectionedMap('web', { nodes: [S.layout], edges: [] }) : sectionedMap(section as SectionName),
+    });
+    render(<BarShell initialSection="api" onConsumed={() => {}} />);
+    const detail = await openNodeDetail(S.handler.name);
+    fireEvent.click(within(detail).getByRole('button', { name: 'Switch to web and show render' }));
+    const dismiss = await screen.findByRole('button', { name: 'Dismiss' }, FIND);
+    await waitFor(() => assertFocused(dismiss, 'Dismiss'), FIND);
+    fireEvent.click(dismiss);
+    assertAbsent(screen.queryByRole('button', { name: 'Dismiss' }), 'screen.queryByRole(button, { name: Dismiss })');
+    assert.match(selectedTab().textContent ?? '', /^web/);
+    assertFocused(selectedTab(), 'the web tab');
+  });
+
+  it('Health Audit (no canvas): the callee opens in Node detail, opened from the selected tab — closing it returns there', BUDGET, async () => {
+    codeMapFake();
+    let consumed = 0;
+    const control: { switchTo?: (section: string, focusNodeId: string) => void } = {};
+    render(<BarShell initialSection="api" mode="healthAudit" onConsumed={() => (consumed += 1)} control={control} />);
+    await screen.findByRole('tab', { name: /^api/, selected: true }, FIND);
+    await screen.findByRole('search', {}, FIND);
+    act(() => control.switchTo!('web', S.render.id));
+    const detail = await screen.findByRole('dialog', { name: `Node detail: ${S.render.name}` }, FIND);
+    assert.equal(consumed, 1);
+    assertAbsent(document.querySelector('.react-flow'), 'no canvas in Health Audit');
+    fireEvent.click(within(detail).getByRole('button', { name: /close/i }));
+    await waitFor(() => assertAbsent(screen.queryByRole('dialog', { name: `Node detail: ${S.render.name}` }), 'screen.queryByRole(dialog, { name: Node detail: ${S.render.name} })'), FIND);
+    assert.match(selectedTab().textContent ?? '', /^web/);
+    await waitFor(() => assertFocused(selectedTab(), 'the web tab'), FIND);
+    assert.equal(consumed, 1);
+  });
+});
+
+/** A found route along `ids` (each the previous one's callee). */
+function foundRoute(ids: readonly string[]): PathTraceResult {
+  const parents = Object.create(null) as Record<string, string | null>;
+  const depths = Object.create(null) as Record<string, number>;
+  ids.forEach((id, index) => {
+    parents[id] = index === 0 ? null : ids[index - 1]!;
+    depths[id] = index;
+  });
+  return { status: 'found', path: [...ids], parents, depths };
+}
+
+/** The canvas Nodes lit as a Path Trace route. */
+function routeIds(): string[] {
+  return [...document.querySelectorAll<HTMLElement>('.react-flow__node.code-map__path-highlight')]
+    .map((node) => node.getAttribute('data-id') ?? '')
+    .sort();
+}
+
+/** The canvas Nodes lit as the blast radius. */
+function blastIds(): string[] {
+  return [...document.querySelectorAll<HTMLElement>('.react-flow__node.code-map__blast-radius-highlight')]
+    .map((node) => node.getAttribute('data-id') ?? '')
+    .sort();
+}
+
+/** The drawn edge `source → target`, measuring the cards first (React Flow draws edges between measured cards). */
+async function findEdge(source: string, target: string): Promise<HTMLElement> {
+  return waitFor(() => {
+    measure();
+    const found = [...document.querySelectorAll<HTMLElement>('.react-flow__edge')].find((element) =>
+      (element.getAttribute('data-id') ?? '').startsWith(`${source}→${target}:`),
+    );
+    assert.ok(found, `the edge ${source} → ${target} is drawn`);
+    return found;
+  }, FIND);
+}
+
+function trace(query: string): void {
+  fireEvent.change(screen.getByRole('textbox', { name: 'Path Trace query' }), { target: { value: query } });
+  fireEvent.click(screen.getByRole('button', { name: /^(Trace|Searching…)$/ }));
+}
+
+async function computeDiff(baseRef = 'main'): Promise<void> {
+  const input = await screen.findByRole('textbox', { name: 'Base ref' }, FIND);
+  await act(async () => {
+    fireEvent.change(input, { target: { value: baseRef } });
+    fireEvent.click(screen.getByRole('button', { name: 'Compute diff scope' }));
+  });
+}
+
+/** In `act`: a few macrotask turns, for replies that would land. */
+async function turns(count = 5): Promise<void> {
+  for (let turn = 0; turn < count; turn += 1) {
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    });
+  }
+}
+
+const IDLE_PROMPT = 'Enter a base ref (or leave it blank to auto-resolve) and compute the diff scope to see changed Nodes.';
+const API_DIFF: DiffScopeResult = { status: 'resolved', resolvedBaseRef: 'abc123', nodeIds: [S.handler.id] };
+const API_BLAST: BlastRadiusExpansionResult = { status: 'resolved', hopDistances: { [S.handler.id]: 0, [S.validate.id]: 1 } };
+
+describe('CodeMap: a switch reloads through the full reset (P4-8k: replaces the loadCodeMap reset pins)', () => {
+  it('history, Node detail and the Path Trace route of the old map are gone, and a trace still out never lands', BUDGET, async () => {
+    const traces: Deferred<PathTraceResult>[] = [];
+    codeMapFake({
+      tracePath: () => {
+        const reply = deferred<PathTraceResult>();
+        traces.push(reply);
+        return reply.promise;
+      },
+      logDiagnosticEvent: async () => undefined,
+    });
+    const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    // Two clicks on handler → validate: to validate, then back to handler.
+    const back = screen.getByRole('button', { name: 'Back' });
+    fireEvent.click(await findEdge(S.handler.id, S.validate.id));
+    await settleViewport();
+    fireEvent.click(await findEdge(S.handler.id, S.validate.id));
+    await waitFor(() => assert.equal(back.hasAttribute('disabled'), false, 'a history to go back through'), FIND);
+    await settleViewport();
+    trace('validate');
+    await act(async () => traces[0]!.resolve(foundRoute([S.handler.id, S.validate.id])));
+    await waitFor(() => {
+      measure();
+      assert.deepEqual(routeIds(), [S.handler.id, S.validate.id].sort());
+    }, FIND);
+    await settleViewport();
+    trace('handler');
+    await openNodeDetail(S.validate.name);
+
+    rerender(<CodeMap {...props({ section: 'web' })} />);
+    await waitForDrawn([S.layout.id, S.render.id]);
+    rerender(<CodeMap {...props({ section: 'api' })} />);
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    assert.equal(screen.getByRole('button', { name: 'Back' }).hasAttribute('disabled'), true, 'no history');
+    assert.equal(screen.getByRole('button', { name: 'Forward' }).hasAttribute('disabled'), true);
+    assertAbsent(screen.queryByRole('dialog'), 'no Node detail');
+    assert.deepEqual(routeIds(), [], 'no route');
+    assert.equal(screen.getByRole('button', { name: 'Trace' }).hasAttribute('disabled'), false, 'not searching');
+    // The trace sent before the switches answers now, back on its section.
+    await act(async () => traces[1]!.resolve(foundRoute([S.handler.id, S.validate.id])));
+    await turns();
+    act(() => measure());
+    assert.deepEqual(routeIds(), [], 'the late route never lands');
+  });
+
+  it('PR Review’s base ref, diff, sync time and blast radius go with the old map; late replies land nowhere', BUDGET, async () => {
+    const diffs: Deferred<DiffScopeResult>[] = [];
+    const blasts: Deferred<BlastRadiusExpansionResult>[] = [];
+    const fake = codeMapFake({
+      computeDiffScope: () => {
+        const reply = deferred<DiffScopeResult>();
+        diffs.push(reply);
+        return reply.promise;
+      },
+      expandBlastRadius: () => {
+        const reply = deferred<BlastRadiusExpansionResult>();
+        blasts.push(reply);
+        return reply.promise;
+      },
+    });
+    const synced: [string | null, number | null][] = [];
+    const view = (mode: CodeMapProps['mode'], section: string) => (
+      <CodeMap {...props({ mode, section, onDiffScopeSynced: (path, at) => synced.push([path, at]) })} />
+    );
+    const { rerender } = render(view('prReview', 'api'));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    await computeDiff();
+    await act(async () => diffs[0]!.resolve(API_DIFF));
+    await act(async () => blasts[0]!.resolve(API_BLAST));
+    await waitFor(() => assert.deepEqual(blastIds(), [S.handler.id, S.validate.id].sort()), FIND);
+    assert.equal(synced.at(-1)?.[0], PROJECT);
+    assert.equal(typeof synced.at(-1)?.[1], 'number', 'a sync time is held');
+
+    // Out of PR Review (no diff to carry), a switch away and back.
+    rerender(view('codeMap', 'api'));
+    rerender(view('codeMap', 'web'));
+    await waitForDrawn([S.layout.id, S.render.id]);
+    rerender(view('codeMap', 'api'));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    assert.deepEqual(synced.at(-1), [PROJECT, null], 'the sync time is cleared');
+    rerender(view('prReview', 'api'));
+    await waitFor(() => assert.equal((screen.getByRole('textbox', { name: 'Base ref' }) as HTMLInputElement).value, ''), FIND);
+    assert.ok(screen.getByText(IDLE_PROMPT));
+    act(() => measure());
+    assert.deepEqual(blastIds(), [], 'no blast radius on the canvas');
+    assert.equal(fake.calls.expandBlastRadius.length, 1);
+
+    // A diff and its expansion sent before another switch answer late.
+    await computeDiff();
+    await act(async () => diffs[1]!.resolve(API_DIFF));
+    assert.equal(fake.calls.expandBlastRadius.length, 2);
+    rerender(view('codeMap', 'api'));
+    rerender(view('codeMap', 'web'));
+    await waitForDrawn([S.layout.id, S.render.id]);
+    rerender(view('codeMap', 'api'));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    rerender(view('prReview', 'api'));
+    await act(async () => blasts[1]!.resolve(API_BLAST));
+    await turns();
+    act(() => measure());
+    assert.deepEqual(blastIds(), [], 'the late expansion never lands');
+    assert.ok(screen.getByText(IDLE_PROMPT));
+  });
+
+  for (const settle of ['resolve', 'reject'] as const) {
+    it(`a diff sent before a switch away and back: its late ${settle === 'resolve' ? 'reply' : 'rejection'} changes nothing`, BUDGET, async () => {
+      const diffs: Deferred<DiffScopeResult>[] = [];
+      const fake = codeMapFake({
+        computeDiffScope: () => {
+          const reply = deferred<DiffScopeResult>();
+          diffs.push(reply);
+          return reply.promise;
+        },
+        expandBlastRadius: async () => API_BLAST,
+      });
+      const view = (mode: CodeMapProps['mode'], section: string) => <CodeMap {...props({ mode, section })} />;
+      const { rerender } = render(view('prReview', 'api'));
+      await waitForDrawn([S.handler.id, S.validate.id]);
+      await computeDiff();
+      rerender(view('codeMap', 'api'));
+      rerender(view('codeMap', 'web'));
+      await waitForDrawn([S.layout.id, S.render.id]);
+      rerender(view('codeMap', 'api'));
+      await waitForDrawn([S.handler.id, S.validate.id]);
+      rerender(view('prReview', 'api'));
+      await act(async () => (settle === 'resolve' ? diffs[0]!.resolve(API_DIFF) : diffs[0]!.reject(new Error('git failed'))));
+      await turns();
+      assert.ok(screen.getByText(IDLE_PROMPT), `${settle}: still the idle prompt`);
+      assertAbsent(screen.queryByRole('alert'), `${settle}: no error`);
+      assert.equal(fake.calls.expandBlastRadius.length, 0, `${settle}: no expansion`);
+    });
+  }
+});
+
+describe('CodeMap: an unknown-section map reply (P4-8k: replaces the load and refresh hand-off pins)', () => {
+  const GONE: CodeMapResult = { status: 'unknown-section', section: 'echo', knownSections: ['web'] };
+
+  it('a load: the section asked for goes to the fallback once — never the error state', BUDGET, async () => {
+    codeMapFake({ getCodeMap: async () => structuredClone(GONE) });
+    const gone: string[] = [];
+    render(<CodeMap {...props({ section: 'api', onUnknownSection: (name) => gone.push(name) })} />);
+    await waitFor(() => assert.deepEqual(gone, ['api']), FIND);
+    await turns();
+    assert.deepEqual(gone, ['api']);
+    assertAbsent(screen.queryByRole('alert'), 'no error notice');
+    assertAbsent(screen.queryByRole('button', { name: 'Retry' }), 'screen.queryByRole(button, { name: Retry })');
+  });
+
+  it('a load with no fallback wired: the explicit error', BUDGET, async () => {
+    codeMapFake({ getCodeMap: async () => structuredClone(GONE) });
+    render(<CodeMap {...props({ section: 'api' })} />);
+    const alert = await screen.findByRole('alert', {}, FIND);
+    assert.match(alert.textContent ?? '', /Couldn.t load the Code Map/);
+  });
+
+  it('a refresh (a new data version) asks for the section on screen; gone, it goes to the fallback and keeps the map', BUDGET, async () => {
+    let calls = 0;
+    const fake = codeMapFake({
+      getCodeMap: async (section) => {
+        calls += 1;
+        return calls === 1 ? sectionedMap(section as SectionName) : structuredClone(GONE);
+      },
+    });
+    const gone: string[] = [];
+    const view = (dataVersion: number) => (
+      <CodeMap {...props({ section: 'api', dataVersion, onUnknownSection: (name) => gone.push(name) })} />
+    );
+    const { rerender } = render(view(0));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    rerender(view(1));
+    await waitFor(() => assert.deepEqual(gone, ['api']), FIND);
+    assert.deepEqual(fake.calls.getCodeMap, [['api'], ['api']]);
+    await turns();
+    assert.deepEqual(gone, ['api']);
+    assertAbsent(screen.queryByRole('alert'), 'screen.queryByRole(alert)');
+    assertAbsent(screen.queryByText(/Couldn.t refresh/), 'screen.queryByText(/Couldn.t refresh/)');
+    assert.deepEqual(drawnNames(), [S.handler.id, S.validate.id].sort(), 'the map stays');
+  });
+});
+
+describe('CodeMap: a stale refresh reply (P4-8k: replaces the refresh hand-off pin)', () => {
+  it('a refresh superseded by a switch: its unknown-section reply calls no fallback', BUDGET, async () => {
+    const refresh = deferred<CodeMapResult>();
+    let calls = 0;
+    codeMapFake({
+      getCodeMap: (section) => {
+        calls += 1;
+        return calls === 2 ? refresh.promise : Promise.resolve(sectionedMap(section as SectionName));
+      },
+    });
+    const gone: string[] = [];
+    const view = (section: string, dataVersion: number) => (
+      <CodeMap {...props({ section, dataVersion, onUnknownSection: (name) => gone.push(name) })} />
+    );
+    const { rerender } = render(view('api', 0));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    rerender(view('api', 1));
+    rerender(view('web', 1));
+    await waitForDrawn([S.layout.id, S.render.id]);
+    await act(async () => refresh.resolve({ status: 'unknown-section', section: 'api', knownSections: ['web'] }));
+    await turns();
+    assert.deepEqual(gone, [], 'no fallback for a superseded refresh');
+    assert.deepEqual(drawnNames(), [S.layout.id, S.render.id].sort());
+  });
+});
+
+describe('CodeMap: an expansion sent before a switch away and back (P4-8k: replaces the section-scoped ops pin)', () => {
+  it('its rejection says nothing', BUDGET, async () => {
+    const blasts: Deferred<BlastRadiusExpansionResult>[] = [];
+    codeMapFake({
+      computeDiffScope: async () => API_DIFF,
+      expandBlastRadius: () => {
+        const reply = deferred<BlastRadiusExpansionResult>();
+        blasts.push(reply);
+        return reply.promise;
+      },
+    });
+    const view = (mode: CodeMapProps['mode'], section: string) => <CodeMap {...props({ mode, section })} />;
+    const { rerender } = render(view('prReview', 'api'));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    await computeDiff();
+    await waitFor(() => assert.equal(blasts.length, 1), FIND);
+    rerender(view('codeMap', 'api'));
+    rerender(view('codeMap', 'web'));
+    await waitForDrawn([S.layout.id, S.render.id]);
+    rerender(view('codeMap', 'api'));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    rerender(view('prReview', 'api'));
+    await act(async () => blasts[0]!.reject(new Error('expansion failed')));
+    await turns();
+    assertAbsent(screen.queryByText(/expansion failed/), 'no error for the old map’s expansion');
+    assert.ok(screen.getByText(IDLE_PROMPT));
+  });
+});
+
+describe('CodeMap: the map it reports carries the reply’s section and sections (P4-8k: replaces the ready-map pin)', () => {
+  it('after a load and after a refresh', BUDGET, async () => {
+    const sectionsAt = (docs: number) => [
+      { path: 'api', nodeCount: 2 },
+      { path: 'web', nodeCount: 2 },
+      { path: 'docs', nodeCount: docs },
+    ];
+    let calls = 0;
+    codeMapFake({
+      getCodeMap: async () => {
+        calls += 1;
+        return sectionedMap('api', { sections: sectionsAt(calls === 1 ? 1 : 7) });
+      },
+    });
+    const reports: unknown[] = [];
+    const view = (dataVersion: number) => (
+      <CodeMap {...props({ section: 'api', dataVersion, onMapState: (_path, state) => reports.push(state) })} />
+    );
+    const { rerender } = render(view(0));
+    const ready = () => reports.filter((state) => (state as { status: string }).status === 'ready') as { section: unknown; sections: unknown }[];
+    await waitFor(() => assert.equal(ready().length, 1), FIND);
+    assert.equal(ready()[0]!.section, 'api');
+    assert.deepEqual(ready()[0]!.sections, sectionsAt(1));
+    rerender(view(1));
+    await waitFor(() => assert.deepEqual(ready().at(-1)!.sections, sectionsAt(7)), FIND);
+    assert.equal(ready().at(-1)!.section, 'api');
+  });
+});
+
+describe('CodeMap: Path Trace and the diff are sent with the section on screen (P4-8k: replaces the section-scoped ops pin)', () => {
+  it('tracePath: the section, or none in all; an unknown-section reply hands that section to the fallback and traces nothing', BUDGET, async () => {
+    const fake = codeMapFake({
+      tracePath: async (_query, section) =>
+        section === 'api' ? { status: 'unknown-section', section: 'echo', knownSections: ['web'] } : foundRoute([S.render.id, S.layout.id]),
+      logDiagnosticEvent: async () => undefined,
+    });
+    const gone: string[] = [];
+    const view = (section: string | null) => <CodeMap {...props({ section, onUnknownSection: (name) => gone.push(name) })} />;
+    const { rerender } = render(view(null));
+    await waitForDrawn([S.handler.id, S.validate.id, S.render.id, S.layout.id]);
+    trace('render');
+    await waitFor(() => {
+      measure();
+      assert.deepEqual(routeIds(), [S.layout.id, S.render.id]);
+    }, FIND);
+    await settleViewport();
+    rerender(view('api'));
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    trace('handler');
+    await waitFor(() => assert.deepEqual(gone, ['api']), FIND);
+    assert.deepEqual(fake.calls.tracePath, [
+      ['render', undefined],
+      ['handler', 'api'],
+    ]);
+    assert.equal(screen.getByRole('button', { name: 'Trace' }).hasAttribute('disabled'), false, 'not left searching');
+    assertAbsent(screen.queryByRole('alert'), 'screen.queryByRole(alert)');
+    assert.deepEqual(routeIds(), []);
+  });
+
+  it('a trace sent before a switch away and back: its rejection says nothing', BUDGET, async () => {
+    const traces: Deferred<PathTraceResult>[] = [];
+    codeMapFake({
+      tracePath: () => {
+        const reply = deferred<PathTraceResult>();
+        traces.push(reply);
+        return reply.promise;
+      },
+      logDiagnosticEvent: async () => undefined,
+    });
+    const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    trace('validate');
+    rerender(<CodeMap {...props({ section: 'web' })} />);
+    await waitForDrawn([S.layout.id, S.render.id]);
+    rerender(<CodeMap {...props({ section: 'api' })} />);
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    await act(async () => traces[0]!.reject(new Error('Graph Service down')));
+    await turns();
+    assertAbsent(screen.queryByText(/Graph Service down/), 'no error for a trace of the old map');
+  });
+
+  it('computeDiffScope: the section; an unknown-section reply hands that section to the fallback, with no diff and no sync time', BUDGET, async () => {
+    const fake = codeMapFake({
+      computeDiffScope: async () => ({ status: 'unknown-section', section: 'echo', knownSections: ['web'] }),
+    });
+    const gone: string[] = [];
+    const synced: [string | null, number | null][] = [];
+    render(
+      <CodeMap
+        {...props({
+          mode: 'prReview',
+          section: 'api',
+          onUnknownSection: (name) => gone.push(name),
+          onDiffScopeSynced: (path, at) => synced.push([path, at]),
+        })}
+      />,
+    );
+    await waitForDrawn([S.handler.id, S.validate.id]);
+    await computeDiff();
+    await waitFor(() => assert.deepEqual(gone, ['api']), FIND);
+    assert.deepEqual(fake.calls.computeDiffScope, [[PROJECT, 'main', 'api']]);
+    assert.ok(screen.getByText(IDLE_PROMPT), 'the diff is idle');
+    assert.deepEqual(synced.filter(([, at]) => at !== null), [], 'no sync time');
+    assert.equal(fake.calls.expandBlastRadius.length, 0);
   });
 });
 
