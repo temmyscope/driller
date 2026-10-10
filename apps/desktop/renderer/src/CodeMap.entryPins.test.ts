@@ -1,18 +1,16 @@
 /**
  * P4-7g: pins in `CodeMap` — the pinned candidate card ("⚑ pinned by you",
  * ", pinned entry point" in its accessible name), Node detail's "Entry point"
- * section and its toggle (`aria-pressed`, the explicit limit message), and
- * the hook wiring (source pins: the component's hooks can't run under
- * `node --test`): a stored pin change bumps the pins revision, which owes
- * Revealed a new listing on the same map.
+ * section and its toggle (`aria-pressed`, the explicit limit message),
+ * hookless. P4-8g: the wiring (pins read per project, a stored change
+ * re-listing Revealed on the same map) is rendered in
+ * `CodeMap.entryPins.dom.test.tsx`.
  *
  * What this cannot reach: a real pin from Node detail topping the live
  * Revealed canvas, and a relaunch — the P4-7g live check.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
-import { fileURLToPath } from 'node:url';
 
 import type { CodeMapNode, EntryCandidate } from '@driller/ipc-contracts';
 
@@ -28,7 +26,6 @@ import {
 import { PIN_LIMIT_TEXT } from './entryPins';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
-const codeMapSrc = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
 const squash = (text: string) => text.replace(/\s+/g, ' ').trim();
 const noop = () => {};
 
@@ -169,45 +166,5 @@ describe("Node detail's pin toggle", () => {
       (element) => element.type === 'section' && element.props['aria-labelledby'] === NODE_DETAIL_SECTION_HEADING_IDS.entryPin,
     );
     assert.ok(section);
-  });
-});
-
-describe('the wiring (source pins)', () => {
-  it('Node detail gets the control for the Node it shows', () => {
-    assert.match(
-      codeMapSrc,
-      /entryPin=\{\s*projectPath === null\s*\? undefined\s*: \{\s*pinned: entryPins\?\.includes\(nodeDetail\.node\.id\) \?\? false,\s*busy: entryPinBusy \|\| entryPins === null,\s*message: entryPinMessage\?\.nodeId === nodeDetail\.node\.id \? entryPinMessage\.text : null,\s*onToggle: \(\) => toggleEntryPin\(nodeDetail\.node\.id\),/,
-    );
-  });
-
-  it('the pins are read per project, and a stored change bumps the pins revision (only a change)', () => {
-    assert.match(codeMapSrc, /loadEntryPins\(projectPath, \(path\) => window\.driller\.getEntryPins\(path\)\)/);
-    // Review round 1: one id, applied by main; nothing sent before the read lands.
-    assert.match(codeMapSrc, /saveEntryPin\(projectPath, nodeId, plan\.pinned, \(path, id, pinned\) =>\s*window\.driller\.setEntryPins\(path, id, pinned\),?\s*\)/);
-    assert.match(codeMapSrc, /if \(projectPath === null \|\| previous === null\) \{\s*return;/);
-    assert.match(codeMapSrc, /useState<readonly string\[\] \| null>\(null\)/);
-    assert.match(codeMapSrc, /setEntryPins\(null\);/);
-    assert.match(codeMapSrc, /if \(outcome\.changed\) \{[\s\S]{0,200}setEntryPinsRevision\(\(revision\) => revision \+ 1\);/);
-    assert.match(codeMapSrc, /if \(plan\.kind === 'limit'\) \{\s*setEntryPinMessage\(\{ nodeId, text: PIN_LIMIT_TEXT \}\);\s*return;/);
-  });
-
-  it('the listing effect re-lists on a pins revision, on the same map, without re-fitting', () => {
-    assert.match(
-      codeMapSrc,
-      /needsRevealListing\(revealHeldRef\.current, currentRevealKey, revealMapStamp, entryPinsRevision\)/,
-    );
-    assert.match(codeMapSrc, /startRevealListing\(revealHeldRef\.current, key, mapStamp, pinsRevision\)/);
-    assert.match(codeMapSrc, /mapStamp,\s*result,\s*pinsRevision,\s*sameFetch,\s*drillGraph,/);
-    assert.match(codeMapSrc, /userMoved: revealUserMovedRef\.current,\s*sameFetch,/);
-    assert.match(codeMapSrc, /isDevFixtureMode,\s*entryPinsRevision,\s*\]\);/);
-  });
-
-  it('review round 1: a same-fetch listing rebases the reveal steps; a kept failed one leaves them; others drop them', () => {
-    assert.match(codeMapSrc, /if \(landed\.status === 'ready' && landed\.pinsListingFailed !== undefined\) \{[\s\S]{0,200}return;/);
-    assert.match(
-      codeMapSrc,
-      /if \(sameFetch && landed\.status === 'ready' && drawnBefore !== null && drillGraph !== null && drillGraph\.edges === mapStamp\) \{[\s\S]{0,600}rebaseRevealHistory\(previous, \{\s*key,\s*mapStamp,\s*previous: drawnBefore,\s*landed: landed\.state,\s*rebase: \(state\) => refreshRevealState\(state, fresh, graph\),/,
-    );
-    assert.match(codeMapSrc, /setHistory\(\(previous\) => historyWithoutReveals\(previous\)\);/);
   });
 });

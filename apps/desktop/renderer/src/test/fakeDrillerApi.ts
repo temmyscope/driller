@@ -28,7 +28,7 @@
  * Test-only: never imported by app code (`domTestConventions.test.ts`).
  */
 import { act } from 'react';
-import type { DrillerApi } from '@driller/ipc-contracts';
+import { ENTRY_PINS_MAX, type DrillerApi, type EntryPinUpdateResult } from '@driller/ipc-contracts';
 
 /** The subscription members (`onGraphServiceStatus`, …). */
 export type DrillerEventName = Extract<keyof DrillerApi, `on${string}`>;
@@ -245,4 +245,41 @@ export function deferred<T>(): Deferred<T> {
     reject = onReject;
   });
   return { promise, resolve, reject };
+}
+
+/**
+ * P4-8g: the entry pins main keeps (AD-5 "Entry pins"), keyed by project —
+ * `getEntryPins` / `setEntryPins` stubs that behave as main's
+ * `settings:getEntryPins` / `settings:setEntryPins` do: a pin is appended
+ * (pin order), an unpin removes it, a repeat changes nothing, and a pin past
+ * `ENTRY_PINS_MAX` is refused with `limit` and the stored list. Pass
+ * `stubs` into `createFakeDrillerApi` (the calls are recorded there);
+ * `pinsOf` reads what is stored now.
+ */
+export interface EntryPinsStore {
+  readonly stubs: Required<Pick<DrillerStubs, 'getEntryPins' | 'setEntryPins'>>;
+  pinsOf(projectPath: string): string[];
+}
+
+export function entryPinsStore(initial: Readonly<Record<string, readonly string[]>> = {}): EntryPinsStore {
+  const byProject = new Map<string, string[]>(Object.entries(initial).map(([project, ids]) => [project, [...ids]]));
+  const pinsOf = (projectPath: string): string[] => [...(byProject.get(projectPath) ?? [])];
+  return {
+    pinsOf,
+    stubs: {
+      getEntryPins: async (projectPath) => pinsOf(projectPath),
+      setEntryPins: async (projectPath, nodeId, pinned): Promise<EntryPinUpdateResult> => {
+        const pins = pinsOf(projectPath);
+        if (pinned && !pins.includes(nodeId)) {
+          if (pins.length >= ENTRY_PINS_MAX) {
+            return { status: 'limit', pins };
+          }
+          pins.push(nodeId);
+        }
+        const stored = pinned ? pins : pins.filter((id) => id !== nodeId);
+        byProject.set(projectPath, stored);
+        return { status: 'stored', pins: [...stored] };
+      },
+    },
+  };
 }

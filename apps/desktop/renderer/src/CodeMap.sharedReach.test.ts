@@ -5,9 +5,10 @@
  * of column 0 with the label at its apex; every pair listed in Node detail.
  * Pure parts: `sharedReachPartners`, `relationEdges`, `sharedReachArc`,
  * `formatSharedReachList`, `sharedReachFlowEdges`, `SharedReachEdge`,
- * `withSharedReachEdges`, the click exclusion, the legend and Node detail's
- * section; the hook wiring by source pins (the component's hooks can't run
- * under `node --test`).
+ * `withSharedReachEdges`, the click exclusion and Node detail's section.
+ * P4-8g: the wiring inside `CodeMap` (hover and focus, Full, the click, the
+ * legend, the Node detail list, a pin change's relations) is rendered in
+ * `CodeMap.sharedReach.dom.test.tsx`.
  *
  * What this cannot reach: the live canvas (the arcs and labels as drawn,
  * hover and focus, a hand count against expanding both candidates) — the
@@ -27,7 +28,6 @@ import {
   NODE_DETAIL_SECTION_HEADING_IDS,
   NodeDetailBody,
   pathTraceHighlight,
-  RevealEdgeLegend,
   SharedReachEdge,
   sharedReachFlowEdges,
   withSharedReachEdges,
@@ -40,7 +40,6 @@ import {
   pruneRevealState,
   refreshRevealState,
   relationEdges,
-  REVEAL_EDGE_LEGEND,
   revealDrillGraphFor,
   SHARED_REACH_ARC_OFFSET,
   SHARED_REACH_ARC_STEP,
@@ -53,7 +52,6 @@ import {
 } from './revealView';
 import { renderTree, textOf } from './testRender';
 
-const codeMapSrc = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
 const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
 
 function candidate(id: string, reach: number): EntryCandidate {
@@ -258,12 +256,9 @@ describe('sharedReachFlowEdges and the canvas (P4-7h)', () => {
     assert.doesNotMatch(css.match(/\.code-map__edge--reveal-ref \{[^}]*\}/)?.[0] ?? '', /shared-reach-edge|0\.5 4/);
   });
 
-  it('a click on it never navigates: the edge-click guard ignores it, so no Node enters history', () => {
+  it('the edge-click guard recognises a shared-reach edge id, never a map edge’s (P4-8g: the click itself is rendered in the DOM test)', () => {
     assert.ok(flowEdge !== undefined && isRevealConnectorEdgeId(flowEdge.id));
     assert.equal(isRevealConnectorEdgeId('A→B:CALLS:0'), false);
-    const start = codeMapSrc.indexOf('const handleEdgeClick: EdgeMouseHandler<FlowEdge> = useCallback(');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('navigateToNode(edgeClickTarget(', start));
-    assert.match(body, /if \(isRevealConnectorEdgeId\(edge\.id\)\) \{\s*return;\s*\}/);
   });
 
   it('added only when both cards are drawn; the edge list is untouched when there is nothing to add', () => {
@@ -274,7 +269,7 @@ describe('sharedReachFlowEdges and the canvas (P4-7h)', () => {
     assert.equal(withSharedReachEdges(map, [], new Set(['A', 'B'])), map);
   });
 
-  it('never a map edge: never path-highlighted, never in callEdgesOf', () => {
+  it('never a map edge: never path-highlighted, never in callEdgesOf (pure; P4-8g: the canvas is rendered in the DOM test)', () => {
     // The map's edges go through the highlight; the shared-reach ones never do.
     const neighbors = pathTraceHighlight(
       { status: 'neighbors', originId: 'A', direction: 'callees', nodeIds: ['A', 'B'], edgeKeys: ['A→B'], neighborIds: ['B'] },
@@ -293,24 +288,10 @@ describe('sharedReachFlowEdges and the canvas (P4-7h)', () => {
     assert.deepEqual(callEdgesOf(sharedReachFlowEdges(relationEdges(HUB, 'h')).map((edge) => ({ ...edge, kind: String(edge.type) }))), []);
     const found = pathTraceHighlight({ status: 'found', path: ['A', 'B'], parents: { A: null, B: 'A' }, depths: { A: 0, B: 1 } }, callEdgesOf(EDGES));
     assert.equal(found.edgeKeys.size, 0, 'A and B share reach, but no CALLS edge joins them');
-    assert.match(codeMapSrc, /const callEdges = useMemo\(\(\) => callEdgesOf\(population\.riskEdges\), \[population\]\);/);
   });
 });
 
-describe('the legend and Node detail (P4-7h)', () => {
-  it('the legend: a line for the shared-reach edge and one for the ref connector, glyphs hidden from assistive tech', () => {
-    const tree = renderTree(RevealEdgeLegend());
-    const items = tree.filter((element) => element.type === 'li');
-    assert.deepEqual(items.map((item) => textOf(item)), [
-      '··· shares N: candidates reaching common Nodes (focus or hover a candidate)',
-      '- - shown above: a callee already revealed',
-    ]);
-    const glyphs = tree.filter((element) => element.type === 'span');
-    assert.equal(glyphs.length, REVEAL_EDGE_LEGEND.length);
-    assert.ok(glyphs.every((glyph) => glyph.props['aria-hidden'] === 'true'));
-    assert.match(codeMapSrc, /\{revealDrawn && <RevealEdgeLegend \/>\}/);
-  });
-
+describe('Node detail (P4-7h)', () => {
   const node: CodeMapNode = {
     id: 'h',
     name: 'h',
@@ -347,43 +328,5 @@ describe('the legend and Node detail (P4-7h)', () => {
       (element) => element.props?.['aria-labelledby'] === NODE_DETAIL_SECTION_HEADING_IDS.sharedReach,
     );
     assert.equal(without, undefined);
-  });
-});
-
-describe('the wiring (P4-7h source pins)', () => {
-  it('drawn for the hovered, else focused, candidate only, apart from the node memos; Full draws none', () => {
-    assert.match(
-      codeMapSrc,
-      /revealCanvas === null\s*\? EMPTY_FLOW_EDGES\s*: sharedReachFlowEdges\(relationEdges\(revealCanvas\.state, hoveredCandidateId \?\? focusedCandidateId\)\),\s*\[revealCanvas, hoveredCandidateId, focusedCandidateId\],/,
-    );
-    assert.match(codeMapSrc, /withSharedReachEdges\(renderedEdges, sharedReachEdges, renderedVisibleIds\)/);
-    assert.match(codeMapSrc, /edges=\{canvasEdges\}\s*nodeTypes=\{nodeTypes\}\s*\/\/[^\n]*\n\s*edgeTypes=\{edgeTypes\}/);
-    assert.match(codeMapSrc, /const edgeTypes = \{ sharedReach: SharedReachEdge \};/);
-    // Only candidate ids are kept as hovered or focused.
-    assert.match(codeMapSrc, /if \(revealCandidatesRef\.current\?\.has\(flowNode\.id\) === true\) \{\s*setHoveredCandidateId\(flowNode\.id\);/);
-    assert.match(codeMapSrc, /setFocusedCandidateId\(id !== null && revealCandidatesRef\.current\?\.has\(id\) === true \? id : null\);/);
-    assert.match(codeMapSrc, /onNodeMouseEnter=\{handleNodeMouseEnter\}\s*onNodeMouseLeave=\{handleNodeMouseLeave\}\s*onFocus=\{handleCanvasFocus\}\s*onBlur=\{handleCanvasBlur\}/);
-    // The node memo no longer depends on the reveal canvas or the hover.
-    const start = codeMapSrc.indexOf('const { renderedNodes, renderedEdges, renderedVisibleIds } = useMemo(');
-    const memo = codeMapSrc.slice(start, codeMapSrc.indexOf('// P4-7h (founder decision 2026-10-05)', start));
-    assert.ok(start >= 0);
-    assert.doesNotMatch(memo, /revealCanvas|hoveredCandidateId|focusedCandidateId|sharedReach/);
-    // The map's own edges (and so adjacency, risk and LOD inputs) never carry them.
-    const flowStart = codeMapSrc.indexOf('const flowEdges = useMemo(');
-    assert.doesNotMatch(codeMapSrc.slice(flowStart, codeMapSrc.indexOf('[population, revealCanvas]', flowStart)), /sharedReach/);
-  });
-
-  it('Node detail gets the list for a shown candidate only', () => {
-    assert.match(
-      codeMapSrc,
-      /sharedReach=\{\s*revealCanvas\?\.candidates\.has\(nodeDetail\.node\.id\) === true\s*\? sharedReachPartners\(revealCanvas\.state, nodeDetail\.node\.id\)\s*: undefined\s*\}/,
-    );
-  });
-
-  it("a pin change's rebased history snapshots take the new listing's relations", () => {
-    assert.match(
-      codeMapSrc,
-      /const \{ candidates, relations \} = landed\.state;\s*const fresh = initialRevealState\(\{ status: 'found', candidates, totalQualifying: 0, relations: \[\.\.\.relations\] \}\);/,
-    );
   });
 });

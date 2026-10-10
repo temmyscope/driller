@@ -4,8 +4,8 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { ModelStatusMessage } from '@driller/ipc-contracts';
-import { createFakeDrillerApi, deferred, INSTALL_NEEDS_DOM_ENV } from './fakeDrillerApi';
+import { ENTRY_PINS_MAX, type ModelStatusMessage } from '@driller/ipc-contracts';
+import { createFakeDrillerApi, deferred, entryPinsStore, INSTALL_NEEDS_DOM_ENV } from './fakeDrillerApi';
 import { pathTraceBasicMap } from './mapFixture';
 
 describe('createFakeDrillerApi', () => {
@@ -116,5 +116,22 @@ describe('deferred (P4-8d)', () => {
     const pending = deferred<string>();
     pending.reject(new Error('read failed'));
     await assert.rejects(pending.promise, { message: 'read failed' });
+  });
+});
+
+describe('entryPinsStore (P4-8g)', () => {
+  it('keeps pins per project, in pin order, as main does: a repeat changes nothing, past the limit is refused', async () => {
+    const store = entryPinsStore({ '/a': ['x'] });
+    const { getEntryPins, setEntryPins } = store.stubs;
+    assert.deepEqual(await getEntryPins('/a'), ['x']);
+    assert.deepEqual(await getEntryPins('/b'), []);
+    assert.deepEqual(await setEntryPins('/a', 'y', true), { status: 'stored', pins: ['x', 'y'] });
+    assert.deepEqual(await setEntryPins('/a', 'x', true), { status: 'stored', pins: ['x', 'y'] });
+    assert.deepEqual(await setEntryPins('/a', 'x', false), { status: 'stored', pins: ['y'] });
+    assert.deepEqual(store.pinsOf('/b'), []);
+    const full = entryPinsStore({ '/a': Array.from({ length: ENTRY_PINS_MAX }, (_, index) => `p${index}`) });
+    const refused = await full.stubs.setEntryPins('/a', 'z', true);
+    assert.equal(refused.status, 'limit');
+    assert.equal(full.pinsOf('/a').length, ENTRY_PINS_MAX);
   });
 });

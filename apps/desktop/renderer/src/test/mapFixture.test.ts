@@ -16,6 +16,11 @@ import {
   PR_REVIEW_HOPS,
   prReviewDiffScope,
   prReviewMap,
+  rankedListing,
+  SHARED_REACH_CANDIDATES,
+  SHARED_REACH_MID,
+  sharedReachListing,
+  sharedReachMap,
   syntheticMap,
   type CodeMapOk,
 } from './mapFixture';
@@ -108,5 +113,39 @@ describe('P4-8f: the Revealed fixtures', () => {
     for (const node of map.nodes) {
       assert.match(node.file, /^hub13(\/c\d\d)?\.ts$/);
     }
+  });
+});
+
+describe('P4-8g: the shared-reach fixture', () => {
+  it('lists the five roots with the relations the DOM tests read, counted from the map’s own edges', () => {
+    const listing = sharedReachListing();
+    const C = SHARED_REACH_CANDIDATES;
+    assert.deepEqual(
+      listing.candidates.map((candidate) => candidate.name).sort(),
+      ['alpha', 'beta', 'delta', 'eps', 'gamma'],
+    );
+    assert.deepEqual(listing.relations, [
+      { a: C.alpha.id, b: C.beta.id, sharedReach: 5 },
+      { a: C.alpha.id, b: C.gamma.id, sharedReach: 4 },
+      { a: C.alpha.id, b: C.delta.id, sharedReach: 3 },
+      { a: C.beta.id, b: C.gamma.id, sharedReach: 2 },
+      { a: C.alpha.id, b: C.eps.id, sharedReach: 1 },
+    ]);
+    // Each listed reach is the renderer drill's reach of the same map.
+    const map = sharedReachMap();
+    const graph = revealDrillGraphFor(null, map.nodes, map.edges);
+    for (const candidate of listing.candidates) {
+      assert.equal(graph.reachById.get(candidate.id), candidate.reach, candidate.id);
+    }
+    assert.equal(new Set(map.nodes.map((node) => node.id)).size, map.nodes.length);
+  });
+
+  it('pinning mid lists it first, "pinned", sharing 2 with alpha and with beta', () => {
+    const listing = sharedReachListing([SHARED_REACH_MID.id]);
+    assert.equal(listing.candidates[0]?.id, SHARED_REACH_MID.id);
+    assert.deepEqual(listing.candidates[0]?.reason, { kind: 'pinned' });
+    const withMid = listing.relations.filter((relation) => relation.a === SHARED_REACH_MID.id || relation.b === SHARED_REACH_MID.id);
+    assert.deepEqual(withMid.map((relation) => relation.sharedReach), [2, 2]);
+    assert.deepEqual(rankedListing(pathTraceBasicMap()), pathTraceBasicListing());
   });
 });

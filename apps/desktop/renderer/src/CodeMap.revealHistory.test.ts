@@ -1,16 +1,14 @@
 /**
  * P4-7f: drill steps in the Back/Forward history (the entry union, the cap,
  * Back/Forward over reveal entries, stale entries never surviving a map
- * change), the `+`/`−` keyboard on a focused card, and the hook wiring
- * (source pins: the component's hooks can't run under `node --test`).
+ * change), and the `+`/`−` keyboard on a focused card, hookless. P4-8g:
+ * the wiring inside `CodeMap` is rendered in `CodeMap.revealHistory.dom.test.tsx`.
  *
  * What this cannot reach: the live canvas — VoiceOver reading the status
- * line, focus landing, Cmd + `=` zooming the app (the P4-7f live check).
+ * line, Cmd + `=` zooming the app (the P4-7f live check).
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
-import { fileURLToPath } from 'node:url';
 
 import type { CodeMapEdge, CodeMapNode, EntryCandidate } from '@driller/ipc-contracts';
 
@@ -46,16 +44,6 @@ import {
   type RevealState,
 } from './revealView';
 import type { RenderedElement } from './testRender';
-
-const codeMapSrc = readFileSync(fileURLToPath(new URL('./CodeMap.tsx', import.meta.url)), 'utf8');
-
-const sliceFrom = (start: string, end: string) => {
-  const from = codeMapSrc.indexOf(start);
-  assert.ok(from >= 0, start);
-  const to = codeMapSrc.indexOf(end, from);
-  assert.ok(to > from, end);
-  return codeMapSrc.slice(from, to);
-};
 
 function mapNode(id: string): CodeMapNode {
   return {
@@ -478,108 +466,5 @@ describe('the card keyboard (Revealed only)', () => {
     assert.equal(press(root, '+', { ctrlKey: true }).prevented, false);
     press(root, '-');
     assert.deepEqual(calls, ['hub', 'hub', 'hub', 'hub']);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// The hook wiring (source pins)
-// ---------------------------------------------------------------------------
-
-describe('CodeMap source: history wiring', () => {
-  it('history is the entry union; navigation pushes a node entry through pushHistoryEntry', () => {
-    assert.match(codeMapSrc, /const \[history, setHistory\] = useState<NavigationHistory>\(\{ stack: \[\], index: -1 \}\);/);
-    assert.match(codeMapSrc, /const pushHistory = useCallback\(\(entry: HistoryEntry\) => \{\s*setHistory\(\(previous\) => pushHistoryEntry\(previous, entry\)\);/);
-    assert.match(codeMapSrc, /if \(centerOnNode\(id\)\) \{\s*pushHistory\(\{ kind: 'node', id \}\);/);
-  });
-
-  it('every drill step (expand, collapse, stub) pushes exactly one reveal entry and announces it', () => {
-    const body = sliceFrom('const applyRevealDrill = useCallback(', 'const onRevealDrill = useCallback(');
-    assert.equal(body.match(/pushHistoryEntry\(/g)?.length, 1);
-    assert.match(body, /kind: 'reveal',\s*before: applied\.before,\s*after: applied\.after,\s*focusId: focus\.id,/);
-    assert.match(body, /announceReveal\(formatRevealAnnouncement\(applied\.before, applied\.after, focus\.name, \{ parentId: focus\.id, step \}\)\);/);
-    // Nothing to do (`+` on a leaf): only the status line, no entry.
-    assert.match(body, /if \(applied === null \|\| step === null\) \{\s*if \(outcome\.text !== null\) \{\s*announceReveal\(outcome\.text\);\s*\}\s*return;/);
-    const stub = sliceFrom('const onActivateRevealStub = useCallback(', 'const onActivateRevealRef = useCallback(');
-    assert.match(stub, /applyRevealDrill\(\{ id: stub\.parentId, name: stub\.parentName \}/);
-  });
-
-  it('toggling Revealed / Full pushes nothing', () => {
-    const body = sliceFrom('const changeRevealView = useCallback(', '  }, []);');
-    assert.doesNotMatch(body, /setHistory|pushHistory/);
-  });
-
-  it('Back/Forward take reveal entries through applyRevealHistoryMove; node entries keep the Full routing', () => {
-    for (const name of ['goBack', 'goForward']) {
-      const body = sliceFrom(`const ${name} = useCallback(() => {`, '}, [history, centerOnNode, applyRevealHistoryMove, mode]);');
-      assert.match(
-        body,
-        new RegExp(
-          `const move = historyMove\\(history, '${name === 'goBack' ? 'back' : 'forward'}', \\{ skipReveals: mode !== 'codeMap' \\}\\);\\s*if \\(move\\.kind === 'reveal'\\) \\{\\s*applyRevealHistoryMove\\(move\\);\\s*return;`,
-        ),
-      );
-    }
-    assert.match(codeMapSrc, /onClick=\{goBack\}\s*disabled=\{!canGoBack\(history, \{ skipReveals: mode !== 'codeMap' \}\)\}/);
-    assert.match(codeMapSrc, /onClick=\{goForward\}\s*disabled=\{!canGoForward\(history, \{ skipReveals: mode !== 'codeMap' \}\)\}/);
-  });
-
-  it('a reveal step restores its snapshot locally (no IPC, no re-listing), switches to Revealed, and announces', () => {
-    const body = sliceFrom('const applyRevealHistoryMove = useCallback(', 'const handleEdgeClick');
-    assert.doesNotMatch(body, /window\.driller|listEntryCandidates/);
-    assert.match(body, /const expected = move\.how === 'redo' \? move\.entry\.before : move\.entry\.after;/);
-    assert.match(body, /restoreRevealSnapshot\(revealHeldRef\.current, key, move\.entry, expected, move\.restore\)/);
-    assert.match(body, /if \(mode !== 'codeMap'\) \{[\s\S]*?return;\s*\}\s*const restored = restoreRevealSnapshot/);
-    assert.match(
-      body,
-      /if \(restored === null\) \{[\s\S]*?setHistory\(\(previous\) => historyWithoutEntry\(previous, move\.entry\)\);\s*announceReveal\(REVEAL_STEP_STALE_TEXT\);\s*return;/,
-    );
-    assert.match(body, /if \(revealViewRef\.current !== 'revealed'\) \{[\s\S]*?setRevealView\('revealed'\);/);
-    assert.match(body, /setRevealFocusRequest\(\{ id: move\.centerId, fallbackId: move\.entry\.focusId, focusedCard \}\);/);
-    assert.match(body, /announceReveal\(formatRevealHistoryAnnouncement\(move\.how, move\.entry\)\);/);
-  });
-
-  it('the restored Node is centred only if it is still drawn, and only in Revealed', () => {
-    assert.match(codeMapSrc, /setRevealFocusRequest\(null\);\s*if \(!revealDrawn\) \{\s*return;\s*\}/);
-    assert.match(
-      codeMapSrc,
-      /const centreId = flowNodesById\.has\(id\) \? id : flowNodesById\.has\(fallbackId\) \? fallbackId : null;\s*if \(centreId !== null\) \{\s*centerOnNode\(centreId\);/,
-    );
-    assert.match(codeMapSrc, /case 'step-card':\s*stepCard\?\.focus\(\{ preventScroll: true \}\);\s*break;\s*case 'back-button':\s*historyBackButtonRef\.current\?\.focus\(\);/);
-  });
-
-  it('review round 1: announcements stay until the next event; an identical one is re-announced on the next frame', () => {
-    const body = sliceFrom('const announceReveal = useCallback(', '  }, []);');
-    assert.match(body, /setRevealSwitchStatus\(null\);\s*const \[first, then\] = announcementSteps\(revealAnnouncementRef\.current, text\);/);
-    assert.match(body, /requestAnimationFrame\(\(\) => \{[\s\S]*?setRevealAnnouncement\(then\);/);
-    assert.doesNotMatch(body, /setTimeout/);
-    // Cleared by the next navigation, a toggle, a reload and a mode change.
-    assert.match(codeMapSrc, /routeThroughFullMapRef\.current = \(ids, action\) => \{\s*\/\/[^\n]*\n\s*if \(!replayingFullNavigationRef\.current\) \{\s*clearRevealAnnouncement\(\);/);
-    assert.match(sliceFrom('const changeRevealView = useCallback(', 'revealViewRequestForToggle({'), /clearRevealAnnouncement\(\);/);
-    assert.match(sliceFrom('const loadCodeMap = useCallback(() => {', 'revealViewRequestRef.current = null;'), /clearRevealAnnouncement\(\);/);
-    assert.match(codeMapSrc, /revealStatusModeRef\.current = mode;\s*setRevealSwitchStatus\(null\);\s*clearRevealAnnouncement\(\);/);
-    // The switch-to-Full message keeps its 8 s clear; the announcement has none.
-    assert.match(codeMapSrc, /const timer = setTimeout\(\(\) => setRevealSwitchStatus\(null\), REVEAL_SWITCH_STATUS_MS\);/);
-    assert.doesNotMatch(codeMapSrc, /setTimeout\(\(\) => setRevealAnnouncement/);
-  });
-
-  it('the hidden-Node replay still restores only a node entry at that index', () => {
-    assert.match(
-      codeMapSrc,
-      /const entry = previous\.stack\[pending\.index\];\s*return entry\?\.kind === 'node' && entry\.id === pending\.id \? \{ \.\.\.previous, index: pending\.index \} : previous;/,
-    );
-  });
-
-  it('no reveal entry outlives its map: a new fetch drops other fetches’ entries; a landed listing drops them all', () => {
-    assert.match(
-      codeMapSrc,
-      /historyWithoutReveals\(previous, \(entry\) => entry\.key === currentRevealKey && entry\.mapStamp === revealMapStamp\),\s*\);\s*\}, \[currentRevealKey, revealMapStamp\]\);/,
-    );
-    // P4-7g review round 1: except a pin change's listing on the same fetch, which rebases them.
-    assert.match(codeMapSrc, /setRevealHeld\(outcome\.held\);[\s\S]{0,2200}?setHistory\(\(previous\) => historyWithoutReveals\(previous\)\);/);
-  });
-
-  it('founder decision (sections): a section switch reloads through loadCodeMap, which clears history with the reveal state', () => {
-    const start = codeMapSrc.indexOf('const loadCodeMap = useCallback(() => {');
-    const body = codeMapSrc.slice(start, codeMapSrc.indexOf('setRevealHeld(null);', start) + 40);
-    assert.match(body, /setHistory\(\{ stack: \[\], index: -1 \}\);[\s\S]*setRevealHeld\(null\);/);
   });
 });

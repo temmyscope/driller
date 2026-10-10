@@ -37,6 +37,7 @@ import type {
   FoldedType,
   RiskSignal,
 } from '@driller/ipc-contracts';
+import { listEntryCandidates } from '@driller/graph-contracts';
 import { generateSyntheticCodeMap } from '../devFixture';
 
 function fn(file: string, name: string, startLine: number, endLine: number): CodeMapNode {
@@ -387,4 +388,91 @@ export function drillMap(hubs: readonly DrillHub[]): CodeMapOk {
     section: null,
     sections: [],
   } satisfies CodeMapOk);
+}
+
+// ---------------------------------------------------------------------------
+// P4-8g: shared reach between candidates, and entry pins
+// ---------------------------------------------------------------------------
+
+/**
+ * The shared-reach candidates: five roots with no callers in indexed code,
+ * each calling the Nodes of the pools it shares directly. Ids sort `alpha`
+ * < `beta` < `delta` < `eps` < `gamma`, so a relation's `a`/`b` order is
+ * not its strength order.
+ */
+export const SHARED_REACH_CANDIDATES = {
+  alpha: fn('alpha.ts', 'alpha', 1, 20),
+  beta: fn('beta.ts', 'beta', 1, 20),
+  gamma: fn('gamma.ts', 'gamma', 1, 20),
+  delta: fn('delta.ts', 'delta', 1, 20),
+  eps: fn('eps.ts', 'eps', 1, 20),
+} as const satisfies Record<string, CodeMapNode>;
+
+type SharedReachName = keyof typeof SHARED_REACH_CANDIDATES;
+
+/** A pool of `size` leaf Nodes (`shared/<name>.ts::<name><k>`) its `owners` all call. */
+function pool(name: string, size: number): CodeMapNode[] {
+  return Array.from({ length: size }, (_, index) => fn(`shared/${name}.ts`, `${name}${index + 1}`, index * 3 + 1, index * 3 + 2));
+}
+
+const SHARED_POOLS: { owners: readonly SharedReachName[]; nodes: CodeMapNode[] }[] = [
+  { owners: ['alpha', 'beta'], nodes: pool('ab', 5) },
+  { owners: ['alpha', 'gamma'], nodes: pool('ag', 4) },
+  { owners: ['alpha', 'delta'], nodes: pool('ad', 3) },
+  { owners: ['alpha', 'eps'], nodes: pool('ae', 1) },
+  { owners: ['beta', 'gamma'], nodes: pool('bg', 2) },
+  { owners: ['eps'], nodes: pool('e', 2) },
+];
+
+/**
+ * `mid` (`mid.ts::mid`), called by `alpha`, calls the first two Nodes `alpha`
+ * and `beta` share — so it is no candidate until it is pinned, and then it
+ * shares reach 2 with `alpha` and with `beta`.
+ */
+export const SHARED_REACH_MID = fn('mid.ts', 'mid', 1, 9);
+
+/**
+ * The shared-reach map. Its listing (`sharedReachListing`) relates
+ * `alpha`–`beta` 5, `alpha`–`gamma` 4, `alpha`–`delta` 3, `beta`–`gamma` 2
+ * and `alpha`–`eps` 1: `alpha`'s three strongest partners are `beta`,
+ * `gamma` and `delta` (never `eps`), and `beta`'s are `alpha` and `gamma`.
+ */
+export function sharedReachMap(): CodeMapOk {
+  const C = SHARED_REACH_CANDIDATES;
+  const poolNodes = SHARED_POOLS.flatMap(({ nodes }) => nodes);
+  const edges = SHARED_POOLS.flatMap(({ owners, nodes }) =>
+    owners.flatMap((owner) => nodes.map((node) => calls(C[owner], node))),
+  );
+  const ab = SHARED_POOLS[0]!.nodes;
+  edges.push(calls(C.alpha, SHARED_REACH_MID), calls(SHARED_REACH_MID, ab[0]!), calls(SHARED_REACH_MID, ab[1]!));
+  return structuredClone({
+    status: 'ok',
+    nodes: [...Object.values(C), SHARED_REACH_MID, ...poolNodes],
+    edges,
+    hiddenByScope: 0,
+    appliedScope: [],
+    foldedTypes: [],
+    foldedModules: [],
+    section: null,
+    sections: [],
+  } satisfies CodeMapOk);
+}
+
+/**
+ * The listing the Graph Service answers for `map` with `pinnedIds` — the
+ * real pure ranking (`@driller/graph-contracts`' `listEntryCandidates`):
+ * pins first, in pin order, then the heuristic candidates, with every
+ * shared-reach relation between them. Test-only: app code never ranks.
+ */
+export function rankedListing(map: CodeMapOk, pinnedIds: readonly string[] = []): EntryCandidatesResult {
+  return structuredClone(listEntryCandidates(map.nodes, map.edges, { pinnedIds: [...pinnedIds] }));
+}
+
+/** `sharedReachMap`'s listing (with `pinnedIds`, if any). */
+export function sharedReachListing(pinnedIds: readonly string[] = []): FoundListing {
+  const listing = rankedListing(sharedReachMap(), pinnedIds);
+  if (listing.status !== 'found') {
+    throw new Error(`the shared-reach map lists ${listing.status}`);
+  }
+  return listing;
 }
