@@ -18,3 +18,6 @@ apps/desktop/out/
 
 # Claude Code agent worktrees (isolation: "worktree" container dirs)
 .claude/worktrees/
+
+# `npm run e2e` failure artifacts (P4-8h)
+e2e-artifacts/

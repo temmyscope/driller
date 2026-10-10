@@ -57,6 +57,9 @@ const TEST_PATTERNS = [
   // The runner's own guard tests. Not recursive: the hanging/leaking
   // fixtures under `scripts/fixtures/` must never be picked up.
   'scripts/*.test.mjs',
+  // The e2e harness's own unit tests (P4-8h). Not recursive, and never
+  // `*.e2e.ts`: the journeys themselves run only under `npm run e2e`.
+  'e2e/*.test.ts',
 ];
 
 const PER_TEST_TIMEOUT_MS = 20_000;

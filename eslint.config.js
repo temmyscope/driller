@@ -29,6 +29,8 @@ export default tseslint.config(
       // Repo tooling that Node itself runs (the `npm test` TypeScript
       // loader), not app code — a Node context like the three above.
       'scripts/**/*.mjs',
+      // The `npm run e2e` harness (P4-8h): Node drives the app over CDP.
+      'e2e/**/*.ts',
       '*.config.js',
       'eslint.config.js',
     ],
