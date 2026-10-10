@@ -429,6 +429,7 @@ describe('A pin change and history (replaces the same-fetch rebase pin)', () => 
     const fake = failingListingFake(entryPinsStore(), failing);
     await mountRevealed();
     await expandHandleRequest();
+    await settleViewport();
     failing.now = true;
     const detail = await openDetail(N.serviceB);
     fireEvent.click(pinSection(detail).toggle);
@@ -441,23 +442,26 @@ describe('A pin change and history (replaces the same-fetch rebase pin)', () => 
     fireEvent.click(screen.getByRole('button', { name: 'Back' }));
     await waitForDrawn([N.handleRequest.id]);
     assert.equal(revealStatus(), `Back: restored the view before expanding ${N.handleRequest.name}`);
+    // FIX-5: Back's centring animates; let it end inside the test (under a
+    // loaded full run its frames otherwise land outside act()).
+    await settleViewport();
   });
 
-  // App bug (P4-7g review round 1 #2: "The Panel status line says
-  // 'Couldn’t update the entry candidates after the pin change …'"): the
-  // Panel line shows the latest drill announcement before any notice
-  // (`revealStatusText`: switch message, announcement, notice, cap line), and
-  // a pin change clears no announcement — so after a drill (the usual way to
-  // reach a Node to pin) the failure is never said.
+  // P4-7g review round 1 #2 ("The Panel status line says 'Couldn’t update
+  // the entry candidates after the pin change …'"). The Panel line shows the
+  // latest drill announcement before any notice (`revealStatusText`), so
+  // after a drill (the usual way to reach a Node to pin) the failure was
+  // never said. FIX-5: a failed pin-change listing clears the announcement.
   it(
     'after a drill, a failed pin-change listing is still said in the Panel line',
-    { ...BUDGET, todo: 'a drill announcement outranks the pin-listing failure notice (revealStatusText order)' },
+    BUDGET,
     async () => {
       elementSize.set(3000, 2000);
       const failing = { now: false };
       const fake = failingListingFake(entryPinsStore(), failing);
       await mountRevealed();
       await expandHandleRequest();
+      await settleViewport();
       failing.now = true;
       const detail = await openDetail(N.serviceB);
       fireEvent.click(pinSection(detail).toggle);

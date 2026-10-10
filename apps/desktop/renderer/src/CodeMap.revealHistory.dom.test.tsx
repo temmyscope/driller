@@ -503,17 +503,16 @@ describe('Back and Forward over drill steps (replaces the Back/Forward, entry-un
     await settleViewport();
   });
 
-  // App bug (P4-7f review round 1 #6, "a Back/Forward over a reveal entry
-  // that removes the keyboard-focused card moves focus to the step's Node
-  // card"): `CodeMap`'s rescue effect checks `focusedCard.isConnected` in
-  // the commit that restores the snapshot, but React Flow only removes the
-  // card in its next render (its `StoreUpdater` copies the `nodes` prop into
-  // its store in a passive effect). So the card still looks shown, nothing
-  // is moved, and focus then falls to `<body>` when the card goes. The same
-  // effect order holds in Chromium; confirm in the P4-7f live check.
+  // P4-7f review round 1 #6 ("a Back/Forward over a reveal entry that
+  // removes the keyboard-focused card moves focus to the step's Node card").
+  // FIX-5: React Flow only removes the card in its next render (its
+  // `StoreUpdater` copies the `nodes` prop into its store in a passive
+  // effect), so the rescue once saw the card still connected, moved nothing,
+  // and focus fell to `<body>`. It now waits for the card to go. The same
+  // effect order holds in Chromium; confirm in the live check (FIX-5 row).
   it(
     'a step that removes the focused card moves focus to the step’s Node card',
-    { ...LONG, todo: 'the focus rescue runs before React Flow removes the card (CodeMap.tsx revealFocusRequest effect)' },
+    LONG,
     async () => {
       elementSize.set(3000, 2000);
       await drillToCacheLookup();

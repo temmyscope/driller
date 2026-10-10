@@ -2335,6 +2335,13 @@ export function revealRefConnectorEdges(auxCards: readonly RevealAuxCard[]): Flo
 const REVEAL_CONNECTOR_ID_PREFIX = 'reveal-connector:';
 
 /**
+ * FIX-5 review round 1: how long a Back/Forward focus rescue waits for React
+ * Flow to remove the focused card before giving up (it goes within a frame
+ * or two; this only stops a rescue from firing long after its step).
+ */
+export const REVEAL_FOCUS_RESCUE_CAP_MS = 1_000;
+
+/**
  * P4-7e review round 1: whether a canvas edge is a Revealed decoration —
  * a ref connector, or (P4-7h) a shared-reach edge — never a Node pair, so
  * `handleEdgeClick` ignores it: no navigation, no history entry.
@@ -9058,6 +9065,15 @@ export function CodeMap({
   // Full, reset to Full on a project change (never persisted: Ask First).
   // Applied only in Code Map mode: PR Review always renders Full.
   const [revealView, setRevealView] = useState<RevealViewMode>('full');
+  // FIX-5 (P4-8f): the project the toggle belongs to. A project change goes
+  // back to Full in the same render (React's "adjust state on a prop change"
+  // pattern), so the listing effect never runs with Revealed still on for the
+  // new project (its held state is dropped by `loadCodeMap`'s reset).
+  const [revealViewProject, setRevealViewProject] = useState(projectPath);
+  if (revealViewProject !== projectPath) {
+    setRevealViewProject(projectPath);
+    setRevealView('full');
+  }
   // P4-7d: the held reveal state — keyed by project and section (`revealKey`)
   // and by the map fetch it was listed for. Switching to Full and back keeps
   // it; a section switch or a reload drops it (`loadCodeMap`). Mirrored in a
@@ -9090,6 +9106,17 @@ export function CodeMap({
     focusedCard: HTMLElement | null;
   } | null>(null);
   const historyBackButtonRef = useRef<HTMLButtonElement | null>(null);
+  // FIX-5: the focus rescue waiting for React Flow to remove the focused card
+  // (its observer, and the cap after which it gives up).
+  const revealFocusRescueRef = useRef<{ observer: MutationObserver; cap: ReturnType<typeof setTimeout> } | null>(null);
+  const cancelRevealFocusRescue = useCallback(() => {
+    const pending = revealFocusRescueRef.current;
+    if (pending !== null) {
+      pending.observer.disconnect();
+      clearTimeout(pending.cap);
+      revealFocusRescueRef.current = null;
+    }
+  }, []);
   // P4-7f: the latest drill or Back/Forward announcement in the Panel's one
   // status line. Review round 1: it stays until the next event (a drill, a
   // navigation, a toggle, a mode change or a reload) — no 8 s clear, unlike
@@ -9450,6 +9477,8 @@ export function CodeMap({
     // "focused" Node from a map that's gone).
     setHistory({ stack: [], index: -1 });
     focusedNodeIdRef.current = null;
+    // FIX-5 review round 1: a focus rescue belongs to the map it waited on.
+    cancelRevealFocusRescue();
     // P4-7d (founder decision 2026-10-04): the held reveal state belongs to
     // one project, section and map — a section switch (or a Retry) drops it,
     // so Revealed restarts from the new map's candidates; a listing still in
@@ -9592,7 +9621,7 @@ export function CodeMap({
           message: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [fixtureNodeCount, clearDiffScopeSync]);
+  }, [fixtureNodeCount, clearDiffScopeSync, cancelRevealFocusRescue]);
 
   // P4-4 phase 1c: `section` is a dependency so that a switch reloads the
   // map through this same full reset — history, Node and type detail, Path
@@ -9842,10 +9871,13 @@ export function CodeMap({
     setBlastRadiusDepth(BLAST_RADIUS_DEFAULT_HOPS);
     setPrReviewMetricSort(null);
     blastRadiusRequestIdRef.current += 1;
-    // P4-7d: the Revealed / Full toggle is per session and per project — a
-    // project change goes back to Full (its held state is dropped by
-    // `loadCodeMap`'s reset).
-    setRevealView('full');
+    // FIX-5 (P4-8e): a diff-scope carry check still in flight belongs to the
+    // project being left — its line goes, and its late reply re-runs nothing.
+    setDiffCarryNote(null);
+    diffCarryRequestIdRef.current += 1;
+    setDiffCarryPending(null);
+    // (P4-7d's reset to Full on a project change happens during render — see
+    // `revealViewProject` — so no effect ever runs Revealed for the new project.)
   }, [projectPath, clearDiffScopeSync]);
 
   /**
@@ -10949,6 +10981,9 @@ export function CodeMap({
       if (landed.status === 'ready' && landed.pinsListingFailed !== undefined) {
         // P4-7g review round 1: a failed pin-change listing kept the drawn
         // state as it was, so every reveal step still applies.
+        // FIX-5 (P4-7g review round 1 #2): the failure is the latest event —
+        // a drill's announcement no longer outranks it in the Panel line.
+        clearRevealAnnouncement();
         return;
       }
       if (sameFetch && landed.status === 'ready' && drawnBefore !== null && drillGraph !== null && drillGraph.edges === mapStamp) {
@@ -10991,6 +11026,7 @@ export function CodeMap({
     revealListingRequests,
     isDevFixtureMode,
     entryPinsRevision,
+    clearRevealAnnouncement,
   ]);
 
   // P4-7d: a navigation to a Node Revealed doesn't draw switches to Full
@@ -11777,6 +11813,8 @@ export function CodeMap({
       return;
     }
     setRevealFocusRequest(null);
+    // FIX-5 review round 1: a new step supersedes a rescue still waiting.
+    cancelRevealFocusRescue();
     if (!revealDrawn) {
       return;
     }
@@ -11787,26 +11825,78 @@ export function CodeMap({
     }
     // Review round 1: a restore that removed the keyboard-focused card moves
     // focus to the step's Node card if shown, else the Back button.
-    const stepCard =
-      canvasElement?.querySelector<HTMLElement>(`.react-flow__node[data-id="${CSS.escape(fallbackId)}"] .code-map__node`) ??
-      null;
-    switch (
-      revealFocusRescue({
-        focusWasOnCard: focusedCard !== null,
-        focusedCardStillShown: focusedCard?.isConnected === true,
-        stepCardShown: stepCard !== null,
-      })
-    ) {
-      case 'step-card':
-        stepCard?.focus({ preventScroll: true });
-        break;
-      case 'back-button':
-        historyBackButtonRef.current?.focus();
-        break;
-      case 'none':
-        break;
+    // FIX-5: React Flow removes the card only in a later render (it copies
+    // the `nodes` prop into its store in a passive effect), so whether the
+    // card stays is read from the laid-out Nodes, and focus is moved only
+    // once the card has really left the DOM — never before (focus would then
+    // fall to <body> when it goes), and not if the user has moved it since.
+    // Review round 1: "stays" also counts the cards drawn (a cluster card's
+    // id is in the rendered set only), so no rescue waits on a card that
+    // never goes.
+    const focusedId = focusedCard?.closest('.react-flow__node')?.getAttribute('data-id') ?? null;
+    const focusedCardStays =
+      focusedCard?.isConnected === true &&
+      focusedId !== null &&
+      (flowNodesById.has(focusedId) || renderedNodes.some((node) => node.id === focusedId));
+    if (focusedCard === null || focusedCardStays) {
+      return;
     }
-  }, [revealFocusRequest, revealDrawn, flowNodesById, centerOnNode, canvasElement]);
+    const rescue = () => {
+      const active = document.activeElement;
+      if (active !== null && active !== document.body && active !== focusedCard) {
+        return;
+      }
+      const stepCard =
+        canvasElement?.querySelector<HTMLElement>(`.react-flow__node[data-id="${CSS.escape(fallbackId)}"] .code-map__node`) ??
+        null;
+      switch (
+        revealFocusRescue({
+          focusWasOnCard: true,
+          focusedCardStillShown: false,
+          stepCardShown: stepCard !== null,
+        })
+      ) {
+        case 'step-card':
+          stepCard?.focus({ preventScroll: true });
+          if (document.activeElement !== stepCard) {
+            // Not focusable yet (e.g. unmeasured, so still hidden): Back.
+            historyBackButtonRef.current?.focus();
+          }
+          break;
+        case 'back-button':
+          historyBackButtonRef.current?.focus();
+          break;
+        case 'none':
+          break;
+      }
+    };
+    if (!focusedCard.isConnected || canvasElement === null) {
+      rescue();
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      if (!focusedCard.isConnected) {
+        cancelRevealFocusRescue();
+        rescue();
+      }
+    });
+    observer.observe(canvasElement, { childList: true, subtree: true });
+    // Review round 1: never long after the step — React Flow removes the
+    // card within a frame or two.
+    const cap = setTimeout(cancelRevealFocusRescue, REVEAL_FOCUS_RESCUE_CAP_MS);
+    revealFocusRescueRef.current = { observer, cap };
+  }, [
+    revealFocusRequest,
+    revealDrawn,
+    flowNodesById,
+    renderedNodes,
+    centerOnNode,
+    canvasElement,
+    cancelRevealFocusRescue,
+  ]);
+  // FIX-5: a rescue still waiting for its card to go never outlives the
+  // canvas it observes (review round 1), nor the map.
+  useEffect(() => cancelRevealFocusRescue, [canvasElement, cancelRevealFocusRescue]);
   // P4-7f: a reveal step belongs to one map fetch — a new fetch (a refresh)
   // drops the reveal entries taken on another one (node entries stay: Node
   // ids are content-stable across re-index). A section switch, Retry or
@@ -13242,7 +13332,9 @@ export function CodeMap({
               onOpenTest={(target) => openTestFromDetail(target, { closeNodeDetail, openSourceForNode })}
               // P4-2 phase 3a: the rendered population `navigateToNode`
               // centres on, so only a navigable Node becomes a button.
-              resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id))}
+              // FIX-5 (P4-7d): in Revealed, a map Node it doesn't draw is
+              // navigable too — `navigateToNode` switches to Full to reach it.
+              resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id)) ?? revealHiddenMapNode(id)}
               onNavigateToNode={(id) => navigateFromDetail(id, { closeNodeDetail, navigateToNode })}
               // P4-2 phase 3b: a "Uses" entry opens its type's detail in
               // place of this panel.
@@ -13320,7 +13412,8 @@ export function CodeMap({
             <TypeDetailHead type={typeDetail.type} onClose={closeTypeDetail} />
             <TypeDetailBody
               type={typeDetail.type}
-              resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id))}
+              // FIX-5 (P4-7d): as Node detail — a Node Revealed hides is reached through Full.
+              resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id)) ?? revealHiddenMapNode(id)}
               onNavigateToNode={(id) =>
                 navigateFromTypeDetail(id, { closeTypeDetail, closeNodeDetail, navigateToNode })
               }

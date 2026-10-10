@@ -442,13 +442,12 @@ describe('what cancels a carry check in flight (P4-8j: replaces the cancel, unmo
 });
 
 describe('the diff carry across a project change (latent, P4-8e finding)', () => {
-  // Found by this phase, not fixed (app code is out of scope): CodeMap's
-  // project-change reset leaves a pending carry check live — its line stays,
-  // and its reply re-runs the old project's diff into the new project's
-  // state. Unreachable through App today: App unmounts CodeMap on a project
-  // change while it reads the new project's saved section (P4-8d), and the
-  // unmount moves the carry id on. A `todo` until CodeMap's reset owns it.
-  it('a project change drops a pending carry check', { ...BUDGET, todo: 'the project-change reset does not cancel a pending carry check' }, async () => {
+  // Found by P4-8e: CodeMap's project-change reset left a pending carry
+  // check live — its line stayed, and its reply re-ran the old project's
+  // diff into the new project's state. Unreachable through App (it unmounts
+  // CodeMap on a project change, P4-8d), but FIX-5 makes the reset own it:
+  // it moves the carry id on.
+  it('a project change drops a pending carry check', BUDGET, async () => {
     const { fake, pending } = carryFake();
     const { rerender } = render(<Shell switches={[]} />);
     await switchToApiWithDiff();

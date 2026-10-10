@@ -702,20 +702,17 @@ describe('Resets (replaces the reload, section-switch and project-reset pins)', 
     rerender(<CodeMap {...props({ projectPath: '/fixture/other' })} />);
     await waitForDrawn(ALL_IDS);
     assert.equal(pressedView(), 'Full map');
-    await waitFor(() => assert.equal(fake.calls.listEntryCandidates.length, 2), FIND);
-    await waitForDrawn(ALL_IDS);
     assert.deepEqual(candidateLines(), []);
-    assert.equal(pressedView(), 'Full map');
+    assert.equal(fake.calls.listEntryCandidates.length, 1, 'no listing for the new project');
   });
 
-  // Latent, not reachable through App (it remounts CodeMap per project):
-  // in the render where `projectPath` changes, the view is still Revealed,
-  // so the listing effect asks for the new project's candidates before the
-  // project reset's switch to Full lands — a listing nobody sees, held for
-  // the new project against the old project's map fetch.
+  // Latent, not reachable through App (it remounts CodeMap per project).
+  // FIX-5: the view goes back to Full in the render where `projectPath`
+  // changes, so the listing effect never asks for the new project's
+  // candidates against the old project's map fetch.
   it(
     'a project change makes no listing call for the new project',
-    { ...BUDGET, todo: 'the listing effect runs in the same commit as the project reset, while Revealed is still on' },
+    BUDGET,
     async () => {
       const fake = revealFake();
       const { rerender } = await mountFull(fake);
@@ -916,14 +913,12 @@ describe('Navigating to a Node Revealed doesn’t draw switches to Full (replace
     ]);
   });
 
-  // App bug (P4-7d "a Node-detail link … switches to Full"): Node detail
-  // resolves its "Go to" links against the cards Revealed draws, so a Node
-  // it doesn't draw reads "Not on the current map (hidden by scope or
-  // filters)" — no link, and a false reason — instead of a link that
-  // switches to Full.
+  // P4-7d "a Node-detail link … switches to Full" (FIX-5): a Node Revealed
+  // doesn't draw is still a link — it once read "Not on the current map
+  // (hidden by scope or filters)", with no link and a false reason.
   it(
     'a Node detail link to a Node Revealed doesn’t draw switches to Full',
-    { ...BUDGET, todo: 'Node detail’s resolveMapNode ignores Nodes Revealed hides (CodeMap.tsx Node detail panel)' },
+    BUDGET,
     async () => {
       const map = pathTraceBasicMap();
       map.nodes[0] = { ...map.nodes[0]!, fileTopLevel: [{ id: N.serviceA.id, kind: 'CALLS' }] };
