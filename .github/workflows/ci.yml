@@ -19,12 +19,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  # P4-8i: the macOS `e2e` job runs only on a manual trigger (founder
+  # decision 2026-10-06). A dispatch also runs the gates.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The event is in the key so a manual e2e dispatch and a push to the same
+  # ref never cancel each other.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -76,5 +81,57 @@ jobs:
         with:
           name: npm-test-output-node-${{ matrix.node }}
           path: ${{ runner.temp }}/npm-test-output.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # P4-8i: `npm run e2e -- --report` drives the real dev app (electron-forge
+  # start) over CDP on the founder's platform. Manual trigger only; never on
+  # push or pull_request (Ask First). No secrets: the run selects the cloud
+  # backend with no key, and the harness refuses non-loopback network inside
+  # the app (the local-model download is expected to be refused).
+  e2e:
+    name: e2e (macOS, manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      # node-llama-cpp's postinstall exits at once; no journey loads a model.
+      NODE_LLAMA_CPP_SKIP_DOWNLOAD: 'true'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node (.nvmrc)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install (npm ci; installs the CBM runtime)
+        run: |
+          node --version
+          time npm ci
+          test -x node_modules/codebase-memory-mcp/bin/codebase-memory-mcp
+
+      # Electron 43 downloads its binary on first launch, which inside the
+      # e2e run would hit the harness's network guard, so fetch it here.
+      - name: Install the Electron binary
+        run: node node_modules/electron/install.js
+
+      - name: npm run e2e -- --report
+        shell: bash # -eo pipefail: the run's exit code survives the tee
+        run: npm run e2e -- --report 2>&1 | tee "$RUNNER_TEMP/npm-e2e-output.txt"
+
+      - name: Upload the e2e artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-artifacts
+          path: |
+            e2e-artifacts/
+            ${{ runner.temp }}/npm-e2e-output.txt
           retention-days: 7
           if-no-files-found: ignore
