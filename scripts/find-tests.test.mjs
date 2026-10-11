@@ -162,7 +162,8 @@ describe('npm test runner guards (P4-8a)', { concurrency: 4 }, () => {
     });
     assert.equal(run.code, 0, run.output);
     assert.match(run.output, /passes/);
-    assert.match(run.output, /20 s per test, 240 s for the suite/);
+    // Node < 24 bounds each file instead (`PER_FILE_TIMEOUT_MS_NODE22`).
+    assert.match(run.output, timeoutEndsFile ? /120 s per file, 240 s for the suite/ : /20 s per test, 240 s for the suite/);
     assert.deepEqual(runDirsIn(run.tmp), [], 'the run dir of a clean run is removed');
   });
 

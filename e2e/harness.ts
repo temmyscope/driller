@@ -126,8 +126,18 @@ export interface KillDeps {
 export const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * SIGTERM, wait up to `graceMs` for the targets to go, then SIGKILL.
- * Returns which signals were sent, in order. Never throws (ESRCH = gone).
+ * How long, after SIGKILL, to wait for the targets to leave the process
+ * table. SIGKILL is delivered asynchronously: right after `kill()` returns,
+ * `ps` can still list a killed process (macOS shows it as `(sleep)` while it
+ * exits), so a survivor check made at once flaked (FIX-6: ~1 in 7 full
+ * `npm test` runs, "the group kill … leaves no survivor").
+ */
+export const KILL_REAP_MS = 2_000;
+
+/**
+ * SIGTERM, wait up to `graceMs` for the targets to go, then SIGKILL and wait
+ * up to `KILL_REAP_MS` for them to be gone. Returns which signals were sent,
+ * in order. Never throws (ESRCH = gone).
  */
 export async function terminateThenKill(
   targets: readonly number[],
@@ -151,7 +161,13 @@ export async function terminateThenKill(
   while (deps.alive() && deps.now() < deadline) {
     await deps.sleep(100);
   }
-  if (deps.alive()) send('SIGKILL');
+  if (deps.alive()) {
+    send('SIGKILL');
+    const reapDeadline = deps.now() + KILL_REAP_MS;
+    while (deps.alive() && deps.now() < reapDeadline) {
+      await deps.sleep(50);
+    }
+  }
   return sent;
 }
 

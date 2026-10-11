@@ -6,8 +6,8 @@
  * in pin order, then handleRequest, and Revealed draws each "pinned by you".
  * `driller-ui-settings.json` holds both ids in that order. Quit, relaunch on
  * the same userData, reopen: after the re-index the same three cards, in the
- * same order, both still "pinned by you". (Revealed's top-to-bottom canvas
- * order puts handleRequest first: a finding, see `expectPinnedFirst`.)
+ * same order, both still "pinned by you". Revealed draws them top to bottom
+ * in that order too (FIX-6: `layeredLayout` puts pins first, in pin order).
  */
 import type { Page } from 'playwright-core';
 
@@ -41,10 +41,9 @@ async function listing(page: Page, projectPath: string): Promise<string[]> {
 /**
  * The pins lead the listing in pin order, and Revealed draws each as
  * "pinned by you" (accessible name "…, pinned entry point, reaches N Nodes,
- * …"). The canvas's top-to-bottom order is not asserted: `layeredLayout`
- * sorts a column by reach, so handleRequest (reach 4) is drawn above the
- * pins — a finding against P4-7g's "tops the candidates", reported, not
- * fixed here.
+ * …"), and draws the three cards top to bottom in the listing's order:
+ * serviceB, cacheLookup, then handleRequest (reach 4, above both pins
+ * before FIX-6).
  */
 async function expectPinnedFirst(page: Page, projectPath: string): Promise<void> {
   const want = ['serviceB(pinned)', 'cacheLookup(pinned)', 'handleRequest(no-callers)'];
@@ -60,6 +59,26 @@ async function expectPinnedFirst(page: Page, projectPath: string): Promise<void>
     await pinned.getByText('pinned by you').waitFor({ state: 'visible' });
   }
   await canvas(page).getByRole('button', { name: /^Function handleRequest, entry candidate, reaches 4 Nodes, open Node detail$/ }).waitFor({ state: 'visible' });
+  const order = ['serviceB', 'cacheLookup', 'handleRequest'];
+  await eventually(
+    () => canvasTopToBottom(page, order),
+    (names) => names.join() === order.join(),
+    (names) => `canvas order top to bottom ${names.join(', ')}; expected ${order.join(', ')}`,
+    10_000,
+  );
+}
+
+/** `names`' Revealed cards, sorted by their drawn top edge. */
+async function canvasTopToBottom(page: Page, names: readonly string[]): Promise<string[]> {
+  const tops = await Promise.all(
+    names.map(async (name) => {
+      const box = await canvas(page).getByRole('button', { name: new RegExp(`^Function ${name}, `) }).boundingBox();
+      return { name, top: box?.y };
+    }),
+  );
+  const missing = tops.filter(({ top }) => top === undefined).map(({ name }) => `${name} (not drawn)`);
+  if (missing.length > 0) return missing;
+  return (tops as { name: string; top: number }[]).sort((a, b) => a.top - b.top).map(({ name }) => name);
 }
 
 async function enterRevealed(page: Page): Promise<void> {
@@ -106,7 +125,7 @@ export const p4_7g: Journey = {
       },
     },
     {
-      name: `Revealed: the listing leads with ${PINS.join(', ')} in pin order; both cards "pinned by you"`,
+      name: `Revealed: the listing and the canvas lead with ${PINS.join(', ')} in pin order; both cards "pinned by you"`,
       run: async ({ page, projectPath }) => {
         await enterRevealed(page);
         await expectPinnedFirst(page, projectPath);

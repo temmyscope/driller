@@ -471,3 +471,40 @@ describe('A pin change and history (replaces the same-fetch rebase pin)', () => 
     },
   );
 });
+
+/** Column 0's card ids, top to bottom, from the cards' drawn transforms. */
+function columnZeroTopToBottom(): string[] {
+  const cards: { id: string; y: number }[] = [];
+  for (const card of document.querySelectorAll<HTMLElement>('.react-flow__node[data-id]')) {
+    const match = /translate\((-?[\d.]+)px,\s*(-?[\d.]+)px\)/.exec(card.style.transform);
+    assert.ok(match, `card ${card.getAttribute('data-id')} has a position`);
+    if (Number(match[1]) === 0) cards.push({ id: card.getAttribute('data-id') ?? '', y: Number(match[2]) });
+  }
+  return cards.sort((a, b) => a.y - b.y).map((card) => card.id);
+}
+
+describe('FIX-6 (P4-7g): pinned candidates are drawn first, in pin order', () => {
+  it('stored pins serviceB, then cacheLookup: the canvas reads serviceB, cacheLookup, handleRequest top to bottom', BUDGET, async () => {
+    pinsFake(entryPinsStore({ [PROJECT]: [N.serviceB.id, N.cacheLookup.id] }));
+    await mountRevealed([N.serviceB.id, N.cacheLookup.id, N.handleRequest.id]);
+    await waitFor(() => {
+      measure();
+      assert.deepEqual(columnZeroTopToBottom(), [N.serviceB.id, N.cacheLookup.id, N.handleRequest.id]);
+    }, FIND);
+  });
+
+  it('pinning from Node detail moves the Node above the higher-reach candidate', BUDGET, async () => {
+    pinsFake();
+    await mountRevealed();
+    // serviceB (reach 2) is drawn once handleRequest (reach 4) is expanded.
+    await expandHandleRequest();
+    const serviceB = await openDetail(N.serviceB);
+    fireEvent.click(pinSection(serviceB).toggle);
+    await waitFor(() => assert.equal(pinSection(serviceB).toggle.getAttribute('aria-pressed'), 'true'), FIND);
+    await closeDetail(serviceB);
+    await waitFor(() => {
+      measure();
+      assert.deepEqual(columnZeroTopToBottom(), [N.serviceB.id, N.handleRequest.id]);
+    }, FIND);
+  });
+});

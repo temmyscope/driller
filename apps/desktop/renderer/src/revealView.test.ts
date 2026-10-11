@@ -137,6 +137,54 @@ describe('layeredLayout', () => {
     });
   });
 
+  it('FIX-6 (P4-7g): puts pinned candidates first in column 0, in pin order, whatever their reach', () => {
+    const pinned = { kind: 'pinned' } as const;
+    // path-trace-basic with serviceB, then cacheLookup pinned: the listing is pins-first.
+    const state = initialRevealState(
+      found([candidate('serviceB', 2, pinned), candidate('cacheLookup', 1, pinned), candidate('handleRequest', 4)]),
+    );
+    assert.deepEqual(Object.fromEntries(layeredLayout(state)), {
+      serviceB: { x: 0, y: 0 },
+      cacheLookup: { x: 0, y: NODE_ROW_GAP },
+      handleRequest: { x: 0, y: 2 * NODE_ROW_GAP },
+    });
+    // Pin order is the order the pins come in, not reach or id: reversed pins, reversed rows.
+    const reversed = initialRevealState(
+      found([candidate('cacheLookup', 1, pinned), candidate('serviceB', 2, pinned), candidate('handleRequest', 4)]),
+    );
+    assert.deepEqual(
+      [...layeredLayout(reversed)].sort((a, b) => a[1].y - b[1].y).map(([id]) => id),
+      ['cacheLookup', 'serviceB', 'handleRequest'],
+    );
+  });
+
+  it('FIX-6: the non-pinned candidates still order by reach, then id, below the pins, whatever their input order', () => {
+    const pinned = { kind: 'pinned' } as const;
+    const candidates = [candidate('p', 1, pinned), candidate('c', 5), candidate('a', 9), candidate('b', 5)];
+    const expected = { p: { x: 0, y: 0 }, a: { x: 0, y: NODE_ROW_GAP }, b: { x: 0, y: 2 * NODE_ROW_GAP }, c: { x: 0, y: 3 * NODE_ROW_GAP } };
+    assert.deepEqual(Object.fromEntries(layeredLayout(initialRevealState(found(candidates)))), expected);
+    const shuffled = [candidates[2]!, candidates[0]!, candidates[3]!, candidates[1]!];
+    assert.deepEqual(Object.fromEntries(layeredLayout(initialRevealState(found(shuffled)))), expected);
+  });
+
+  it('FIX-6: a drill under a pinned candidate follows its parent’s row', () => {
+    const state: RevealState = stateFrom({
+      candidates: [candidate('pin', 1, { kind: 'pinned' }), candidate('big', 9)],
+      revealed: new Map([
+        ['pin', { depth: 0, parentId: null }],
+        ['big', { depth: 0, parentId: null }],
+        ['child-of-big', { depth: 1, parentId: 'big' }],
+        ['child-of-pin', { depth: 1, parentId: 'pin' }],
+      ]),
+    });
+    assert.deepEqual(Object.fromEntries(layeredLayout(state)), {
+      pin: { x: 0, y: 0 },
+      big: { x: 0, y: NODE_ROW_GAP },
+      'child-of-pin': { x: NODE_COLUMN_GAP, y: 0 },
+      'child-of-big': { x: NODE_COLUMN_GAP, y: NODE_ROW_GAP },
+    });
+  });
+
   it('orders a deeper column by its parents’ rows first', () => {
     const state: RevealState = stateFrom({
       candidates: [candidate('p1', 9), candidate('p2', 3)],

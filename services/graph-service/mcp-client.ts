@@ -193,6 +193,38 @@ const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const INDEX_STATUS_TIMEOUT_MS = 30 * 1000;
 
 /**
+ * FIX-6: the bound on the MCP handshake (spawning the backend and its
+ * `initialize` reply) in `indexRepository` and `fetchCodeMap`. Not a new budget: the MCP
+ * SDK already gives every request, `initialize` included, a 60 s default
+ * timeout, which ended a silent backend with a bare "Request timed out".
+ * Making it explicit, at the same 60 s, lets the error say what failed and
+ * what to do. A healthy handshake takes ~4 s (a cold CBM daemon start),
+ * ~8 s while a previous daemon is stopping. `DEFAULT_TIMEOUT_MS` (the index
+ * itself) is unchanged.
+ */
+export const BACKEND_CONNECT_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * FIX-6: every MCP request gets an explicit SDK timeout from its own budget.
+ * The SDK otherwise caps each request at its 60 s default
+ * (`DEFAULT_REQUEST_TIMEOUT_MSEC`), so a real index over 60 s failed with
+ * "Request timed out", long before the intended budget (AD-15: ~3 min,
+ * `DEFAULT_TIMEOUT_MS` as the hang net). The SDK's timer is set this much
+ * past the budget, so the budget's own `withTimeout`, with its descriptive
+ * message, is the one that fires. Progress notifications don't reset it:
+ * the budget is the bound.
+ */
+const SDK_TIMEOUT_SLACK_MS = 1_000;
+
+/** FIX-6: the SDK request options for a call whose intended budget is `budgetMs`. */
+export function requestOptions(budgetMs: number): { timeout: number } {
+  return { timeout: budgetMs + SDK_TIMEOUT_SLACK_MS };
+}
+
+/** FIX-6: how much of the backend's stderr `indexRepository` keeps for its error message. */
+const BACKEND_STDERR_TAIL_CHARS = 4_000;
+
+/**
  * Resolves `codebase-memory-mcp`'s own installed `bin` entry via Node's
  * module resolution (starting from this module's location, so it always
  * finds the exact version pinned in `services/graph-service/package.json`
@@ -329,17 +361,25 @@ export function stopCbmDaemon(): void {
 export async function indexRepository(
   repoPath: string,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  options: IndexRepositoryOptions = {},
 ): Promise<IndexRepositoryResult> {
-  const { command, args } = resolveBackendCommand();
-  const transport = new StdioClientTransport({ command, args, env: cbmEnvironment() });
+  const { command, args } = options.backend ?? resolveBackendCommand();
+  // FIX-6: stderr is piped (not inherited) so a failure can quote the
+  // backend's own explanation — CBM's start-up refusals go only there. Each
+  // chunk is still echoed to this process's stderr, as before.
+  const transport = new StdioClientTransport({ command, args, env: cbmEnvironment(), stderr: 'pipe' });
+  const stderr = captureBackendStderr(transport.stderr);
   const client = new Client(CLIENT_INFO);
+  const connectTimeoutMs = options.connectTimeoutMs ?? BACKEND_CONNECT_TIMEOUT_MS;
 
   try {
     return await withTimeout(
-      runIndex(client, transport, repoPath),
+      runIndex(client, transport, repoPath, connectTimeoutMs, timeoutMs),
       timeoutMs,
       `index_repository (${repoPath})`,
     );
+  } catch (error) {
+    throw withBackendExplanation(error, stderr.lastLine());
   } finally {
     // Best-effort: the transport's child process may already be gone (e.g.
     // it crashed before/during connect, or the call above timed out), in
@@ -349,12 +389,34 @@ export async function indexRepository(
   }
 }
 
+/**
+ * FIX-6: connects `client` over `transport` (spawn plus `initialize`) within
+ * `connectTimeoutMs`, rejecting with an actionable message when the backend
+ * never answers. The SDK's own `initialize` timeout is lifted past ours
+ * (`requestOptions`), so this one fires.
+ */
+async function connectBackend(client: Client, transport: StdioClientTransport, connectTimeoutMs: number): Promise<void> {
+  try {
+    await withTimeout(client.connect(transport, requestOptions(connectTimeoutMs)), connectTimeoutMs, 'start');
+  } catch (error) {
+    if (error instanceof Error && error.message === `start timed out after ${connectTimeoutMs}ms`) {
+      throw new Error(
+        `the code-graph backend (codebase-memory-mcp) didn't answer within ${Math.round(connectTimeoutMs / 1000)} s of starting. ` +
+          'Close other codebase-memory-mcp sessions, then retry.',
+      );
+    }
+    throw error;
+  }
+}
+
 async function runIndex(
   client: Client,
   transport: StdioClientTransport,
   repoPath: string,
+  connectTimeoutMs: number,
+  timeoutMs: number,
 ): Promise<IndexRepositoryResult> {
-  await client.connect(transport);
+  await connectBackend(client, transport, connectTimeoutMs);
   const result = await client.callTool({
     name: 'index_repository',
     arguments: {
@@ -366,7 +428,7 @@ async function runIndex(
       // default ever silently flipping.
       persistence: false,
     },
-  });
+  }, requestOptions(timeoutMs));
 
   if (result.isError) {
     throw new Error(`index_repository reported an error: ${extractErrorText(result)}`);
@@ -614,7 +676,7 @@ export async function fetchCodeMap(
 
   try {
     return await withTimeout(
-      runFetchCodeMap(client, transport, project, options),
+      runFetchCodeMap(client, transport, project, options, timeoutMs),
       timeoutMs,
       `query_graph (${project})`,
     );
@@ -654,9 +716,10 @@ async function runFetchCodeMap(
   transport: StdioClientTransport,
   project: string,
   options: FetchCodeMapOptions,
+  timeoutMs: number,
 ): Promise<CodeMapFetchResult> {
-  await client.connect(transport);
-  return runCodeMapQueries(client, project, options);
+  await connectBackend(client, transport, BACKEND_CONNECT_TIMEOUT_MS);
+  return runCodeMapQueries(client, project, options, EVIDENCE_TIMEOUT_MS, timeoutMs);
 }
 
 /** The one method of the MCP `Client` the Code Map queries use — a seam, so tests can drive them with a stub. */
@@ -668,18 +731,20 @@ export type QueryGraphClient = Pick<Client, 'callTool'>;
  * best-effort evidence queries, in parallel, each under its own timeout:
  * test evidence (two queries), `IMPLEMENTS` (P4-2 phase 3b) and
  * `SIMILAR_TO` (P4-2 phase 4). Exported for tests; `evidenceTimeoutMs` is a
- * test seam too.
+ * test seam too. FIX-6: `requestTimeoutMs` is the fetch's own budget, given
+ * to the SDK for the three map queries (see `requestOptions`).
  */
 export async function runCodeMapQueries(
   client: QueryGraphClient,
   project: string,
   options: FetchCodeMapOptions,
   evidenceTimeoutMs: number = EVIDENCE_TIMEOUT_MS,
+  requestTimeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<CodeMapFetchResult> {
   const nodesResult = await client.callTool({
     name: 'query_graph',
     arguments: { project, query: CODE_MAP_NODES_QUERY },
-  });
+  }, requestOptions(requestTimeoutMs));
   if (nodesResult.isError) {
     throw new Error(`query_graph (Code Map nodes) reported an error: ${extractErrorText(nodesResult)}`);
   }
@@ -688,7 +753,7 @@ export async function runCodeMapQueries(
   const edgesResult = await client.callTool({
     name: 'query_graph',
     arguments: { project, query: CODE_MAP_EDGES_QUERY },
-  });
+  }, requestOptions(requestTimeoutMs));
   if (edgesResult.isError) {
     throw new Error(`query_graph (Code Map edges) reported an error: ${extractErrorText(edgesResult)}`);
   }
@@ -704,7 +769,7 @@ export async function runCodeMapQueries(
   const filesResult = await client.callTool({
     name: 'query_graph',
     arguments: { project, query: CODE_MAP_FILES_QUERY },
-  });
+  }, requestOptions(requestTimeoutMs));
   if (filesResult.isError) {
     throw new Error(`query_graph (Code Map files) reported an error: ${extractErrorText(filesResult)}`);
   }
@@ -798,7 +863,7 @@ async function queryTestEvidence<T>(
     // `withTimeout` clears its timer as soon as the call settles, and a timed-out
     // call leaves no timer behind, so nothing here keeps the process alive.
     const result = await withTimeout(
-      client.callTool({ name: 'query_graph', arguments: { project, query } }),
+      client.callTool({ name: 'query_graph', arguments: { project, query } }, requestOptions(timeoutMs)),
       timeoutMs,
       `query_graph (${section} ${label})`,
     );
@@ -1327,7 +1392,7 @@ async function fetchCoverage(
   let statusResult: unknown;
   try {
     statusResult = await withTimeout(
-      client.callTool({ name: 'index_status', arguments: { project } }),
+      client.callTool({ name: 'index_status', arguments: { project } }, requestOptions(INDEX_STATUS_TIMEOUT_MS)),
       INDEX_STATUS_TIMEOUT_MS,
       `index_status(${project})`,
     );
@@ -1353,6 +1418,52 @@ async function fetchCoverage(
   }
 
   return { expectedNodes, expectedEdges, skippedCount, parsePartialCount, gapPaths };
+}
+
+/** FIX-6: `indexRepository`'s test seams. */
+export interface IndexRepositoryOptions {
+  /** The backend to spawn instead of `codebase-memory-mcp` (a stub, in tests). */
+  backend?: { command: string; args: string[] };
+  /** The handshake bound; `BACKEND_CONNECT_TIMEOUT_MS` when omitted. */
+  connectTimeoutMs?: number;
+}
+
+/**
+ * FIX-6: echoes the backend's stderr to this process's stderr (what the
+ * inherited stream used to do) and keeps a bounded tail of it.
+ * `lastLine()` is the last non-empty line that isn't a routine
+ * `level=info`/`level=debug` log line — for CBM, its one-line explanation
+ * of why it stopped — or `undefined`.
+ */
+export function captureBackendStderr(stream: Pick<NodeJS.EventEmitter, 'on'> | null): { lastLine: () => string | undefined } {
+  let tail = '';
+  stream?.on('data', (chunk: Buffer | string) => {
+    process.stderr.write(chunk);
+    tail = (tail + String(chunk)).slice(-BACKEND_STDERR_TAIL_CHARS);
+  });
+  // A stream error here must never crash the Graph Service; the call's own outcome reports the failure.
+  stream?.on('error', () => {});
+  return {
+    lastLine: () =>
+      tail
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line !== '' && !/^level=(info|debug)\b/.test(line))
+        .at(-1),
+  };
+}
+
+/**
+ * FIX-6: `error` with the backend's own last word appended — "…: Connection
+ * closed — codebase-memory-mcp said: CBM could not start because …". Kept
+ * as is when the backend said nothing, or when the message already has it.
+ */
+export function withBackendExplanation(error: unknown, backendLine: string | undefined): Error {
+  const base = error instanceof Error ? error : new Error(String(error));
+  if (backendLine === undefined) return base;
+  const said = backendLine.replace(/^codebase-memory-mcp:\s*/, '');
+  if (base.message.includes(said)) return base;
+  return new Error(`${base.message} — codebase-memory-mcp said: ${said}`, { cause: base });
 }
 
 /**

@@ -302,17 +302,23 @@ const ENTRY_KIND_RANK: Record<RevealEntry['kind'], number> = { node: 0, ref: 1, 
  * The layered layout: column = depth × `NODE_COLUMN_GAP`; within a column,
  * row index × `NODE_ROW_GAP`, ordered by the parent's row (a Node with no
  * parent — a candidate — first), then Nodes before refs before the stub,
- * then reach descending (a candidate's reach is the server's; a drilled
- * Node's is the one it was revealed with), then id. Never depends on the
- * order of `entries` or `candidates`. Parents are laid out first (shallower
+ * then (FIX-6, P4-7g "pins rank first") pinned candidates before the rest,
+ * in their order in `candidates` — the listing's pin order — then reach
+ * descending (a candidate's reach is the server's; a drilled Node's is the
+ * one it was revealed with), then id. Apart from the pins' order, never
+ * depends on the order of `entries` or `candidates`. Parents are laid out first (shallower
  * columns), so a parent's row is known when its children are ordered.
  * P4-7e: ref and stub cards are placed too, under their own card ids
  * (`revealEntryCardId`); a depth past the canvas just adds columns.
  */
 export function layeredLayout(state: RevealState): Map<string, { x: number; y: number }> {
   const reachById = new Map<string, number>();
+  const pinRankById = new Map<string, number>();
   for (const candidate of state.candidates) {
     reachById.set(candidate.id, candidate.reach);
+    if (candidate.reason.kind === 'pinned' && !pinRankById.has(candidate.id)) {
+      pinRankById.set(candidate.id, pinRankById.size);
+    }
   }
   const byDepth = new Map<number, { cardId: string; entry: RevealEntry }[]>();
   const seen = new Set<string>();
@@ -339,11 +345,15 @@ export function layeredLayout(state: RevealState): Map<string, { x: number; y: n
     return parentId === null ? -1 : (rowOf.get(parentId) ?? -1);
   };
   const reachOf = (entry: RevealEntry): number => (entry.kind === 'node' ? (reachById.get(entry.id) ?? 0) : 0);
+  // A pinned candidate's rank in pin order; every other entry ranks after all pins.
+  const pinRankOf = (entry: RevealEntry): number =>
+    entry.kind === 'node' && entry.parentId === null ? (pinRankById.get(entry.id) ?? pinRankById.size) : pinRankById.size;
   for (const depth of [...byDepth.keys()].sort((a, b) => a - b)) {
     const column = [...(byDepth.get(depth) ?? [])].sort(
       (a, b) =>
         parentRow(a.entry) - parentRow(b.entry) ||
         ENTRY_KIND_RANK[a.entry.kind] - ENTRY_KIND_RANK[b.entry.kind] ||
+        pinRankOf(a.entry) - pinRankOf(b.entry) ||
         reachOf(b.entry) - reachOf(a.entry) ||
         compareIds(a.cardId, b.cardId),
     );

@@ -47,6 +47,7 @@ import {
   runSteps,
   snapshotDir,
   startAppProcess,
+  KILL_REAP_MS,
   terminateThenKill,
   withNetworkGuard,
   withTimeout,
@@ -426,6 +427,25 @@ describe('terminateThenKill', () => {
     assert.deepEqual(await terminateThenKill([-42, -99], 5_000, fake.deps), ['SIGTERM', 'SIGKILL']);
     assert.ok(fake.clock() >= 5_000, 'waited the whole grace period first');
     assert.deepEqual(fake.sent.at(-1), [-99, 'SIGKILL']);
+  });
+
+  it('FIX-6: after SIGKILL, waits (bounded) until the targets are gone — SIGKILL lands asynchronously', async () => {
+    let clock = 0;
+    let killed = false;
+    let pollsAfterKill = 0;
+    const deps = {
+      kill: (_pid: number, signal: NodeJS.Signals) => void (signal === 'SIGKILL' && (killed = true)),
+      // Still listed for three polls after the SIGKILL, like a process that is exiting.
+      alive: () => !killed || (pollsAfterKill += 1) <= 3,
+      sleep: async (ms: number) => void (clock += ms),
+      now: () => clock,
+    };
+    assert.deepEqual(await terminateThenKill([-42], 300, deps), ['SIGTERM', 'SIGKILL']);
+    assert.ok(pollsAfterKill > 3, 'returned only once the targets were gone');
+    // A target that never goes: the wait stops at KILL_REAP_MS.
+    const stuck = fakeDeps(true);
+    await terminateThenKill([-42], 300, stuck.deps);
+    assert.ok(stuck.clock() >= 300 + KILL_REAP_MS && stuck.clock() < 300 + KILL_REAP_MS + 200, `waited ${stuck.clock()} ms`);
   });
 
   it('does nothing with no targets', async () => {
