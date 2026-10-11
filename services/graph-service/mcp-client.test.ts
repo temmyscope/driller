@@ -6,7 +6,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { CODE_MAP_NODES_QUERY, parseCodeMapNodeRow, parseQueryGraphRows, parseTestFlag } from './mcp-client';
+import { cbmEnvironment, CODE_MAP_NODES_QUERY, parseCodeMapNodeRow, parseQueryGraphRows, parseTestFlag } from './mcp-client';
+import { readFileSync } from 'node:fs';
 
 const NODE_COLUMNS = ['id', 'name', 'file', 'startLine', 'endLine', 'kind', 'complexity', 'cognitive', 'isTest'];
 
@@ -73,5 +74,23 @@ describe('parseCodeMapNodeRow over a real-shaped query_graph response', () => {
     // Absent, not `false`: the key itself is omitted.
     assert.equal('isTest' in nodes[0]!, false);
     assert.equal(nodes[0]!.complexity, 4);
+  });
+});
+
+describe('cbmEnvironment (CBM_* settings reach the backend child)', () => {
+  it('passes every CBM_* string variable and nothing else', () => {
+    const env = cbmEnvironment({ CBM_CACHE_DIR: '/tmp/cbm', CBM_INDEX_LOG: '1', HOME: '/h', PATH: '/p', CBMX: 'no', cbm_lower: 'no', CBM_UNDEF: undefined });
+    assert.deepEqual(env, { CBM_CACHE_DIR: '/tmp/cbm', CBM_INDEX_LOG: '1' });
+  });
+
+  it('is empty when no CBM_* variable is set', () => {
+    assert.deepEqual(cbmEnvironment({ HOME: '/h' }), {});
+  });
+
+  it('is passed to every StdioClientTransport the client creates', () => {
+    const src = readFileSync(new URL('./mcp-client.ts', import.meta.url), 'utf8');
+    const transports = src.match(/new StdioClientTransport\(\{[^}]*\}\)/g) ?? [];
+    assert.ok(transports.length >= 2);
+    for (const t of transports) assert.match(t, /env: cbmEnvironment\(\)/);
   });
 });

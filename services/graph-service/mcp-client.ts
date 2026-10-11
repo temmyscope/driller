@@ -210,6 +210,21 @@ const INDEX_STATUS_TIMEOUT_MS = 30 * 1000;
  * (`readFileSync` + `JSON.parse`) rather than via a second `require(...)`,
  * which the lint config forbids as an import pattern.
  */
+/**
+ * The `CBM_*` variables of this process, passed to the CBM backend child.
+ * The MCP SDK's stdio transport otherwise gives the child only a small
+ * fixed set (HOME, PATH, …), which silently drops settings such as
+ * `CBM_CACHE_DIR` (found by the P4-8h e2e harness, whose temp CBM cache
+ * was ignored).
+ */
+export function cbmEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const picked: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith('CBM_') && typeof value === 'string') picked[key] = value;
+  }
+  return picked;
+}
+
 function resolveBackendCommand(): { command: string; args: string[] } {
   const packageJsonPath = require.resolve('codebase-memory-mcp/package.json');
   const packageDir = path.dirname(packageJsonPath);
@@ -316,7 +331,7 @@ export async function indexRepository(
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<IndexRepositoryResult> {
   const { command, args } = resolveBackendCommand();
-  const transport = new StdioClientTransport({ command, args });
+  const transport = new StdioClientTransport({ command, args, env: cbmEnvironment() });
   const client = new Client(CLIENT_INFO);
 
   try {
@@ -594,7 +609,7 @@ export async function fetchCodeMap(
   options: FetchCodeMapOptions = {},
 ): Promise<CodeMapFetchResult> {
   const { command, args } = resolveBackendCommand();
-  const transport = new StdioClientTransport({ command, args });
+  const transport = new StdioClientTransport({ command, args, env: cbmEnvironment() });
   const client = new Client(CLIENT_INFO);
 
   try {
