@@ -14,6 +14,7 @@ import { p4_3c } from './p4-3c.e2e';
 import { p4_4i } from './p4-4i.e2e';
 import { p4_7de } from './p4-7de.e2e';
 import { p4_7g } from './p4-7g.e2e';
+import { fix_7 } from './fix-7.e2e';
 
 /** P4-8h's smoke journey, as the P0-3 "Close project" row. */
 export const smoke: Journey = {
@@ -28,4 +29,4 @@ export const smoke: Journey = {
   })),
 };
 
-export const JOURNEYS: readonly Journey[] = [smoke, p0_5, p1_5_6, p2_1, p2_5, p4_3c, p4_4i, p4_7de, p4_7g];
+export const JOURNEYS: readonly Journey[] = [smoke, p0_5, p1_5_6, p2_1, p2_5, p4_3c, p4_4i, p4_7de, p4_7g, fix_7];

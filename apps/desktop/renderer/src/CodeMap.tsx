@@ -76,6 +76,7 @@ import {
   type EdgeMouseHandler,
   type EdgeProps,
   type Node as FlowNode,
+  type NodeChange,
   type NodeMouseHandler,
   type NodeProps,
   type OnMove,
@@ -151,6 +152,7 @@ import {
   formatCandidateReason,
   hiddenNavigationTarget,
   layeredLayout,
+  revealCardPitch,
   needsRevealListing,
   NODE_COLUMN_GAP,
   NODE_ROW_GAP,
@@ -181,6 +183,8 @@ import {
   planRevealDrill,
   REVEAL_STEP_STALE_TEXT,
   revealFocusRescue,
+  historyButtonFocusTarget,
+  historyFocusFallback,
   pushHistoryEntry,
   restoreRevealSnapshot,
   revealDrillKey,
@@ -210,6 +214,7 @@ import {
   type RevealAuxCard,
   type RevealDrillControl,
   type RevealNotice,
+  type RevealCardSize,
   type RevealState,
   type RevealViewMode,
   type RevealViewRequest,
@@ -689,6 +694,57 @@ export function quantizeZoomBand(zoom: number, threshold: number): number {
 }
 
 const PAN_QUANTIZE_RATIO = 0.25;
+
+/** FIX-7: what the live render hands `computeLOD` — its banded zoom and world-space `viewportBounds`. */
+export interface LiveLODView {
+  zoomBand: number;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+/**
+ * FIX-7: the banded zoom and world-space viewport bounds the live render
+ * feeds `computeLOD`, from React Flow's viewport (`x`/`y` are the screen
+ * offset of world 0,0; `zoom` the real scale) and the canvas's pixel size.
+ *
+ * The visible world rectangle starts at `-x / zoom` — the REAL zoom. Before
+ * FIX-7 the origin was divided by the banded zoom, which is below the real
+ * one inside a band (e.g. 1.6 at zoom 2), so the bounds slid away from the
+ * screen by `distance × (1/band − 1/zoom)`: far from the map origin at high
+ * zoom, the Node the view is centred on fell outside them and was drawn as
+ * a "Cluster of N Nodes" bubble (even a one-Node one) instead of its card.
+ *
+ * The width and height stay banded (`size / band`, never smaller than the
+ * real `size / zoom`, so the bounds always cover the screen) to keep the
+ * recompute churn low within a band, and the origin is snapped to a quarter
+ * of that size (`PAN_QUANTIZE_RATIO`) so small pans don't recompute.
+ * `computeLOD`'s own margin (half the bounds on every side) absorbs the snap.
+ * Zero bounds while the canvas is unmeasured. Pure.
+ */
+export function liveLODView(
+  viewport: { x: number; y: number; zoom: number },
+  container: { width: number; height: number },
+  threshold: number,
+): LiveLODView {
+  const zoomBand = quantizeZoomBand(viewport.zoom, threshold);
+  const measured = container.width > 0 && container.height > 0;
+  if (!measured) {
+    return { zoomBand, bounds: { x: 0, y: 0, width: 0, height: 0 } };
+  }
+  const zoom = Math.max(viewport.zoom, 1e-6);
+  const width = container.width / zoomBand;
+  const height = container.height / zoomBand;
+  const panStepX = Math.max(width * PAN_QUANTIZE_RATIO, 1);
+  const panStepY = Math.max(height * PAN_QUANTIZE_RATIO, 1);
+  return {
+    zoomBand,
+    bounds: {
+      x: Math.round(-viewport.x / zoom / panStepX) * panStepX,
+      y: Math.round(-viewport.y / zoom / panStepY) * panStepY,
+      width,
+      height,
+    },
+  };
+}
 
 // Defensive cap on `expandedClusterIds` (review finding, defense in depth
 // on top of `quantizeZoomBand` reducing churn): even with far fewer
@@ -6786,6 +6842,9 @@ export function decidePendingFocus({
 /** Review round 1: how many animation frames the card focus waits for a culled card before focusing the canvas. */
 export const CARD_FOCUS_MAX_FRAMES = 60;
 
+/** FIX-7: how long a Back/Forward press waits for the history update it causes before its focus request lapses. */
+export const HISTORY_FOCUS_REQUEST_MS = 2_000;
+
 /**
  * Review round 1: one frame of the card-focus wait — focus the card once it
  * is rendered; keep waiting; or, once `CARD_FOCUS_MAX_FRAMES` frames have
@@ -9106,6 +9165,15 @@ export function CodeMap({
     focusedCard: HTMLElement | null;
   } | null>(null);
   const historyBackButtonRef = useRef<HTMLButtonElement | null>(null);
+  const historyForwardButtonRef = useRef<HTMLButtonElement | null>(null);
+  // FIX-7: a Back/Forward pressed while it had focus — which button, the
+  // step's Node(s) to focus if the step disables it, and when (a request
+  // only applies to the history update that follows it, not a later one).
+  const historyFocusRequestRef = useRef<{
+    button: 'back' | 'forward';
+    stepIds: readonly string[];
+    at: number;
+  } | null>(null);
   // FIX-5: the focus rescue waiting for React Flow to remove the focused card
   // (its observer, and the cap after which it gives up).
   const revealFocusRescueRef = useRef<{ observer: MutationObserver; cap: ReturnType<typeof setTimeout> } | null>(null);
@@ -9169,6 +9237,11 @@ export function CodeMap({
   // Review round 1: the user moved the view since Revealed last fitted (a
   // refresh's listing re-fits only when they haven't).
   const revealUserMovedRef = useRef(false);
+  // FIX-7: the viewport the last Revealed fit set, and the drawn state it
+  // fitted. A re-layout from measured card sizes re-fits only while both are
+  // still current (`handleNodesChange`), so the fit covers the cards as drawn.
+  const revealFitMarkRef = useRef<{ viewport: Viewport; state: RevealState | null } | null>(null);
+  const revealDrawnStateRef = useRef<RevealState | null>(null);
   // The current view, project/section key and map fetch, for the toggle
   // handler below (synced each render, further down).
   const revealViewRef = useRef<RevealViewMode>('full');
@@ -10671,6 +10744,57 @@ export function CodeMap({
   const revealDrawn = revealView === 'revealed' && mode === 'codeMap';
   const revealDrawnRef = useRef(revealDrawn);
   revealDrawnRef.current = revealDrawn;
+  // FIX-7 (live pass 2026-10-11, P4-7e): each Revealed card's drawn size, as
+  // React Flow measured it, so `layeredLayout` spaces rows and columns by
+  // what is drawn (a summary + AI-judgment card is taller than the 110 px
+  // grid pitch). Recorded only while Revealed is drawn — Full never reads it
+  // and never re-renders for it. Only a change to a card's pitch
+  // (`revealCardPitch`, all the layout reads) re-lays out: a card within the
+  // grid pitch never causes one, and a re-layout (positions only) never loops.
+  const revealCardSizesRef = useRef(new Map<string, RevealCardSize>());
+  const [revealCardSizesVersion, setRevealCardSizesVersion] = useState(0);
+  const handleNodesChange = useCallback((changes: NodeChange<CodeMapAnyFlowNode>[]) => {
+    if (!revealDrawnRef.current) {
+      return;
+    }
+    const sizes = revealCardSizesRef.current;
+    let changed = false;
+    for (const change of changes) {
+      if (change.type !== 'dimensions' || change.dimensions === undefined) {
+        continue;
+      }
+      const size = { width: change.dimensions.width, height: change.dimensions.height };
+      const before = revealCardPitch(sizes.get(change.id));
+      const after = revealCardPitch(size);
+      sizes.set(change.id, size);
+      if (Math.abs(before.row - after.row) >= 1 || Math.abs(before.column - after.column) >= 1) {
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return;
+    }
+    // The Revealed fit was computed on the layout before these sizes: while
+    // the view is still that fit, over the same drawn state (no expand, no
+    // pan, zoom or centring since), fit again over the new layout.
+    const mark = revealFitMarkRef.current;
+    const current = reactFlowInstanceRef.current?.getViewport();
+    if (
+      mark !== null &&
+      current !== undefined &&
+      mark.state === revealDrawnStateRef.current &&
+      Math.abs(current.x - mark.viewport.x) < 0.5 &&
+      Math.abs(current.y - mark.viewport.y) < 0.5 &&
+      Math.abs(current.zoom - mark.viewport.zoom) < 1e-6
+    ) {
+      revealViewRequestRef.current = {
+        target: 'revealed',
+        key: revealMapRef.current.key,
+        mapStamp: revealMapRef.current.mapStamp,
+      };
+    }
+    setRevealCardSizesVersion((version) => version + 1);
+  }, []);
   const revealMapStamp = fetchState.status === 'ready' ? fetchState.edges : null;
   const revealSection = fetchState.status === 'ready' ? (fetchState.section ?? null) : null;
   const currentRevealKey =
@@ -10770,7 +10894,8 @@ export function CodeMap({
       return null;
     }
     const state = drawnRevealState(revealHeld, currentRevealKey);
-    const positions = layeredLayout(state);
+    const sizes = revealCardSizesRef.current;
+    const positions = layeredLayout(state, (cardId) => sizes.get(cardId));
     const drawn = revealedPopulation(population, state);
     const nameById = new Map(drawn.mapNodes.map((node) => [node.id, node.name]));
     const auxCards = revealAuxCards(state, (id) => nameById.get(id), revealDrillGraph.adjacency);
@@ -10796,6 +10921,7 @@ export function CodeMap({
     currentRevealKey,
     population,
     revealDrillGraph,
+    revealCardSizesVersion,
     onRevealDrill,
     onActivateRevealRef,
     onActivateRevealStub,
@@ -11085,18 +11211,15 @@ export function CodeMap({
   // `worldHeight` are derived from the *banded* zoom too, so they (and the
   // `computeLOD` call they feed) stay stable within a band instead of
   // drifting on every animation-frame's exact zoom value.
-  const zoomBand = quantizeZoomBand(viewport.zoom, LOD_ZOOM_THRESHOLD);
-  const worldWidth = containerSize.width > 0 ? containerSize.width / zoomBand : 0;
-  const worldHeight = containerSize.height > 0 ? containerSize.height / zoomBand : 0;
-  const worldMinX = containerSize.width > 0 ? -viewport.x / zoomBand : 0;
-  const worldMinY = containerSize.height > 0 ? -viewport.y / zoomBand : 0;
   // Pan is quantized separately, to a quarter of the current (banded)
   // viewport size — panning less than that doesn't move `viewportBounds`
   // enough to matter, so it doesn't trigger a `computeLOD` recompute either.
-  const panStepX = Math.max(worldWidth * PAN_QUANTIZE_RATIO, 1);
-  const panStepY = Math.max(worldHeight * PAN_QUANTIZE_RATIO, 1);
-  const boundsX = Math.round(worldMinX / panStepX) * panStepX;
-  const boundsY = Math.round(worldMinY / panStepY) * panStepY;
+  // FIX-7: `liveLODView` places the bounds' origin with the REAL zoom (it
+  // used the banded one, which slid the bounds off a far-away centred Node).
+  const {
+    zoomBand,
+    bounds: { x: boundsX, y: boundsY, width: worldWidth, height: worldHeight },
+  } = liveLODView(viewport, containerSize, LOD_ZOOM_THRESHOLD);
 
   // AD-2's clustering half: `computeLOD` grid-buckets the already laid-out
   // Nodes and only ever promotes a bucket to full rendering when it's both
@@ -11298,6 +11421,7 @@ export function CodeMap({
   const [focusedCandidateId, setFocusedCandidateId] = useState<string | null>(null);
   const revealCandidatesRef = useRef<ReadonlyMap<string, EntryCandidate> | null>(null);
   revealCandidatesRef.current = revealCanvas?.candidates ?? null;
+  revealDrawnStateRef.current = revealCanvas?.state ?? null;
   const handleNodeMouseEnter: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback((_event, flowNode) => {
     if (revealCandidatesRef.current?.has(flowNode.id) === true) {
       setHoveredCandidateId(flowNode.id);
@@ -11484,8 +11608,23 @@ export function CodeMap({
   // unreachable after every Back.
   // P4-7f: a reveal entry goes through `applyRevealHistoryMove` instead —
   // Back undoes the step (its `before`), Forward redoes it (its `after`).
+  // FIX-7: only a press of a focused button is recorded (a mouse press in
+  // Chromium focuses it first; a keyboard press already has it).
+  const recordHistoryFocusRequest = (
+    button: 'back' | 'forward',
+    element: HTMLButtonElement | null,
+    move: HistoryMove,
+  ): void => {
+    if (element === null || document.activeElement !== element || move.kind === 'none') {
+      historyFocusRequestRef.current = null;
+      return;
+    }
+    const stepIds = move.kind === 'center' ? [move.id] : [move.centerId, move.entry.focusId];
+    historyFocusRequestRef.current = { button, stepIds, at: Date.now() };
+  };
   const goBack = useCallback(() => {
     const move = historyMove(history, 'back', { skipReveals: mode !== 'codeMap' });
+    recordHistoryFocusRequest('back', historyBackButtonRef.current, move);
     if (move.kind === 'reveal') {
       applyRevealHistoryMove(move);
       return;
@@ -11512,6 +11651,7 @@ export function CodeMap({
 
   const goForward = useCallback(() => {
     const move = historyMove(history, 'forward', { skipReveals: mode !== 'codeMap' });
+    recordHistoryFocusRequest('forward', historyForwardButtonRef.current, move);
     if (move.kind === 'reveal') {
       applyRevealHistoryMove(move);
       return;
@@ -11648,6 +11788,9 @@ export function CodeMap({
     revealViewRequestRef.current = null;
     revealUserMovedRef.current = false;
     routeFitSeqRef.current += 1;
+    // FIX-7: a fit into Revealed may be redone once its cards are measured.
+    revealFitMarkRef.current =
+      decision.kind === 'fit' && revealDrawn ? { viewport: next, state: revealDrawnStateRef.current } : null;
     void instance.setViewport(next);
     setViewport(next);
   }, [mode, revealDrawn, revealHeld, currentRevealKey, lodInputNodes, revealMapStamp, awaitingFirstFit, measuredViewportSize]);
@@ -12263,6 +12406,50 @@ export function CodeMap({
     },
     [],
   );
+  /**
+   * Keyboard users land on the Node the map was just centred on: focuses its
+   * card once React Flow has rendered it (it can be culled, or still an LOD
+   * cluster, until the centring brings it into view), for at most
+   * `CARD_FOCUS_MAX_FRAMES` frames; then `onMissing` (review round 1: never
+   * left on <body> — the canvas wrapper by default). A newer call supersedes
+   * a wait still running. FIX-7: shared by the cross-section switch, Node
+   * detail's "Go to …" links and a Back/Forward that disables its button.
+   */
+  const focusCardWhenRendered = useCallback(
+    (id: string, onMissing?: () => void) => {
+      if (focusCardFrameRef.current !== null) {
+        cancelAnimationFrame(focusCardFrameRef.current);
+      }
+      let frames = 0;
+      const selector = `.react-flow__node[data-id="${CSS.escape(id)}"] .code-map__node`;
+      const tryFocus = () => {
+        focusCardFrameRef.current = null;
+        const card = canvasElement?.querySelector<HTMLElement>(selector) ?? null;
+        // FIX-7: a drawn card React Flow hasn't measured yet is still hidden,
+        // and `focus()` on it is a silent no-op — so a card that didn't take
+        // focus counts as not there yet, and the wait goes on.
+        card?.focus({ preventScroll: true });
+        const focused = card !== null && document.activeElement === card;
+        switch (cardFocusStep(focused, frames)) {
+          case 'focus-card':
+            return;
+          case 'focus-canvas':
+            if (onMissing !== undefined) {
+              onMissing();
+            } else {
+              canvasElement?.focus({ preventScroll: true });
+            }
+            return;
+          case 'retry':
+            frames += 1;
+            focusCardFrameRef.current = requestAnimationFrame(tryFocus);
+            return;
+        }
+      };
+      focusCardFrameRef.current = requestAnimationFrame(tryFocus);
+    },
+    [canvasElement],
+  );
   // Carry review: on unmount, a carry check or diff run still in flight must
   // never apply (nor re-run a diff) — their request ids move on.
   useEffect(() => {
@@ -12273,6 +12460,73 @@ export function CodeMap({
       diffIds.current += 1;
     };
   }, []);
+  // FIX-7 (live pass 2026-10-11, FIX-5 follow-up): a Back/Forward press that
+  // disables its own (focused) button — the end of history that way — moves
+  // focus to the step's Node card, else the other history button, else the
+  // canvas (`historyButtonFocusTarget`), so it never falls to <body>. Runs on
+  // the history update the press caused (the request is at most
+  // `HISTORY_FOCUS_REQUEST_MS` old); the laid-out Nodes are read through a
+  // ref so a re-layout alone never consumes the request early.
+  const flowNodesByIdRef = useRef(flowNodesById);
+  flowNodesByIdRef.current = flowNodesById;
+  useEffect(() => {
+    const request = historyFocusRequestRef.current;
+    if (request === null) {
+      return;
+    }
+    historyFocusRequestRef.current = null;
+    if (Date.now() - request.at > HISTORY_FOCUS_REQUEST_MS) {
+      return;
+    }
+    const options = { skipReveals: mode !== 'codeMap' };
+    const backEnabled = canGoBack(history, options);
+    const forwardEnabled = canGoForward(history, options);
+    const pressed = request.button === 'back' ? historyBackButtonRef.current : historyForwardButtonRef.current;
+    const other = request.button === 'back' ? historyForwardButtonRef.current : historyBackButtonRef.current;
+    const otherEnabled = request.button === 'back' ? forwardEnabled : backEnabled;
+    const active = document.activeElement;
+    const stepId = request.stepIds.find((id) => flowNodesByIdRef.current.has(id));
+    const fallback = () => {
+      const current = document.activeElement;
+      if (current !== null && current !== document.body && current !== pressed) {
+        return;
+      }
+      if (historyFocusFallback(otherEnabled && other !== null) === 'other-button') {
+        other?.focus();
+      } else {
+        canvasElement?.focus({ preventScroll: true });
+      }
+    };
+    switch (
+      historyButtonFocusTarget({
+        pressedButtonDisabled: request.button === 'back' ? !backEnabled : !forwardEnabled,
+        focusStillOnPressedButtonOrBody: active === null || active === document.body || active === pressed,
+        stepNodeOnMap: stepId !== undefined,
+      })
+    ) {
+      case 'stay':
+        return;
+      case 'step-card':
+        if (stepId !== undefined) {
+          focusCardWhenRendered(stepId, fallback);
+        }
+        return;
+      case 'fallback':
+        fallback();
+        return;
+    }
+  }, [history, mode, canvasElement, focusCardWhenRendered]);
+
+  // FIX-7 (live pass 2026-10-11, P4-2f): a "Go to …" link in Node detail or
+  // type detail closes its panel, which takes the focused link with it — so
+  // focus lands on the card the map is centred on, never <body>.
+  const navigateAndFocusCard = useCallback(
+    (id: string) => {
+      navigateToNode(id);
+      focusCardWhenRendered(id);
+    },
+    [navigateToNode, focusCardWhenRendered],
+  );
   // P4-7d: a map Node the Revealed view doesn't draw (`undefined` in Full,
   // where every map Node is drawn).
   const revealHiddenMapNode = (id: string): CodeMapNode | undefined =>
@@ -12295,33 +12549,8 @@ export function CodeMap({
     switch (decision.kind) {
       case 'focus': {
         navigateToNode(decision.id);
-        // Keyboard users land on the selected card: focus it once React Flow
-        // has rendered it (it can be culled until the centring brings it into
-        // view), for at most ~1s of frames.
-        if (focusCardFrameRef.current !== null) {
-          cancelAnimationFrame(focusCardFrameRef.current);
-        }
-        let frames = 0;
-        const selector = `.react-flow__node[data-id="${CSS.escape(decision.id)}"] .code-map__node`;
-        const tryFocus = () => {
-          focusCardFrameRef.current = null;
-          const card = canvasElement?.querySelector<HTMLElement>(selector) ?? null;
-          // Review round 1: never left on <body> — the canvas wrapper takes
-          // focus when the card never renders (`cardFocusStep`).
-          switch (cardFocusStep(card !== null, frames)) {
-            case 'focus-card':
-              card?.focus({ preventScroll: true });
-              return;
-            case 'focus-canvas':
-              canvasElement?.focus({ preventScroll: true });
-              return;
-            case 'retry':
-              frames += 1;
-              focusCardFrameRef.current = requestAnimationFrame(tryFocus);
-              return;
-          }
-        };
-        focusCardFrameRef.current = requestAnimationFrame(tryFocus);
+        // Keyboard users land on the selected card (`focusCardWhenRendered`).
+        focusCardWhenRendered(decision.id);
         return;
       }
       case 'open-detail': {
@@ -12356,7 +12585,7 @@ export function CodeMap({
     flowNodesById,
     navigateToNode,
     openNodeDetail,
-    canvasElement,
+    focusCardWhenRendered,
   ]);
   // Review round 1: the missed-callee notice takes focus (its Dismiss button,
   // described by the notice's text) when it appears.
@@ -12767,6 +12996,9 @@ export function CodeMap({
             nodeTypes={nodeTypes}
             // P4-7h: the shared-reach arc, and the cards that show it.
             edgeTypes={edgeTypes}
+            // FIX-7: only reads the measured sizes (Revealed's spacing); the
+            // Nodes stay controlled by `renderedNodes`.
+            onNodesChange={handleNodesChange}
             onNodeMouseEnter={handleNodeMouseEnter}
             onNodeMouseLeave={handleNodeMouseLeave}
             onFocus={handleCanvasFocus}
@@ -13175,6 +13407,7 @@ export function CodeMap({
           </button>
           <button
             type="button"
+            ref={historyForwardButtonRef}
             onClick={goForward}
             disabled={!canGoForward(history, { skipReveals: mode !== 'codeMap' })}
             aria-label="Forward"
@@ -13335,7 +13568,7 @@ export function CodeMap({
               // FIX-5 (P4-7d): in Revealed, a map Node it doesn't draw is
               // navigable too — `navigateToNode` switches to Full to reach it.
               resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id)) ?? revealHiddenMapNode(id)}
-              onNavigateToNode={(id) => navigateFromDetail(id, { closeNodeDetail, navigateToNode })}
+              onNavigateToNode={(id) => navigateFromDetail(id, { closeNodeDetail, navigateToNode: navigateAndFocusCard })}
               // P4-2 phase 3b: a "Uses" entry opens its type's detail in
               // place of this panel.
               resolveFoldedType={resolveFoldedType}
@@ -13415,7 +13648,7 @@ export function CodeMap({
               // FIX-5 (P4-7d): as Node detail — a Node Revealed hides is reached through Full.
               resolveMapNode={(id) => mapNodeOf(flowNodesById.get(id)) ?? revealHiddenMapNode(id)}
               onNavigateToNode={(id) =>
-                navigateFromTypeDetail(id, { closeTypeDetail, closeNodeDetail, navigateToNode })
+                navigateFromTypeDetail(id, { closeTypeDetail, closeNodeDetail, navigateToNode: navigateAndFocusCard })
               }
               resolveFoldedType={resolveFoldedType}
               onOpenType={openType}

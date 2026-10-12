@@ -3202,7 +3202,14 @@ code,
    DESIGN.md's own `canvas-edge-highlighted.note` is explicit the two never
    share a treatment). Also never color-only: the width change alone reads
    at a glance, and every highlighted Node also carries its step number. */
-.code-map__edge--path-highlight {
+/* FIX-7 (live pass 2026-10-11): the class sits on the edge's `<g>`, but
+   `@xyflow/react`'s own `.react-flow__edge-path` rule sets the visible
+   path's stroke directly, so a rule on the `<g>` never reached it (only the
+   invisible interaction path inherited it) and every lit edge stayed React
+   Flow's grey 1px. The rule targets the visible path, at a higher
+   specificity than React Flow's. Its selected/focused-edge rule still wins
+   while an edge has focus (focus feedback). */
+.code-map__edge--path-highlight .react-flow__edge-path {
   stroke: var(--trace-cyan);
   stroke-width: 2;
 }
@@ -3217,7 +3224,8 @@ code,
    independent conditions checked in source order in that same memo — the
    first match wins, since DESIGN.md's own two tokens are never meant to
    layer on the same edge). */
-.code-map__edge--changed-source {
+/* FIX-7: on the visible path, as `--path-highlight` above. */
+.code-map__edge--changed-source .react-flow__edge-path {
   stroke: var(--accent);
   stroke-width: 2;
 }

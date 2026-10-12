@@ -37,6 +37,31 @@ import type { CanvasPopulation } from './CodeMap';
 export const NODE_COLUMN_GAP = 260;
 export const NODE_ROW_GAP = 110;
 
+/** FIX-7: a Revealed card's drawn size, as React Flow measured it. */
+export interface RevealCardSize {
+  width: number;
+  height: number;
+}
+
+/** FIX-7: the least space between a Revealed card and the one below it (the grid's own: 110 − an 80 px card is 30). */
+export const REVEAL_CARD_GAP_Y = 24;
+
+/** FIX-7: the least space between a Revealed column's widest card and the next column (the grid's own: 260 − 200 is 60). */
+export const REVEAL_CARD_GAP_X = 60;
+
+/**
+ * FIX-7: the room a Revealed card takes in `layeredLayout` — its row's
+ * height and its share of its column's width: its size plus the gaps, never
+ * less than the grid pitch. Positions depend on sizes only through this, so
+ * a new measurement that leaves it unchanged needs no re-layout. Pure.
+ */
+export function revealCardPitch(size: RevealCardSize | undefined): { row: number; column: number } {
+  return {
+    row: Math.max(NODE_ROW_GAP, (size?.height ?? 0) + REVEAL_CARD_GAP_Y),
+    column: Math.max(NODE_COLUMN_GAP, (size?.width ?? 0) + REVEAL_CARD_GAP_X),
+  };
+}
+
 /** The two views of the Code Map canvas. Session state, default `'full'` (never persisted — Ask First). */
 export type RevealViewMode = 'full' | 'revealed';
 
@@ -310,8 +335,22 @@ const ENTRY_KIND_RANK: Record<RevealEntry['kind'], number> = { node: 0, ref: 1, 
  * columns), so a parent's row is known when its children are ordered.
  * P4-7e: ref and stub cards are placed too, under their own card ids
  * (`revealEntryCardId`); a depth past the canvas just adds columns.
+ *
+ * FIX-7 (live pass 2026-10-11, P4-7e): a card with a summary, an AI-judgment
+ * line and a risk strip is taller (and wider) than the grid's 110 × 260
+ * pitch, so it hid the card below it and its own "▸ Expand callees" button.
+ * `cardSizeOf` gives a card's drawn size (React Flow's measurement) when it
+ * is known: a row is then at least that card's height plus
+ * `REVEAL_CARD_GAP_Y` tall, and a column at least its widest card plus
+ * `REVEAL_CARD_GAP_X` wide. Never closer than the grid pitch, so an
+ * unmeasured or small card sits exactly where it did. Deterministic: the
+ * same state and sizes always give the same positions; the order above is
+ * unchanged.
  */
-export function layeredLayout(state: RevealState): Map<string, { x: number; y: number }> {
+export function layeredLayout(
+  state: RevealState,
+  cardSizeOf: (cardId: string) => RevealCardSize | undefined = () => undefined,
+): Map<string, { x: number; y: number }> {
   const reachById = new Map<string, number>();
   const pinRankById = new Map<string, number>();
   for (const candidate of state.candidates) {
@@ -348,7 +387,15 @@ export function layeredLayout(state: RevealState): Map<string, { x: number; y: n
   // A pinned candidate's rank in pin order; every other entry ranks after all pins.
   const pinRankOf = (entry: RevealEntry): number =>
     entry.kind === 'node' && entry.parentId === null ? (pinRankById.get(entry.id) ?? pinRankById.size) : pinRankById.size;
+  let columnX = 0;
+  let previousDepth: number | null = null;
+  let previousColumnWidth = 0;
   for (const depth of [...byDepth.keys()].sort((a, b) => a - b)) {
+    // Columns are consecutive depths in practice; a gap still advances one pitch per missing depth.
+    columnX =
+      previousDepth === null
+        ? depth * NODE_COLUMN_GAP
+        : columnX + previousColumnWidth + (depth - previousDepth - 1) * NODE_COLUMN_GAP;
     const column = [...(byDepth.get(depth) ?? [])].sort(
       (a, b) =>
         parentRow(a.entry) - parentRow(b.entry) ||
@@ -357,10 +404,17 @@ export function layeredLayout(state: RevealState): Map<string, { x: number; y: n
         reachOf(b.entry) - reachOf(a.entry) ||
         compareIds(a.cardId, b.cardId),
     );
+    let rowY = 0;
+    let columnWidth = NODE_COLUMN_GAP;
     column.forEach(({ cardId }, row) => {
       rowOf.set(cardId, row);
-      positions.set(cardId, { x: depth * NODE_COLUMN_GAP, y: row * NODE_ROW_GAP });
+      positions.set(cardId, { x: columnX, y: rowY });
+      const pitch = revealCardPitch(cardSizeOf(cardId));
+      rowY += pitch.row;
+      columnWidth = Math.max(columnWidth, pitch.column);
     });
+    previousDepth = depth;
+    previousColumnWidth = columnWidth;
   }
   return positions;
 }
@@ -1991,6 +2045,32 @@ export function revealFocusRescue(input: {
     return 'none';
   }
   return input.stepCardShown ? 'step-card' : 'back-button';
+}
+
+/**
+ * FIX-7 (live pass 2026-10-11, FIX-5 follow-up): where keyboard focus goes
+ * after Back or Forward was pressed while it had focus. A button that stays
+ * enabled keeps focus (P4-7f: Back/Forward centre on the step's Node rather
+ * than moving focus). One that the step disabled (the end of history that
+ * way) would leave focus on <body>, so focus goes to the step's Node card
+ * (`step-card`: once it is drawn; the caller waits), else the other history
+ * button if it is enabled, else the canvas. Nothing moves if focus has
+ * already gone elsewhere (`focusStillOnPressedButtonOrBody` false). Pure.
+ */
+export function historyButtonFocusTarget(input: {
+  pressedButtonDisabled: boolean;
+  focusStillOnPressedButtonOrBody: boolean;
+  stepNodeOnMap: boolean;
+}): 'stay' | 'step-card' | 'fallback' {
+  if (!input.pressedButtonDisabled || !input.focusStillOnPressedButtonOrBody) {
+    return 'stay';
+  }
+  return input.stepNodeOnMap ? 'step-card' : 'fallback';
+}
+
+/** FIX-7: the fallback after `historyButtonFocusTarget` — the other history button when enabled, else the canvas. */
+export function historyFocusFallback(otherButtonEnabled: boolean): 'other-button' | 'canvas' {
+  return otherButtonEnabled ? 'other-button' : 'canvas';
 }
 
 /**

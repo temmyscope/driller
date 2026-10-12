@@ -33,6 +33,10 @@ import {
   hiddenNavigationTarget,
   initialRevealState,
   layeredLayout,
+  historyButtonFocusTarget,
+  historyFocusFallback,
+  REVEAL_CARD_GAP_X,
+  REVEAL_CARD_GAP_Y,
   needsRevealListing,
   NO_ENTRY_CANDIDATES_SENTENCE,
   NODE_COLUMN_GAP,
@@ -183,6 +187,66 @@ describe('layeredLayout', () => {
       'child-of-pin': { x: NODE_COLUMN_GAP, y: 0 },
       'child-of-big': { x: NODE_COLUMN_GAP, y: NODE_ROW_GAP },
     });
+  });
+
+  it('FIX-7 (P4-7e live): rows and columns grow to the measured card sizes, so no two cards overlap', () => {
+    const state: RevealState = stateFrom({
+      candidates: [candidate('tall', 9), candidate('short', 5), candidate('last', 1)],
+      revealed: new Map([
+        ['tall', { depth: 0, parentId: null }],
+        ['short', { depth: 0, parentId: null }],
+        ['last', { depth: 0, parentId: null }],
+        ['child', { depth: 1, parentId: 'tall' }],
+        ['grandchild', { depth: 2, parentId: 'child' }],
+      ]),
+    });
+    // The live pass: a summary + AI-judgment + risk-strip card is ~150 px tall and far wider than a column.
+    const sizes: Record<string, { width: number; height: number }> = {
+      tall: { width: 900, height: 152 },
+      short: { width: 210, height: 60 },
+      last: { width: 300, height: 140 },
+      child: { width: 180, height: 70 },
+      grandchild: { width: 200, height: 80 },
+    };
+    const positions = layeredLayout(state, (id) => sizes[id]);
+    assert.deepEqual(Object.fromEntries(positions), {
+      tall: { x: 0, y: 0 },
+      short: { x: 0, y: 152 + REVEAL_CARD_GAP_Y },
+      // `short` is small: the grid pitch still applies below it.
+      last: { x: 0, y: 152 + REVEAL_CARD_GAP_Y + NODE_ROW_GAP },
+      child: { x: 900 + REVEAL_CARD_GAP_X, y: 0 },
+      // Column 1's cards are narrow: the grid pitch.
+      grandchild: { x: 900 + REVEAL_CARD_GAP_X + NODE_COLUMN_GAP, y: 0 },
+    });
+    const boxes = [...positions].map(([id, at]) => ({ id, ...at, ...sizes[id]! }));
+    for (const a of boxes) {
+      for (const b of boxes) {
+        if (a.id >= b.id) continue;
+        const overlap = a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+        assert.ok(!overlap, `${a.id} and ${b.id} overlap`);
+      }
+    }
+  });
+
+  it('FIX-7: unmeasured cards keep the grid; the same sizes always give the same positions', () => {
+    const state: RevealState = stateFrom({
+      candidates: [candidate('p1', 9), candidate('p2', 3)],
+      revealed: new Map([
+        ['p1', { depth: 0, parentId: null }],
+        ['p2', { depth: 0, parentId: null }],
+        ['k', { depth: 1, parentId: 'p2' }],
+      ]),
+    });
+    assert.deepEqual(Object.fromEntries(layeredLayout(state, () => undefined)), Object.fromEntries(layeredLayout(state)));
+    assert.deepEqual(Object.fromEntries(layeredLayout(state)), {
+      p1: { x: 0, y: 0 },
+      p2: { x: 0, y: NODE_ROW_GAP },
+      k: { x: NODE_COLUMN_GAP, y: 0 },
+    });
+    const sizes = new Map([['p1', { width: 500, height: 200 }]]);
+    const once = Object.fromEntries(layeredLayout(state, (id) => sizes.get(id)));
+    assert.deepEqual(Object.fromEntries(layeredLayout(state, (id) => sizes.get(id))), once);
+    assert.deepEqual(once, { p1: { x: 0, y: 0 }, p2: { x: 0, y: 200 + REVEAL_CARD_GAP_Y }, k: { x: 500 + REVEAL_CARD_GAP_X, y: 0 } });
   });
 
   it('orders a deeper column by its parents’ rows first', () => {
@@ -1444,5 +1508,22 @@ describe('P4-7f: planRevealDrill (the button and `+`/`−`)', () => {
     assert.deepEqual(plan.next, collapseNode(after, 'handleRequest'));
     assert.deepEqual(planRevealDrill(start, graph, 'handleRequest', 'collapse'), { kind: 'none', text: NOTHING_TO_COLLAPSE_TEXT });
     assert.deepEqual(planRevealDrill(start, graph, 'cacheLookup', 'expand'), { kind: 'ignore' });
+  });
+});
+
+describe('FIX-7: focus after a Back/Forward press that disables its button', () => {
+  it('a button that stays enabled keeps focus', () => {
+    assert.equal(historyButtonFocusTarget({ pressedButtonDisabled: false, focusStillOnPressedButtonOrBody: true, stepNodeOnMap: true }), 'stay');
+  });
+  it('a disabled button sends focus to the step’s card, else the fallback', () => {
+    assert.equal(historyButtonFocusTarget({ pressedButtonDisabled: true, focusStillOnPressedButtonOrBody: true, stepNodeOnMap: true }), 'step-card');
+    assert.equal(historyButtonFocusTarget({ pressedButtonDisabled: true, focusStillOnPressedButtonOrBody: true, stepNodeOnMap: false }), 'fallback');
+  });
+  it('never moves focus the user has already moved', () => {
+    assert.equal(historyButtonFocusTarget({ pressedButtonDisabled: true, focusStillOnPressedButtonOrBody: false, stepNodeOnMap: true }), 'stay');
+  });
+  it('the fallback is the other history button when enabled, else the canvas', () => {
+    assert.equal(historyFocusFallback(true), 'other-button');
+    assert.equal(historyFocusFallback(false), 'canvas');
   });
 });

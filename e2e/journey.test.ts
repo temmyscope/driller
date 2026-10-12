@@ -99,10 +99,10 @@ describe('formatReport', () => {
 });
 
 describe('JOURNEYS', () => {
-  it('covers P0-3 (smoke) and the 8 P4-8i row groups, each journey with a unique id', () => {
+  it('covers P0-3 (smoke), the 8 P4-8i row groups and FIX-7’s regressions, each journey with a unique id', () => {
     assert.deepEqual(
       JOURNEYS.flatMap((j) => j.rows),
-      ['P0-3', 'P0-5', 'P1-5/6', 'P2-1', 'P2-5', 'P4-3c', 'P4-4i', 'P4-7d', 'P4-7e', 'P4-7g'],
+      ['P0-3', 'P0-5', 'P1-5/6', 'P2-1', 'P2-5', 'P4-3c', 'P4-4i', 'P4-7d', 'P4-7e', 'P4-7g', 'P2-4', 'P3-11/12', 'P4-7e', 'FIX-5'],
     );
     assert.equal(new Set(JOURNEYS.map((j) => j.id)).size, JOURNEYS.length);
   });

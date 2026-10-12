@@ -30,7 +30,7 @@ import {
   initialFitDecision,
   initialViewport,
   layoutPosition,
-  quantizeZoomBand,
+  liveLODView,
   type InitialFitDecisionInput,
 } from './CodeMap';
 
@@ -62,7 +62,7 @@ function viewCentre(result: { x: number; y: number; zoom: number }, viewport = V
 
 /** Full Node cards the live render would show at `result` — `computeLOD` at its banded zoom, over what's on screen. */
 function cardsInView(nodes: LODInputNode[], result: { x: number; y: number; zoom: number }, viewport = VIEW): string[] {
-  const band = quantizeZoomBand(result.zoom, LOD_ZOOM_THRESHOLD);
+  const live = liveLODView(result, viewport, LOD_ZOOM_THRESHOLD);
   const visible = {
     x: -result.x / result.zoom,
     y: -result.y / result.zoom,
@@ -71,9 +71,9 @@ function cardsInView(nodes: LODInputNode[], result: { x: number; y: number; zoom
   };
   const { fullNodeIds } = computeLOD({
     nodes,
-    zoom: band,
+    zoom: live.zoomBand,
     threshold: LOD_ZOOM_THRESHOLD,
-    viewportBounds: { x: -result.x / band, y: -result.y / band, width: viewport.width / band, height: viewport.height / band },
+    viewportBounds: live.bounds,
   });
   return nodes
     .filter((node) => fullNodeIds.has(node.id))
