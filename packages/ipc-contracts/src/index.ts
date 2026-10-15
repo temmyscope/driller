@@ -196,6 +196,18 @@ export type GraphServiceState =
 // (P4-6) and re-exported above.
 // ---------------------------------------------------------------------------
 
+/**
+ * P5-a review round 1: why a re-index runs — the open project's checkout
+ * moved from `indexedHead` to `currentHead` (full commit SHAs). Main adds it
+ * to the `indexing`/`indexed` statuses of the re-index it started for a
+ * `graphService:headChanged`, so the renderer can say so (never a silent
+ * reset of PR Review). The Graph Service itself never sets it.
+ */
+export interface HeadMove {
+  indexedHead: string;
+  currentHead: string;
+}
+
 export type GraphServiceStatusMessage =
   | { state: 'starting'; pid?: number; at: string }
   | { state: 'alive'; pid?: number; at: string }
@@ -205,6 +217,8 @@ export type GraphServiceStatusMessage =
       at: string;
       /** Absolute path of the project this indexing attempt is for. */
       path: string;
+      /** P5-a review round 1: set by main on a HEAD-triggered re-index. */
+      headMoved?: HeadMove;
     }
   | {
       state: 'indexed';
@@ -229,6 +243,8 @@ export type GraphServiceStatusMessage =
        * result into an `error` status.
        */
       coverage?: IndexCoverageSummary;
+      /** P5-a review round 1: set by main on a HEAD-triggered re-index. */
+      headMoved?: HeadMove;
     }
   | {
       state: 'exited';
@@ -258,6 +274,8 @@ export type GraphServiceStatusMessage =
        * subprocess-level errors unrelated to any particular index attempt.
        */
       elapsedMs?: number;
+      /** P5-a review round 1: set by main when a HEAD-triggered re-index fails. */
+      headMoved?: HeadMove;
     };
 
 /** Message main sends to ask the Graph Service subprocess to shut down cleanly. */
@@ -341,6 +359,32 @@ export interface GraphServiceEntryPinsMissingMessage {
   type: 'graphService:entryPinsMissing';
   projectPath: string;
   nodeIds: string[];
+}
+
+/**
+ * P5-a (founder decision 6.1): main asks the Graph Service whether the open
+ * project's checkout moved since it was indexed — sent when the app window
+ * regains focus. The Graph Service answers only on drift, with
+ * `GraphServiceHeadChangedMessage`; otherwise it posts nothing.
+ */
+export interface GraphServiceCheckHeadRequest {
+  type: 'graphService:checkHead';
+  /** Absolute, OS-native project root (main's `currentProjectPath`). */
+  path: string;
+}
+
+/**
+ * P5-a: the Graph Service found HEAD at `currentHead` while the index it
+ * serves was taken at `indexedHead` (both full commit SHAs). Posted at most
+ * once per distinct `currentHead`, never while an index is in flight. Main
+ * re-sends the index request for `path` when it is the open project and the
+ * Graph Service is running; anything else is logged and ignored.
+ */
+export interface GraphServiceHeadChangedMessage {
+  type: 'graphService:headChanged';
+  path: string;
+  indexedHead: string;
+  currentHead: string;
 }
 
 /**

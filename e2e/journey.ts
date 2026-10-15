@@ -55,6 +55,8 @@ export interface JourneyContext {
   relaunch: () => Promise<void>;
   /** SIGKILLs the app's Graph Service utility process (and only it), as P0-3's live check did. */
   killGraphService: () => Promise<void>;
+  /** P5-a review round 1: fires main's real `browser-window-focus` path (SIGUSR2 to Electron main, the dev-only e2e hook). */
+  emitWindowFocus: () => Promise<void>;
 }
 
 export interface Journey {

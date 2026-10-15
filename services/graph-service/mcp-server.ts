@@ -592,6 +592,8 @@ export function registerComputeDiffScopeTool(server: Pick<McpServer, 'registerTo
         "'changedContractsApproximate: true' means approximate: couldn't read line ranges for some changed file, so " +
         "every type in it was counted (may over-report, never hides a contract). " +
         "'topLevelFiles' leaves out a file whose every change lies inside a type. " +
+        // P5-a: no result shape change (an 'error' state), so MCP_SERVER_VERSION is unchanged.
+        "If the project's checkout (git HEAD) moved since it was indexed, the result is an 'error' saying so instead of a diff, and driller re-indexes the project; call again once the re-index has finished. If that re-index didn't complete, the error says so instead (the project needs a Retry or a re-open in the app). " +
         "With 'section', the changed Nodes, changed contracts (and their dependents) and top-level-only files are only that section's own, matched against its Nodes alone; changed Nodes in other sections are never in 'nodeIds'. Instead, a resolved result's optional 'changedInOtherSections' counts them: [{section, changedNodes, changedContracts, topLevelFiles}], one entry per other allowlist section in the SAME git repository as 'section' with at least one change, each count being what that section's own result would hold (its changed Nodes, changed contracts and top-level-only files, by the same nearest-section rule); sorted by the sum of the three (highest first), then by section. A section in another git repository (or in none) is never listed: it is not part of this diff. It is absent when there are none and always absent without 'section'; nothing outside the allowlist is counted. " +
         SECTION_RULE_DESCRIPTION,
       inputSchema: z.object({

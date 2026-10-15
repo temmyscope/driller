@@ -931,6 +931,9 @@ describe('graphService:scopeChanged through index.ts', () => {
       writeFileSync(path.join(repo, 'web/a.ts'), 'w();\n');
       git('add', '.');
       git('commit', '-q', '-m', 'function change');
+      // P5-a: HEAD moved since the index, so re-index first (as the app does).
+      await index(repo);
+      await fetchMap();
       const mixed = await computeDiffScopeResult(repo, 'main');
       assert.deepEqual(mixed, {
         status: 'resolved',
@@ -993,7 +996,13 @@ describe('graphService:scopeChanged through index.ts', () => {
         ],
       );
       const { computeDiffScopeResult } = await import('./index');
-      const diff = async () => {
+      const diff = async (reindex = true) => {
+        // P5-a: each branch moved HEAD since the last index, so re-index
+        // first (as the app does on a checkout).
+        if (reindex) {
+          await index(repo);
+          await fetchMap();
+        }
         const result = await computeDiffScopeResult(repo, 'main');
         assert.equal(result.status, 'resolved');
         const { resolvedBaseRef: _base, ...rest } = result as Extract<typeof result, { status: 'resolved' }>;
@@ -1042,9 +1051,12 @@ describe('graphService:scopeChanged through index.ts', () => {
       // Dependents follow the indexing scope: with only web/ in scope, a (in
       // app/) is gone, and the count says so.
       git('checkout', '-q', 'inside');
+      // P5-a: re-indexed at this HEAD before the scope change (an index
+      // request from this test carries no scope).
+      await index(repo);
       send({ type: 'graphService:scopeChanged', path: repo, includedPaths: ['web'] });
       await fetchMap();
-      assert.deepEqual(await diff(), {
+      assert.deepEqual(await diff(false), {
         status: 'resolved',
         nodeIds: [],
         changedContracts: [{ ...T_CONTRACT, dependentCount: 1, dependentIds: ['w'] }],

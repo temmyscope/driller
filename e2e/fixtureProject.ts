@@ -112,6 +112,39 @@ export function createScratchDiffFixture(sourceDir: string, tmpRoot = os.tmpdir(
   return dir;
 }
 
+/** P5-a: the branch whose one commit changes all seven contracts. */
+export const SEVEN_TYPES_BRANCH = 'seventypes';
+/** P5-a: the seven interfaces `types.ts` declares. */
+export const SEVEN_TYPE_NAMES = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Golf'] as const;
+
+/** `types.ts`: the seven interfaces, each with `fieldsEach` fields. */
+export function sevenTypesSource(fieldsEach: number): string {
+  return SEVEN_TYPE_NAMES.map(
+    (name) =>
+      `export interface ${name} {\n${Array.from({ length: fieldsEach }, (_, i) => `  field${i + 1}: string;\n`).join('')}}\n`,
+  ).join('\n');
+}
+
+/**
+ * The P5-a scratch repo (the 2026-10-11 `seventypes` finding):
+ * path-trace-basic plus `types.ts` (seven interfaces) committed on `main`,
+ * then a `seventypes` branch whose one commit adds a field to each interface
+ * — so every later interface's lines shift, and an index taken on `main`
+ * maps that diff onto stale ranges. Left checked out on `main`, where the
+ * journey opens it.
+ */
+export function createSevenTypesFixture(sourceDir: string, tmpRoot = os.tmpdir()): string {
+  const dir = makeTempDir(TEMP_PREFIXES.fixture, tmpRoot);
+  cpSync(sourceDir, dir, { recursive: true });
+  writeFileSync(path.join(dir, 'types.ts'), sevenTypesSource(2));
+  commitAll(dir);
+  git(dir, ['checkout', '--quiet', '-b', SEVEN_TYPES_BRANCH]);
+  writeFileSync(path.join(dir, 'types.ts'), sevenTypesSource(3));
+  git(dir, ['commit', '--quiet', '--all', '--message', 'add a field to all seven contracts']);
+  git(dir, ['checkout', '--quiet', SCRATCH_BASE_REF]);
+  return dir;
+}
+
 /**
  * Rewrites one committed file in place (an uncommitted working-tree change),
  * so PR Review against base ref `HEAD` sees exactly that diff. Throws when

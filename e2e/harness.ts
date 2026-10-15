@@ -84,6 +84,14 @@ export function listProcesses(): ProcessInfo[] {
   return parsePs(ps.stdout);
 }
 
+/**
+ * P5-a review round 1: the Electron main process (the `Electron` / `electron`
+ * binary itself, not one of its `--type=` helpers: renderer, GPU, utility).
+ */
+export function isElectronMainCommand(command: string): boolean {
+  return /[\\/](Electron|electron)(\.exe)?(\s|$)/.test(command) && !/\s--type=/.test(command);
+}
+
 /** A `codebase-memory-mcp` process: the native binary (daemon or client), or its npm `bin.js` shim. */
 export function isCbmCommand(command: string): boolean {
   const program = command.trim().split(/\s+/)[0] ?? '';
@@ -520,6 +528,8 @@ export function appEnv({ base, guardPath, cbmCacheDir, appTmpDir }: AppEnvInput)
   delete env.ELECTRON_RUN_AS_NODE;
   env.NODE_OPTIONS = withNetworkGuard(base.NODE_OPTIONS, guardPath);
   env.CBM_CACHE_DIR = cbmCacheDir;
+  // P5-a review round 1: enables the dev app's SIGUSR2 → `browser-window-focus` hook (never packaged).
+  env.DRILLER_E2E_HOOKS = '1';
   env.TMPDIR = appTmpDir;
   env.TMP = appTmpDir;
   env.TEMP = appTmpDir;

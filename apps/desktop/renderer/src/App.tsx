@@ -11,6 +11,7 @@ import type {
   RecentProject,
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
+import { headMoveNoticeClearsOnUserAction, nextHeadMoveNotice, type HeadMoveNotice } from './headMoveNotice';
 import { formatElapsedMs, hasCoverageGap, statusLineText } from './statusLine';
 import {
   INITIAL_FRAME_MAP_STATE,
@@ -133,6 +134,8 @@ export function DegradedSessionNotice({ showRetry, onRetry }: { showRetry: boole
 export function App() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[] | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
+  // P5-a review round 1: why the map re-indexed — the checkout moved.
+  const [headMoveNotice, setHeadMoveNotice] = useState<HeadMoveNotice | null>(null);
   const [isOpening, setIsOpening] = useState(false);
   // Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
   // surface, opened via the gear-icon button in the header below.
@@ -476,6 +479,7 @@ export function App() {
         return;
       }
       setGraphServiceStatus(status);
+      setHeadMoveNotice((current) => nextHeadMoveNotice(current, status));
       const next = applyStatusToSessionMap(sessionMapRef.current, status);
       if (next !== sessionMapRef.current) {
         commitSessionMap(next);
@@ -527,6 +531,7 @@ export function App() {
     // fresh advisory of its own for a newly-opened project if/when it's
     // actually warranted again.
     setHardwareAdvisories(new Set());
+    setHeadMoveNotice(null);
     switch (result.status) {
       case 'opened':
         setNotice(null);
@@ -780,6 +785,7 @@ export function App() {
     setFrameSync(applyProjectClosedToFrameSync);
     setGraphServiceStatus(null);
     setNotice(null);
+    setHeadMoveNotice(null);
     setHardwareAdvisories(new Set());
     // P2-2: with no project open the (disabled) switcher shows Code Map, not
     // the closed project's mode; the first-open rule picks again on open.
@@ -788,6 +794,22 @@ export function App() {
     setPendingSectionFocus(null);
     focusOpenFolderAfterCloseRef.current = true;
   }, [commitSessionMap, commitSectionShell]);
+
+  // P5-a review round 1: once its re-index has ended, the checkout-moved
+  // notice goes on the next user action (a pointer press or a key).
+  const headMoveNoticeClears = headMoveNoticeClearsOnUserAction(headMoveNotice);
+  useEffect(() => {
+    if (!headMoveNoticeClears) {
+      return undefined;
+    }
+    const clear = () => setHeadMoveNotice(null);
+    window.addEventListener('pointerdown', clear, true);
+    window.addEventListener('keydown', clear, true);
+    return () => {
+      window.removeEventListener('pointerdown', clear, true);
+      window.removeEventListener('keydown', clear, true);
+    };
+  }, [headMoveNoticeClears]);
 
   // P2-3: the window title follows the titlebar.
   const title = deriveTitle({ currentProjectPath });
@@ -1185,6 +1207,12 @@ export function App() {
             {/* No nested `role="alert"` — the enclosing `role="status"` region
                 announces it. */}
             {notice?.kind === 'error' && <ActionableNotice tone="error">{notice.message}</ActionableNotice>}
+            {/* P5-a review round 1: never a silent reset — why it re-indexed. */}
+            {headMoveNotice !== null && (
+              <ActionableNotice tone={headMoveNotice.phase === 'failed' ? 'warning' : headMoveNotice.phase === 'reindexing' ? 'progress' : 'info'}>
+                {headMoveNotice.text}
+              </ActionableNotice>
+            )}
           </div>
 
           <section

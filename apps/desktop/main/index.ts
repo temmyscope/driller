@@ -45,6 +45,7 @@ import {
   type GraphServiceGetCodeMapRequest,
   type GraphServiceListEntryCandidatesResultMessage,
   type GraphServiceEntryPinsMissingMessage,
+  type GraphServiceHeadChangedMessage,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRetryModelRequest,
@@ -92,6 +93,7 @@ import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import {
   buildBackendSwitchedRequest,
+  buildCheckHeadRequest,
   buildIndexRequest,
   buildSetEntryPinsRequest,
   createEntryCandidatesRelay,
@@ -111,6 +113,7 @@ import {
   parseOperationSectionArg,
 } from './section-operations';
 import { createDiffScopeCarryRelay, isDiffScopeCarryResultMessage } from './diff-scope-carry-relay';
+import { e2eHooksEnabled, headChangedAction, isHeadChangedMessage, tagHeadMove, type PendingHeadMove } from './head-drift';
 import { relayKeyChange } from './key-change-relay';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
@@ -142,6 +145,9 @@ let isGraphServiceShuttingDown = false;
 // error) can re-send the index request without requiring the user to
 // re-pick the folder.
 let currentProjectPath: string | null = null;
+// P5-a review round 1: the HEAD move behind a re-index main requested
+// (`handleHeadChanged`), until that re-index's `indexed`/`error`.
+let pendingHeadMove: PendingHeadMove | undefined;
 // The in-flight `codeMap:get` renderer request (Story 1.3) lives in
 // `codeMapRequests` (declared below, after its timeout): `requestCodeMap`
 // posts a fire-and-forget `graphService:getCodeMap` message to the
@@ -858,6 +864,7 @@ function spawnGraphService(): void {
         | GraphServiceDiffScopeCarryResultMessage
         | GraphServiceListEntryCandidatesResultMessage
         | GraphServiceEntryPinsMissingMessage
+        | GraphServiceHeadChangedMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -908,6 +915,14 @@ function spawnGraphService(): void {
         logMissingEntryPins(message.projectPath, message.nodeIds);
         return;
       }
+      // P5-a (founder decision 6.1): the open project's checkout moved since
+      // it was indexed — re-send its index request exactly as a reopen would
+      // (backend, key, scope, pins). For a project no longer open, or with no
+      // running Graph Service, it is logged and ignored.
+      if (isHeadChangedMessage(message)) {
+        handleHeadChanged(message);
+        return;
+      }
       // P4-7c: validated at the process boundary by the relay.
       if (isListEntryCandidatesResultMessage(message)) {
         entryCandidatesRelay.settleReply(message.requestId, message.result, message.section);
@@ -933,12 +948,18 @@ function spawnGraphService(): void {
         sendMcpServerStatus(message);
         return;
       }
-      sendGraphServiceStatus(message);
+      // P5-a review round 1: a HEAD-triggered re-index's statuses carry the
+      // move, so the renderer says why PR Review reset.
+      const tagged = tagHeadMove(message, pendingHeadMove, currentProjectPath);
+      pendingHeadMove = tagged.pending;
+      sendGraphServiceStatus(tagged.status);
     },
   );
 
   graphService.on('exit', (code: number) => {
     graphService = null;
+    // P5-a review round 1: the re-index it was running is gone with it.
+    pendingHeadMove = undefined;
     // A request still outstanding when the subprocess exits will never get
     // its reply now — settle it as an explicit failure rather than leaving
     // the renderer's `getCodeMap()` promise hanging (matrix: "Map data
@@ -1039,6 +1060,36 @@ function sendIndexRequest(projectPath: string): void {
       entryPins: entryPinsSetting.get(projectPath),
     }),
   );
+}
+
+/**
+ * P5-a: routes a validated `graphService:headChanged` (`headChangedAction`):
+ * a re-index of the open project through `sendIndexRequest`, or a log line.
+ */
+function handleHeadChanged(message: GraphServiceHeadChangedMessage): void {
+  const running = graphService !== null && !isGraphServiceShuttingDown;
+  if (headChangedAction(message, currentProjectPath, running) === 'reindex' && currentProjectPath !== null) {
+    console.info(
+      `Checkout moved since ${currentProjectPath} was indexed (HEAD ${message.indexedHead.slice(0, 7)} → ${message.currentHead.slice(0, 7)}); re-indexing.`,
+    );
+    pendingHeadMove = { path: currentProjectPath, indexedHead: message.indexedHead, currentHead: message.currentHead };
+    sendIndexRequest(currentProjectPath);
+    return;
+  }
+  console.warn(`Ignored a HEAD change for ${message.path}: not the open project, or the Graph Service is not running.`);
+}
+
+/**
+ * P5-a: when a window regains focus, asks the Graph Service whether the open
+ * project's checkout moved since it was indexed (it answers only on drift,
+ * with `graphService:headChanged`). Nothing without an open project or a
+ * running Graph Service.
+ */
+function checkHeadOnFocus(): void {
+  if (graphService === null || isGraphServiceShuttingDown || currentProjectPath === null) {
+    return;
+  }
+  graphService.postMessage(buildCheckHeadRequest(currentProjectPath));
 }
 
 /**
@@ -2496,6 +2547,21 @@ app.on('ready', () => {
   installAppMenu();
   createWindow();
 });
+
+// P5-a (founder decision 6.1): a checkout or commit made outside the app is
+// noticed when the user comes back to it.
+app.on('browser-window-focus', () => {
+  checkHeadOnFocus();
+});
+
+// P5-a review round 1: the e2e journey's deterministic refocus — SIGUSR2
+// emits the real `browser-window-focus` (dev app under the e2e harness only;
+// see `e2eHooksEnabled`).
+if (e2eHooksEnabled(app.isPackaged, process.env)) {
+  process.on('SIGUSR2', () => {
+    app.emit('browser-window-focus', undefined, mainWindow);
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

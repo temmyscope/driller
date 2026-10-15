@@ -35,6 +35,7 @@ import {
   formatStepTable,
   groupMembers,
   isCbmCommand,
+  isElectronMainCommand,
   isPortFree,
   killProcessGroup,
   listProcesses,
@@ -115,6 +116,16 @@ describe('parsePs / CBM detection', () => {
     assert.equal(isCbmCommand('pgrep -fl codebase-memory-mcp'), false);
     assert.equal(isCbmCommand('less /x/codebase-memory-mcp/bin.js.orig'), false);
     assert.equal(isCbmCommand('node C:\\x\\codebase-memory-mcp\\bin.js daemon stop'), true);
+  });
+
+  it('P5-a review round 1: isElectronMainCommand picks Electron main, never its --type= helpers or forge', () => {
+    const bin = '/repo/app/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron';
+    assert.equal(isElectronMainCommand(`${bin} . --remote-debugging-port=0 --user-data-dir=/tmp/u`), true);
+    assert.equal(isElectronMainCommand('/repo/node_modules/electron/dist/electron .'), true);
+    assert.equal(isElectronMainCommand('C:\\repo\\node_modules\\electron\\dist\\electron.exe .'), true);
+    assert.equal(isElectronMainCommand(`/repo/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer`), false);
+    assert.equal(isElectronMainCommand(`${bin} --type=utility --utility-sub-type=node.mojom.NodeService`), false);
+    assert.equal(isElectronMainCommand('/usr/local/bin/node /repo/node_modules/@electron-forge/cli/dist/electron-forge-start.js -- --remote-debugging-port=0'), false);
   });
 
   it('never lists the harness itself', () => {
@@ -580,6 +591,7 @@ describe('spawn environment', () => {
     assert.equal(env.TMP, '/tmp/driller-e2e-tmp-1');
     assert.equal(env.HOME, '/Users/me');
     assert.match(env.NODE_OPTIONS!, /no-network-guard|g\.mjs/);
+    assert.equal(env.DRILLER_E2E_HOOKS, '1', 'P5-a review round 1: the dev-only focus hook');
     assert.equal(base.ELECTRON_RUN_AS_NODE, '1');
     assert.equal(base.TMPDIR, '/var/x');
   });

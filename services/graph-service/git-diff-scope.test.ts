@@ -5,12 +5,12 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { computeDiffScope, parseChangedLines } from './git-diff-scope';
+import { computeDiffScope, parseChangedLines, readHeadCommit } from './git-diff-scope';
 
 describe('parseChangedLines', () => {
   it('reads each hunk header as a range in the new file, per file', () => {
@@ -183,4 +183,51 @@ describe('parseChangedLines', () => {
       }
     },
   );
+});
+
+describe('P5-a: readHeadCommit', { skip: spawnSync('git', ['--version']).status !== 0 && 'git is not installed' }, () => {
+  it('a repository: the HEAD commit, following a commit and a checkout', { timeout: 30_000 }, async () => {
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'driller-head-'));
+    try {
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], {
+          cwd: repo,
+          stdio: 'pipe',
+        })
+          .toString()
+          .trim();
+      git('init', '-q', '-b', 'main');
+      writeFileSync(path.join(repo, 'a.ts'), '// a\n');
+      git('add', '.');
+      git('commit', '-q', '-m', 'base');
+      const base = git('rev-parse', 'HEAD');
+      assert.match(base, /^[0-9a-f]{40}$/);
+      assert.equal(await readHeadCommit(repo), base);
+      git('checkout', '-q', '-b', 'feature');
+      git('commit', '-q', '--allow-empty', '-m', 'next');
+      const next = git('rev-parse', 'HEAD');
+      assert.notEqual(next, base);
+      assert.equal(await readHeadCommit(repo), next);
+      git('checkout', '-q', 'main');
+      assert.equal(await readHeadCommit(repo), base);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('an unborn HEAD (no commit yet), a folder in no repository, and a missing folder: undefined', { timeout: 30_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'driller-head-none-'));
+    try {
+      const unborn = path.join(root, 'unborn');
+      mkdirSync(unborn);
+      execFileSync('git', ['init', '-q'], { cwd: unborn, stdio: 'pipe' });
+      const plain = path.join(root, 'plain');
+      mkdirSync(plain);
+      assert.equal(await readHeadCommit(unborn), undefined, 'unborn HEAD');
+      assert.equal(await readHeadCommit(plain), undefined, 'not a repository');
+      assert.equal(await readHeadCommit(path.join(root, 'missing')), undefined, 'a failed call');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

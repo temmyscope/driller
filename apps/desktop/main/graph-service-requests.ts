@@ -17,6 +17,7 @@ import type {
   DiagnosticLogEntry,
   EntryCandidatesResult,
   GraphServiceBackendSwitchedRequest,
+  GraphServiceCheckHeadRequest,
   GraphServiceEntryPinsMissingMessage,
   GraphServiceIndexRequest,
   GraphServiceSetEntryPinsRequest,
@@ -397,4 +398,9 @@ export function isEntryPinsMissingMessage(message: unknown): message is GraphSer
     Array.isArray(nodeIds) &&
     nodeIds.every((id) => typeof id === 'string')
   );
+}
+
+/** P5-a: the focus-time `graphService:checkHead` for the open project (`head-drift.ts` handles the reply). */
+export function buildCheckHeadRequest(projectPath: string): GraphServiceCheckHeadRequest {
+  return { type: 'graphService:checkHead', path: projectPath };
 }

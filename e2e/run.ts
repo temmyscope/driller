@@ -51,6 +51,7 @@ import {
   formatStepTable,
   groupMembers,
   installExitHandlers,
+  isElectronMainCommand,
   isPortFree,
   killProcessGroup,
   listProcesses,
@@ -217,6 +218,15 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
     }
   };
 
+  const emitWindowFocus = async () => {
+    if (app === undefined) throw new Error('the app is not running');
+    const mains = groupMembers(listProcesses(), app.pgid).filter((p) => isElectronMainCommand(p.command));
+    if (mains.length !== 1) {
+      throw new Error(`expected one Electron main process in the app's group, found ${mains.length}`);
+    }
+    process.kill(mains[0]!.pid, 'SIGUSR2');
+  };
+
   let finishing: Promise<JourneyOutcome> | undefined;
   const finish = (exitCode: number, reason?: string): Promise<JourneyOutcome> => {
     finishing ??= (async () => {
@@ -302,6 +312,7 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
       userDataDir,
       relaunch,
       killGraphService,
+      emitWindowFocus,
     } as JourneyContext;
 
     /** Spawn → DevTools URL → CDP → landing → IPC counter, all within `limitMs`. */

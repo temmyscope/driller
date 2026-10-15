@@ -140,6 +140,7 @@ import type {
   CodeMapEdge,
   CodeMapNode,
   GraphServiceBackendSwitchedRequest,
+  GraphServiceCheckHeadRequest,
   GraphServiceCodeMapMessage,
   GraphServiceComputeDiffScopeRequest,
   GraphServiceComputeDiffScopeResultMessage,
@@ -149,6 +150,7 @@ import type {
   GraphServiceExpandBlastRadiusRequest,
   GraphServiceExpandBlastRadiusResultMessage,
   GraphServiceGetCodeMapRequest,
+  GraphServiceHeadChangedMessage,
   GraphServiceIndexRequest,
   GraphServiceListEntryCandidatesRequest,
   GraphServiceListEntryCandidatesResultMessage,
@@ -180,7 +182,8 @@ import type {} from 'electron';
 import { backendSwitchKind, nextBackendConfig, type BackendConfigState } from './backend-switch';
 import { CLOUD_SUMMARY_MODEL, createCloudSummarizer } from './cloud-summary-generator';
 import { CODERABBIT_SOURCE_TOOL, runCodeRabbitIngestion } from './coderabbit-adapter';
-import { computeDiffScope, decideDiffScopeCarry, resolveGitToplevel } from './git-diff-scope';
+import { computeDiffScope, decideDiffScopeCarry, readHeadCommit, resolveGitToplevel } from './git-diff-scope';
+import { assessHeadDrift, autoReindexHeadAfterSuccess, headDriftErrorMessage, REINDEX_REQUEST_GRACE_MS } from './head-drift';
 import { CLOUD_JUDGMENT_MODEL, createCloudJudge, createLocalJudge, generateJudgments } from './judgment-generator';
 import { ensureLocalModel, type LocalModelReady } from './model-manager';
 import { loadLcovCoverage } from './lcov';
@@ -270,6 +273,30 @@ let activeIndexRequest: Promise<void> | null = null;
 // `activeBlastRadiusExpansionInFlight`.
 let activeIndexInFlight = false;
 let isShuttingDown = false;
+
+// P5-a (founder decision 6.1): the commit HEAD pointed at when the index now
+// served (`activeProjectPath`'s) STARTED — read before `indexRepository`, and
+// committed only on that index's success branch, with `activeProjectPath`.
+// A checkout during indexing is therefore caught by the next check.
+// `undefined` when there was no HEAD to read (not a repository, unborn HEAD,
+// git missing or timed out): never compared, so never a re-index.
+let indexedHead: string | undefined;
+// P5-a: the current HEAD an automatic re-index was already requested for
+// (`graphService:headChanged`) — at most one per distinct HEAD, so a re-index
+// that fails is never retried automatically. See `autoReindexHeadAfterSuccess`.
+let autoReindexHead: string | undefined;
+// P5-a: at most one focus-time `graphService:checkHead` in flight.
+let headCheckInFlight = false;
+// P5-a review round 1: when the last `headChanged` was posted (cleared when
+// any index starts), so a diff in the moment before main's index request
+// arrives still says "Re-indexing now" (`REINDEX_REQUEST_GRACE_MS`).
+let reindexRequestedAt: number | undefined;
+let reindexRequestGraceMs = REINDEX_REQUEST_GRACE_MS;
+
+/** Tests only: shortens (or, with `undefined`, restores) the grace after a `headChanged` post. */
+export function setReindexRequestGraceMsForTests(ms: number | undefined): void {
+  reindexRequestGraceMs = ms ?? REINDEX_REQUEST_GRACE_MS;
+}
 
 // The backend's own project identifier for the most recently *successfully*
 // `indexed` project (Story 1.3) — set only once `handleIndexRequest`'s
@@ -1770,6 +1797,9 @@ async function handleIndexRequest(
   // comment — this is the half of the re-entrancy guard that actually means
   // "still running," reset unconditionally in the `finally` below.
   activeIndexInFlight = true;
+  // P5-a review round 1: a requested re-index has started (or another index
+  // took its place): `activeIndexInFlight` now speaks for it.
+  reindexRequestedAt = undefined;
   // Story 1.6 Phase 2: this request's backend choice/decrypted key becomes
   // the one `startSummaryGenerationForProject` resolves a summarizer from,
   // whenever generation for this project actually starts (after the
@@ -1841,6 +1871,10 @@ async function handleIndexRequest(
   // posts below — never hidden regardless of hardware speed or repo size.
   const startedAt = Date.now();
   try {
+    // P5-a: HEAD is read BEFORE the index starts, so a checkout while it
+    // runs leaves `indexedHead` at the older commit and the next check
+    // re-indexes. Never throws (`undefined` on any failure).
+    const headAtStart = await readHeadCommit(projectPath);
     const { nodes, edges, coverage, project } = await indexRepository(projectPath);
     if (activeIndexPath !== projectPath) {
       // A request for a different project superseded this one while it was
@@ -1852,6 +1886,10 @@ async function handleIndexRequest(
     // branch below) never overwrites the last project that actually
     // finished with `undefined` or a not-yet-indexed path.
     activeProject = project;
+    // P5-a: before `activeProjectPath` is replaced (it tells a re-index of the
+    // same project from a project switch).
+    autoReindexHead = autoReindexHeadAfterSuccess(autoReindexHead, headAtStart, activeProjectPath === projectPath);
+    indexedHead = headAtStart;
     // Story 1.5 Phase 2: captured alongside `activeProject`, same
     // never-on-failure reasoning — `activeProjectPath` is what
     // `summary-generator.ts` reads source off disk relative to.
@@ -2637,6 +2675,89 @@ export function peekGitToplevelCacheForTests(): { generation: number; sections: 
     : { generation: gitToplevelCache.generation, sections: [...gitToplevelCache.bySection.keys()] };
 }
 
+/** P5-a: posts `graphService:headChanged` — main re-sends the index request for the open project. */
+function postHeadChanged(message: GraphServiceHeadChangedMessage): void {
+  process.parentPort?.postMessage(message);
+}
+
+/**
+ * P5-a (founder decision 6.1): has the checkout of `projectPath` — the
+ * project whose index is served — moved since that index started? Reads HEAD
+ * now and compares it with `indexedHead` (`assessHeadDrift`: only two known,
+ * different HEADs are drift). On drift, posts `graphService:headChanged` at
+ * most once per distinct current HEAD and never while an index is in flight,
+ * and returns both HEADs; otherwise `undefined`. Read-only git; never throws.
+ */
+async function checkHeadDrift(
+  projectPath: string,
+): Promise<{ indexedHead: string; currentHead: string; reindexing: boolean } | undefined> {
+  if (activeProjectPath !== projectPath || indexedHead === undefined) {
+    return undefined;
+  }
+  const comparedWith = indexedHead;
+  const currentHead = await readHeadCommit(projectPath);
+  // The served index changed while HEAD was read (a re-index finished, or
+  // another project's did): this comparison no longer describes it.
+  if (activeProjectPath !== projectPath || indexedHead !== comparedWith) {
+    return undefined;
+  }
+  const decision = assessHeadDrift({
+    indexedHead: comparedWith,
+    currentHead,
+    autoReindexHead,
+    indexInFlight: activeIndexInFlight,
+    reindexRequestPending: reindexRequestedAt !== undefined && Date.now() - reindexRequestedAt < reindexRequestGraceMs,
+  });
+  if (!decision.drift) {
+    return undefined;
+  }
+  if (decision.requestReindex) {
+    autoReindexHead = decision.currentHead;
+    reindexRequestedAt = Date.now();
+    postHeadChanged({
+      type: 'graphService:headChanged',
+      path: projectPath,
+      indexedHead: decision.indexedHead,
+      currentHead: decision.currentHead,
+    });
+  }
+  return { indexedHead: decision.indexedHead, currentHead: decision.currentHead, reindexing: decision.reindexing };
+}
+
+/** P5-a: a well-formed `graphService:checkHead` (a non-empty absolute `path`). */
+function isCheckHeadRequest(data: unknown): data is GraphServiceCheckHeadRequest {
+  if (typeof data !== 'object' || data === null) {
+    return false;
+  }
+  const { type, path: projectPath } = data as Record<string, unknown>;
+  return (
+    type === 'graphService:checkHead' &&
+    typeof projectPath === 'string' &&
+    projectPath.length > 0 &&
+    path.isAbsolute(projectPath)
+  );
+}
+
+/**
+ * P5-a: main's focus-time check. Posts nothing unless the checkout drifted
+ * (then `headChanged`, via `checkHeadDrift`). Skipped while another focus
+ * check is still running, or while an index is in flight (it could not ask
+ * for a re-index anyway). Never throws.
+ */
+async function handleCheckHeadRequest(projectPath: string): Promise<void> {
+  if (headCheckInFlight || activeIndexInFlight) {
+    return;
+  }
+  headCheckInFlight = true;
+  try {
+    await checkHeadDrift(projectPath);
+  } catch (error) {
+    console.error(`[graph-service] HEAD check failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    headCheckInFlight = false;
+  }
+}
+
 /**
  * Computes the diff-scoped `DiffScopeResult` for `projectPath` against
  * `baseRef` — branches on `git-diff-scope.ts`'s `computeDiffScope` result:
@@ -2676,13 +2797,8 @@ export async function computeDiffScopeResult(
   }
   activeDiffScopeComputationInFlight = true;
   try {
-    const nodes = activeCodeMapNodes;
-    // P4-2 phase 3a: captured with `nodes` (same fetch, same tick).
-    const foldedModules = activeFoldedModules ?? [];
-    // P4-2 phase 3c: captured with them too; `usedBy` here is uncapped.
-    const foldedTypes = activeFoldedTypes ?? [];
     const projectRoot = activeProjectPath;
-    if (!nodes || !projectRoot) {
+    if (!projectRoot) {
       return { status: 'error', message: 'No project has finished indexing yet.' };
     }
     if (projectRoot !== projectPath) {
@@ -2690,6 +2806,29 @@ export async function computeDiffScopeResult(
       // for a project that isn't (or is no longer) this process's active one
       // must never silently compute against the wrong project's Nodes.
       return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    // P5-a (founder decision 6.1): the checkout moved since this project was
+    // indexed — the served line ranges are an older commit's, so no diff is
+    // computed against them. The check asks main for a re-index (once per
+    // HEAD); every call during the drift, including while that re-index
+    // runs or after it fails (when `nodes` is unset), gets this same error.
+    const drift = await checkHeadDrift(projectRoot);
+    if (drift !== undefined) {
+      return { status: 'error', message: headDriftErrorMessage(drift.indexedHead, drift.currentHead, drift.reindexing) };
+    }
+    // Captured after the HEAD read above (it awaits), so a re-index that
+    // started meanwhile is seen here rather than slipping past the
+    // supersession check further down.
+    const nodes = activeCodeMapNodes;
+    // P4-2 phase 3a: captured with `nodes` (same fetch, same tick).
+    const foldedModules = activeFoldedModules ?? [];
+    // P4-2 phase 3c: captured with them too; `usedBy` here is uncapped.
+    const foldedTypes = activeFoldedTypes ?? [];
+    if (activeProjectPath !== projectRoot) {
+      return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    if (!nodes) {
+      return { status: 'error', message: 'No project has finished indexing yet.' };
     }
     // P4-4 phase 2a (AD-13 "Section scope"): with a `section`, the inputs —
     // the whole-scope cached Nodes, folded types and folded Modules — are
@@ -3580,6 +3719,11 @@ process.parentPort?.on('message', (event) => {
       event.data.includedPaths ?? [],
       sanitizeEntryPins((event.data as { entryPins?: unknown }).entryPins),
     );
+    return;
+  }
+  if (!isShuttingDown && isCheckHeadRequest(event.data)) {
+    // P5-a: posts `headChanged` only on drift; never throws.
+    void handleCheckHeadRequest(event.data.path);
     return;
   }
   if (!isShuttingDown && isSetEntryPinsRequest(event.data)) {
