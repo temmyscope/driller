@@ -534,6 +534,13 @@ export function computeBlastRadiusHopDistances(
 // point": every "no callers" and every reach count comes from the real
 // edges passed in, nothing from names, exports or CBM's `is_entry_point`.
 //
+// P5-e (founder decision 3.2): a Node in a harness or fixture file
+// (`isEntryCandidateExcludedFile`: the file's base name contains `harness`
+// or `fixture`, any case) is never a heuristic root — code only tests drive
+// but outside test-named files. It stays on the map, still counts as a
+// caller (so what it calls never becomes caller-free), and a pin still
+// lists it.
+//
 // Test code never reaches here: callers pass `fetchProductionCodeMap`'s
 // output (P4-2), which has already dropped test Nodes and their edges. A
 // section's candidates (AD-13 "(f) per section") come from calling this
@@ -671,6 +678,21 @@ export function entryReachAdjacency(nodes: PathTraceNode[], edges: PathTraceEdge
     nodes,
     edges.filter((edge) => ENTRY_CALLER_EDGE_KINDS.includes(edge.kind)),
   );
+}
+
+/** P5-e: a file base name matching this is never a heuristic entry candidate's. */
+const ENTRY_CANDIDATE_EXCLUDED_BASE_NAME = /harness|fixture/i;
+
+/**
+ * P5-e (founder decision 3.2): `true` when a Node in the project-relative
+ * `file` is never taken as a heuristic entry candidate — the file's base
+ * name (never a directory name: a production `fixtures/` folder holds real
+ * code) contains `harness` or `fixture`, in any case. Such Nodes stay on the
+ * map, still count as callers, and are listed when pinned.
+ */
+export function isEntryCandidateExcludedFile(file: string): boolean {
+  const separator = Math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'));
+  return ENTRY_CANDIDATE_EXCLUDED_BASE_NAME.test(file.slice(separator + 1));
 }
 
 /** `true` when `id` has no caller in `adjacency` other than itself (a self-loop is not a caller). */
@@ -948,7 +970,8 @@ function ranksAhead(a: { id: string; reach: number }, b: { id: string; reach: nu
 /**
  * P4-7: `listEntryCandidates` plus how much walking it did — a seam for
  * `entryCandidates.test.ts` (proving the pruning skips work) and
- * `bench/entryCandidates.bench.ts`. `roots` is the caller-free Node count;
+ * `bench/entryCandidates.bench.ts`. `roots` is the caller-free Node count
+ * (P5-e: Nodes in harness or fixture files left out — never roots);
  * `exactReachWalks` the ids whose reach was walked in full, in walk order.
  *
  * Ranking without walking every root in full:
@@ -980,7 +1003,8 @@ export function listEntryCandidatesWithWork(
   const ordered = [...nodesById.values()];
   const roots: number[] = [];
   ordered.forEach((node, index) => {
-    if (hasNoCaller(adjacency, node.id)) {
+    // P5-e: a harness or fixture file's Node is never a heuristic root.
+    if (hasNoCaller(adjacency, node.id) && !isEntryCandidateExcludedFile(node.file)) {
       roots.push(index);
     }
   });
@@ -1129,6 +1153,11 @@ export function listEntryCandidatesWithWork(
  * a forward walk per caller-free Node — in full only while the top
  * `ENTRY_CANDIDATE_MAX` can still change, otherwise only until it reaches
  * `ENTRY_CANDIDATE_MIN_REACH` Nodes (`listEntryCandidatesWithWork`).
+ *
+ * P5-e: a Node whose file's base name contains `harness` or `fixture` (any
+ * case, `isEntryCandidateExcludedFile`) is never a heuristic candidate, nor
+ * counted in `totalQualifying`; it still counts as a caller, and a pin
+ * still lists it.
  *
  * P4-7g: `options.pinnedIds` (the engineer's pins, AD-5 "Entry pins") come
  * first, in pin order, with `reason: {kind: 'pinned'}` and their real reach,

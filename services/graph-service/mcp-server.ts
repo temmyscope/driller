@@ -523,7 +523,7 @@ export const LIST_ENTRY_CANDIDATES_DESCRIPTION =
   "'hiddenPinIds' (present only when not empty) lists pinned Node ids that are not on the Code Map (for example renamed or deleted, or out of scope): they are never candidates. " +
   "Each candidate is {id, name, file, startLine, endLine, reach, reason}. Reason kinds: 'pinned' (the engineer pinned it as an entry point); 'no-callers' (no Code Map Node calls or uses it in indexed code); when files' top-level code calls or uses it at load time, a 'no-callers' reason also carries 'loadedBy' " +
   `(those files, sorted, at most ${ENTRY_CANDIDATE_LOADED_BY_MAX}) and 'loadedByTotal' (how many there are). ` +
-  "Test code is never a candidate and never counted in reach. The result is the exact same EntryCandidatesResult the human-facing UI gets for the identical request, except that 'relations' is cut to the strongest pairs (with 'relationsTotal'). " +
+  "Test code is never a candidate and never counted in reach. Files whose name contains 'harness' or 'fixture' are never suggested (pin one to list it). The result is the exact same EntryCandidatesResult the human-facing UI gets for the identical request, except that 'relations' is cut to the strongest pairs (with 'relationsTotal'). " +
   "With 'section', candidates and reach are computed from that section's own Nodes and the edges between them, never by filtering the whole-scope result: a Node whose only callers are in another section is a candidate in its own section, and 'loadedBy' names only files inside the section. A pinned Node in another section is not listed there (nor in 'hiddenPinIds'). " +
   SECTION_RULE_DESCRIPTION;
 

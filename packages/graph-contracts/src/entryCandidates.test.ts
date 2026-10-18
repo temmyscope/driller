@@ -17,6 +17,7 @@ import {
   type EntryCandidateInputNode,
   type EntryCandidatesResult,
   entryReachAdjacency,
+  isEntryCandidateExcludedFile,
   listEntryCandidates,
   listEntryCandidatesWithWork,
   type PathTraceEdge,
@@ -260,7 +261,10 @@ describe('listEntryCandidates (P4-7 phase 1a)', () => {
  * string-keyed `directionalHopDistances` walk of every root in full
  * (through the exported `blastRadiusNodeIds`, given that forward-only map
  * and an effectively unbounded hop count), and `reason` is rebuilt from
- * `calledAtLoadBy`. No pruning: every root is walked and ranked.
+ * `calledAtLoadBy`. No pruning: every root is walked and ranked. P5-e: a
+ * root whose file's base name contains `harness` or `fixture` (any case) is
+ * left out here by `referenceExcludedFile`, its own string test — never
+ * `isEntryCandidateExcludedFile`.
  */
 function referenceEntryCandidates(graphNodes: EntryCandidateInputNode[], graphEdges: PathTraceEdge[]): EntryCandidatesResult {
   const byId = new Map<string, EntryCandidateInputNode>();
@@ -280,7 +284,7 @@ function referenceEntryCandidates(graphNodes: EntryCandidateInputNode[], graphEd
   }
   const forwardOnly: BidirectionalAdjacency = { validNodeIds: new Set(byId.keys()), forward, backward: new Map() };
   const qualifying = [...byId.values()]
-    .filter((graphNode) => !called.has(graphNode.id))
+    .filter((graphNode) => !called.has(graphNode.id) && !referenceExcludedFile(graphNode.file))
     .map((graphNode) => ({ graphNode, reach: blastRadiusNodeIds(forwardOnly, graphNode.id, Number.MAX_SAFE_INTEGER).size }))
     .filter((root) => root.reach >= 3)
     .sort((a, b) => b.reach - a.reach || (a.graphNode.id < b.graphNode.id ? -1 : 1));
@@ -308,6 +312,40 @@ function referenceEntryCandidates(graphNodes: EntryCandidateInputNode[], graphEd
       listed.map(({ graphNode }) => graphNode.id),
     ),
   };
+}
+
+/** P5-e: the reference's own harness/fixture test — the last path segment, lower-cased, searched as plain text. */
+function referenceExcludedFile(file: string): boolean {
+  const baseName = file.split(/[\\/]/).pop()!.toLowerCase();
+  return baseName.includes('harness') || baseName.includes('fixture');
+}
+
+/**
+ * P5-e: a deterministic share of the Nodes moved into harness or fixture
+ * files (excluded as roots), and into a `fixtures/` directory (kept — the
+ * base name alone decides), without consuming the graph's random source.
+ */
+function withHarnessFiles(graphNodes: EntryCandidateInputNode[]): EntryCandidateInputNode[] {
+  return graphNodes.map((graphNode, index) =>
+    index % 9 === 4
+      ? { ...graphNode, file: `src/${graphNode.id}-harness.ts` }
+      : index % 9 === 7
+        ? { ...graphNode, file: `src/fixtures/${graphNode.id}.ts` }
+        : index % 13 === 6
+          ? { ...graphNode, file: `lib/${graphNode.id}FIXTURE.java` }
+          : graphNode,
+  );
+}
+
+/** P5-e: how many of `graph`'s caller-free Nodes the exclusion takes out (per the reference's own test). */
+function excludedRootCount(graph: { nodes: EntryCandidateInputNode[]; edges: PathTraceEdge[] }): number {
+  const ids = new Set(graph.nodes.map((graphNode) => graphNode.id));
+  const called = new Set(
+    graph.edges
+      .filter((graphEdge) => (graphEdge.kind === 'CALLS' || graphEdge.kind === 'USAGE') && graphEdge.source !== graphEdge.target && ids.has(graphEdge.source))
+      .map((graphEdge) => graphEdge.target),
+  );
+  return graph.nodes.filter((graphNode) => !called.has(graphNode.id) && referenceExcludedFile(graphNode.file)).length;
 }
 
 /**
@@ -381,7 +419,7 @@ function randomGraph(seed: number, nodeCount: number, edgeCount: number): { node
       graphEdges.push({ ...graphEdge });
     }
   }
-  return { nodes: withLoadCallers(ids, next), edges: graphEdges };
+  return { nodes: withHarnessFiles(withLoadCallers(ids, next)), edges: graphEdges };
 }
 
 /**
@@ -424,26 +462,31 @@ function rootForest(seed: number): { nodes: EntryCandidateInputNode[]; edges: Pa
       graphEdges.push(edge(id, pool[next(pool.length)]!, 'IMPORTS'));
     }
   }
-  return { nodes: withLoadCallers(ids, next), edges: graphEdges };
+  return { nodes: withHarnessFiles(withLoadCallers(ids, next)), edges: graphEdges };
 }
 
 describe('listEntryCandidates equals an independent full-walk reference (P4-7 indexed BFS and pruning)', () => {
   it('on 200 seeded random graphs, sparse to dense', () => {
     let found = 0;
+    let withExcludedRoots = 0;
     for (let seed = 1; seed <= 200; seed += 1) {
       const nodeCount = 1 + (seed % 60);
       const graph = randomGraph(seed, nodeCount, Math.floor(nodeCount * (0.5 + (seed % 7) * 0.4)));
       const expected = referenceEntryCandidates(graph.nodes, graph.edges);
       assert.deepEqual(listEntryCandidates(graph.nodes, graph.edges), expected, `seed ${seed}`);
       found += expected.status === 'found' ? 1 : 0;
+      withExcludedRoots += excludedRootCount(graph) > 0 ? 1 : 0;
     }
     // The generator must exercise both outcomes, or the comparison proves little.
     assert.ok(found > 50 && found < 200, `found in ${found} of 200`);
+    // P5-e: and caller-free Nodes in harness/fixture files, which must be left out.
+    assert.ok(withExcludedRoots > 100, `excluded roots in ${withExcludedRoots} of 200`);
   });
 
   it('on 200 seeded root forests that take the pruned path, with ties at the cutoff', () => {
     let pruned = 0;
     let tiedAtCutoff = 0;
+    let withExcludedRoots = 0;
     for (let seed = 1; seed <= 200; seed += 1) {
       const graph = rootForest(seed);
       const expected = referenceEntryCandidates(graph.nodes, graph.edges);
@@ -454,12 +497,14 @@ describe('listEntryCandidates equals an independent full-walk reference (P4-7 in
         continue;
       }
       pruned += exactReachWalks.length < expected.totalQualifying ? 1 : 0;
+      withExcludedRoots += excludedRootCount(graph) > 0 ? 1 : 0;
       // A root left out at the cutoff with the same reach as the last one ranked.
       const lastReach = expected.candidates[ENTRY_CANDIDATE_MAX - 1]!.reach;
       const adjacency = entryReachAdjacency(graph.nodes, graph.edges);
       const leftOutTied = graph.nodes.some(
         (graphNode) =>
           /^r\d+-\d+$/.test(graphNode.id) &&
+          !referenceExcludedFile(graphNode.file) &&
           !expected.candidates.some((candidate) => candidate.id === graphNode.id) &&
           blastRadiusNodeIds(adjacency, graphNode.id, Number.MAX_SAFE_INTEGER).size === lastReach,
       );
@@ -468,6 +513,8 @@ describe('listEntryCandidates equals an independent full-walk reference (P4-7 in
     // Both the pruned path and ties at the cutoff must actually be exercised.
     assert.ok(pruned > 100, `pruned in ${pruned} of 200`);
     assert.ok(tiedAtCutoff > 50, `tied at the cutoff in ${tiedAtCutoff} of 200`);
+    // P5-e: excluded roots are present on the pruned path too.
+    assert.ok(withExcludedRoots > 150, `excluded roots in ${withExcludedRoots} of 200`);
   });
 
   it('on the hand-built fixtures and matrix graphs', () => {
@@ -489,7 +536,12 @@ describe('listEntryCandidates pruning skips work it can prove unnecessary (P4-7)
     const big = Array.from({ length: 12 }, (_, index) => chain(`big${String(index).padStart(2, '0')}`, 20 + index));
     const small = Array.from({ length: 50 }, (_, index) => chain(`small${String(index).padStart(2, '0')}`, 4));
     const tiny = Array.from({ length: 5 }, (_, index) => chain(`tiny${index}`, 1));
-    const graph = merge(...shuffled([...big, ...small, ...tiny], 11));
+    // P5-e: 3 harness/fixture roots that would outrank every big root — never roots, never walked.
+    const excluded = ['run-harness.ts', 'seed.fixture.ts', 'LoadFixtures.java'].map((file, index) => {
+      const graph = chain(`huge${index}`, 40 + index);
+      return { nodes: [{ ...graph.nodes[0]!, file }, ...graph.nodes.slice(1)], edges: graph.edges };
+    });
+    const graph = merge(...shuffled([...big, ...small, ...tiny, ...excluded], 11));
     const { result, roots, exactReachWalks } = listEntryCandidatesWithWork(graph.nodes, graph.edges);
     assert.equal(roots, 67);
     assert.deepEqual(exactReachWalks, Array.from({ length: 12 }, (_, index) => `big${String(11 - index).padStart(2, '0')}`));
@@ -673,6 +725,104 @@ describe('listEntryCandidates with pins (P4-7g)', () => {
 
   it('ENTRY_PINS_MAX is 50', () => {
     assert.equal(ENTRY_PINS_MAX, 50);
+  });
+});
+
+describe('entry candidates skip harness and fixture files (P5-e)', () => {
+  const inFile = (graphNode: EntryCandidateInputNode, file: string): EntryCandidateInputNode => ({ ...graphNode, file });
+  /** `id` in `file`, reaching `length` Nodes of its own. */
+  const rootIn = (id: string, file: string, length: number) => {
+    const graph = chain(id, length);
+    return { nodes: [inFile(graph.nodes[0]!, file), ...graph.nodes.slice(1)], edges: graph.edges };
+  };
+  // driller/app's shape: `getters` (in the harness) would be the top root.
+  const GRAPH = merge(
+    rootIn('getters', 'services/graph-service/scoped-code-map-harness.ts', 9),
+    rootIn('main', 'main/index.ts', 6),
+    rootIn('render', 'renderer/App.tsx', 4),
+  );
+
+  it('isEntryCandidateExcludedFile: the base name, any case, never a directory', () => {
+    const table: [string, boolean][] = [
+      ['services/graph-service/scoped-code-map-harness.ts', true],
+      ['src/load-fixture.ts', true],
+      ['FixtureLoader.java', true],
+      ['src/TestHARNESS.py', true],
+      ['lib/myFixtures.go', true],
+      ['C:\\repo\\src\\fixture.ts', true],
+      ['src/fixtures/load.ts', false],
+      ['harness/run.ts', false],
+      ['a/fixture/b/harnesses/c.ts', false],
+      ['src/harnes.ts', false],
+      ['src/fixtur.ts', false],
+      ['main/index.ts', false],
+      ['', false],
+    ];
+    for (const [file, excluded] of table) {
+      assert.equal(isEntryCandidateExcludedFile(file), excluded, file);
+    }
+  });
+
+  it('driller/app: getters in scoped-code-map-harness.ts is not a candidate; the next one moves up; totalQualifying one lower', () => {
+    const result = listEntryCandidates(GRAPH.nodes, GRAPH.edges);
+    assert.ok(result.status === 'found');
+    assert.deepEqual(candidateIds(result), ['main', 'render']);
+    assert.equal(result.totalQualifying, 2);
+    // Its Nodes stay: what it reaches is still there to reach.
+    const control = listEntryCandidates(
+      GRAPH.nodes.map((graphNode) => (graphNode.id === 'getters' ? inFile(graphNode, 'services/graph-service/scoped-code-map.ts') : graphNode)),
+      GRAPH.edges,
+    );
+    assert.ok(control.status === 'found');
+    assert.deepEqual(candidateIds(control), ['getters', 'main', 'render']);
+    assert.equal(control.totalQualifying, 3);
+  });
+
+  it('a harness calling production foo only: foo still has a caller, so it is not a candidate', () => {
+    const foo = chain('foo', 5);
+    const graph = { nodes: [node('harnessMain'), ...foo.nodes].map((graphNode) => (graphNode.id === 'harnessMain' ? inFile(graphNode, 'src/foo-harness.ts') : graphNode)), edges: [edge('harnessMain', 'foo'), ...foo.edges] };
+    assert.deepEqual(listEntryCandidates(graph.nodes, graph.edges), { status: 'none' });
+  });
+
+  it('getters pinned: listed first, pinned, with its real reach', () => {
+    const result = listEntryCandidates(GRAPH.nodes, GRAPH.edges, { pinnedIds: ['getters'] });
+    assert.ok(result.status === 'found');
+    assert.deepEqual(
+      result.candidates.map((candidate) => [candidate.id, candidate.reach, candidate.reason.kind]),
+      [
+        ['getters', 9, 'pinned'],
+        ['main', 6, 'no-callers'],
+        ['render', 4, 'no-callers'],
+      ],
+    );
+    assert.equal(result.candidates[0]!.file, 'services/graph-service/scoped-code-map-harness.ts');
+    assert.equal(result.totalQualifying, 3);
+  });
+
+  it('src/fixtures/load.ts: a directory named fixtures is no exclusion — still a candidate', () => {
+    const graph = rootIn('load', 'src/fixtures/load.ts', 4);
+    assert.deepEqual(candidateIds(listEntryCandidates(graph.nodes, graph.edges)), ['load']);
+  });
+
+  it('FixtureLoader.java: the base name contains Fixture (any case) — excluded', () => {
+    const graph = merge(rootIn('FixtureLoader.load', 'src/main/java/FixtureLoader.java', 7), rootIn('App.main', 'src/main/java/App.java', 3));
+    assert.deepEqual(candidateIds(listEntryCandidates(graph.nodes, graph.edges)), ['App.main']);
+  });
+
+  it('every caller-free Node excluded: none; a pin still makes it found', () => {
+    const graph = merge(rootIn('h1', 'test-harness.ts', 5), rootIn('f1', 'db.fixture.ts', 4));
+    assert.deepEqual(listEntryCandidates(graph.nodes, graph.edges), { status: 'none' });
+    const { roots } = listEntryCandidatesWithWork(graph.nodes, graph.edges);
+    assert.equal(roots, 0);
+    assert.deepEqual(candidateIds(listEntryCandidates(graph.nodes, graph.edges, { pinnedIds: ['f1'] })), ['f1']);
+  });
+
+  it('shuffled input gives an identical result', () => {
+    const graph = merge(GRAPH, rootIn('load', 'src/fixtures/load.ts', 4), rootIn('FixtureLoader.load', 'FixtureLoader.java', 8));
+    const expected = listEntryCandidates(graph.nodes, graph.edges, { pinnedIds: ['getters'] });
+    for (let seed = 1; seed <= 5; seed += 1) {
+      assert.deepEqual(listEntryCandidates(shuffled(graph.nodes, seed), shuffled(graph.edges, seed + 3), { pinnedIds: ['getters'] }), expected);
+    }
   });
 });
 

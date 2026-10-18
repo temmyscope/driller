@@ -63,7 +63,10 @@ const usage = (source: string, target: string): CodeMapEdge => ({ source, target
  *  - test code (by path, and by the backend flag) that would be the top
  *    candidate and would take `handleRequest`'s place if it leaked through;
  *  - `lib.tool`, outside the scope, calling into api (a candidate only on
- *    the unscoped fetch).
+ *    the unscoped fetch);
+ *  - P5-e: `api.getters` in `api/scoped-code-map-harness.ts` → both
+ *    services and helpers (reach 6, so it would rank above
+ *    `handleRequest`): on the map, but never a candidate.
  */
 const FIXTURE: CodeMapFetchResult = {
   nodes: [
@@ -80,6 +83,7 @@ const FIXTURE: CodeMapFetchResult = {
     fn('web.body', 'web/app.ts'),
     fn('web.footer', 'web/app.ts'),
     fn('lib.tool', 'lib/tool.ts'),
+    fn('api.getters', 'api/scoped-code-map-harness.ts'),
     fn('api.entrySpec', 'api/entry.test.ts'),
     fn('web.flagged', 'web/support.ts', { isTest: true }),
     fn('mod:web/main', 'web/main.ts', { kind: 'Module', endLine: 10 }),
@@ -100,6 +104,11 @@ const FIXTURE: CodeMapFetchResult = {
     calls('lib.tool', 'api.serviceB'),
     calls('lib.tool', 'api.helper1'),
     calls('lib.tool', 'api.helper2'),
+    // P5-e: a harness — its Node stays on the map, never a candidate.
+    calls('api.getters', 'api.serviceA'),
+    calls('api.getters', 'api.serviceB'),
+    calls('api.getters', 'api.helper1'),
+    calls('api.getters', 'api.helper2'),
     // Test code: dropped with its Nodes.
     calls('api.entrySpec', 'api.handleRequest'),
     calls('api.entrySpec', 'api.helper1'),
@@ -355,6 +364,9 @@ describe('P4-7c: the whole scope', () => {
       const reply = await requestMap();
       const result = indexModule.computeEntryCandidatesResult(PROJECT);
       assert.deepEqual(result, listEntryCandidates(reply.nodes, reply.edges), scope.join(','));
+      // P5-e: the harness Node is on the map, never a candidate.
+      assert.ok(reply.nodes.some((mapNode) => mapNode.id === 'api.getters'));
+      assert.ok(!ids(result).includes('api.getters'));
       for (const id of ids(result)) {
         assert.ok(!TEST_IDS.has(id), `${id} is test code`);
         assert.doesNotMatch(candidate(result, id)!.file, /\.test\.ts$/);
@@ -585,6 +597,13 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.equal(result.status, 'found');
     assert.ok(ids(result).includes('api.handleRequest'));
     assert.ok(ids(result).every((id) => !TEST_IDS.has(id)));
+    // P5-e: the harness root is left out on both transports alike.
+    for (const section of [undefined, 'api']) {
+      const ipc = (await viaIpc(PROJECT, section)).result as EntryCandidatesResult;
+      const agent = JSON.parse(await viaMcp({ projectPath: PROJECT, ...(section === undefined ? {} : { section }) })) as EntryCandidatesResult;
+      assert.ok(!ids(ipc).includes('api.getters') && !ids(agent).includes('api.getters'), String(section));
+      assert.deepEqual(ids(agent), ids(ipc));
+    }
   });
 
   it('review round 1: startMcpServer registers list_entry_candidates (source)', () => {
@@ -618,6 +637,8 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(description, /Only the 50 strongest pairs are returned here; 'relationsTotal' is how many pairs there are/);
     assert.match(description, /\{status: 'found', candidates, totalQualifying, relations, relationsTotal, hiddenPinIds\?\}/);
     assert.match(description, /USAGE counts as a caller/);
+    // P5-e: the harness/fixture rule.
+    assert.match(description, /Files whose name contains 'harness' or 'fixture' are never suggested \(pin one to list it\)\./);
     assert.match(description, /Load-time calls from a file's top level .* do NOT count as callers/);
     assert.match(description, /at most 12/);
     assert.match(description, /fewer than 3/);
