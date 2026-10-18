@@ -438,3 +438,22 @@ describe('styles.css floated-toolbar collision layout (FIX-4)', () => {
     ]);
   });
 });
+
+// P5-f (founder decision 7.1): plain canvas edges now paint DESIGN.md
+// `canvas-edge` (`--border-strong`, 1.5px) instead of React Flow's dark
+// default (#3e3e3e, 1px). Informational only: an edge is not a control's
+// only cue, so WCAG 1.4.11's 3:1 is never asserted here. The founder's
+// Ask First: if plain edges read too faint on a dense map, `--border-control`
+// (≥ 3:1) replaces it, amending DESIGN.md. Recorded so a token change shows.
+describe('plain canvas-edge stroke against the canvas (P5-f, informational)', () => {
+  const REACT_FLOW_DARK_EDGE = '#3e3e3e';
+  it('--border-strong on --bg is ≈1.72:1, next to React Flow’s #3e3e3e at ≈1.81:1', (t) => {
+    const [strong] = hexDefinitionsOf('--border-strong');
+    const [bg] = hexDefinitionsOf('--bg');
+    const ours = contrastRatio(strong!, bg!);
+    const before = contrastRatio(REACT_FLOW_DARK_EDGE, bg!);
+    t.diagnostic(`--border-strong ${strong} on --bg ${bg}: ${ours.toFixed(2)}:1; ${REACT_FLOW_DARK_EDGE}: ${before.toFixed(2)}:1`);
+    assert.equal(Number(ours.toFixed(2)), 1.72);
+    assert.equal(Number(before.toFixed(2)), 1.81);
+  });
+});

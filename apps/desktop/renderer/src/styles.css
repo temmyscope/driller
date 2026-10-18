@@ -1235,6 +1235,15 @@ code,
   border: 1px solid var(--border-strong);
   background: var(--panel);
   min-width: 160px;
+  /* P5-f (founder decision 7.2): DESIGN.md `node-card.maxWidth`. Without a
+     cap, one long summary or AI-judgment line made a card ~1000 px wide, and
+     Revealed (spacing each column by its widest measured card, FIX-7)
+     pushed the whole next column far right. The text children below take
+     `min-width: 0` and wrap (or ellipsize) inside it; the rows wrap. */
+  max-width: 320px;
+  /* An unbroken token (a long path or identifier in prose) breaks rather
+     than overflowing the cap. */
+  overflow-wrap: anywhere;
   cursor: pointer;
 }
 
@@ -1337,6 +1346,7 @@ code,
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1357,6 +1367,7 @@ code,
   font-size: 10.5px;
   line-height: 1.45;
   color: var(--text-dim);
+  min-width: 0;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -1428,9 +1439,23 @@ code,
    its own here — DESIGN.md draws no distinction between edge kinds, only
    between plain/path-highlighted/changed-source, all below. */
 .code-map__edge {
+  cursor: pointer;
+}
+
+/* P5-f (founder decision 7.1): the stroke goes on the VISIBLE path. On the
+   edge's `<g>` it never reached it — `@xyflow/react`'s own
+   `.react-flow__edge-path` rule sets the path's stroke directly, so every
+   plain edge painted React Flow's #3e3e3e at 1px (FIX-7 found the same for
+   the lit edges). This rule must stay BEFORE every other
+   `.react-flow__edge-path` rule in this file: at equal (0,2,0) specificity,
+   source order lets the shared-reach, path-highlight and changed-source
+   rules below win. React Flow's selected/focused-edge rule is (0,3,0) and
+   still wins while an edge has focus. The ref connector's dashes and
+   opacity (`.code-map__edge--reveal-ref`, on the `<g>`) inherit or apply
+   over it. */
+.code-map__edge .react-flow__edge-path {
   stroke: var(--border-strong);
   stroke-width: 1.5;
-  cursor: pointer;
 }
 
 /* The Node card's affordance row (Story 1.4, FR4; Source pill added by P0-1
@@ -1443,6 +1468,8 @@ code,
    Node Detail). */
 .code-map__node-affordances {
   display: flex;
+  /* P5-f: wraps inside the card's 320 px cap. */
+  flex-wrap: wrap;
   gap: 0.35rem;
   margin-top: 0.15rem;
 }
@@ -1539,6 +1566,7 @@ code,
   display: flex;
   align-items: flex-start;
   gap: 0.3rem;
+  min-width: 0;
   margin: 0.15rem 0 0;
   padding: 0.25rem 0.45rem;
   font-size: 10.5px;

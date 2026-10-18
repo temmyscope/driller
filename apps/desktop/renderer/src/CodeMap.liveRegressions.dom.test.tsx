@@ -251,6 +251,158 @@ describe('FIX-7: a lit edge paints its visible path (P2-4, P3-11/12)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// P5-f (founder decision 7.1): a plain edge paints DESIGN.md `canvas-edge`
+
+describe('P5-f: a plain edge paints DESIGN.md canvas-edge on its visible path (7.1)', () => {
+  it('every plain Full-map edge paints --border-strong, 1.5px (was React Flow’s #3e3e3e, 1px)', BUDGET, async () => {
+    fake();
+    await mountFull();
+    loadRealStylesheets();
+    const edges = await waitFor(() => {
+      measure();
+      const drawn = [...document.querySelectorAll('.react-flow__edge')];
+      assert.ok(drawn.length > 0, 'edges are drawn');
+      return drawn;
+    }, FIND);
+    const strong = token('--border-strong');
+    for (const edge of edges) {
+      assert.deepEqual(paintedStroke(edge), { stroke: strong, width: '1.5' }, `${edge.getAttribute('data-id')} paints canvas-edge`);
+    }
+  });
+
+  it('a lit route still paints trace-cyan 2px over the base rule; the rest keep canvas-edge', BUDGET, async () => {
+    fake();
+    await mountFull();
+    loadRealStylesheets();
+    fireEvent.click(await findOnCanvas(`2 calls — show the callees of ${N.handleRequest.name}`));
+    await settleViewport();
+    const lit = await waitFor(() => {
+      measure();
+      const edges = edgesWithClass('code-map__edge--path-highlight');
+      assert.equal(edges.length, 2);
+      return edges;
+    }, FIND);
+    for (const edge of lit) {
+      assert.deepEqual(paintedStroke(edge), { stroke: token('--trace-cyan'), width: '2' });
+    }
+    for (const edge of [...document.querySelectorAll('.react-flow__edge')].filter((e) => !lit.includes(e))) {
+      assert.deepEqual(paintedStroke(edge), { stroke: token('--border-strong'), width: '1.5' });
+    }
+  });
+
+  it('a focused edge takes React Flow’s selected/focus stroke over the base rule', BUDGET, async () => {
+    fake();
+    await mountFull();
+    loadRealStylesheets();
+    const edge = await waitFor(() => {
+      measure();
+      const found = document.querySelector<SVGGElement>('.react-flow__edge.selectable[tabindex]');
+      assert.ok(found, 'a focusable edge is drawn');
+      return found;
+    }, FIND);
+    act(() => edge.focus());
+    assertSameElement(document.activeElement, edge, 'the edge holds focus');
+    const path = edge.querySelector('.react-flow__edge-path')!;
+    const selected = substituteVars('var(--xy-edge-stroke-selected-default)', path);
+    assert.notEqual(selected, '');
+    assert.notEqual(selected, token('--border-strong'));
+    assert.equal(paintedStroke(edge).stroke, selected);
+  });
+
+  it('Revealed: the "shown above" connector keeps its dashes and 0.5 opacity over the base stroke', BUDGET, async () => {
+    elementSize.set(4000, 3000);
+    fake();
+    await mountFull();
+    await toRevealed();
+    fireEvent.click(await findOnCanvas(`Expand 2 callees of ${N.handleRequest.name}`));
+    await settleViewport();
+    loadRealStylesheets();
+    const connector = await waitFor(() => {
+      measure();
+      const found = document.querySelector('.react-flow__edge.code-map__edge--reveal-ref');
+      assert.ok(found, 'the ref connector is drawn');
+      return found;
+    }, FIND);
+    assert.deepEqual(paintedStroke(connector), { stroke: token('--border-strong'), width: '1.5' });
+    const path = connector.querySelector('.react-flow__edge-path')!;
+    assert.equal(getComputedStyle(path).getPropertyValue('stroke-dasharray').trim(), '3 4', 'the path inherits the dashes');
+    assert.equal(getComputedStyle(connector).getPropertyValue('opacity').trim(), '0.5');
+  });
+
+  it('Revealed hover: a shared-reach arc keeps its own dotted --shared-reach-edge stroke', BUDGET, async () => {
+    fake({ getCodeMap: async () => sharedReachMap(), listEntryCandidates: async () => sharedReachListing() });
+    render(<CodeMap {...props()} />);
+    await waitFor(() => {
+      measure();
+      assert.ok(drawnIds().length > 0);
+    }, FIND);
+    fireEvent.click(within(screen.getByRole('group', { name: 'Code Map view' })).getByRole('button', { name: 'Revealed' }));
+    await waitForDrawn(Object.values(SHARED_REACH_CANDIDATES).map((node) => node.id));
+    await settleViewport();
+    loadRealStylesheets();
+    fireEvent.mouseEnter(document.querySelector(`.react-flow__node[data-id="${CSS.escape(SHARED_REACH_CANDIDATES.alpha.id)}"]`)!);
+    const arcs = await waitFor(() => {
+      measure();
+      const found = edgesWithClass('code-map__edge--shared-reach');
+      assert.ok(found.length > 0, 'a shared-reach arc is drawn');
+      return found;
+    }, FIND);
+    for (const arc of arcs) {
+      assert.deepEqual(paintedStroke(arc), { stroke: token('--shared-reach-edge'), width: '1.5' });
+      const path = arc.querySelector('.react-flow__edge-path')!;
+      assert.equal(getComputedStyle(path).getPropertyValue('stroke-dasharray').trim(), '0.5 4');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P5-f (founder decision 7.2): a card caps at 320 px and wraps inside it
+
+describe('P5-f: a Node card caps at 320 px with its text wrapping inside (7.2)', () => {
+  it('the card’s cascaded max-width is 320px; its rows wrap and its text children may shrink', BUDGET, async () => {
+    fake();
+    await mountFull();
+    loadRealStylesheets();
+    const card = nodeCard(N.handleRequest.id);
+    assert.ok(card, 'handleRequest’s card is drawn');
+    const style = getComputedStyle(card);
+    assert.equal(style.getPropertyValue('max-width'), '320px');
+    assert.equal(style.getPropertyValue('min-width'), '160px', 'the floor is unchanged');
+    const affordances = card.querySelector('.code-map__node-affordances');
+    assert.ok(affordances, 'the affordance row is drawn');
+    assert.equal(getComputedStyle(affordances).getPropertyValue('flex-wrap'), 'wrap', 'the affordance row wraps');
+    const identifier = card.querySelector('.code-map__node-id')!;
+    const idStyle = getComputedStyle(identifier);
+    assert.equal(idStyle.getPropertyValue('min-width'), '0px');
+    assert.equal(idStyle.getPropertyValue('white-space'), 'nowrap', 'the identifier stays one line');
+    assert.equal(idStyle.getPropertyValue('text-overflow'), 'ellipsis');
+    assert.match(card.getAttribute('aria-label') ?? '', new RegExp(`\\b${N.handleRequest.name}\\b`), 'the accessible name keeps the full identifier');
+  });
+
+  it('the summary, AI-judgment line and signal strip may shrink and wrap inside the cap', () => {
+    loadRealStylesheets();
+    /** `property` as cascaded on an element of `className` inside a card (rendered by CodeMap only with signal data). */
+    const inCard = (className: string, property: string): string => {
+      const card = document.createElement('div');
+      card.className = 'code-map__node';
+      const element = document.createElement('div');
+      element.className = className;
+      card.append(element);
+      document.body.append(card);
+      try {
+        return getComputedStyle(element).getPropertyValue(property).trim();
+      } finally {
+        card.remove();
+      }
+    };
+    assert.equal(inCard('code-map__node-summary', 'min-width'), '0px');
+    assert.equal(inCard('code-map__node-summary', '-webkit-line-clamp'), '2', 'the clamp line count is unchanged');
+    assert.equal(inCard('code-map__llm-judgment', 'min-width'), '0px');
+    assert.equal(inCard('code-map__node-signal-strip', 'flex-wrap'), 'wrap');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Revealed card spacing
 
 /** A drawn card's box: React Flow's `translate(x, y)` and domEnv's measured `cardSize`. */
