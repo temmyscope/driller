@@ -119,3 +119,14 @@ export function sectionOfFile(file: string, includedPaths: readonly string[]): s
   }
   return owner;
 }
+
+/**
+ * P5-b (founder decision 2.1): whether two indexing scopes are the same list
+ * — the same entries in the same order. The raw map cache's `appliedScope`
+ * is a copy of the live `activeIncludedPaths` taken when it was fetched, so
+ * any saved scope change (even a reorder, which reorders `sections`) makes
+ * them differ, and the Code Map request then re-fetches. Pure.
+ */
+export function sameScope(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((entry, i) => entry === b[i]);
+}

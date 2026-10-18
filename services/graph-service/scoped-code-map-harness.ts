@@ -20,7 +20,14 @@
  *  - `__harnessModel`: a factory for `ensureLocalModel`'s promise (never
  *    settles when unset);
  *  - `__harnessFixtureOverride` (P4-4g review round 1): a raw fetch result
- *    `fetchCodeMap` returns instead of the fixture while set.
+ *    `fetchCodeMap` returns instead of the fixture while set;
+ *  - `__harnessLcovCount` (P5-b): counts `index.ts`'s `loadLcovCoverage`
+ *    calls. `./lcov` is wrapped, not replaced: the real loader still runs;
+ *  - `__harnessSummarize` / `__harnessJudge` (P5-b founder decision 1): when
+ *    set, the per-Node function `index.ts`'s `createLocalSummarizer` /
+ *    `createLocalJudge` return (the local model must be ready, via
+ *    `__harnessModel`). `./summary-generator` and `./judgment-generator` are
+ *    wrapped the same way; everything else in them is the real code.
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -63,11 +70,39 @@ const MCP_SERVER_STUB = toDataUrl(
   'export function startMcpServer(getNodes, _post, derive, getFolded, getFoldedTypes, getSectionCodeMap) { globalThis.__harnessGetters = { getNodes, getFolded, getFoldedTypes, derive, getSectionCodeMap }; return async () => {}; }',
 );
 
+// P5-b: the real `lcov.ts`, re-exported, with `loadLcovCoverage` counted.
+const REAL_LCOV_URL = new URL('./lcov.ts', import.meta.url).href;
+const LCOV_STUB = toDataUrl(`
+import { loadLcovCoverage as realLoadLcovCoverage } from ${JSON.stringify(REAL_LCOV_URL)};
+export * from ${JSON.stringify(REAL_LCOV_URL)};
+export function loadLcovCoverage(projectRoot) {
+  globalThis.__harnessLcovCount = (globalThis.__harnessLcovCount ?? 0) + 1;
+  return realLoadLcovCoverage(projectRoot);
+}
+`);
+
+// P5-b founder decision 1: the real generators, with the local per-Node step overridable.
+const wrapFactory = (file: string, name: string, override: string): string => {
+  const url = new URL(file, import.meta.url).href;
+  return toDataUrl(`
+import { ${name} as real } from ${JSON.stringify(url)};
+export * from ${JSON.stringify(url)};
+export function ${name}(model) {
+  return globalThis.${override} ?? real(model);
+}
+`);
+};
+const SUMMARY_GENERATOR_STUB = wrapFactory('./summary-generator.ts', 'createLocalSummarizer', '__harnessSummarize');
+const JUDGMENT_GENERATOR_STUB = wrapFactory('./judgment-generator.ts', 'createLocalJudge', '__harnessJudge');
+
 const HOOKS = toDataUrl(`
 const STUBS = ${JSON.stringify({
   './mcp-client': MCP_CLIENT_STUB,
   './model-manager': MODEL_MANAGER_STUB,
   './mcp-server': MCP_SERVER_STUB,
+  './lcov': LCOV_STUB,
+  './summary-generator': SUMMARY_GENERATOR_STUB,
+  './judgment-generator': JUDGMENT_GENERATOR_STUB,
 })};
 export function resolve(specifier, context, nextResolve) {
   const parent = context.parentURL ?? '';

@@ -17,7 +17,8 @@
  *    entries included), never `not-found`; an unknown section is
  *    `unknown-section` from every tool; `''` is invalid input;
  *  - the section build is memoized per section and raw cache, and dropped
- *    when the raw cache is replaced (refetch) or cleared (re-index);
+ *    when the raw cache is replaced (refetch: P5-b, a scope save) or cleared
+ *    (re-index);
  *  - `trace_path` in a section never leaves it; `expand_blast_radius` and
  *    `compute_diff_scope` pass the section through (diff scope equals the IPC
  *    result for `api`).
@@ -439,6 +440,9 @@ describe('P4-4 phase 2b: the section build memo', () => {
   it('memoized per section and raw cache; dropped on a refetch and on a re-index', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const compute = indexModule;
+    // P5-b: a fresh raw cache (a same-scope request is served from the
+    // current one, which keeps the previous tests' section builds).
+    await index(PROJECT);
     setScope(['web', 'api']);
     await requestMap();
     assert.equal(compute.peekSectionCodeMapMemoForTests(), undefined);
@@ -451,10 +455,13 @@ describe('P4-4 phase 2b: the section build memo', () => {
     assert.equal(await coverageOf(), true, 'LCOV lists api/server.ts');
 
     // The raw cache is replaced by a refetch without the LCOV report: the
-    // memo goes with it, and the next section lookup rebuilds.
+    // memo goes with it, and the next section lookup rebuilds. P5-b: a
+    // refetch is a scope save (here a reorder); a same-scope request is
+    // served from the raw cache and never re-reads LCOV.
     const lcov = path.join(PROJECT, 'coverage', 'lcov.info');
     rmSync(lcov);
     try {
+      setScope(['api', 'web']);
       await requestMap();
       assert.equal(compute.peekSectionCodeMapMemoForTests(), undefined, 'dropped with the replaced raw cache');
       assert.notEqual(compute.getSectionCodeMap('api'), first);
@@ -462,6 +469,7 @@ describe('P4-4 phase 2b: the section build memo', () => {
     } finally {
       writeFileSync(lcov, FIXTURE_LCOV);
     }
+    setScope(['web', 'api']);
     await requestMap();
     assert.equal(await coverageOf(), true);
 

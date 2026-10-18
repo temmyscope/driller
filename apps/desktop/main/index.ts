@@ -82,8 +82,10 @@ import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection
 import { toValidatedDiffScopeResult } from './code-map-reply';
 import {
   createCodeMapRequester,
+  INVALID_CODE_MAP_OPTIONS_RESULT,
   INVALID_SECTION_RESULT,
   isCodeMapMessage,
+  parseCodeMapOptionsArg,
   parseCodeMapSectionArg,
   PROJECT_CHANGED_RESULT,
   routeCodeMapReply,
@@ -175,13 +177,15 @@ const CODE_MAP_REQUEST_TIMEOUT_MS = 30 * 60 * 1000 + 10_000;
 // section (`code-map-requests.ts`).
 const codeMapRequests = createCodeMapRequester({
   isRunning: () => graphService !== null,
-  send: (section) => {
+  send: (section, force) => {
     if (!graphService) {
       throw new Error('Graph Service is not running.');
     }
     graphService.postMessage({
       type: 'graphService:getCodeMap',
       ...(section === null ? {} : { section }),
+      // P5-b founder decision 2: only on a forced request (the map's Retry).
+      ...(force ? { force: true as const } : {}),
     } satisfies GraphServiceGetCodeMapRequest);
   },
   timeoutMs: CODE_MAP_REQUEST_TIMEOUT_MS,
@@ -1130,8 +1134,8 @@ function relayKeyChangeToGraphService(): boolean {
  * overlapping call for another section is sent only once the in-flight one
  * settles, so each caller gets its own section's reply.
  */
-function requestCodeMap(section?: string): Promise<CodeMapResult> {
-  return codeMapRequests.request(section);
+function requestCodeMap(section?: string, force = false): Promise<CodeMapResult> {
+  return codeMapRequests.request(section, force);
 }
 
 /**
@@ -1928,11 +1932,16 @@ function registerIpcHandlers(): void {
     return { ok: true };
   });
 
-  ipcMain.handle(IpcChannels.codeMapGet, (_event, section: unknown): Promise<CodeMapResult> => {
+  ipcMain.handle(IpcChannels.codeMapGet, (_event, section: unknown, options: unknown): Promise<CodeMapResult> => {
     // P4-4 phase 1b: a non-string section from the renderer is rejected
     // here and never sent to the Graph Service.
     const parsed = parseCodeMapSectionArg(section);
-    return parsed.ok ? requestCodeMap(parsed.section) : Promise.resolve(INVALID_SECTION_RESULT);
+    if (!parsed.ok) {
+      return Promise.resolve(INVALID_SECTION_RESULT);
+    }
+    // P5-b founder decision 2: `{force}` (the map's Retry), validated here.
+    const parsedOptions = parseCodeMapOptionsArg(options);
+    return parsedOptions.ok ? requestCodeMap(parsed.section, parsedOptions.force) : Promise.resolve(INVALID_CODE_MAP_OPTIONS_RESULT);
   });
 
   ipcMain.handle(

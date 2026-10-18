@@ -627,10 +627,22 @@ function consoleErrorProblems(): string[] {
  * didn't declare (see the header).
  */
 export async function cleanupAfterEach(): Promise<void> {
+  // P5-b (Node 22 act flake): from the first statement of the teardown, the
+  // act environment is off, as in `finishViewportAnimations` — an update
+  // landing now (a viewport move a test's last step started, a frame firing
+  // during the dynamic import below) belongs to no test step and must not
+  // warn "not wrapped in act(...)". Seen on Node 22 only, where those frames
+  // land inside this window (CodeMap.revealed / CodeMap.diffCarry). RTL's
+  // `cleanup` still unmounts inside its own `act`, which turns the act
+  // environment on for its callback.
+  const previousActEnvironment = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = false;
   // Imported here, not at the top: see the header.
   const { cleanup } = await import('@testing-library/react');
   const problems: string[] = [];
   await finishViewportAnimations();
+  await drainPendingImmediates();
+  globalThis.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
   try {
     cleanup();
     // Anything a test appended by hand (RTL removes only its own containers).

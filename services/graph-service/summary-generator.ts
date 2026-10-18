@@ -489,9 +489,14 @@ export async function captureSourceBaseline(
 /**
  * Detects staleness for every Node with a full recorded baseline (Story 1.8,
  * Phase 2) — run fire-and-forget from `index.ts`'s `handleGetCodeMapRequest`
- * on every `graphService:getCodeMap` fetch, since this app has no separate
+ * on every `graphService:getCodeMap` FETCH, since this app has no separate
  * incremental-refresh mechanism (Design Notes): today, this *is* "the next
- * index refresh" the feature description means.
+ * index refresh" the feature description means. P5-b: a map request served
+ * from the raw cache (a section switch, a reload) is no fetch and does not
+ * run it. Detection runs on the first fetch after a re-index (incl. P5-a's
+ * HEAD-move re-index) or a scope save, and when a backend switch or key
+ * re-affirm restarts generation over the cached map; an edited source is not
+ * re-checked by a mere switch.
  *
  * A Node is skipped entirely (its `stale` field left exactly as it already
  * is) unless it has a full baseline — `summary.sourceMtimeMs`/`sourceSize`/

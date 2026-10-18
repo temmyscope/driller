@@ -390,6 +390,21 @@ export type DiffScopeState =
  */
 export type DiffScopeNoticeStatus = 'no-changes' | 'not-a-git-repo' | 'no-base-ref-resolvable';
 
+/** P5-b founder decision 2: how a map load or refresh asks for the map. */
+export interface CodeMapLoadOptions {
+  /** Re-read the map from the backend, bypassing the Graph Service's cache (the map's Retry). */
+  force?: boolean;
+}
+
+/**
+ * P5-b founder decision 2: `window.driller.getCodeMap` for the section on
+ * screen (`null` = the whole scope), with `{force: true}` only when forced —
+ * every unforced call keeps exactly today's arguments.
+ */
+export function getCodeMapFromMain(section: string | null, force: boolean): Promise<CodeMapResult> {
+  return force ? window.driller.getCodeMap(section ?? undefined, { force: true }) : window.driller.getCodeMap(section ?? undefined);
+}
+
 /**
  * P4-4 phase 1b: the error-state sentence for a Code Map fetch that did not
  * return a map. P4-4d: an `unknown-section` reply goes to the shell's
@@ -9533,7 +9548,7 @@ export function CodeMap({
     showNeighborsImplRef.current(originId, direction);
   }, []);
 
-  const loadCodeMap = useCallback(() => {
+  const loadCodeMap = useCallback((options?: CodeMapLoadOptions) => {
     // P0-3: this full load shares `refreshRequestIdRef` with
     // `refreshCodeMap`, so whichever started last wins — a slow initial reply
     // can never overwrite a map refreshed after a newer `indexed`, and a
@@ -9654,8 +9669,7 @@ export function CodeMap({
     // request per switch in main; only the latest one's reply applies (the
     // shared `refreshRequestIdRef` check below).
     const requestedSection = sectionRef.current;
-    window.driller
-      .getCodeMap(requestedSection ?? undefined)
+    getCodeMapFromMain(requestedSection, options?.force === true)
       .then((result) => {
         if (requestId !== refreshRequestIdRef.current) {
           return;
@@ -9732,7 +9746,7 @@ export function CodeMap({
    * An open Node Detail panel is re-pointed at the refreshed copy of its
    * Node, or closed if that Node is gone.
    */
-  const refreshCodeMap = useCallback(() => {
+  const refreshCodeMap = useCallback((options?: CodeMapLoadOptions) => {
     if (isDevFixtureMode) {
       // A synthetic fixture has no index behind it to refresh from.
       return;
@@ -9807,8 +9821,7 @@ export function CodeMap({
       }
     };
     const requestedSection = sectionRef.current;
-    window.driller
-      .getCodeMap(requestedSection ?? undefined)
+    getCodeMapFromMain(requestedSection, options?.force === true)
       .then((result) => {
         // P4-4 phase 1c: a refresh (new index, e.g. after a scope change) can
         // find the section gone — the same fallback to `all` as a load.
@@ -9850,6 +9863,12 @@ export function CodeMap({
     loadedDataVersionRef.current = dataVersion;
     refreshCodeMap();
   }, [dataVersion, refreshCodeMap]);
+
+  // P5-b founder decision 2: the map's two Retry buttons (a failed load, a
+  // failed refresh) always force a fresh read; a section switch, a load and
+  // a `dataVersion` refresh may be served from the Graph Service's cache.
+  const retryLoad = useCallback(() => loadCodeMap({ force: true }), [loadCodeMap]);
+  const retryRefresh = useCallback(() => refreshCodeMap({ force: true }), [refreshCodeMap]);
 
   // Story 1.5 Phase 2: incoming batched summary-generation progress patches
   // the already-rendered node set in place — never a full remap/refetch
@@ -12913,7 +12932,7 @@ export function CodeMap({
           <RefreshErrorNotice
             graphServiceAvailable={graphServiceAvailable}
             message={refreshError}
-            onRetry={refreshCodeMap}
+            onRetry={retryRefresh}
           />
         </div>
       )}
@@ -12931,7 +12950,7 @@ export function CodeMap({
             <span className="visually-hidden">{`${ACTIONABLE_NOTICE_SPOKEN_PREFIX.error} `}</span>
             Couldn&rsquo;t load the Code Map: {fetchState.message}
           </p>
-          <button type="button" onClick={loadCodeMap}>
+          <button type="button" onClick={retryLoad}>
             Retry
           </button>
         </div>

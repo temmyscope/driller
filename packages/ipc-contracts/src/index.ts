@@ -576,6 +576,21 @@ export interface GraphServiceGetCodeMapRequest {
    * Omitted means the whole scope (never the string `"all"`).
    */
   section?: string;
+  /**
+   * P5-b founder decision 2: `true` bypasses the raw map cache and re-reads
+   * the map from the backend (the map's Retry). Omitted on every other
+   * request (a section switch or a reload is served from the cache).
+   */
+  force?: true;
+}
+
+/**
+ * P5-b founder decision 2: options for `DrillerApi.getCodeMap`. `force`
+ * re-reads the map from the backend instead of serving it from the Graph
+ * Service's raw cache — the map's Retry buttons only.
+ */
+export interface GetCodeMapOptions {
+  force?: boolean;
 }
 
 /**
@@ -1620,8 +1635,12 @@ export interface DrillerApi {
    *
    * P4-4 phase 1b: `section` (one indexing-scope allowlist entry) maps that
    * section alone; omitted means the whole scope.
+   *
+   * P5-b founder decision 2: `options.force` re-reads the map from the
+   * backend (the map's Retry); without it the Graph Service may serve the
+   * request from its raw cache.
    */
-  getCodeMap: (section?: string) => Promise<CodeMapResult>;
+  getCodeMap: (section?: string, options?: GetCodeMapOptions) => Promise<CodeMapResult>;
   /**
    * Reads a Node's exact source line range off disk, read-only (FR3/FR17
    * groundwork) — `file` is the Node's POSIX-relative path (AD-19),

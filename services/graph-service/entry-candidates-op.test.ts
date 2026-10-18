@@ -248,6 +248,9 @@ describe('P4-7c: guards', () => {
   it('a generation change mid-compute discards the result and memoizes nothing', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const module = indexModule;
+    // P5-b: a fresh map (a same-scope request is served from the raw cache,
+    // which keeps the previous test's whole-scope memo).
+    await index(PROJECT);
     setScope([]);
     await requestMap();
     module.setEntryCandidatesListerForTests((nodes, edges) => {
@@ -308,8 +311,10 @@ describe('P4-7c review round 1: a stale fetch landing after an index', () => {
     it(`after an index of ${target}, the stale map is never listed (refreshing), nor memoized`, { timeout: 30_000 }, async () => {
       assert.ok(indexModule);
       const module = indexModule;
+      // P5-b: the raw cache is cleared, so the request below is a real fetch
+      // (a current same-scope cache would serve it without one).
+      await index(PROJECT);
       setScope(['api', 'web']);
-      await requestMap();
       const gate = deferred();
       harness.__harnessFetchGate = gate.promise;
       const fetchesBefore = harness.__harnessFetchCount ?? 0;
@@ -378,6 +383,8 @@ describe('P4-7c: the whole scope', () => {
   it('memoized per map: a repeat call does no walk; a refetch or a re-index recomputes on the new map', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const module = indexModule;
+    // P5-b: a fresh map, so no memo is carried over from the previous test.
+    await index(PROJECT);
     setScope(['api', 'web']);
     await requestMap();
     const counter = countListings();
@@ -390,7 +397,10 @@ describe('P4-7c: the whole scope', () => {
       assert.equal(module.peekEntryCandidatesMemoForTests().whole, first);
 
       // A refetch over a different graph: recomputed, never the stale memo.
+      // P5-b: a refetch is a scope save (a same-scope request is served from
+      // the raw cache); every CYCLIC Node is in api.
       harness.__harnessFixtureOverride = CYCLIC;
+      setScope(['api']);
       await requestMap();
       assert.equal(module.peekEntryCandidatesMemoForTests().whole, undefined, 'dropped with the replaced map');
       assert.deepEqual(module.computeEntryCandidatesResult(PROJECT), { status: 'none' }, 'a cyclic project has no candidate');
@@ -533,6 +543,9 @@ describe('P4-7c: with a section (founder decision 2026-10-04)', () => {
       assert.deepEqual([...(module.peekEntryCandidatesMemoForTests().sections?.keys() ?? [])], ['api', 'web']);
       assert.equal(counter.count(), 2, 'one walk per section');
       assert.equal(module.peekEntryCandidatesMemoForTests().whole, undefined, 'a section call never fills the whole-scope memo');
+      // P5-b: a refetch is a scope save (here a reorder); a same-scope
+      // request is served from the raw cache and keeps the memo.
+      setScope(['web', 'api']);
       await requestMap();
       assert.equal(module.peekEntryCandidatesMemoForTests().sections, undefined, 'dropped with the replaced raw cache');
       assert.deepEqual(module.computeEntryCandidatesResult(PROJECT, 'api'), api);

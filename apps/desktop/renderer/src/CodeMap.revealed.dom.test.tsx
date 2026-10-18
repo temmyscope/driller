@@ -804,6 +804,9 @@ describe('Navigating to a Node Revealed doesn’t draw switches to Full (replace
     await waitForDrawn(drilled);
     assert.equal(fake.calls.listEntryCandidates.length, 1);
     assert.equal(revealStatus().textContent, '', 'a toggle clears the switch line');
+    // P5-b (Node 22 act flake): the toggle's fit is still moving the view;
+    // let it finish inside the test's own wait, not in the teardown.
+    await settleViewport();
   });
 
   it('a Path Trace search through hidden Nodes: Full, the line, the route lit', BUDGET, async () => {

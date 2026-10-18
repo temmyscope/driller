@@ -4,15 +4,19 @@
  * `codeMap:get` argument check.
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import type { CodeMapResult, GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
 
 import {
   createCodeMapRequester,
+  INVALID_CODE_MAP_OPTIONS_RESULT,
   INVALID_SECTION_RESULT,
   isCodeMapMessage,
   MALFORMED_REPLY_RESULT,
+  parseCodeMapOptionsArg,
   parseCodeMapSectionArg,
   PROJECT_CHANGED_RESULT,
   routeCodeMapReply,
@@ -346,3 +350,88 @@ describe('routeCodeMapReply (review round 1)', () => {
   });
 });
 
+
+// P5-b founder decision 2: the map's Retry forces a fresh read.
+describe('forced Code Map requests (P5-b founder decision 2)', () => {
+  function forcedSetup() {
+    const sent: [CodeMapRequestKey, boolean][] = [];
+    const requester = createCodeMapRequester({
+      isRunning: () => true,
+      send: (section, force) => {
+        sent.push([section, force]);
+      },
+      timeoutMs: 60_000,
+    });
+    return { requester, sent };
+  }
+
+  it('sends force only for a forced request', () => {
+    const { requester, sent } = forcedSetup();
+    void requester.request('api');
+    requester.settleInFlight(okFor('api'));
+    void requester.request('api', true);
+    requester.settleInFlight(okFor('api'));
+    void requester.request(undefined, true);
+    assert.deepEqual(sent, [
+      ['api', false],
+      ['api', true],
+      [null, true],
+    ]);
+  });
+
+  it('a forced call never shares an unforced request already sent; it is sent with force once that settles', async () => {
+    const { requester, sent } = forcedSetup();
+    const plain = requester.request('api');
+    const forced = requester.request('api', true);
+    assert.notEqual(forced, plain);
+    assert.deepEqual(sent, [['api', false]]);
+    requester.settleInFlight(okFor('api'));
+    assert.deepEqual(sent, [
+      ['api', false],
+      ['api', true],
+    ]);
+    assert.equal(await isSettled(forced), false, 'the forced call waits for its own reply');
+    requester.settleInFlight(okFor('api'));
+    assert.deepEqual(await forced, okFor('api'));
+  });
+
+  it('an unforced call shares a forced request in flight; a waiting request is shared and upgraded to force', () => {
+    const { requester, sent } = forcedSetup();
+    const forced = requester.request('api', true);
+    assert.equal(requester.request('api'), forced, 'an unforced call may share a forced one');
+    const waitingPlain = requester.request('web');
+    assert.equal(requester.request('web', true), waitingPlain, 'the waiting web request is shared');
+    requester.settleInFlight(okFor('api'));
+    assert.deepEqual(sent, [
+      ['api', true],
+      ['web', true],
+    ]);
+  });
+
+  it('parseCodeMapOptionsArg: absent or {force: boolean} only', () => {
+    assert.deepEqual(parseCodeMapOptionsArg(undefined), { ok: true, force: false });
+    assert.deepEqual(parseCodeMapOptionsArg({}), { ok: true, force: false });
+    assert.deepEqual(parseCodeMapOptionsArg({ force: true }), { ok: true, force: true });
+    assert.deepEqual(parseCodeMapOptionsArg({ force: false }), { ok: true, force: false });
+    for (const bad of [null, true, 'force', 1, [], { force: 'yes' }, { force: 1 }, { force: true, extra: 1 }]) {
+      assert.deepEqual(parseCodeMapOptionsArg(bad), { ok: false }, JSON.stringify(bad));
+    }
+    assert.deepEqual(INVALID_CODE_MAP_OPTIONS_RESULT, { status: 'error', message: 'Invalid Code Map request options.' });
+  });
+
+  it('main validates the options before sending, and puts force on the message only when set (source)', () => {
+    const main = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+    const handler = main.slice(main.indexOf('ipcMain.handle(IpcChannels.codeMapGet'), main.indexOf('ipcMain.handle(IpcChannels.sourceReadRange'));
+    assert.match(handler, /\(_event, section: unknown, options: unknown\)/);
+    assert.match(handler, /const parsedOptions = parseCodeMapOptionsArg\(options\);/);
+    assert.match(handler, /parsedOptions\.ok \? requestCodeMap\(parsed\.section, parsedOptions\.force\) : Promise\.resolve\(INVALID_CODE_MAP_OPTIONS_RESULT\)/);
+    assert.match(main, /\.\.\.\(force \? \{ force: true as const \} : \{\}\),/);
+    assert.match(main, /return codeMapRequests\.request\(section, force\);/);
+  });
+
+  it('preload passes {force: true} only when forced; every other call is unchanged (source)', () => {
+    const preload = readFileSync(fileURLToPath(new URL('../preload/index.ts', import.meta.url)), 'utf8');
+    assert.match(preload, /options\?\.force === true\s*\? ipcRenderer\.invoke\(IpcChannels\.codeMapGet, section, \{ force: true \}\)/);
+    assert.match(preload, /: section === undefined\s*\? ipcRenderer\.invoke\(IpcChannels\.codeMapGet\)\s*: ipcRenderer\.invoke\(IpcChannels\.codeMapGet, section\)/);
+  });
+});

@@ -193,6 +193,7 @@ import {
   applyScopeChanged,
   isScopeChangedRequest,
   resolveIncludedPathsOnIndexSuccess,
+  sameScope,
   type PendingScopeOverride,
 } from './project-scope';
 import { capFoldedTypeUsedBy } from './fold-types';
@@ -429,6 +430,28 @@ let activeJudgmentGenerationRunId: number | null = null;
 // observes this flag already set.
 let activeStalenessRunId: number | null = null;
 
+// P5-b review round 1 (tests only, via `peekGenerationRunsForTests`): the
+// `activeSummaryGenerationId` the latest judgment and staleness runs started
+// under (after their redundant-trigger checks).
+const lastStartedGenerationRuns: { judgment: number | undefined; staleness: number | undefined } = {
+  judgment: undefined,
+  staleness: undefined,
+};
+
+/**
+ * Tests only: the current summary generation id and the generation the
+ * latest judgment and staleness runs started under — a run whose generation
+ * is behind the current one was superseded and is not running.
+ */
+export function peekGenerationRunsForTests(): { generation: number; judgment: number | undefined; staleness: number | undefined } {
+  return { generation: activeSummaryGenerationId, ...lastStartedGenerationRuns };
+}
+
+/** Tests only (P5-b founder decision 1): whether a summary / judgment run is in flight. */
+export function peekActiveGenerationRunsForTests(): { summary: boolean; judgment: boolean } {
+  return { summary: activeGenerationRunId !== null, judgment: activeJudgmentGenerationRunId !== null };
+}
+
 // Story 2.3 (Phase 3, review finding — Edge Case Hunter, major): which
 // PR-bots currently have an ingestion pass actually running in THIS process.
 // main's own `pendingIngestionResolvers` guard (apps/desktop/main/index.ts)
@@ -540,7 +563,10 @@ let activeFoldedTypes: FoldedType[] | undefined;
 //    `startSummaryGenerationForProject` (a backend switch or model retry
 //    re-caches the same value, unchanged);
 //  - replaced by every Code Map fetch (`handleGetCodeMapRequest`), which is
-//    also when a new LCOV report or a saved scope change is picked up;
+//    also when a new LCOV report or a saved scope change is picked up.
+//    P5-b: a request it can serve (current, fetched outside an index, built
+//    under the live scope — `resolveRawForRequest`) is no fetch: it is
+//    answered from this cache and leaves it, and everything keyed on it, as is;
 //  - cleared with them when any index starts (`handleIndexRequest`) — a
 //    re-index of this project or a switch to another one.
 // A `scopeChanged` alone does not clear it: like the Nodes, it keeps
@@ -1276,7 +1302,9 @@ function isGetCodeMapRequest(data: unknown): data is GraphServiceGetCodeMapReque
   }
   // P4-4 phase 1b: an optional string `section` (absent = the whole scope).
   const section = (data as { section?: unknown }).section;
-  return section === undefined || typeof section === 'string';
+  // P5-b founder decision 2: an optional boolean `force`.
+  const force = (data as { force?: unknown }).force;
+  return (section === undefined || typeof section === 'string') && (force === undefined || typeof force === 'boolean');
 }
 
 /**
@@ -1978,8 +2006,10 @@ async function handleIndexRequest(
  * Story 1.8 Phase 2: `detectStaleness` is likewise kicked off in the
  * background right after, against this same `normalizedNodes` set — this
  * app has no separate incremental-refresh mechanism, so every
- * `graphService:getCodeMap` fetch (today's only "index refresh") is when
- * staleness gets (re-)checked. Fire-and-forget for the same reason
+ * `graphService:getCodeMap` FETCH (today's only "index refresh") is when
+ * staleness gets (re-)checked. P5-b: a request served from the raw cache is
+ * no fetch, so it neither re-checks staleness nor re-reads the backend; see
+ * the P5-b paragraph below. Fire-and-forget for the same reason
  * `generateSummaries` is; writes only the independent `stale` field
  * (`node-record-store.ts`'s `NodeRecord.stale`), never touching `summary`.
  *
@@ -1999,8 +2029,30 @@ async function handleIndexRequest(
  * here given the `activeProject === undefined` guard above already passed —
  * the combined guard below only makes that existing invariant visible to the
  * type checker, it changes no observable behavior.
+ *
+ * P5-b (founder decision 2.1): a request — a section switch, a switch back
+ * to the whole scope, or a plain reload — is served from the raw cache
+ * (`activeRawCodeMap`) when it is current (same project and index
+ * generation, fetched outside an index) and was built under the live
+ * allowlist (`resolveRawForRequest`). Such a reply is built by the same
+ * `postCodeMapReply` steps from the cached raw fetch, so it is exactly what a
+ * fetch would post for that raw fetch now, including the current summary and
+ * judgment state (the build reads the record store). It makes no CBM fetch
+ * and no LCOV load, re-caches nothing, and runs no staleness check (summary
+ * and judgment: see founder decision 1 below). Consequence: a new `coverage/lcov.info` and edited sources
+ * are picked up — and staleness is re-checked — only by the next real fetch:
+ * the first after `indexed` (a re-index, including P5-a's re-index on a HEAD
+ * move, or a reopen), after a scope save, or a forced request (the map's
+ * Retry, founder decision 2). Founder decision 1: a cache-served request
+ * still re-kicks summary and judgment generation over the cached arrays (a
+ * no-op while a run is going), but never staleness. Likewise, a switch no longer
+ * reflects any backend-side refresh (e.g. the backend re-indexing a watched
+ * project on its own) until such a fetch. A build that throws on the cached
+ * raw fetch posts `codeMapError` and stops that cache from serving, so the
+ * next request re-fetches. The unknown-section check runs first, before
+ * either path.
  */
-async function handleGetCodeMapRequest(section?: string): Promise<void> {
+async function handleGetCodeMapRequest(section?: string, force = false): Promise<void> {
   if (activeProject === undefined || activeProjectPath === undefined) {
     postCodeMapMessage({
       type: 'graphService:codeMapError',
@@ -2025,137 +2077,26 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
     });
     return;
   }
-  const projectRoot = activeProjectPath;
-  // Review round 1 (P4-4 phase 1a): the generation this fetch starts under,
-  // stamped on the raw cache (see `activeRawCodeMap`).
-  const generation = indexGeneration;
+  // P5-b review round 1: the raw cache this request is served from, if any.
+  let servedFrom: Readonly<ActiveRawCodeMap> | undefined;
   try {
-    // P4-2 phase 1: `fetchProductionCodeMap` normalizes every Node's `file`
-    // and drops test code (Nodes, edges touching them, test files' hotspot
-    // rows) before the scope filter below — so test Nodes are neither
-    // counted in `hiddenByScope` nor seen by adjacency, blast radius, the
-    // severity cuts, or anything cached from this map (diff scope,
-    // `lookup_node`, Health Audit, staleness). See `test-code.ts`.
-    // P4-2 phase 2: this fetch also attaches `testedBy` (Node detail's
-    // "Tested by" row, and `lookup_node` via the cached Nodes).
-    // P4-2 phase 3a: and folds Module Nodes off the map (`fold-modules.ts`):
-    // no Module Node or Module edge reaches anything below; each Node carries
-    // its file's top-level uses as `fileTopLevel`.
-    // P4-2 phase 3b: and folds Type/Interface Nodes off the map
-    // (`fold-types.ts`): no type Node or type edge reaches anything below;
-    // each Node carries the types it uses as `usesTypes`.
-    // P4-2 phase 4: and attaches `similarTo` (Node detail's "Similar
-    // implementations", and `lookup_node`) from the backend's `SIMILAR_TO`.
-    const fetched = await fetchProductionCodeMap(
-      activeProject,
-      projectRoot,
-      'Code Map',
-      { includeTestedBy: true, includeImplements: true, includeSimilar: true },
-    );
-    // P2-5: captured once, so the scope reported with the map is exactly the
-    // one the pipeline's filter used.
-    // P4-4 phase 1a: this and the index's coverage-gap files are read right
-    // after the fetch, before the LCOV `await` — the same point the inline
-    // pipeline read them.
-    const appliedScope = [...activeIncludedPaths];
-    const coverageGapFiles = coverageGapFileSet;
-    // Story 2.1 (Phase 2): loaded once per fetch (not per-Node) — a
-    // wholly independent data source from the backend-query-derived
-    // signals, read fresh every fetch for the same never-persisted,
-    // always-recomputed reasoning as the rest of `riskSignals` (FR7
-    // reproducibility). `undefined` when `coverage/lcov.info` doesn't exist
-    // or doesn't parse — never thrown, so it can never fail this fetch.
-    // P4-3f review round 1: the report also carries the `FN:`/`FNDA:`
-    // records and the listed files newer than it, which decide
-    // `testCoverageHit` (the table's `covered`); `test-coverage-gap` still
-    // reads its `DA:` lines alone.
-    // P4-4 phase 1a: loaded before the (now synchronous) pipeline rather
-    // than between its scope steps and its risk-signal step; nothing in the
-    // pipeline reads it earlier, so the result is the same.
-    const coverage = await loadLcovCoverage(projectRoot);
-    // P4-4 phase 1a: everything this map is built from, cached with it
-    // (`activeRawCodeMap`) so later phases can re-filter without re-fetching.
-    const raw: RawCodeMap = { projectRoot, fetched, coverage, coverageGapFiles };
-    // P4-4 phase 1a: the whole pipeline — scope filter, folded type/Module
-    // re-scoping, folded-link / type-use / similar re-attach, summary state,
-    // adjacency, project-relative severity and the LCOV flags — is
-    // `buildScopedCodeMap` (`scoped-code-map.ts`, where each step's
-    // reasoning now lives). Severity is relative to the in-scope set.
-    //
-    // P4-4 phase 1b: this whole-scope build is made for every request,
-    // sectioned or not — it is what the caches and the summary, judgment and
-    // staleness kicks below receive, so `lookup_node`, diff scope, Blast
-    // Radius expansion and MCP never see a section.
-    const {
-      nodes: nodesWithRiskSignals,
-      edges,
-      preSignalNodes: normalizedNodes,
-      foldedTypes,
-      foldedModules,
-      hiddenByScope,
-    } = buildScopedCodeMap(raw, keepFileForScope(appliedScope));
-    // P4-4 phase 1b: the Section bar's tab counts, over the whole-scope Nodes
-    // (nearest-section rule, so they sum to the whole-scope count).
-    const sections = countSectionNodes(projectRoot, normalizedNodes, appliedScope);
-    // P4-4 phase 2a: the section re-resolved against the scope this map was
-    // built with (`undefined` for the whole scope).
-    const sectionFilter = section === undefined ? undefined : resolveSectionFilter(section, appliedScope);
-    if (sectionFilter === undefined) {
-      postCodeMapMessage({
-        type: 'graphService:codeMap',
-        nodes: nodesWithRiskSignals,
-        edges,
-        // P2-5: how many Nodes the scope filter removed — reported with the
-        // map (and the scope that removed them) so an empty map can say the
-        // scope hid everything. Test Nodes never reach the scope filter, so
-        // they are never counted here.
-        hiddenByScope,
-        appliedScope,
-        // Capped per type for the reply only (`usedByTotal` stays the full
-        // count); the cache below keeps every user for `lookup_node`.
-        foldedTypes: capFoldedTypeUsedBy(foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
-        // P4-2 phase 3c: for the "Show types & modules" canvas toggle only.
-        foldedModules,
-        section: null,
-        sections,
-      });
-    } else if (typeof sectionFilter !== 'function') {
-      // P4-4 phase 1b: the allowlist changed during the fetch and dropped
-      // this section. Still explicit, against the scope the map was built
-      // with; the whole-scope caches below are refreshed as usual.
-      postCodeMapMessage({
-        type: 'graphService:codeMapUnknownSection',
-        section: sectionFilter.section,
-        knownSections: sectionFilter.knownSections,
-      });
-    } else {
-      // P4-4 phase 1b: the reply is a second run of the same pipeline over
-      // this section's files alone (nearest-section rule), so its edges,
-      // folded types/Modules and every severity cut are the section's own —
-      // never filtered out of, or subtracted from, the whole-scope build.
-      const sectionMap = buildScopedCodeMap(raw, sectionFilter);
-      // A string here: `sectionFilter` is only a predicate when `section` was given.
-      const sectionName = section as string;
-      // P4-4 phase 3a: what the section's both-endpoints filter dropped,
-      // counted over the whole-scope build's Nodes and edges (before that
-      // filter), never as "whole scope minus section": the edges joining
-      // this section to each other section, and each section Node's callees
-      // in another section. Absent when there are none.
-      const crossSectionEdges = countCrossSectionEdges(projectRoot, normalizedNodes, edges, sectionName, appliedScope);
-      postCodeMapMessage({
-        type: 'graphService:codeMap',
-        nodes: attachCrossSectionCalls(projectRoot, sectionMap.nodes, normalizedNodes, edges, sectionName, appliedScope),
-        edges: sectionMap.edges,
-        // P2-5's meaning is kept: the Nodes the allowlist removed. Other
-        // sections' Nodes are not counted.
-        hiddenByScope,
-        appliedScope,
-        foldedTypes: capFoldedTypeUsedBy(sectionMap.foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
-        foldedModules: sectionMap.foldedModules,
-        section: section ?? null,
-        sections,
-        ...(crossSectionEdges.length > 0 ? { crossSectionEdges } : {}),
-      });
+    // P5-b (founder decision 2.1): the raw fetch this reply is built from —
+    // the raw cache when it is current and was built under the live scope,
+    // otherwise a fresh CBM fetch with its LCOV load (today's path).
+    const resolved = await resolveRawForRequest(activeProject, activeProjectPath, force);
+    servedFrom = resolved.cached ? resolved.source : undefined;
+    const whole = postCodeMapReply(resolved.raw, resolved.appliedScope, section);
+    if (resolved.cached) {
+      // P5-b: served from the raw cache. Nothing is re-cached:
+      // `activeCodeMapNodes`/`Edges`, the raw cache's identity and every memo
+      // keyed on them (section builds, entry candidates) survive the switch.
+      // Founder decision 1 (2026-10-15): summary and judgment generation are
+      // re-kicked over those same cached arrays, so Nodes a finished run left
+      // pending (a failed summarize, say) retry on the next switch or reload,
+      // as they did before P5-b. A run still going makes each kick a no-op
+      // (same generation). Staleness is not re-checked here.
+      rekickPendingGenerationOverCachedMap();
+      return;
     }
     // Review round (patch): passes `nodesWithRiskSignals`, not
     // `normalizedNodes` — `startSummaryGenerationForProject` caches its
@@ -2183,30 +2124,263 @@ async function handleGetCodeMapRequest(section?: string): Promise<void> {
     // changes on a plain Code Map refetch of the same project.
     // Frozen (shallowly) — read-only to every reader; see `getActiveRawCodeMap`.
     const rawCodeMap: ActiveRawCodeMap = Object.freeze({
-      raw: Object.freeze(raw),
-      appliedScope: Object.freeze([...appliedScope]),
-      indexGeneration: generation,
+      raw: Object.freeze(resolved.raw),
+      appliedScope: Object.freeze([...resolved.appliedScope]),
+      indexGeneration: resolved.generation,
     });
-    void startSummaryGenerationForProject(nodesWithRiskSignals, edges, foldedModules, foldedTypes, rawCodeMap);
+    // P5-b: a fetch that started while an index was running may hold that
+    // index's half-written graph and the previous index's scope and
+    // coverage-gap files, yet carries the new generation's stamp. It is
+    // cached as today, but never serves a later request: the first fetch
+    // after `indexed` always re-fetches.
+    if (!resolved.startedDuringIndex) {
+      servableRawCodeMaps.add(rawCodeMap);
+    }
+    void startSummaryGenerationForProject(whole.nodes, whole.edges, whole.foldedModules, whole.foldedTypes, rawCodeMap);
     // Story 2.2 Phase 2: judgment generation kicked off the same
     // fire-and-forget way, alongside the summary/staleness kick-offs — never
     // delays this response (AD-8). Same `nodesWithRiskSignals` set (not
     // `normalizedNodes`) for the identical reasoning the comment above
     // documents for `startSummaryGenerationForProject`.
-    void startJudgmentGenerationForProject(nodesWithRiskSignals);
-    // Story 1.8 Phase 2: staleness detection runs on every Code Map fetch
+    void startJudgmentGenerationForProject(whole.nodes);
+    // Story 1.8 Phase 2: staleness detection runs on every Code Map FETCH
     // (Design Notes — this app has no separate incremental-refresh
     // mechanism, so this *is* "the next index refresh"), fire-and-forget
     // exactly like `startSummaryGenerationForProject` above so it can never
-    // delay this response.
-    void startStalenessDetectionForProject(projectRoot, normalizedNodes);
+    // delay this response. P5-b: not on a request served from the raw cache.
+    void startStalenessDetectionForProject(resolved.raw.projectRoot, whole.preSignalNodes);
   } catch (error) {
+    // P5-b review round 1: a build that throws on the cached raw fetch stops
+    // that cache from serving, so the next request (e.g. Retry) re-fetches.
+    if (servedFrom !== undefined) {
+      servableRawCodeMaps.delete(servedFrom);
+    }
     postCodeMapMessage({
       type: 'graphService:codeMapError',
       message: error instanceof Error ? error.message : String(error),
       section: section ?? null,
     });
   }
+}
+
+/**
+ * P5-b founder decision 1 (2026-10-15): on a cache-served Code Map request,
+ * restarts summary and judgment generation over the CACHED arrays and raw
+ * cache — the same objects, so `startSummaryGenerationForProject` re-caches
+ * them unchanged and drops no memo. No generation bump: a run already in
+ * flight for this generation makes each kick a no-op, so there is never a
+ * second concurrent run; a finished one is restarted and only attempts what
+ * its eligibility filter still finds pending. Never staleness.
+ */
+function rekickPendingGenerationOverCachedMap(): void {
+  const nodes = activeCodeMapNodes;
+  const edges = activeCodeMapEdges;
+  if (nodes === undefined || edges === undefined) {
+    return;
+  }
+  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap);
+  void startJudgmentGenerationForProject(nodes);
+}
+
+/**
+ * P5-b: where a Code Map request's raw fetch comes from — the raw cache
+ * (`cached: true`), or a fresh fetch (`cached: false`).
+ */
+type ResolvedRawCodeMap =
+  | { cached: true; raw: RawCodeMap; appliedScope: readonly string[]; source: Readonly<ActiveRawCodeMap> }
+  | {
+      cached: false;
+      raw: RawCodeMap;
+      appliedScope: readonly string[];
+      /** The index generation the fetch started under, stamped on the raw cache. */
+      generation: number;
+      /** Whether an index was running when the fetch started (see `servableRawCodeMaps`). */
+      startedDuringIndex: boolean;
+    };
+
+/**
+ * P5-b: the raw caches that may serve a later Code Map request — every one
+ * a fetch stored, except a fetch that started while an index was running.
+ * Such a fetch carries the new generation's stamp (it started after the
+ * index's bump) but may read a half-written graph and the previous index's
+ * scope and coverage-gap files, so the first request after `indexed` must
+ * still re-fetch. Weak, so a replaced raw cache is simply dropped.
+ */
+const servableRawCodeMaps = new WeakSet<Readonly<ActiveRawCodeMap>>();
+
+/**
+ * P5-b (founder decision 2.1): the raw fetch a Code Map request is built
+ * from. The raw cache serves when all of these hold:
+ *  - it is current (`getActiveRawCodeMap`: the active project, the current
+ *    index generation — `handleIndexRequest` bumps it, so the first fetch
+ *    after `indexed` and a stale in-flight fetch never serve);
+ *  - its fetch did not start during an index (`servableRawCodeMaps`);
+ *  - it was built under the live allowlist (`sameScope`), so a saved scope
+ *    change re-fetches;
+ *  - the request is not `force`d (P5-b founder decision 2: the map's Retry
+ *    always re-reads the map).
+ * Otherwise this is today's fetch path, unchanged: `fetchProductionCodeMap`,
+ * the scope and coverage-gap files read right after it, then the LCOV load.
+ */
+async function resolveRawForRequest(project: string, projectRoot: string, force: boolean): Promise<ResolvedRawCodeMap> {
+  const cached = getActiveRawCodeMap();
+  // P5-b founder decision 2: a forced request (the map's Retry) always fetches.
+  if (!force && cached !== null && servableRawCodeMaps.has(cached) && sameScope(cached.appliedScope, activeIncludedPaths)) {
+    return { cached: true, raw: cached.raw, appliedScope: cached.appliedScope, source: cached };
+  }
+  // Review round 1 (P4-4 phase 1a): the generation this fetch starts under,
+  // stamped on the raw cache (see `activeRawCodeMap`).
+  const generation = indexGeneration;
+  const startedDuringIndex = activeIndexInFlight;
+  // P4-2 phase 1: `fetchProductionCodeMap` normalizes every Node's `file`
+  // and drops test code (Nodes, edges touching them, test files' hotspot
+  // rows) before the scope filter below — so test Nodes are neither
+  // counted in `hiddenByScope` nor seen by adjacency, blast radius, the
+  // severity cuts, or anything cached from this map (diff scope,
+  // `lookup_node`, Health Audit, staleness). See `test-code.ts`.
+  // P4-2 phase 2: this fetch also attaches `testedBy` (Node detail's
+  // "Tested by" row, and `lookup_node` via the cached Nodes).
+  // P4-2 phase 3a: and folds Module Nodes off the map (`fold-modules.ts`):
+  // no Module Node or Module edge reaches anything below; each Node carries
+  // its file's top-level uses as `fileTopLevel`.
+  // P4-2 phase 3b: and folds Type/Interface Nodes off the map
+  // (`fold-types.ts`): no type Node or type edge reaches anything below;
+  // each Node carries the types it uses as `usesTypes`.
+  // P4-2 phase 4: and attaches `similarTo` (Node detail's "Similar
+  // implementations", and `lookup_node`) from the backend's `SIMILAR_TO`.
+  const fetched = await fetchProductionCodeMap(project, projectRoot, 'Code Map', {
+    includeTestedBy: true,
+    includeImplements: true,
+    includeSimilar: true,
+  });
+  // P2-5: captured once, so the scope reported with the map is exactly the
+  // one the pipeline's filter used.
+  // P4-4 phase 1a: this and the index's coverage-gap files are read right
+  // after the fetch, before the LCOV `await` — the same point the inline
+  // pipeline read them.
+  const appliedScope = [...activeIncludedPaths];
+  const coverageGapFiles = coverageGapFileSet;
+  // Story 2.1 (Phase 2): loaded once per fetch (not per-Node) — a
+  // wholly independent data source from the backend-query-derived
+  // signals, read fresh every fetch for the same never-persisted,
+  // always-recomputed reasoning as the rest of `riskSignals` (FR7
+  // reproducibility). `undefined` when `coverage/lcov.info` doesn't exist
+  // or doesn't parse — never thrown, so it can never fail this fetch.
+  // P4-3f review round 1: the report also carries the `FN:`/`FNDA:`
+  // records and the listed files newer than it, which decide
+  // `testCoverageHit` (the table's `covered`); `test-coverage-gap` still
+  // reads its `DA:` lines alone.
+  // P4-4 phase 1a: loaded before the (now synchronous) pipeline rather
+  // than between its scope steps and its risk-signal step; nothing in the
+  // pipeline reads it earlier, so the result is the same.
+  // P5-b: loaded on a fetch only, never on a request the raw cache serves.
+  const coverage = await loadLcovCoverage(projectRoot);
+  // P4-4 phase 1a: everything this map is built from, cached with it
+  // (`activeRawCodeMap`) so later requests can re-filter without re-fetching.
+  const raw: RawCodeMap = { projectRoot, fetched, coverage, coverageGapFiles };
+  return { cached: false, raw, appliedScope, generation, startedDuringIndex };
+}
+
+/**
+ * P5-b: builds a Code Map reply from `raw` and posts it — shared by the fetch
+ * path and the raw-cache path, so both post exactly the same reply for the
+ * same raw fetch. Synchronous: it reads the Node record store now (summary
+ * and judgment state as of this request). Returns the whole-scope build,
+ * which the fetch path caches and hands to the generation kicks. Throws only
+ * on a pipeline bug; the caller turns that into `codeMapError`.
+ */
+function postCodeMapReply(
+  raw: RawCodeMap,
+  scope: readonly string[],
+  section: string | undefined,
+): ReturnType<typeof buildScopedCodeMap> {
+  const { projectRoot } = raw;
+  // A fresh (mutable) copy for the reply, as the fetch path always posted.
+  const appliedScope = [...scope];
+  // P4-4 phase 1a: the whole pipeline — scope filter, folded type/Module
+  // re-scoping, folded-link / type-use / similar re-attach, summary state,
+  // adjacency, project-relative severity and the LCOV flags — is
+  // `buildScopedCodeMap` (`scoped-code-map.ts`, where each step's
+  // reasoning now lives). Severity is relative to the in-scope set.
+  //
+  // P4-4 phase 1b: this whole-scope build is made for every request,
+  // sectioned or not — it is what the caches and the summary, judgment and
+  // staleness kicks receive, so `lookup_node`, diff scope, Blast Radius
+  // expansion and MCP never see a section. P5-b: on the raw-cache path too,
+  // for `sections`, `hiddenByScope` and the cross-section counts.
+  const whole = buildScopedCodeMap(raw, keepFileForScope(appliedScope));
+  const {
+    nodes: nodesWithRiskSignals,
+    edges,
+    preSignalNodes: normalizedNodes,
+    foldedTypes,
+    foldedModules,
+    hiddenByScope,
+  } = whole;
+  // P4-4 phase 1b: the Section bar's tab counts, over the whole-scope Nodes
+  // (nearest-section rule, so they sum to the whole-scope count).
+  const sections = countSectionNodes(projectRoot, normalizedNodes, appliedScope);
+  // P4-4 phase 2a: the section re-resolved against the scope this map was
+  // built with (`undefined` for the whole scope).
+  const sectionFilter = section === undefined ? undefined : resolveSectionFilter(section, appliedScope);
+  if (sectionFilter === undefined) {
+    postCodeMapMessage({
+      type: 'graphService:codeMap',
+      nodes: nodesWithRiskSignals,
+      edges,
+      // P2-5: how many Nodes the scope filter removed — reported with the
+      // map (and the scope that removed them) so an empty map can say the
+      // scope hid everything. Test Nodes never reach the scope filter, so
+      // they are never counted here.
+      hiddenByScope,
+      appliedScope,
+      // Capped per type for the reply only (`usedByTotal` stays the full
+      // count); the cache keeps every user for `lookup_node`.
+      foldedTypes: capFoldedTypeUsedBy(foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
+      // P4-2 phase 3c: for the "Show types & modules" canvas toggle only.
+      foldedModules,
+      section: null,
+      sections,
+    });
+  } else if (typeof sectionFilter !== 'function') {
+    // P4-4 phase 1b: the allowlist changed during the fetch and dropped
+    // this section. Still explicit, against the scope the map was built
+    // with; the whole-scope caches are refreshed as usual.
+    postCodeMapMessage({
+      type: 'graphService:codeMapUnknownSection',
+      section: sectionFilter.section,
+      knownSections: sectionFilter.knownSections,
+    });
+  } else {
+    // P4-4 phase 1b: the reply is a second run of the same pipeline over
+    // this section's files alone (nearest-section rule), so its edges,
+    // folded types/Modules and every severity cut are the section's own —
+    // never filtered out of, or subtracted from, the whole-scope build.
+    const sectionMap = buildScopedCodeMap(raw, sectionFilter);
+    // A string here: `sectionFilter` is only a predicate when `section` was given.
+    const sectionName = section as string;
+    // P4-4 phase 3a: what the section's both-endpoints filter dropped,
+    // counted over the whole-scope build's Nodes and edges (before that
+    // filter), never as "whole scope minus section": the edges joining
+    // this section to each other section, and each section Node's callees
+    // in another section. Absent when there are none.
+    const crossSectionEdges = countCrossSectionEdges(projectRoot, normalizedNodes, edges, sectionName, appliedScope);
+    postCodeMapMessage({
+      type: 'graphService:codeMap',
+      nodes: attachCrossSectionCalls(projectRoot, sectionMap.nodes, normalizedNodes, edges, sectionName, appliedScope),
+      edges: sectionMap.edges,
+      // P2-5's meaning is kept: the Nodes the allowlist removed. Other
+      // sections' Nodes are not counted.
+      hiddenByScope,
+      appliedScope,
+      foldedTypes: capFoldedTypeUsedBy(sectionMap.foldedTypes, FOLDED_TYPE_IPC_MAX_USED_BY),
+      foldedModules: sectionMap.foldedModules,
+      section: section ?? null,
+      sections,
+      ...(crossSectionEdges.length > 0 ? { crossSectionEdges } : {}),
+    });
+  }
+  return whole;
 }
 
 /**
@@ -3340,6 +3514,7 @@ async function startJudgmentGenerationForProject(nodes: CodeMapNode[]): Promise<
     return;
   }
   activeJudgmentGenerationRunId = generationId;
+  lastStartedGenerationRuns.judgment = generationId;
 
   try {
     let judge: SummarizeFn;
@@ -3414,7 +3589,9 @@ async function startJudgmentGenerationForProject(nodes: CodeMapNode[]): Promise<
 /**
  * Kicks off `detectStaleness` for the Nodes just posted in a
  * `graphService:codeMap` response (Story 1.8, Phase 2), fire-and-forget from
- * the caller's perspective (`handleGetCodeMapRequest` never awaits this) —
+ * the caller's perspective (`handleGetCodeMapRequest` never awaits this; P5-b:
+ * only on its fetch path, plus `rekickGenerationOverCachedMap` after a
+ * backend switch or re-affirm) —
  * mirrors `startSummaryGenerationForProject` immediately above in every
  * structural respect, including its two supersession guards, since
  * `detectStaleness` needs exactly the same protection `generateSummaries`
@@ -3458,6 +3635,7 @@ async function startStalenessDetectionForProject(
     return;
   }
   activeStalenessRunId = generationId;
+  lastStartedGenerationRuns.staleness = generationId;
 
   try {
     await detectStaleness(projectRoot, nodes, () => generationId !== activeSummaryGenerationId);
@@ -3474,6 +3652,24 @@ async function startStalenessDetectionForProject(
     if (activeStalenessRunId === generationId) {
       activeStalenessRunId = null;
     }
+  }
+}
+
+/**
+ * P5-b review round 1: re-kicks every generation run over the cached map
+ * after a bump of `activeSummaryGenerationId` that is not an index
+ * (`handleBackendSwitchedRequest`'s two branches). The bump supersedes the
+ * running summary, judgment AND staleness runs, so all three restart here:
+ * since P5-b the renderer's refetch after a backend switch is served from the
+ * raw cache and kicks nothing, so a run left superseded here would never
+ * restart (e.g. Cloud with no key → key saved → summaries generate, judgments
+ * never do). Same cached arrays and raw cache, so no memo is dropped.
+ */
+function rekickGenerationOverCachedMap(nodes: CodeMapNode[], edges: CodeMapEdge[]): void {
+  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap);
+  void startJudgmentGenerationForProject(nodes);
+  if (activeProjectPath !== undefined) {
+    void startStalenessDetectionForProject(activeProjectPath, nodes);
   }
 }
 
@@ -3538,7 +3734,8 @@ async function handleBackendSwitchedRequest(backendConfig: {
     // genuinely-blocked/pending Nodes (e.g. blocked on a missing key that
     // now exists) are retried.
     activeSummaryGenerationId += 1;
-    void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap);
+    // P5-b review round 1: judgment and staleness too (see the helper).
+    rekickGenerationOverCachedMap(nodes, edges);
     return;
   }
 
@@ -3578,7 +3775,8 @@ async function handleBackendSwitchedRequest(backendConfig: {
   }
 
   activeSummaryGenerationId += 1;
-  void startSummaryGenerationForProject(nodes, edges, activeFoldedModules ?? [], activeFoldedTypes ?? [], activeRawCodeMap);
+  // P5-b review round 1: judgment and staleness too (see the helper).
+  rekickGenerationOverCachedMap(nodes, edges);
 }
 
 process.parentPort?.on('message', (event) => {
@@ -3587,7 +3785,7 @@ process.parentPort?.on('message', (event) => {
     return;
   }
   if (!isShuttingDown && isGetCodeMapRequest(event.data)) {
-    void handleGetCodeMapRequest(event.data.section);
+    void handleGetCodeMapRequest(event.data.section, event.data.force === true);
     return;
   }
   if (!isShuttingDown && isMalformedGetCodeMapRequest(event.data)) {
