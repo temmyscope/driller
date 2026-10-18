@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { BackendConfig, CloudBackend } from '@driller/ipc-contracts';
+import { BACKEND_SETTING_SAVE_FAILED_MESSAGE, type BackendConfig, type CloudBackend } from '@driller/ipc-contracts';
 
 import {
   BACKEND_CHOICES,
@@ -118,6 +118,14 @@ describe('backendSwitchErrorText', () => {
       backendSwitchErrorText('cloud', "Error invoking remote method 'x': Error: nope"),
       "Couldn't switch to Cloud: nope",
     );
+  });
+
+  it('P5-g: main\'s save-failed rejection reads as the actionable message, with no path', () => {
+    const text = backendSwitchErrorText(
+      'cloud',
+      `Error invoking remote method 'settings:setActiveBackend': Error: ${BACKEND_SETTING_SAVE_FAILED_MESSAGE}`,
+    );
+    assert.equal(text, "Couldn't switch to Cloud: the backend setting couldn't be saved — check that the app's data folder is writable");
   });
 });
 

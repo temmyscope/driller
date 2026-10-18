@@ -79,6 +79,7 @@ import {
   setCloudApiKey,
 } from './backend-settings';
 import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection } from './app-menu';
+import { mainWindowOptions } from './window-options';
 import { toValidatedDiffScopeResult } from './code-map-reply';
 import {
   createCodeMapRequester,
@@ -91,6 +92,7 @@ import {
   routeCodeMapReply,
 } from './code-map-requests';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
+import { saveActiveBackend } from './backend-switch-save';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import {
@@ -2004,7 +2006,9 @@ function registerIpcHandlers(): void {
     if (backend !== 'local' && backend !== 'cloud') {
       return;
     }
-    setActiveBackend(backend);
+    // P5-g: a failed save logs its raw error locally and rejects with the
+    // actionable message only — the notice never shows a userData path.
+    saveActiveBackend(backend, { save: setActiveBackend, log: appendDiagnosticLogEntry });
     // Story 1.6 (Phase 2): relay the switch to a running Graph Service only
     // when a project is actually open — a no-op backend change before any
     // project has ever been opened has nothing to clear/re-queue, and the
@@ -2437,19 +2441,15 @@ let pendingMenuOpenFolder = false;
 const DEV_ICON_PATH = app.isPackaged ? undefined : path.join(app.getAppPath(), 'assets', 'icon', 'icon.png');
 
 const createWindow = (): BrowserWindow => {
-  const win = new BrowserWindow({
-    width: 1100,
-    height: 720,
-    ...(DEV_ICON_PATH && process.platform !== 'darwin' ? { icon: DEV_ICON_PATH } : {}),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      // P2-9: open at the remembered zoom, with no 100% flash first.
+  // P5-g: the options (and the 640×480 minimum) live in `window-options.ts`.
+  const win = new BrowserWindow(
+    mainWindowOptions({
+      iconPath: DEV_ICON_PATH,
+      platform: process.platform,
+      preloadPath: path.join(__dirname, 'preload.js'),
       zoomFactor: uiSettings.getZoomFactor(),
-    },
-  });
+    }),
+  );
   mainWindow = win;
   mainWindowLoaded = false;
 

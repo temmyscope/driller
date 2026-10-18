@@ -11,6 +11,7 @@
  *    `all` flash), the `api` tab is selected, and nothing is announced.
  * 3. Close, then reopen → again the first fetch carries `api`.
  * 4. Pick `all` → the entry is removed (never stored as "all").
+ * P5-g: before step 1, every Section bar tab is ≥ 24px tall (WCAG 2.5.8).
  * `window.driller` calls are counted from the page side (`ipcCounter.ts`).
  */
 import type { Page } from 'playwright-core';
@@ -66,6 +67,22 @@ export const p4_4i: Journey = {
         for (const section of ['all', 'api', 'web']) await sectionTab(page, section).waitFor({ state: 'visible' });
         await until(async () => (await sectionTab(page, 'all').getAttribute('aria-selected')) === 'true', 'all is not selected');
         await card(page, 'renderPage').first().waitFor({ state: 'visible' });
+      },
+    },
+    {
+      // P5-g (founder 2.3): DESIGN.md `section-tab.padding` 6px 10px — WCAG
+      // 2.5.8's 24px target, at the default 100% zoom.
+      name: 'Every Section bar tab is at least 24px tall',
+      run: async ({ page }) => {
+        const tabs = page.getByRole('tablist', { name: 'Section' }).getByRole('tab');
+        const count = await tabs.count();
+        if (count < 3) throw new Error(`${count} section tabs (expected all, api, web)`);
+        for (let i = 0; i < count; i += 1) {
+          const box = await tabs.nth(i).boundingBox();
+          if (box === null || box.height < 24) {
+            throw new Error(`tab "${await tabs.nth(i).textContent()}" is ${box === null ? 'not laid out' : `${box.height}px`} tall (expected ≥ 24px)`);
+          }
+        }
       },
     },
     {

@@ -404,7 +404,9 @@ code,
 .section-bar__tab {
   flex-shrink: 0;
   white-space: nowrap;
-  padding: 4px 10px;
+  /* P5-g (founder 2.3): DESIGN.md `section-tab.padding` 6px 10px — a ~25px
+     target, over WCAG 2.5.8's 24px (was 4px: ~21px). */
+  padding: 6px 10px;
   border: none;
   border-bottom: 2px solid transparent;
   border-radius: 0;
@@ -4264,8 +4266,16 @@ code,
   cursor: pointer;
 }
 
-.code-map__metrics-sort:hover {
+.code-map__metrics-sort:not([aria-disabled='true']):hover {
   color: var(--text);
+}
+
+/* P5-g (founder 1.7): a contract-only table has no Node rows to sort — the
+   headers are inert: muted, no pointer affordance, still focusable (as
+   `.section-bar__tab[aria-disabled='true']`). */
+.code-map__metrics-sort[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .code-map__metrics-sort:focus-visible {

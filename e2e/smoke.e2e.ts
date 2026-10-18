@@ -105,4 +105,36 @@ export const smokeJourney: readonly Step<SmokeContext>[] = [
       await until(() => button.evaluate((element) => element === document.activeElement));
     },
   },
+  {
+    // P5-g (founder 5.3): `mainWindowOptions` sets minWidth/minHeight 640×480.
+    // Last, so a CDP gap can't skip the steps above. If Electron's DevTools
+    // server doesn't implement `Browser.getWindowForTarget` /
+    // `Browser.setWindowBounds`, this fails naming the method — then the
+    // check is the owed live one in the tracker's P2-3 row (drag the window).
+    name: 'The window clamps a 400×300 resize to its 640×480 minimum',
+    run: async ({ page }) => {
+      const browser = page.context().browser();
+      if (browser === null) throw new Error('no CDP browser to resize the window through');
+      const pageSession = await page.context().newCDPSession(page);
+      const { targetInfo } = await pageSession.send('Target.getTargetInfo');
+      await pageSession.detach();
+      const session = await browser.newBrowserCDPSession();
+      try {
+        let windowId: number;
+        try {
+          ({ windowId } = await session.send('Browser.getWindowForTarget', { targetId: targetInfo.targetId }));
+          await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal', width: 400, height: 300 } });
+        } catch (error) {
+          throw new Error(`CDP window resize unavailable (${String(error)}) — record the 640×480 minimum as a live check (tracker P2-3)`);
+        }
+        const outer = () => page.evaluate(() => ({ width: window.outerWidth, height: window.outerHeight }));
+        await realSleep(500);
+        const size = await outer();
+        if (size.width < 640 || size.height < 480) throw new Error(`the window resized to ${size.width}×${size.height}, under 640×480`);
+        await session.send('Browser.setWindowBounds', { windowId, bounds: { width: 1100, height: 720 } });
+      } finally {
+        await session.detach();
+      }
+    },
+  },
 ];

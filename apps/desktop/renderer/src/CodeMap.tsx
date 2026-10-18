@@ -5262,11 +5262,18 @@ export function PrReviewMetricsTable({
   ...table
 }: PrReviewMetricsTableProps & PrReviewMetricsTableSortProps & PrReviewMetricsTableActivationProps) {
   const { missingChangedCount, hiddenAffectedCount, missingAffectedCount } = table;
+  // P5-g (founder 1.7): with no Node rows (a contract-only table) there is
+  // nothing to sort, so the table renders as if unsorted — no `aria-sort`,
+  // no indicator, an empty announcement, no sorted-within-cap note — and the
+  // headers are `aria-disabled` no-ops. The caller's `sort` is kept, so it
+  // applies again when rows return.
+  const sortInert = table.rows.length === 0;
+  const effectiveSort = sortInert ? null : sort;
   // P4-3d: sorted here, from the rows already capped in the default order —
   // the cap line stays last, after every row, whatever the sort.
-  const rows = sortPrReviewMetricRows(table.rows, sort);
+  const rows = sortPrReviewMetricRows(table.rows, effectiveSort);
   const barMax = metricBarWidths(table.rows);
-  const sortedWithinCap = formatSortedWithinCapNote(sort, rows.length, hiddenAffectedCount);
+  const sortedWithinCap = formatSortedWithinCapNote(effectiveSort, rows.length, hiddenAffectedCount);
   const missing = formatMissingChangedNodes(missingChangedCount);
   const hiddenAffected = formatHiddenAffectedNodes(hiddenAffectedCount);
   const missingAffected = formatMissingAffectedNodes(missingAffectedCount);
@@ -5285,7 +5292,7 @@ export function PrReviewMetricsTable({
     />
   );
   const hasContracts = changedContracts.length > 0;
-  const changedCount = sort === null && hasContracts ? leadingChangedRowCount(rows) : 0;
+  const changedCount = effectiveSort === null && hasContracts ? leadingChangedRowCount(rows) : 0;
   const leadingRows = rows.slice(0, changedCount);
   const trailingRows = rows.slice(changedCount);
   // Keyed rows keep their button across re-sorts and depth steps WITHIN one
@@ -5375,14 +5382,20 @@ export function PrReviewMetricsTable({
             {/* P4-3d: real sorting — only the active column carries
                 `aria-sort`; a native button in each header. */}
             {PR_REVIEW_METRIC_COLUMNS.map(({ column, label, bar }) => {
-              const direction = sort !== null && sort.column === column ? sort.direction : undefined;
+              const direction = effectiveSort !== null && effectiveSort.column === column ? effectiveSort.direction : undefined;
               return (
                 <th key={column} scope="col" aria-sort={direction}>
                   <button
                     type="button"
                     className="code-map__metrics-sort"
                     title={bar ? METRIC_BAR_HEADER_NOTE : undefined}
-                    onClick={() => onSort(nextPrReviewMetricSort(sort, column))}
+                    // P5-g: `aria-disabled`, never native `disabled`, so a
+                    // focused header keeps focus when the rows go (P2-2).
+                    aria-disabled={sortInert ? 'true' : undefined}
+                    onClick={() => {
+                      if (sortInert) return;
+                      onSort(nextPrReviewMetricSort(sort, column));
+                    }}
                   >
                     {column === 'blastRadius' ? prReviewBlastRadiusHeader() : label}
                     {bar && <span className="visually-hidden">{` ${METRIC_BAR_HEADER_NOTE}`}</span>}
@@ -5397,7 +5410,7 @@ export function PrReviewMetricsTable({
             })}
           </tr>
         </thead>
-        {sort !== null && hasContracts && contractGroup}
+        {effectiveSort !== null && hasContracts && contractGroup}
         {/* P4-3d review: a sort on a capped table says it covers only the
             rows shown. Inert; its own tbody, so the rows' zebra keeps its
             parity. */}
@@ -5411,7 +5424,7 @@ export function PrReviewMetricsTable({
         {/* P4-3g: in the default order, with contracts, the changed rows
             get their own tbody so the contract group can sit after them. */}
         {leadingRows.length > 0 && <tbody>{leadingRows.map(renderRow)}</tbody>}
-        {sort === null && hasContracts && contractGroup}
+        {effectiveSort === null && hasContracts && contractGroup}
         {/* P4-3g review: no empty tbody (a contract-only table). */}
         {(trailingRows.length > 0 || hiddenAffected !== null) && (
           <tbody>
@@ -5432,7 +5445,7 @@ export function PrReviewMetricsTable({
       )}
       {/* P4-3d: always mounted, so a sort change is announced, not missed as a new region. */}
       <p className="visually-hidden" role="status">
-        {formatMetricSortAnnouncement(sort)}
+        {formatMetricSortAnnouncement(effectiveSort)}
       </p>
     </section>
   );

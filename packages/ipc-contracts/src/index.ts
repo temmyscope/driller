@@ -852,6 +852,16 @@ export interface BackendConfig {
 }
 
 /**
+ * P5-g (founder approval 2026-10-15, from the P3-5 live run): the message a
+ * `setActiveBackend` rejection carries when main couldn't persist the
+ * choice — actionable, and never the raw store error (a rename error names
+ * the full userData file path). Main writes the raw error to the local
+ * diagnostic log only (`'backend-setting-save-failed'`).
+ */
+export const BACKEND_SETTING_SAVE_FAILED_MESSAGE =
+  "the backend setting couldn't be saved — check that the app's data folder is writable";
+
+/**
  * Result of a `setCloudApiKey` attempt:
  *  - `'ok'`: stored as ciphertext.
  *  - `'warning'`: Linux with no secure keystore and no acknowledgment yet —
@@ -1074,6 +1084,21 @@ export type DiagnosticLogEntry =
       /** P4-7g review round 1: the project the pin belongs to (local only, AD-21). */
       projectPath: string;
       nodeId: string;
+    }
+  | {
+      /**
+       * P5-g (founder approval 2026-10-15): persisting the active backend
+       * failed (e.g. the settings file's rename was refused). Written by
+       * main only; the renderer is shown
+       * `BACKEND_SETTING_SAVE_FAILED_MESSAGE`, never this raw error.
+       */
+      eventType: 'backend-setting-save-failed';
+      /** ISO-8601 timestamp of the failed save. */
+      timestamp: string;
+      /** The backend the user tried to switch to. */
+      backend: CloudBackend;
+      /** The raw store error's message (it may name userData paths — local only, AD-21). */
+      error: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -1669,7 +1694,10 @@ export interface DrillerApi {
    * this machine is Linux with no secure OS keystore.
    */
   getBackendConfig: () => Promise<BackendConfig>;
-  /** Sets the active summary backend (local/cloud) choice. */
+  /**
+   * Sets the active summary backend (local/cloud) choice. P5-g: when the
+   * choice can't be saved it rejects with `BACKEND_SETTING_SAVE_FAILED_MESSAGE`.
+   */
   setActiveBackend: (backend: CloudBackend) => Promise<void>;
   /**
    * Attempts to store a cloud API key as ciphertext. On Linux with no
