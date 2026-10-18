@@ -48,8 +48,9 @@
  *    request, so a later signal-family write (Phase 2's summaries) always
  *    lands against the right project's persisted file.
  *  - The local-model download/verify (`model-manager.ts`'s
- *    `ensureLocalModel`) is kicked off alongside `indexRepository`, not
- *    sequentially after it (the pre-mortem finding driving the Intent's
+ *    `ensureLocalModel`) is kicked off alongside `indexRepository` under
+ *    Local (P5-c: under Cloud, only when a local consumer first needs it),
+ *    not sequentially after it (the pre-mortem finding driving the Intent's
  *    "one bounded first-run wait" framing) — its progress/result is turned
  *    into `graphService:modelStatus` posts on this same `parentPort`
  *    channel, a stream kept separate from `graphService:status` (Design
@@ -1218,6 +1219,13 @@ function kickOffModelDownload(): Promise<void> {
         at: now(),
         model: result.model,
       });
+      // P5-c review round 1: every successful download under Local checks
+      // the constrained-tier advisory for the open project — the index-time
+      // check alone misses a Cloud→Local switch and a recovery after a
+      // failure. Posted at most once per project session (its own flag).
+      if (activeBackendConfig.activeBackend === 'local' && activeIndexPath !== null) {
+        void checkConstrainedTierAdvisory(activeIndexPath);
+      }
     })
     .catch((error) => {
       postModelStatus({
@@ -1239,9 +1247,32 @@ function kickOffModelDownload(): Promise<void> {
 }
 
 /**
+ * P5-c review round 1 (no download storm): what the implicit generation
+ * kicks wait on — the fetch path, the P5-b cache-served re-kick and the
+ * backend re-kicks all run `startSummaryGenerationForProject` /
+ * `startJudgmentGenerationForProject`. It joins an attempt in flight and
+ * returns at once otherwise (model ready, or no attempt), so after a failed
+ * download no section switch or reload starts another. A fresh attempt
+ * starts only on an explicit trigger: an index under Local, a genuine
+ * switch to Local (`handleBackendSwitchedRequest`), the model Retry, or a
+ * user Regenerate (`computeRegenerateNodeResult`).
+ */
+async function joinModelAttempt(): Promise<void> {
+  if (modelAttempt) {
+    await modelAttempt;
+  }
+}
+
+/**
  * Checks whether `projectPath`'s session should get the constrained-tier
  * hardware advisory (Story 1.5 Phase 3), once the model attempt this
- * subprocess is currently using has settled. Called once per
+ * subprocess is currently using has settled. P5-c: Local only. Called from
+ * a Local `handleIndexRequest` (the memo may already be ready, so a second
+ * project still gets checked), from every successful download under Local
+ * (`kickOffModelDownload`'s success path — so a Cloud→Local switch and a
+ * recovery after a failure get the nudge too, review round 1), and from a
+ * successful model Retry. The rest of this comment is the original reason
+ * the per-index call exists. Called once per
  * `handleIndexRequest`, deliberately decoupled from `kickOffModelDownload`'s
  * own one-shot `.then()` (review finding, High) — `kickOffModelDownload` is
  * memoized for the whole subprocess lifetime (Story 1.5 Phase 1's "once per
@@ -1431,6 +1462,12 @@ function isRetryModelRequest(data: unknown): data is GraphServiceRetryModelReque
  * generation is driven by the backend-switch path.
  */
 function handleRetryModelRequest(): void {
+  if (activeBackendConfig.activeBackend !== 'local') {
+    // P5-c review round 1: under Cloud the local model is never needed, so
+    // a Retry (e.g. from a badge left over from a Local session) downloads
+    // nothing and posts no model status.
+    return;
+  }
   if (localModelReady) {
     // Nothing to retry — but re-post the current `ready` status so a footer
     // still showing a stale `error` catches up rather than the Retry
@@ -1873,21 +1910,28 @@ async function handleIndexRequest(
   // before the potentially long-running backend call below.
   postStatus({ state: 'indexing', pid: process.pid, at: now(), path: projectPath });
 
-  // Story 1.5 Phase 1 (AD-18): the local-model download/verify starts here,
-  // alongside indexing, not sequentially after it — the pre-mortem finding
-  // behind the Intent's "one bounded first-run wait." Fire-and-forget: its
-  // own promise settles independently and is never awaited by this
-  // function, so neither piece of work can block or be blocked by the
-  // other. Memoized (see `kickOffModelDownload`'s doc comment), so this is
-  // a no-op after the first `graphService:index` request in this process's
-  // lifetime.
-  void kickOffModelDownload();
-  // Story 1.5 Phase 3 (review finding, High): re-checked per project, not
-  // just inside `kickOffModelDownload`'s own one-shot `.then()` — see
-  // `checkConstrainedTierAdvisory`'s own doc comment for why. Fire-and-
-  // forget, same reasoning as `kickOffModelDownload` itself: never awaited
-  // here, so it can't delay `indexRepository` below.
-  void checkConstrainedTierAdvisory(projectPath);
+  // Story 1.5 Phase 1 (AD-18): under Local, the local-model download/verify
+  // starts here, alongside indexing, not sequentially after it — the
+  // pre-mortem finding behind the Intent's "one bounded first-run wait."
+  // Fire-and-forget: its own promise settles independently and is never
+  // awaited by this function, so neither piece of work can block or be
+  // blocked by the other. Memoized (see `kickOffModelDownload`'s doc
+  // comment), so this is a no-op once an attempt is in flight or has
+  // succeeded in this process's lifetime.
+  //
+  // P5-c (founder decision 4.7): only when this request's backend is Local.
+  // Under Cloud nothing is downloaded (no Hugging Face traffic, no model
+  // status); the first local consumer starts it on demand instead (e.g. the
+  // generation restart after a Cloud→Local switch).
+  if (activeBackendConfig.activeBackend === 'local') {
+    void kickOffModelDownload();
+    // Story 1.5 Phase 3 (review finding, High): re-checked per project, not
+    // just inside `kickOffModelDownload`'s own one-shot `.then()` — see
+    // `checkConstrainedTierAdvisory`'s own doc comment for why. Fire-and-
+    // forget, same reasoning as `kickOffModelDownload` itself: never awaited
+    // here, so it can't delay `indexRepository` below. P5-c: Local only too.
+    void checkConstrainedTierAdvisory(projectPath);
+  }
   // Switches the Node record store to this project (AD-19/AD-20) before
   // indexing proceeds — cheap, local JSON I/O (see node-record-store.ts),
   // and a no-op when this is already the active project (re-index of the
@@ -2560,17 +2604,22 @@ async function computeRegenerateNodeResult(nodeId: string): Promise<RegenerateNo
     summarize = createCloudSummarizer(backendConfig.cloudApiKey);
     modelName = CLOUD_SUMMARY_MODEL;
   } else {
-    if (modelAttempt) {
-      try {
-        await modelAttempt;
-      } catch {
-        // Already reported via `graphService:modelStatus` 'error' — nothing
-        // more to do; there is no model to regenerate with this session.
-        return { status: 'error', message: 'The local model failed to load — no summary backend is available.' };
-      }
+    // P5-c: an explicit user action, so it starts the download if nothing
+    // has downloaded yet, or joins the memoized attempt. It never rejects;
+    // an attempt that just settled without a model failed (already reported
+    // via `graphService:modelStatus` 'error').
+    // Review round 1: snapshotted before the wait — a backend switch (or a
+    // re-index) during it must never let a local write land under Cloud.
+    const generationBeforeModel = activeSummaryGenerationId;
+    await kickOffModelDownload();
+    if (generationBeforeModel !== activeSummaryGenerationId || activeBackendConfig.activeBackend !== 'local') {
+      return {
+        status: 'error',
+        message: 'The summary backend or project changed while the local model was loading — nothing was regenerated.',
+      };
     }
     if (!localModelReady) {
-      return { status: 'error', message: 'No summary backend is available yet — check Settings.' };
+      return { status: 'error', message: 'The local model failed to load — no summary backend is available.' };
     }
     summarize = createLocalSummarizer(localModelReady);
     modelName = localModelReady.model;
@@ -3319,13 +3368,13 @@ export function getCoverageSummaryResult(projectPath: string): CoverageSummaryRe
  *    Actionable Notice from `BackendConfig` directly; nothing further needs
  *    to be posted from here.
  *  - `'local'`: waits for the local-model download/verify (kicked off
- *    alongside indexing, Story 1.5 Phase 1) to settle before generation can
- *    start — reads the current `modelAttempt` at the moment this function
- *    runs, not a value captured earlier, so a since-failed-and-reset attempt
- *    (see `kickOffModelDownload`'s doc comment) is correctly treated as "no
- *    model available" rather than awaiting a stale reference forever. If the
- *    attempt failed, generation is likewise skipped — same "no silent
- *    fallback" reasoning, mirrored for the local side.
+ *    alongside indexing under Local, Story 1.5 Phase 1) to settle before
+ *    generation can start. P5-c review round 1: it joins the attempt in
+ *    flight at the moment this function runs (`joinModelAttempt`) and never
+ *    starts one; a Cloud→Local switch starts it in
+ *    `handleBackendSwitchedRequest`. With no attempt and no model (one
+ *    failed), generation is skipped — same "no silent fallback" reasoning,
+ *    mirrored for the local side — until an explicit trigger downloads.
  *
  * `generationId` snapshots `activeSummaryGenerationId` at the moment this
  * run starts; every check against the live module variable below (both here
@@ -3413,15 +3462,10 @@ async function startSummaryGenerationForProject(
       summarize = createCloudSummarizer(backendConfig.cloudApiKey);
       modelName = CLOUD_SUMMARY_MODEL;
     } else {
-      if (modelAttempt) {
-        try {
-          await modelAttempt;
-        } catch {
-          // Already reported via `graphService:modelStatus` 'error' — nothing
-          // more to do; there is no model to generate with this session.
-          return;
-        }
-      }
+      // P5-c review round 1: joins an attempt in flight, never starts one —
+      // see `joinModelAttempt`. A failure is already reported via
+      // `graphService:modelStatus` 'error' and leaves `localModelReady` unset.
+      await joinModelAttempt();
       if (generationId !== activeSummaryGenerationId || !localModelReady) {
         return;
       }
@@ -3537,15 +3581,8 @@ async function startJudgmentGenerationForProject(nodes: CodeMapNode[]): Promise<
       // provenance if the two ever diverge).
       modelName = CLOUD_JUDGMENT_MODEL;
     } else {
-      if (modelAttempt) {
-        try {
-          await modelAttempt;
-        } catch {
-          // Already reported via `graphService:modelStatus` 'error' — nothing
-          // more to do; there is no model to generate with this session.
-          return;
-        }
-      }
+      // P5-c review round 1: joins only — see `joinModelAttempt`.
+      await joinModelAttempt();
       if (generationId !== activeSummaryGenerationId || !localModelReady) {
         return;
       }
@@ -3711,6 +3748,18 @@ async function handleBackendSwitchedRequest(backendConfig: {
   // real Anthropic API calls regenerating summaries that already existed.
   const previousBackend = activeBackendConfig.activeBackend;
   activeBackendConfig = nextBackendConfig(backendConfig);
+  // P5-c: a genuine switch to Local with a project open is a first need of
+  // the local model — start (or join) the download here, before the early
+  // return below, so a switch before the first map lands still downloads.
+  // The restarted runs then join it (`joinModelAttempt`). With no project
+  // open nothing is pre-downloaded (Ask First).
+  if (
+    backendSwitchKind(previousBackend, activeBackendConfig.activeBackend) === 'switch' &&
+    activeBackendConfig.activeBackend === 'local' &&
+    activeIndexPath !== null
+  ) {
+    void kickOffModelDownload();
+  }
   const nodes = activeCodeMapNodes;
   // Story 3.2 (Phase 1): `activeCodeMapEdges` is captured alongside
   // `activeCodeMapNodes` here too — the two are always set together (see

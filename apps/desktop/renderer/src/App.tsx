@@ -54,6 +54,7 @@ import {
 } from './appFrame';
 import { CodeMap, createLatestRequestGuard, type CodeMapMode } from './CodeMap';
 import { createMenuOpenFolderHandler } from './menuOpenFolder';
+import { visibleModelStatus } from './modelStatusView';
 import { openModalLayers } from './modalStack';
 import { ModeSwitcher } from './ModeSwitcher';
 import { SECTION_PANEL_ID, SectionBar, selectedSectionTabId, showSectionBar } from './SectionBar';
@@ -442,7 +443,10 @@ export function App() {
   // sees the cleared (`pending`) state, same as `lookup_node`.
   const handleBackendSwitched = useCallback(() => {
     commitSessionMap(applyBackendSwitchedToSessionMap(sessionMapRef.current));
-  }, [commitSessionMap]);
+    // P5-c review round 1: the model badge follows the backend at once
+    // (hidden under Cloud), not only when Settings closes.
+    refetchBackendConfig();
+  }, [commitSessionMap, refetchBackendConfig]);
 
   // P2-1: Settings reports each scope save main handed to the running Graph
   // Service. The scope is a query-time filter, so the loaded map is refetched
@@ -947,6 +951,8 @@ export function App() {
   // while the local model attempt is still in flight or hasn't been
   // observed yet this session.
   const localUnusable = modelStatus?.state === 'error';
+  // P5-c review round 1: never a model badge under Cloud (see `visibleModelStatus`).
+  const shownModelStatus = visibleModelStatus(modelStatus, backendConfig?.activeBackend);
   const hasCloudKey = backendConfig?.hasCloudKey ?? false;
   // "cloud selected, no key" — the currently *active* backend is cloud but
   // has no key to generate with, regardless of whether local happens to be
@@ -1273,10 +1279,10 @@ export function App() {
         </footer>
       )}
 
-      {showServiceFooters && modelStatus && (
+      {showServiceFooters && shownModelStatus && (
         <footer className="model-status" role="status">
-          <ModelStatusBadge status={modelStatus} />
-          {modelStatus.state === 'error' && (
+          <ModelStatusBadge status={shownModelStatus} />
+          {shownModelStatus.state === 'error' && (
             // P1-3: its own model-only retry path — no restart, no
             // re-index, map untouched (see `handleRetryLocalModel`).
             <button type="button" className="model-status__retry" onClick={handleRetryLocalModel}>

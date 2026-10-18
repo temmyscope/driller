@@ -8,8 +8,9 @@
  *
  * The seeded `driller-backend-settings.json` selects the cloud backend with
  * no key: summaries stay paused, so the run needs neither a cloud key nor
- * the local model. (The Graph Service still starts its model download on
- * index; the harness's network guard refuses it, which the map tolerates.)
+ * the local model. P5-c: under Cloud the Graph Service never starts the
+ * model download, and the run's teardown checks that the network guard
+ * refused no Hugging Face host.
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';

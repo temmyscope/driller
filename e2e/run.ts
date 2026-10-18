@@ -51,6 +51,7 @@ import {
   formatStepTable,
   groupMembers,
   installExitHandlers,
+  noHuggingFaceHostCheck,
   isElectronMainCommand,
   isPortFree,
   killProcessGroup,
@@ -235,6 +236,8 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
       let artifacts: string | undefined;
       if (failed) artifacts = await writeArtifacts();
       const report = await teardown();
+      const appOutput = outputs.map((o) => o()).join('\n');
+      const refused = refusedHosts(appOutput);
       const checks: StepResult[] = [
         {
           name: 'Teardown: group killed, own CBM stopped, temp dirs removed, no survivors',
@@ -242,10 +245,11 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
           ms: 0,
           error: report.failures.map((f) => `${f.phase}: ${f.message}`).join(' | ') || undefined,
         },
+        // P5-c: every journey seeds Cloud, so no local-model download.
+        noHuggingFaceHostCheck(appOutput),
       ];
       log(`\n${formatStepTable([...results, ...checks])}`);
-      const refused = refusedHosts(outputs.map((o) => o()).join('\n'));
-      if (refused.length > 0) log(`network guard refused (expected, e.g. the local-model download): ${refused.join(', ')}`);
+      if (refused.length > 0) log(`network guard refused: ${refused.join(', ')}`);
       if (artifacts !== undefined) log(`artifacts: ${artifacts}`);
       const ms = Date.now() - startedAt;
       log(`${journey.id}: ${(ms / 1000).toFixed(1)} s`);

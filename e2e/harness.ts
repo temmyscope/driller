@@ -506,6 +506,49 @@ export function refusedHosts(output: string): string[] {
   return [...hosts].sort();
 }
 
+/**
+ * P5-c: the refused hosts that are Hugging Face's (`huggingface.co`, `hf.co`
+ * and their subdomains, e.g. `cdn-lfs.hf.co`), where the local model
+ * downloads from. Every journey seeds Cloud, so any of these is a download
+ * the app should never have started.
+ */
+export function huggingFaceHosts(hosts: readonly string[]): string[] {
+  return hosts.filter((host) => {
+    const name = host.toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '');
+    return ['huggingface.co', 'hf.co'].some((domain) => name === domain || name.endsWith(`.${domain}`));
+  });
+}
+
+/**
+ * P5-c review round 1: whether `output` holds the network guard's load
+ * marker (`DRILLER_NETWORK_GUARD_ANNOUNCE`) from the Graph Service process —
+ * proof its guard output is captured at all.
+ */
+export function graphServiceGuardCaptured(output: string): boolean {
+  return /^NetworkGuardActive: .*graph-service\.js\s*$/m.test(output);
+}
+
+/**
+ * P5-c: the journey's teardown check over the app's whole output: the
+ * network guard refused no Hugging Face host (`huggingFaceHosts`), and
+ * (review round 1, the positive control) the Graph Service's guard output
+ * was captured, so an empty refusal list means something.
+ */
+export function noHuggingFaceHostCheck(output: string): StepResult {
+  const hosts = huggingFaceHosts(refusedHosts(output));
+  const captured = graphServiceGuardCaptured(output);
+  const errors = [
+    ...(hosts.length === 0 ? [] : [`the network guard refused ${hosts.join(', ')}`]),
+    ...(captured ? [] : ["the Graph Service's network-guard output was not captured (no NetworkGuardActive marker)"]),
+  ];
+  return {
+    name: 'No Hugging Face host contacted (Cloud selected: no local-model download)',
+    ok: errors.length === 0,
+    ms: 0,
+    error: errors.length === 0 ? undefined : errors.join('; '),
+  };
+}
+
 /** Appends an `--import` of `guardPath` to `NODE_OPTIONS`, once. */
 export function withNetworkGuard(nodeOptions: string | undefined, guardPath: string): string {
   const flag = `--import=${pathToFileURL(guardPath).href}`;
@@ -530,6 +573,8 @@ export function appEnv({ base, guardPath, cbmCacheDir, appTmpDir }: AppEnvInput)
   env.CBM_CACHE_DIR = cbmCacheDir;
   // P5-a review round 1: enables the dev app's SIGUSR2 → `browser-window-focus` hook (never packaged).
   env.DRILLER_E2E_HOOKS = '1';
+  // P5-c review round 1: guarded processes announce the guard (positive control).
+  env.DRILLER_NETWORK_GUARD_ANNOUNCE = '1';
   env.TMPDIR = appTmpDir;
   env.TMP = appTmpDir;
   env.TEMP = appTmpDir;

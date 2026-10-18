@@ -18,7 +18,8 @@
  *  - `__harnessFetchGate`: a promise `fetchCodeMap` awaits first
  *    (`__harnessFetchCount` counts calls);
  *  - `__harnessModel`: a factory for `ensureLocalModel`'s promise (never
- *    settles when unset);
+ *    settles when unset); `__harnessModelCount` (P5-c) counts
+ *    `ensureLocalModel` calls;
  *  - `__harnessFixtureOverride` (P4-4g review round 1): a raw fetch result
  *    `fetchCodeMap` returns instead of the fixture while set;
  *  - `__harnessLcovCount` (P5-b): counts `index.ts`'s `loadLcovCoverage`
@@ -27,7 +28,10 @@
  *    set, the per-Node function `index.ts`'s `createLocalSummarizer` /
  *    `createLocalJudge` return (the local model must be ready, via
  *    `__harnessModel`). `./summary-generator` and `./judgment-generator` are
- *    wrapped the same way; everything else in them is the real code.
+ *    wrapped the same way; everything else in them is the real code;
+ *  - `__harnessCloudSummarize` / `__harnessCloudJudge` (P5-c): the same for
+ *    `createCloudSummarizer` / `createCloudJudge` (`./cloud-summary-generator`
+ *    is wrapped too), so a Cloud-with-key test never calls the Anthropic API.
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -62,7 +66,7 @@ export async function fetchCodeMap() {
 }
 `);
 const MODEL_MANAGER_STUB = toDataUrl(
-  'export function ensureLocalModel() { const make = globalThis.__harnessModel; return make ? make() : new Promise(() => {}); }',
+  'export function ensureLocalModel() { globalThis.__harnessModelCount = (globalThis.__harnessModelCount ?? 0) + 1; const make = globalThis.__harnessModel; return make ? make() : new Promise(() => {}); }',
 );
 const MCP_SERVER_STUB = toDataUrl(
   // P4-4 phase 2b: also keeps the live derivation and the section-build
@@ -81,19 +85,31 @@ export function loadLcovCoverage(projectRoot) {
 }
 `);
 
-// P5-b founder decision 1: the real generators, with the local per-Node step overridable.
-const wrapFactory = (file: string, name: string, override: string): string => {
+// P5-b founder decision 1: the real generators, with the local per-Node step
+// overridable. P5-c: the cloud per-Node steps too, so a Cloud-with-key test
+// never reaches the network.
+const wrapFactory = (file: string, factories: readonly (readonly [name: string, override: string])[]): string => {
   const url = new URL(file, import.meta.url).href;
+  const wrappers = factories
+    .map(
+      ([name, override]) => `
+import { ${name} as real_${name} } from ${JSON.stringify(url)};
+export function ${name}(arg) {
+  return globalThis.${override} ?? real_${name}(arg);
+}`,
+    )
+    .join('\n');
   return toDataUrl(`
-import { ${name} as real } from ${JSON.stringify(url)};
 export * from ${JSON.stringify(url)};
-export function ${name}(model) {
-  return globalThis.${override} ?? real(model);
-}
+${wrappers}
 `);
 };
-const SUMMARY_GENERATOR_STUB = wrapFactory('./summary-generator.ts', 'createLocalSummarizer', '__harnessSummarize');
-const JUDGMENT_GENERATOR_STUB = wrapFactory('./judgment-generator.ts', 'createLocalJudge', '__harnessJudge');
+const SUMMARY_GENERATOR_STUB = wrapFactory('./summary-generator.ts', [['createLocalSummarizer', '__harnessSummarize']]);
+const JUDGMENT_GENERATOR_STUB = wrapFactory('./judgment-generator.ts', [
+  ['createLocalJudge', '__harnessJudge'],
+  ['createCloudJudge', '__harnessCloudJudge'],
+]);
+const CLOUD_SUMMARY_GENERATOR_STUB = wrapFactory('./cloud-summary-generator.ts', [['createCloudSummarizer', '__harnessCloudSummarize']]);
 
 const HOOKS = toDataUrl(`
 const STUBS = ${JSON.stringify({
@@ -103,6 +119,7 @@ const STUBS = ${JSON.stringify({
   './lcov': LCOV_STUB,
   './summary-generator': SUMMARY_GENERATOR_STUB,
   './judgment-generator': JUDGMENT_GENERATOR_STUB,
+  './cloud-summary-generator': CLOUD_SUMMARY_GENERATOR_STUB,
 })};
 export function resolve(specifier, context, nextResolve) {
   const parent = context.parentURL ?? '';
@@ -202,13 +219,20 @@ export function getters(): {
   return captured;
 }
 
+/** The backend an index request carries (P5-c); `cloudApiKey` only with `cloud`. */
+export interface HarnessBackend {
+  activeBackend: 'local' | 'cloud';
+  cloudApiKey?: string;
+}
+
 /**
  * Posts an index request for `projectPath` and resolves once it is
- * `indexing`; with `wait`, once it is `indexed` (or `error`).
+ * `indexing`; with `wait`, once it is `indexed` (or `error`). Local unless
+ * `backend` says otherwise (P5-c).
  */
-export async function index(projectPath: string, wait = true): Promise<void> {
+export async function index(projectPath: string, wait = true, backend: HarnessBackend = { activeBackend: 'local' }): Promise<void> {
   const from = posted.length;
-  send({ type: 'graphService:index', path: projectPath, activeBackend: 'local' });
+  send({ type: 'graphService:index', path: projectPath, ...backend });
   await waitFor(() => statusSince(from, ['indexing', 'error']), 'indexing to start');
   if (wait) {
     await waitFor(() => statusSince(from, ['indexed', 'error']), 'the index to finish');
@@ -256,13 +280,13 @@ export function makeFixtureProject(): string {
 
 /**
  * Loads the real `index.ts` behind the stubs (once per process), indexes
- * `project`, and returns the loaded module.
+ * `project` (under `backend`, Local by default), and returns the loaded module.
  */
-export async function startIndexTs(project: string): Promise<typeof import('./index')> {
+export async function startIndexTs(project: string, backend?: HarnessBackend): Promise<typeof import('./index')> {
   register(HOOKS, import.meta.url);
   (process as unknown as { parentPort: typeof port }).parentPort = port;
   process.argv[2] = makeTempDir('driller-scoped-harness-userdata-');
   const indexModule = await import('./index');
-  await index(project);
+  await index(project, true, backend);
   return indexModule;
 }
