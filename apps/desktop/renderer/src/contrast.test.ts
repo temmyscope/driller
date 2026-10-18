@@ -457,3 +457,22 @@ describe('plain canvas-edge stroke against the canvas (P5-f, informational)', ()
     assert.equal(Number(before.toFixed(2)), 1.81);
   });
 });
+
+// P5-i (founder decision 3.23): `--shared-reach-edge`, now documented in
+// DESIGN.md (`colors.shared-reach-edge`, `components.reveal-shared-reach-edge`),
+// draws Revealed's shared-reach arc through the canvas gutter left of
+// column 0, so it sits on `--bg`. Its "shares N" label carries the meaning,
+// but the dotted stroke must stay visible: WCAG 1.4.11's 3:1 against every
+// `--bg` definition (≈8.19:1 today).
+describe('styles.css shared-reach edge token (P5-i)', () => {
+  it('every --shared-reach-edge definition is at least 3:1 against every --bg definition', () => {
+    const failures: string[] = [];
+    for (const edge of hexDefinitionsOf('--shared-reach-edge')) {
+      for (const background of hexDefinitionsOf('--bg')) {
+        const ratio = contrastRatio(edge, background);
+        if (ratio < 3) failures.push(`--shared-reach-edge ${edge} on --bg ${background} is ${ratio.toFixed(3)}:1`);
+      }
+    }
+    assert.deepEqual(failures, []);
+  });
+});
