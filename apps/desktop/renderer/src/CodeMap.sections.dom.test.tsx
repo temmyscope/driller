@@ -281,6 +281,39 @@ describe('CodeMap: the section prop (replaces the sectionScopedOps prop/ref pin)
   });
 });
 
+// P5-d: main supersedes a waiting Code Map request when a later one for
+// another section arrives; that caller gets this explicit result (the same
+// text as main's `SUPERSEDED_RESULT`, `code-map-requests.ts`).
+const SUPERSEDED: CodeMapResult = { status: 'error', message: 'Superseded by a later Code Map request.' };
+
+describe('CodeMap: a fast run of switches main coalesces (P5-d)', () => {
+  it('all → api → web, api superseded: shows web, with no error and nothing said about it', BUDGET, async () => {
+    const maps = deferredMaps();
+    const fake = codeMapFake({ getCodeMap: maps.stub });
+    const { rerender } = render(<CodeMap {...props({ section: null })} />);
+    rerender(<CodeMap {...props({ section: 'api' })} />);
+    rerender(<CodeMap {...props({ section: 'web' })} />);
+    assert.deepEqual(fake.calls.getCodeMap, [[undefined], ['api'], ['web']]);
+
+    // Main's order: api is superseded the moment web arrives, then the
+    // whole scope (in flight) answers, then web.
+    await act(async () => {
+      maps.replies[1]!.resolve(SUPERSEDED);
+    });
+    assertAbsent(screen.queryByRole('alert'), 'an error notice while web loads');
+    assert.equal(document.body.textContent?.includes('Superseded'), false, 'nothing flashes');
+    await act(async () => {
+      maps.replies[0]!.resolve(sectionedMap(null));
+    });
+    await act(async () => {
+      maps.replies[2]!.resolve(sectionedMap('web'));
+    });
+    await waitForDrawn([S.layout.id, S.render.id]);
+    assertAbsent(screen.queryByRole('alert'), 'an error notice');
+    assert.equal(document.body.textContent?.includes('Superseded'), false, 'the superseded result is never shown or announced');
+  });
+});
+
 describe('CodeMap: switching section from Node detail (replaces the crossSection wiring pins)', () => {
   it('offers the callee’s section on a section map only, and asks for the switch with the callee', BUDGET, async () => {
     codeMapFake({

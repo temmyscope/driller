@@ -8,7 +8,8 @@
  *  - a call for the section already in flight (or already waiting) shares
  *    that request's promise (e.g. a fast double-click on Retry);
  *  - a call for any other section waits for the in-flight request to
- *    settle, then sends its own — two in flight could cross;
+ *    settle, then sends its own — two in flight could cross — and replaces
+ *    any other waiting section (P5-d, below);
  *  - the reply's echoed `section` is checked against the in-flight request
  *    by the caller (`replySection` names it) before it settles that request.
  *
@@ -25,6 +26,15 @@
  * cache-served); it waits and is sent with `force`. A waiting request for the
  * same section is shared and upgraded to `force`, and an unforced call may
  * share a forced one.
+ *
+ * P5-d (founder decision 2.1, coalesce to latest): the renderer applies
+ * only its latest reply, so a waiting request for another section is wasted
+ * work. Every call first settles each waiting request for a section other
+ * than its own with `SUPERSEDED_RESULT`, then shares or queues as above; a
+ * waiting request for its own section is kept and shared (with its `force`,
+ * so a waiting Retry is never folded into an unforced call). The request in
+ * flight can't be recalled (replies carry no request id), so a fast run of
+ * switches sends at most two: the one in flight and the latest.
  *
  * Every request resolves, never rejects: no Graph Service, a throwing
  * `send`, its own timeout, or the caller settling it with an error all give
@@ -78,6 +88,13 @@ interface PendingCodeMapRequest {
   promise: Promise<CodeMapResult>;
   resolve: (result: CodeMapResult) => void;
 }
+
+/**
+ * P5-d: what a waiting Code Map request gets when a later request for
+ * another section replaces it. The renderer never shows it: its caller has
+ * already been overtaken by that later request (request-id guard).
+ */
+export const SUPERSEDED_RESULT: CodeMapResult = { status: 'error', message: 'Superseded by a later Code Map request.' };
 
 const NOT_RUNNING: CodeMapResult = { status: 'error', message: 'Graph Service is not running.' };
 const TIMED_OUT: CodeMapResult = {
@@ -134,6 +151,15 @@ export function createCodeMapRequester(deps: CodeMapRequesterDeps): CodeMapReque
 
   const request = (section?: string, force = false): Promise<CodeMapResult> => {
     const key: CodeMapRequestKey = section ?? null;
+    // P5-d: coalesce to latest. Every waiting request for another section is
+    // superseded; one for this section stays and is shared below.
+    for (let index = waiting.length - 1; index >= 0; index -= 1) {
+      const pending = waiting[index]!;
+      if (pending.key !== key) {
+        waiting.splice(index, 1);
+        pending.resolve(SUPERSEDED_RESULT);
+      }
+    }
     // P5-b founder decision 2: a forced call never shares an unforced
     // request already sent (it may be served from the cache).
     if (inFlight && inFlight.key === key && (inFlight.force || !force)) {

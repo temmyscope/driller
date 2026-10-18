@@ -160,7 +160,8 @@ let pendingHeadMove: PendingHeadMove | undefined;
 // Retry) shares the one in-flight result instead of getting an immediate,
 // spurious "already in progress" failure (review finding). P4-4 phase 1b: a
 // caller for another section waits for it to settle, then sends its own
-// (`code-map-requests.ts`).
+// (`code-map-requests.ts`); P5-d: and supersedes any other section still
+// waiting, so only the latest is sent next.
 
 // A pure backstop, slightly exceeding `fetchCodeMap`'s own internal timeout
 // (mcp-client.ts's `DEFAULT_TIMEOUT_MS`, 30 minutes) — for a hang that
@@ -1132,7 +1133,9 @@ function relayKeyChangeToGraphService(): boolean {
  * spurious "already in progress" failure — both callers see the same
  * eventual result. P4-4 phase 1b: `section` (omitted = the whole scope); an
  * overlapping call for another section is sent only once the in-flight one
- * settles, so each caller gets its own section's reply.
+ * settles, so each caller gets its own section's reply. P5-d: a waiting call
+ * for another section is settled with `SUPERSEDED_RESULT` when a later call
+ * arrives, so the latest caller always gets its own section's reply.
  */
 function requestCodeMap(section?: string, force = false): Promise<CodeMapResult> {
   return codeMapRequests.request(section, force);

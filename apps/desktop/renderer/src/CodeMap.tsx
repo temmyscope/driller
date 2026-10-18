@@ -9665,9 +9665,10 @@ export function CodeMap({
     }
     // P4-4 phase 1c: the map of the section on screen (`sectionRef`, synced
     // in a layout effect, so it is already the new section when the
-    // section-keyed effect below calls this). Fast switching queues one
-    // request per switch in main; only the latest one's reply applies (the
-    // shared `refreshRequestIdRef` check below).
+    // section-keyed effect below calls this). On fast switching, main keeps
+    // only the latest waiting request and answers the others "superseded"
+    // (P5-d); only the latest one's reply applies (the shared
+    // `refreshRequestIdRef` check below).
     const requestedSection = sectionRef.current;
     getCodeMapFromMain(requestedSection, options?.force === true)
       .then((result) => {

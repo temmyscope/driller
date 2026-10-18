@@ -1013,7 +1013,9 @@ describe('The switch line clears (replaces the status-clear pin)', () => {
 });
 
 describe('A toggle resets the cluster expansions (replaces the toggle wiring pin)', () => {
-  it('a cluster expanded in Full is a cluster again after Revealed and back', BUDGET, async () => {
+  // P5-d chore: usually 1.2–2.3 s, it overran its ~3 s budget once under
+  // full-suite load (P5-c's run); the doubled budget its siblings use.
+  it('a cluster expanded in Full is a cluster again after Revealed and back', { timeout: 2 * BUDGET.timeout }, async () => {
     const map = syntheticMapForClusters();
     await mountClusters(map);
     const cluster = expandableCluster();
