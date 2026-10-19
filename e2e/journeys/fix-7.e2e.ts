@@ -141,6 +141,10 @@ async function cardFits(page: Page): Promise<CardFit[]> {
         // Every descendant, so a chip inside the wrapping strip counts too.
         const walk = (parent: Element): void => {
           for (const child of Array.from(parent.children)) {
+            // React Flow's connection handles sit ON the card's border by
+            // design (half outside, +2.8 px); they're edge anchors, not
+            // content. Live pass 2026-10-19: they're the only overflow left.
+            if (child.classList.contains('react-flow__handle')) continue;
             const past = child.getBoundingClientRect().right - right;
             if (past > 1) overflowing.push(`${child.tagName.toLowerCase()}.${child.getAttribute('class') ?? ''} +${past.toFixed(1)}px`);
             walk(child);
@@ -213,7 +217,12 @@ export const fix_7: Journey = {
     {
       name: 'P2-4: handleRequest’s callee pill lights its call edges, painted --trace-cyan at 2px',
       run: async ({ page }) => {
-        await card(page, 'handleRequest').first().getByRole('button', { name: /^\d+ calls? — show the callees of handleRequest$/ }).click();
+        // Keyboard, not the mouse: in Full's fixed 260×110 grid the row below
+        // (a 2-line-wrapped "Cloud is selected…" card since P5-f's 320 px cap)
+        // covers this pill, so a mouse can't reach it — deferred-work
+        // "P5-f / Full grid overlap — 2026-10-19" (Ask First: Full's pitch).
+        // P2-4's check is the paint, which the keyboard path exercises alike.
+        await card(page, 'handleRequest').first().getByRole('button', { name: /^\d+ calls? — show the callees of handleRequest$/ }).press('Enter');
         await expectPainted(page, ROUTE.slice(0, 2), '--trace-cyan');
         // The neighbour trace replaced the route: serviceA → repository is no longer lit.
         await expectNotPainted(page, 'serviceA', 'repository', '--trace-cyan');
@@ -278,8 +287,16 @@ export const fix_7: Journey = {
         await switchMode(page, 'PR Review');
         await computeDiffScope(page, SCRATCH_BASE_REF);
         await page.getByRole('status').filter({ hasText: /— 1 changed Node\.$/ }).waitFor({ state: 'visible' });
-        const leaving = await canvas(page).getByRole('group', { name: /^Edge from \S*\bhandleRequest to / }).all();
-        if (leaving.length === 0) throw new Error('no edge leaving handleRequest is drawn');
+        // Fit first: the canvas draws only edges in view, and after FIX-5's
+        // Back and the metrics table opening, handleRequest can sit off-screen
+        // (live pass 2026-10-19: 2 of 3 full runs, "no edge … is drawn").
+        await canvas(page).getByRole('button', { name: 'Fit View', exact: true }).click();
+        const leaving = await eventually(
+          () => canvas(page).getByRole('group', { name: /^Edge from \S*\bhandleRequest to / }).all(),
+          (edges) => edges.length > 0,
+          () => 'no edge leaving handleRequest is drawn',
+          10_000,
+        );
         const targets = await Promise.all(
           leaving.map(async (e) => /\b(\w+)$/.exec((await e.getAttribute('aria-label')) ?? '')?.[1] ?? '?'),
         );

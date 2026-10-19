@@ -45,6 +45,12 @@ export interface IpcCall {
   args?: unknown[];
   /** Page time of the call (ms). */
   at: number;
+  /**
+   * Page time the call's promise settled (ms), once it has. Live pass
+   * 2026-10-19: a journey waiting for a refetch must wait for its reply, not
+   * its start (the Graph Service caches the map only when the fetch lands).
+   */
+  settledAt?: number;
 }
 
 export interface IpcCounter {
@@ -99,25 +105,37 @@ function wrapIpcRendererInvoke(this: unknown[], binding: string): string {
   if (found.length === 0) return 'no ipcRenderer in the isolated world';
   let depth = 0;
   let wrappedCount = 0;
+  let nextId = 0;
   for (const ipc of found) {
     const original = ipc.invoke;
     const wrapped = function (this: unknown, channel: string, ...args: unknown[]) {
       const live = g[binding] as ((payload: string) => void) | undefined;
-      if (depth === 0 && typeof live === 'function') {
+      const counted = depth === 0 && typeof live === 'function';
+      const id = (nextId += 1);
+      if (counted) {
         let payload: string;
         try {
-          payload = JSON.stringify({ channel, args, at: Date.now() });
+          payload = JSON.stringify({ channel, args, at: Date.now(), id });
         } catch {
-          payload = JSON.stringify({ channel, at: Date.now() });
+          payload = JSON.stringify({ channel, at: Date.now(), id });
         }
         live(payload);
       }
       depth += 1;
+      let result: unknown;
       try {
-        return original.call(this, channel, ...args);
+        result = original.call(this, channel, ...args);
       } finally {
         depth -= 1;
       }
+      if (counted && result !== null && typeof result === 'object' && typeof (result as Promise<unknown>).then === 'function') {
+        const settled = () => {
+          const still = g[binding] as ((payload: string) => void) | undefined;
+          if (typeof still === 'function') still(JSON.stringify({ settled: id, at: Date.now() }));
+        };
+        (result as Promise<unknown>).then(settled, settled);
+      }
+      return result;
     };
     try {
       ipc.invoke = wrapped;
@@ -144,13 +162,21 @@ export async function installIpcCounter(page: Page): Promise<IpcCounter> {
   const cdp: CDPSession = await page.context().newCDPSession(page);
   const contexts: ExecutionContextDescription[] = [];
   const recorded: IpcCall[] = [];
+  const ids = new Map<number, IpcCall>();
   const onContext = (event: { context: ExecutionContextDescription }) => contexts.push(event.context);
   const onBinding = (event: { name: string; payload: string }) => {
     if (event.name !== IPC_BINDING) return;
     try {
-      const raw = JSON.parse(event.payload) as { channel: string; args?: unknown[]; at: number };
+      const raw = JSON.parse(event.payload) as { channel: string; args?: unknown[]; at: number; id?: number; settled?: number };
+      if (raw.settled !== undefined) {
+        const call = ids.get(raw.settled);
+        if (call !== undefined) call.settledAt = raw.at;
+        return;
+      }
       if (!known.has(raw.channel)) return; // Electron-internal traffic
-      recorded.push({ method: methods.get(raw.channel) ?? raw.channel, channel: raw.channel, args: raw.args, at: raw.at });
+      const call: IpcCall = { method: methods.get(raw.channel) ?? raw.channel, channel: raw.channel, args: raw.args, at: raw.at };
+      recorded.push(call);
+      if (raw.id !== undefined) ids.set(raw.id, call);
     } catch {
       recorded.push({ method: '(unparsable)', channel: '', at: Date.now() });
     }
@@ -186,7 +212,7 @@ export async function installIpcCounter(page: Page): Promise<IpcCounter> {
   if (status !== 'wrapped') return fail(String(status ?? result.exceptionDetails?.text));
   const calls = async () => {
     await cdp.send('Runtime.evaluate', { expression: '0', contextId: world.id });
-    return [...recorded];
+    return recorded.map((call) => ({ ...call }));
   };
   return {
     calls,

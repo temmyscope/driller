@@ -800,17 +800,21 @@ export function App() {
   }, [commitSessionMap, commitSectionShell]);
 
   // P5-a review round 1: once its re-index has ended, the checkout-moved
-  // notice goes on the next user action (a pointer press or a key).
+  // notice goes on the next user action (a pointer press or a key). The press
+  // clears it when it ENDS (`pointerup`), not when it starts: removing the
+  // notice row on `pointerdown` moved everything below it up mid-press, so
+  // the release landed on another element and the press never became a
+  // click (live pass 2026-10-19: "Compute diff scope" did nothing).
   const headMoveNoticeClears = headMoveNoticeClearsOnUserAction(headMoveNotice);
   useEffect(() => {
     if (!headMoveNoticeClears) {
       return undefined;
     }
     const clear = () => setHeadMoveNotice(null);
-    window.addEventListener('pointerdown', clear, true);
+    window.addEventListener('pointerup', clear, true);
     window.addEventListener('keydown', clear, true);
     return () => {
-      window.removeEventListener('pointerdown', clear, true);
+      window.removeEventListener('pointerup', clear, true);
       window.removeEventListener('keydown', clear, true);
     };
   }, [headMoveNoticeClears]);

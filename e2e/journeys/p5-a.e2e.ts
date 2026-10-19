@@ -11,7 +11,8 @@
  *    `indexed` arrives — the session notice says "Checkout moved … —
  *    re-indexed; compute the diff again.", and no diff notice shows.
  * 2. PR Review against `main` then reports all 7 changed contracts (the
- *    status line's count, and all 7 in the metrics table, which is not
+ *    status line's count, and all 7 in the metrics table — captioned
+ *    "Changed contracts" when contract-only (P4-3g) — which is not
  *    capped; the toolbar list is, at 5 + "+2 more"). Review round 1: no
  *    assertion on a "top-level code changed" line — that leftover is a
  *    separate deferred-work finding (2026-10-11) P5-a does not touch.
@@ -22,13 +23,15 @@
  *
  * "Indexed" is observed as the renderer's refetch (`getCodeMap`, counted by
  * the IPC counter): it only refetches on a new `indexed` for the open project.
+ * Live pass 2026-10-19: the wait is for that refetch's REPLY (`settledAt`),
+ * since the Graph Service caches the Nodes a diff reads only when it lands.
  */
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 
 import { createSevenTypesFixture, git, SCRATCH_BASE_REF, SEVEN_TYPES_BRANCH, SEVEN_TYPE_NAMES } from '../fixtureProject';
 import type { Journey, JourneyContext } from '../journey';
-import { card, computeDiffScope, landingStep, mapShowsStep, openProjectStep, switchMode, until } from './common';
+import { computeDiffScope, getCodeMapCalls, landingStep, mapShowsStep, metricsTable, openProjectStep, switchMode, until, waitForMapRefetch } from './common';
 
 const state = { projectPath: '', mapRefetches: 0 };
 
@@ -48,16 +51,9 @@ function headOf(dir: string): string {
 const driftError = (indexed: string, current: string) =>
   `The checkout changed since this project was indexed (HEAD ${indexed.slice(0, 7)} → ${current.slice(0, 7)}). Re-indexing now — compute the diff scope again when the map refreshes.`;
 
-async function getCodeMapCalls(ctx: JourneyContext): Promise<number> {
-  return (await ctx.ipc.calls()).filter((call) => call.method === 'getCodeMap').length;
-}
-
-/** Waits for the renderer's refetch after a new `indexed`; the map stays mounted throughout. */
+/** Waits for the refetch after a new `indexed` to land; the map stays mounted throughout. */
 async function waitForReindexRefresh(ctx: JourneyContext, from: number): Promise<void> {
-  await until(async () => {
-    if ((await card(ctx.page, 'handleRequest').count()) === 0) throw new Error('the map unmounted during the re-index');
-    return (await getCodeMapCalls(ctx)) > from;
-  }, 'no map refetch: the re-index never reached `indexed`');
+  await waitForMapRefetch(ctx, from);
   await until(
     async () => (await ctx.page.getByText('Re-indexing — the map shows the last completed index until it finishes.').count()) === 0,
     'still re-indexing',
@@ -69,7 +65,7 @@ async function expectSevenContracts(ctx: JourneyContext): Promise<void> {
   const line = ctx.page.getByRole('status').filter({ hasText: /— 7 contracts changed\b/ });
   await line.waitFor({ state: 'visible' });
   for (const name of SEVEN_TYPE_NAMES) {
-    await ctx.page.getByRole('table', { name: /risk metrics/ }).getByRole('button', { name: `Open the type detail of ${name}`, exact: true }).first().waitFor({ state: 'visible' });
+    await metricsTable(ctx.page).getByRole('button', { name: `Open the type detail of ${name}`, exact: true }).first().waitFor({ state: 'visible' });
   }
 }
 

@@ -98,7 +98,30 @@ describe('App: the checkout-moved notice (P5-a review round 1)', () => {
     assert.ok(!shows(REINDEXING));
 
     fireEvent.pointerDown(window);
+    fireEvent.pointerUp(window);
     await waitFor(() => assert.ok(!shows('Checkout moved'), 'cleared by the next user action'), FIND);
+  });
+
+  // Live pass 2026-10-19 (e2e p5-a, p1-5-6): clearing on pointerdown removed
+  // the notice row mid-press, so the toolbar below moved 52 px up between
+  // mousedown and mouseup and the press on "Compute diff scope" never became
+  // a click (0 computeDiffScope calls). The notice stays through the press
+  // and goes when it ends, after the browser has hit-tested the release.
+  it('a finished notice stays through a pointer press and goes when the press ends, so the pressed control keeps its place', BUDGET, async () => {
+    const fake = appFake();
+    render(<App />);
+    await openAndIndex(fake);
+    act(() => fake.emit.onGraphServiceStatus(indexing(MOVE)));
+    act(() => fake.emit.onGraphServiceStatus(indexed(MOVE)));
+    await waitFor(() => assert.ok(shows(REINDEXED), sessionNotice().textContent ?? ''), FIND);
+
+    const control = screen.getByRole('button', { name: 'Close project' });
+    fireEvent.pointerDown(control);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(shows(REINDEXED), 'still shown while the pointer is down (no layout shift under the press)');
+
+    fireEvent.pointerUp(control);
+    await waitFor(() => assert.ok(!shows('Checkout moved'), 'cleared once the press ends'), FIND);
   });
 
   it('a failed HEAD-triggered re-index says so; an ordinary re-index shows no checkout notice', BUDGET, async () => {

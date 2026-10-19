@@ -108,7 +108,11 @@ export async function computeDiffScope(page: Page, baseRef: string): Promise<voi
   await toolbar.getByRole('button', { name: 'Compute diff scope', exact: true }).click();
 }
 
-export const metricsTable = (page: Page) => page.getByRole('table', { name: /risk metrics/ });
+/**
+ * PR Review's metrics table, by its caption (`prReviewMetricsCaption`): "…risk
+ * metrics…", or "Changed contracts" for a contract-only table (P4-3g).
+ */
+export const metricsTable = (page: Page) => page.getByRole('table', { name: /risk metrics|^Changed contracts$/ });
 
 export interface MetricsRow {
   node: string;
@@ -149,4 +153,31 @@ export const canvas = (page: Page) => page.getByRole('application');
 export async function cardNames(page: Page): Promise<string[]> {
   const cards = canvas(page).getByRole('button', { name: /, open Node detail$/ });
   return Promise.all((await cards.all()).map(async (c) => (await c.getAttribute('aria-label')) ?? ''));
+}
+
+/** How many `getCodeMap` calls the renderer has made so far. */
+export async function getCodeMapCalls(ctx: JourneyContext): Promise<number> {
+  return (await ctx.ipc.calls()).filter((call) => call.method === 'getCodeMap').length;
+}
+
+/**
+ * Waits until a `getCodeMap` call after the first `from` has SETTLED (its
+ * reply landed), with the map mounted throughout. Live pass 2026-10-19: the
+ * renderer refetches on `indexed`, and the Graph Service caches the Nodes a
+ * diff is computed against only when that fetch lands (~4 s on the fixture);
+ * a diff in between is "No project has finished indexing yet."
+ */
+export async function waitForMapRefetch(ctx: JourneyContext, from: number, mountedCard = 'handleRequest'): Promise<void> {
+  await until(async () => {
+    // `includeHidden`: when the refetched map lands, React Flow re-measures
+    // its cards with `visibility: hidden` for one frame (~7 ms, live pass
+    // 2026-10-19) — still mounted, which is what P0-3 asks.
+    const mounted = canvas(ctx.page).getByRole('button', {
+      name: new RegExp(`^\\S+ ${escapeRegExp(mountedCard)}(,[^]*)?, open Node detail$`),
+      includeHidden: true,
+    });
+    if ((await mounted.count()) === 0) throw new Error('the map unmounted during the re-index');
+    const fetches = (await ctx.ipc.calls()).filter((call) => call.method === 'getCodeMap').slice(from);
+    return fetches.some((call) => call.settledAt !== undefined);
+  }, 'no settled map refetch: the re-index never reached `indexed`, or its map never arrived');
 }
