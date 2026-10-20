@@ -38,6 +38,7 @@ import type {
   RiskSignal,
 } from '@driller/ipc-contracts';
 import { listEntryCandidates } from '@driller/graph-contracts';
+import { communityLayout } from '../communityLayout';
 import { generateSyntheticCodeMap } from '../devFixture';
 
 function fn(file: string, name: string, startLine: number, endLine: number): CodeMapNode {
@@ -475,4 +476,25 @@ export function sharedReachListing(pinnedIds: readonly string[] = []): FoundList
     throw new Error(`the shared-reach map lists ${listing.status}`);
   }
   return listing;
+}
+
+/**
+ * Where Full lays each card of `map` out — the community layout
+ * (`communityLayout.ts`), exactly as `positionOf` hands it to `layoutNodes`.
+ *
+ * Use this rather than `layoutPosition` to build an expected position or an
+ * expected first fit: Full stopped laying cards out in a grid of the fetched
+ * order when the community layout landed, and a test that still computes
+ * the old grid is asserting a layout the app no longer has.
+ *
+ * No card size is passed because the DOM tests measure every card at
+ * `NODE_CARD_FALLBACK_WIDTH`×`NODE_CARD_FALLBACK_HEIGHT`, which is exactly
+ * the grid pitch, so a measured card sits where an unmeasured one does
+ * (`communityLayout.test.ts` pins that).
+ */
+export function fullMapPositions(
+  map: CodeMapOk,
+  foldedCardIds: readonly string[] = [],
+): ReadonlyMap<string, { x: number; y: number }> {
+  return communityLayout({ nodes: map.nodes, edges: map.edges, extraCardIds: foldedCardIds }).positions;
 }

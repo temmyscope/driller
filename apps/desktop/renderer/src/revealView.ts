@@ -26,41 +26,25 @@ import {
 } from '@driller/ipc-contracts';
 
 import type { CanvasPopulation } from './CodeMap';
+import { layeredPositions, type LayeredCardSize } from './layered';
 
-// No LOD/layout library yet (Design Notes: acceptable at this phase's real
-// scale) — a plain deterministic grid, roughly square, is enough to lay the
-// full fetched Node set out without overlap. P4-7d: declared here (and
-// re-exported by `CodeMap.tsx`, where every existing importer reads them) so
-// this pure module needs no value import from the React component module —
-// the Full grid (`layoutPosition`) and the Revealed columns (`layeredLayout`)
-// share one spacing.
-export const NODE_COLUMN_GAP = 260;
-export const NODE_ROW_GAP = 110;
-
+// The grid spacing and the card pitch now live in `layered.ts`, with the
+// layered placement that uses them, so the Code Map's Full map can reuse one
+// definition instead of a second copy (see that module's header). They are
+// re-exported here under their original names — `CodeMap.tsx` re-exports
+// `NODE_COLUMN_GAP`/`NODE_ROW_GAP` from here in turn, and several tests read
+// `revealCardPitch`/`RevealCardSize` from here — so no importer changed.
+// The dependency runs one way only: this module imports `layered.ts`, never
+// the reverse.
+export {
+  NODE_COLUMN_GAP,
+  NODE_ROW_GAP,
+  CARD_GAP_Y as REVEAL_CARD_GAP_Y,
+  CARD_GAP_X as REVEAL_CARD_GAP_X,
+  cardPitch as revealCardPitch,
+} from './layered';
 /** FIX-7: a Revealed card's drawn size, as React Flow measured it. */
-export interface RevealCardSize {
-  width: number;
-  height: number;
-}
-
-/** FIX-7: the least space between a Revealed card and the one below it (the grid's own: 110 − an 80 px card is 30). */
-export const REVEAL_CARD_GAP_Y = 24;
-
-/** FIX-7: the least space between a Revealed column's widest card and the next column (the grid's own: 260 − 200 is 60). */
-export const REVEAL_CARD_GAP_X = 60;
-
-/**
- * FIX-7: the room a Revealed card takes in `layeredLayout` — its row's
- * height and its share of its column's width: its size plus the gaps, never
- * less than the grid pitch. Positions depend on sizes only through this, so
- * a new measurement that leaves it unchanged needs no re-layout. Pure.
- */
-export function revealCardPitch(size: RevealCardSize | undefined): { row: number; column: number } {
-  return {
-    row: Math.max(NODE_ROW_GAP, (size?.height ?? 0) + REVEAL_CARD_GAP_Y),
-    column: Math.max(NODE_COLUMN_GAP, (size?.width ?? 0) + REVEAL_CARD_GAP_X),
-  };
-}
+export type RevealCardSize = LayeredCardSize;
 
 /** The two views of the Code Map canvas. Session state, default `'full'` (never persisted — Ask First). */
 export type RevealViewMode = 'full' | 'revealed';
@@ -359,7 +343,9 @@ export function layeredLayout(
       pinRankById.set(candidate.id, pinRankById.size);
     }
   }
-  const byDepth = new Map<number, { cardId: string; entry: RevealEntry }[]>();
+  // Deduped in entry order, which is also where a `node`'s reach is learned —
+  // a repeated card keeps the first entry's, as it always has.
+  const entries: { cardId: string; entry: RevealEntry }[] = [];
   const seen = new Set<string>();
   for (const entry of state.entries) {
     const cardId = revealEntryCardId(entry);
@@ -370,53 +356,23 @@ export function layeredLayout(
     if (entry.kind === 'node' && !reachById.has(entry.id)) {
       reachById.set(entry.id, entry.reach);
     }
-    const column = byDepth.get(entry.depth);
-    if (column === undefined) {
-      byDepth.set(entry.depth, [{ cardId, entry }]);
-    } else {
-      column.push({ cardId, entry });
-    }
+    entries.push({ cardId, entry });
   }
-  const rowOf = new Map<string, number>();
-  const positions = new Map<string, { x: number; y: number }>();
-  const parentRow = (entry: RevealEntry): number => {
-    const parentId = entry.parentId;
-    return parentId === null ? -1 : (rowOf.get(parentId) ?? -1);
-  };
   const reachOf = (entry: RevealEntry): number => (entry.kind === 'node' ? (reachById.get(entry.id) ?? 0) : 0);
   // A pinned candidate's rank in pin order; every other entry ranks after all pins.
   const pinRankOf = (entry: RevealEntry): number =>
     entry.kind === 'node' && entry.parentId === null ? (pinRankById.get(entry.id) ?? pinRankById.size) : pinRankById.size;
-  let columnX = 0;
-  let previousDepth: number | null = null;
-  let previousColumnWidth = 0;
-  for (const depth of [...byDepth.keys()].sort((a, b) => a - b)) {
-    // Columns are consecutive depths in practice; a gap still advances one pitch per missing depth.
-    columnX =
-      previousDepth === null
-        ? depth * NODE_COLUMN_GAP
-        : columnX + previousColumnWidth + (depth - previousDepth - 1) * NODE_COLUMN_GAP;
-    const column = [...(byDepth.get(depth) ?? [])].sort(
-      (a, b) =>
-        parentRow(a.entry) - parentRow(b.entry) ||
-        ENTRY_KIND_RANK[a.entry.kind] - ENTRY_KIND_RANK[b.entry.kind] ||
-        pinRankOf(a.entry) - pinRankOf(b.entry) ||
-        reachOf(b.entry) - reachOf(a.entry) ||
-        compareIds(a.cardId, b.cardId),
-    );
-    let rowY = 0;
-    let columnWidth = NODE_COLUMN_GAP;
-    column.forEach(({ cardId }, row) => {
-      rowOf.set(cardId, row);
-      positions.set(cardId, { x: columnX, y: rowY });
-      const pitch = revealCardPitch(cardSizeOf(cardId));
-      rowY += pitch.row;
-      columnWidth = Math.max(columnWidth, pitch.column);
-    });
-    previousDepth = depth;
-    previousColumnWidth = columnWidth;
-  }
-  return positions;
+  // `layeredPositions` orders by parent row, then these ranks ascending, then
+  // id — so reach, which ranks descending, is negated.
+  return layeredPositions(
+    entries.map(({ cardId, entry }) => ({
+      cardId,
+      depth: entry.depth,
+      parentId: entry.parentId,
+      ranks: [ENTRY_KIND_RANK[entry.kind], pinRankOf(entry), -reachOf(entry)],
+    })),
+    cardSizeOf,
+  ).positions;
 }
 
 /** `revealedPopulation`'s result: the population to draw, plus its map Nodes (the cards `layoutNodes` lays out). */

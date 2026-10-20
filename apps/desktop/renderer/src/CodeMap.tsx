@@ -130,6 +130,8 @@ import { diffScopeSyncTimeFor, mapFooterState, type MapFooterState } from './app
 import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
+import { samePositions, type CommunityStructure } from './communityLayout';
+import { fullGridOf, fullStructureOf, type FullGrid } from './fullLayout';
 import { SECTION_SWITCH_UNAVAILABLE_HINT, selectedSectionTabId } from './SectionBar';
 import {
   loadEntryPins,
@@ -1974,6 +1976,13 @@ export function FoundTraceSteps({
 export function layoutPosition(index: number, nodeCount: number): { x: number; y: number } {
   const columns = Math.max(1, Math.ceil(Math.sqrt(nodeCount)));
   return { x: (index % columns) * NODE_COLUMN_GAP, y: Math.floor(index / columns) * NODE_ROW_GAP };
+}
+
+/** FIX-7 / P5-f: whether the view is still exactly `mark` (a fit no pan, zoom or centring has moved since). */
+export function sameViewport(current: Viewport, mark: Viewport): boolean {
+  return (
+    Math.abs(current.x - mark.x) < 0.5 && Math.abs(current.y - mark.y) < 0.5 && Math.abs(current.zoom - mark.zoom) < 1e-6
+  );
 }
 
 export function layoutNodes(
@@ -9270,6 +9279,12 @@ export function CodeMap({
   // still current (`handleNodesChange`), so the fit covers the cards as drawn.
   const revealFitMarkRef = useRef<{ viewport: Viewport; state: RevealState | null } | null>(null);
   const revealDrawnStateRef = useRef<RevealState | null>(null);
+  // P5-f founder decision (2026-10-19): the viewport the last automatic Full
+  // fit set (the first fit, a toggle's fit, or a re-fit), for the map it was
+  // fitted on. A Full re-layout from measured card sizes fits again only
+  // while the view is still exactly that (no pan, zoom or centring since).
+  const fullFitMarkRef = useRef<{ viewport: Viewport; key: string | null; mapStamp: readonly CodeMapEdge[] | null } | null>(null);
+  const fullRefitPendingRef = useRef(false);
   // The current view, project/section key and map fetch, for the toggle
   // handler below (synced each render, further down).
   const revealViewRef = useRef<RevealViewMode>('full');
@@ -10786,8 +10801,61 @@ export function CodeMap({
   // grid pitch never causes one, and a re-layout (positions only) never loops.
   const revealCardSizesRef = useRef(new Map<string, RevealCardSize>());
   const [revealCardSizesVersion, setRevealCardSizesVersion] = useState(0);
+  // P5-f founder decision (2026-10-19): Full's cards too — each drawn card's
+  // measured size, so the community layout spaces Full's columns and rows by
+  // what is drawn (a capped, wrapping card is taller than the 110 px pitch).
+  // Recorded only while Full is drawn, per map (cleared when the project or
+  // section changes). React Flow hands over a ResizeObserver batch at a time;
+  // a batch re-lays out only when it actually moves a card (`samePositions`).
+  const fullCardSizesRef = useRef(new Map<string, RevealCardSize>());
+  const fullCardSizesKeyRef = useRef<string | null>(null);
+  const [fullCardSizesVersion, setFullCardSizesVersion] = useState(0);
+  const fullGridRef = useRef<FullGrid | null>(null);
+  const recordFullCardSizes = useCallback((changes: NodeChange<CodeMapAnyFlowNode>[]) => {
+    const full = fullGridRef.current;
+    if (full === null) {
+      return;
+    }
+    const sizes = fullCardSizesRef.current;
+    let recorded = false;
+    for (const change of changes) {
+      if (change.type !== 'dimensions' || change.dimensions === undefined || !full.idSet.has(change.id)) {
+        continue;
+      }
+      const before = sizes.get(change.id);
+      const { width, height } = change.dimensions;
+      if (before !== undefined && Math.abs(before.width - width) < 1 && Math.abs(before.height - height) < 1) {
+        continue;
+      }
+      sizes.set(change.id, { width, height });
+      recorded = true;
+    }
+    if (!recorded) {
+      return;
+    }
+    // Re-place the same communities with the new sizes; a re-render is owed
+    // only when a card actually moved. `samePositions` is what stops the
+    // measure/re-layout loop (it replaces `sameGridSpacing`, whose row and
+    // column pitch arrays a block layout has no equivalent of).
+    const next = fullGridOf(full.structure, [], full.extraCardIds, (id) => sizes.get(id));
+    if (samePositions(next.positions, full.positions)) {
+      return;
+    }
+    // The fit was computed on the layout before these sizes: while the view
+    // is still that fit, over the same map, fit again over the new layout.
+    const mark = fullFitMarkRef.current;
+    const current = reactFlowInstanceRef.current?.getViewport();
+    fullRefitPendingRef.current =
+      mark !== null &&
+      current !== undefined &&
+      mark.key === revealMapRef.current.key &&
+      mark.mapStamp === revealMapRef.current.mapStamp &&
+      sameViewport(current, mark.viewport);
+    setFullCardSizesVersion((version) => version + 1);
+  }, []);
   const handleNodesChange = useCallback((changes: NodeChange<CodeMapAnyFlowNode>[]) => {
     if (!revealDrawnRef.current) {
+      recordFullCardSizes(changes);
       return;
     }
     const sizes = revealCardSizesRef.current;
@@ -10816,9 +10884,7 @@ export function CodeMap({
       mark !== null &&
       current !== undefined &&
       mark.state === revealDrawnStateRef.current &&
-      Math.abs(current.x - mark.viewport.x) < 0.5 &&
-      Math.abs(current.y - mark.viewport.y) < 0.5 &&
-      Math.abs(current.zoom - mark.viewport.zoom) < 1e-6
+      sameViewport(current, mark.viewport)
     ) {
       revealViewRequestRef.current = {
         target: 'revealed',
@@ -10827,7 +10893,7 @@ export function CodeMap({
       };
     }
     setRevealCardSizesVersion((version) => version + 1);
-  }, []);
+  }, [recordFullCardSizes]);
   const revealMapStamp = fetchState.status === 'ready' ? fetchState.edges : null;
   const revealSection = fetchState.status === 'ready' ? (fetchState.section ?? null) : null;
   const currentRevealKey =
@@ -10971,6 +11037,35 @@ export function CodeMap({
     capText: revealDrawn ? revealCapText(revealHeld, currentRevealKey) : null,
   });
 
+  // Full's layout (Full only — Revealed has `layeredLayout`). The partition
+  // is memoized on the fetched map by itself, so a batch of card
+  // measurements re-places the cards without re-running it.
+  if (fullCardSizesKeyRef.current !== currentRevealKey) {
+    fullCardSizesKeyRef.current = currentRevealKey;
+    fullCardSizesRef.current = new Map();
+  }
+  const fullStructure = useMemo<CommunityStructure | null>(
+    () =>
+      revealDrawn || fetchState.status !== 'ready'
+        ? null
+        : fullStructureOf(population.riskNodes, population.riskEdges),
+    [revealDrawn, fetchState.status, population],
+  );
+  const fullGrid = useMemo<FullGrid | null>(() => {
+    if (fullStructure === null) {
+      return null;
+    }
+    const sizes = fullCardSizesRef.current;
+    return fullGridOf(
+      fullStructure,
+      population.riskNodes,
+      population.foldedNodes.map((folded) => folded.id),
+      (id) => sizes.get(id),
+    );
+    // `fullCardSizesVersion`: a batch of sizes that moved a card; `currentRevealKey`: the map's sizes were cleared.
+  }, [fullStructure, population, fullCardSizesVersion, currentRevealKey]);
+  fullGridRef.current = fullGrid;
+
   const flowNodes = useMemo(
     () =>
       fetchState.status === 'ready'
@@ -10990,6 +11085,12 @@ export function CodeMap({
               population.foldedNodes,
               activateFoldedNode,
               contractDependentsById,
+              fullGrid === null
+                ? undefined
+                : // The community layout places every card; `layoutPosition`
+                  // stays the fallback for one it somehow did not, exactly as
+                  // Revealed's `layeredLayout` has one.
+                  (id, index) => fullGrid.positions.get(id) ?? layoutPosition(index, fullGrid.gridSize),
             )
           : layoutNodes(
               revealCanvas.population.mapNodes,
@@ -11015,6 +11116,7 @@ export function CodeMap({
       fetchState.status,
       population,
       revealCanvas,
+      fullGrid,
       activateNode,
       showNeighbors,
       openSourceForNode,
@@ -11771,11 +11873,49 @@ export function CodeMap({
     }
     initialFitRef.current = completeInitialFit(projectPath, shownSection);
     const nextViewport = { x: next.x, y: next.y, zoom: next.zoom };
+    // P5-f: a first fit of Full may be redone once its cards are measured.
+    fullFitMarkRef.current = revealDrawn
+      ? null
+      : { viewport: nextViewport, key: revealMapRef.current.key, mapStamp: revealMapRef.current.mapStamp };
     void instance.setViewport(nextViewport);
     setViewport(nextViewport);
     setAwaitingFirstFit(false);
     return undefined;
   }, [canvasInitCount, initialFitRetry, lodInputNodes, containerSize, measuredViewportSize, projectPath, shownSection, revealDrawn]);
+
+  // P5-f founder decision (2026-10-19): Full's cards were measured after its
+  // automatic fit and spread the grid (`recordFullCardSizes`), while the view
+  // was still exactly that fit: fit again over the measured layout, as the
+  // first fit would have. A pan, zoom, centring or route fit since then means
+  // the view never moves. The re-fit is a fit too, so a later batch (cards
+  // newly on screen after it) may refine it while nothing else has moved.
+  useLayoutEffect(() => {
+    if (!fullRefitPendingRef.current) {
+      return;
+    }
+    fullRefitPendingRef.current = false;
+    const instance = reactFlowInstanceRef.current;
+    const mark = fullFitMarkRef.current;
+    if (instance === null || mark === null || revealDrawn || !sameViewport(instance.getViewport(), mark.viewport)) {
+      return;
+    }
+    const fit = initialViewport({
+      nodes: lodInputNodes,
+      cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
+      viewport: measuredViewportSize(),
+      minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
+      maxZoom: MAP_MAX_ZOOM,
+      lodThreshold: LOD_ZOOM_THRESHOLD,
+    });
+    if (fit === null) {
+      return;
+    }
+    const next = { x: fit.x, y: fit.y, zoom: fit.zoom };
+    fullFitMarkRef.current = { ...mark, viewport: next };
+    routeFitSeqRef.current += 1;
+    void instance.setViewport(next);
+    setViewport(next);
+  }, [lodInputNodes, revealDrawn, measuredViewportSize]);
 
   // P4-7d (review round 1): applies the view an explicit toggle owes
   // (`changeRevealView`, or a refresh's re-fit) once its cards are laid out,
@@ -11824,6 +11964,11 @@ export function CodeMap({
     // FIX-7: a fit into Revealed may be redone once its cards are measured.
     revealFitMarkRef.current =
       decision.kind === 'fit' && revealDrawn ? { viewport: next, state: revealDrawnStateRef.current } : null;
+    // P5-f: so may a fit into Full (never a restored view).
+    fullFitMarkRef.current =
+      decision.kind === 'fit' && !revealDrawn
+        ? { viewport: next, key: revealMapRef.current.key, mapStamp: revealMapRef.current.mapStamp }
+        : null;
     void instance.setViewport(next);
     setViewport(next);
   }, [mode, revealDrawn, revealHeld, currentRevealKey, lodInputNodes, revealMapStamp, awaitingFirstFit, measuredViewportSize]);

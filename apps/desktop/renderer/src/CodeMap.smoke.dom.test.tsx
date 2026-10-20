@@ -22,7 +22,6 @@ import { act, render, screen, waitFor } from '@testing-library/react';
 import {
   CodeMap,
   initialViewport,
-  layoutPosition,
   LOD_ZOOM_THRESHOLD,
   MAP_MAX_ZOOM,
   NODE_CARD_FALLBACK_HEIGHT,
@@ -32,7 +31,7 @@ import {
 } from './CodeMap';
 import type { MapFooterState } from './appFrame';
 import { createFakeDrillerApi, type FakeDrillerApi } from './test/fakeDrillerApi';
-import { FIXTURE_NODES, FIXTURE_PROJECT_PATH, pathTraceBasicMap, syntheticMap, type CodeMapOk } from './test/mapFixture';
+import { fullMapPositions, FIXTURE_NODES, FIXTURE_PROJECT_PATH, pathTraceBasicMap, syntheticMap, type CodeMapOk } from './test/mapFixture';
 
 afterEach(cleanupAfterEach);
 
@@ -76,10 +75,10 @@ function flowNodeOf(element: HTMLElement): HTMLElement | null {
   return element.closest<HTMLElement>('.react-flow__node');
 }
 
-/** The fit `CodeMap` owes a container of `width`×`height` for an `n`-Node grid map. */
-function expectedFirstFit(nodeCount: number, width: number, height: number): string {
+/** The fit `CodeMap` owes a container of `width`×`height` for `map`, laid out as Full lays it out. */
+function expectedFirstFit(map: CodeMapOk, width: number, height: number): string {
   const fit = initialViewport({
-    nodes: Array.from({ length: nodeCount }, (_, index) => ({ id: String(index), position: layoutPosition(index, nodeCount) })),
+    nodes: [...fullMapPositions(map)].map(([id, position]) => ({ id, position })),
     cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
     viewport: { width, height },
     minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
@@ -109,8 +108,8 @@ describe('CodeMap (DOM smoke)', () => {
     const fixture = pathTraceBasicMap();
     // The first fit is the one a 1200×800 container calls for — not React
     // Flow's 500×500 placeholder, and not the unfitted identity.
-    const fitted = expectedFirstFit(fixture.nodes.length, elementSize.width, elementSize.height);
-    assert.notEqual(fitted, expectedFirstFit(fixture.nodes.length, 500, 500));
+    const fitted = expectedFirstFit(fixture, elementSize.width, elementSize.height);
+    assert.notEqual(fitted, expectedFirstFit(fixture, 500, 500));
     await waitFor(() => assert.equal(viewportTransform(), fitted), FIND);
     assert.notEqual(canvas.style.visibility, 'hidden', 'the canvas is shown once fitted');
 
@@ -128,7 +127,7 @@ describe('CodeMap (DOM smoke)', () => {
     elementSize.set(600, 400);
     renderCodeMap();
     await screen.findByText(FIXTURE_NODES.handleRequest.name, { selector: '.react-flow__node *' }, FIND);
-    const fitted = expectedFirstFit(7, 600, 400);
+    const fitted = expectedFirstFit(pathTraceBasicMap(), 600, 400);
     await waitFor(() => assert.equal(viewportTransform(), fitted), FIND);
 
     // `CodeMap`'s canvas and map frames, React Flow's container and its Node

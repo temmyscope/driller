@@ -23,10 +23,8 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import type { CodeMapResult, EntryCandidatesResult, PathTraceResult } from '@driller/ipc-contracts';
 import type { MapFooterState } from './appFrame';
 import {
-  canvasGridSize,
   CodeMap,
   initialViewport,
-  layoutPosition,
   LOD_ZOOM_THRESHOLD,
   MAP_MAX_ZOOM,
   NODE_CARD_FALLBACK_HEIGHT,
@@ -60,6 +58,7 @@ import {
   syntheticMap,
   type CodeMapOk,
   type SectionName,
+  fullMapPositions,
 } from './test/mapFixture';
 
 afterEach(cleanupAfterEach);
@@ -232,10 +231,9 @@ function fitTransform(positions: readonly { x: number; y: number }[]): string {
   return `translate(${fit.x}px,${fit.y}px) scale(${fit.zoom})`;
 }
 
-/** Where Full lays out each Node of a map (`layoutPosition` over the fetched order, as `layoutNodes` without `positionOf`). */
-function fullGrid(map: CodeMapOk): Map<string, { x: number; y: number }> {
-  const gridSize = canvasGridSize(map.nodes.length, 0);
-  return new Map(map.nodes.map((node, index) => [node.id, layoutPosition(index, gridSize)]));
+/** Where Full lays out each Node of a map — the community layout, as `positionOf` hands it to `layoutNodes`. */
+function fullGrid(map: CodeMapOk): ReadonlyMap<string, { x: number; y: number }> {
+  return fullMapPositions(map);
 }
 
 /** Waits for an animated viewport move (React Flow's `setCenter`/route fit) to end. */

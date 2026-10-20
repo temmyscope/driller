@@ -32,7 +32,6 @@ import {
   CodeMap,
   CROSS_SECTION_MISS_TEXT_ID,
   initialViewport,
-  layoutPosition,
   LOD_ZOOM_THRESHOLD,
   MAP_MAX_ZOOM,
   NODE_CARD_FALLBACK_HEIGHT,
@@ -43,7 +42,7 @@ import {
 } from './CodeMap';
 import { SectionBar } from './SectionBar';
 import { createFakeDrillerApi, deferred, type Deferred, type DrillerStubs, type FakeDrillerApi } from './test/fakeDrillerApi';
-import { SECTION_NODES, sectionedMap, syntheticMap, type CodeMapOk, type SectionName } from './test/mapFixture';
+import { fullMapPositions, SECTION_NODES, sectionedMap, syntheticMap, type CodeMapOk, type SectionName } from './test/mapFixture';
 
 // `cleanupAfterEach` also lets a viewport animation still running finish (bounded) before the unmount.
 afterEach(cleanupAfterEach);
@@ -1019,9 +1018,9 @@ describe('CodeMap: Path Trace and the diff are sent with the section on screen (
 });
 
 describe('CodeMap: per-section first fit and empty notice (replaces the sectionBar CodeMap pins)', () => {
-  function expectedFit(nodeCount: number): string {
+  function expectedFit(map: CodeMapOk): string {
     const fit = initialViewport({
-      nodes: Array.from({ length: nodeCount }, (_, index) => ({ id: String(index), position: layoutPosition(index, nodeCount) })),
+      nodes: [...fullMapPositions(map)].map(([id, position]) => ({ id, position })),
       cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
       viewport: { width: elementSize.width, height: elementSize.height },
       minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
@@ -1035,20 +1034,21 @@ describe('CodeMap: per-section first fit and empty notice (replaces the sectionB
   it('each section’s map gets its own first fit', BUDGET, async () => {
     // `api` has 2 Nodes; `web` 40, which a 2-Node fit would leave off screen.
     const web = syntheticMap({ nodes: 40 });
+    const api = sectionedMap('api');
     codeMapFake({
       getCodeMap: async (section) =>
         section === 'web'
           ? { ...web, appliedScope: ['api', 'web'], section: 'web', sections: sectionedMap('web').sections }
-          : sectionedMap('api'),
+          : api,
     });
     const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
     await findCard(S.handler.name);
-    await waitFor(() => assert.equal(viewportTransform(), expectedFit(2)), FIND);
+    await waitFor(() => assert.equal(viewportTransform(), expectedFit(api)), FIND);
 
     rerender(<CodeMap {...props({ section: 'web' })} />);
     await waitFor(() => assert.ok(drawnNames().some((id) => id.startsWith('fixture://'))), FIND);
-    assert.notEqual(expectedFit(40), expectedFit(2));
-    await waitFor(() => assert.equal(viewportTransform(), expectedFit(40)), FIND);
+    assert.notEqual(expectedFit(web), expectedFit(api));
+    await waitFor(() => assert.equal(viewportTransform(), expectedFit(web)), FIND);
   });
 
   it('an empty section names the section, never the indexing-scope notice', BUDGET, async () => {
