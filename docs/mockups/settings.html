@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>driller — Settings</title>
+<style>
+/*
+  RESOLVED SYNTHESIS — Settings (this pass, 2026-09-23)
+  Governed by: DESIGN.md § Components ("Backend config control / External
+  editor control — standard Settings-surface form controls... no bespoke
+  treatment beyond this system's base tokens"); EXPERIENCE.md § Component
+  Patterns (Backend config control, External editor control, Actionable
+  Notice), § State Patterns (Cloud selected/no key, PR-bot tool not found).
+  No source mockup composes this surface — assembled directly from already-
+  decided components/tokens, no new pattern invented, per DESIGN.md's own
+  note. A modal overlay, since EXPERIENCE.md describes Settings as "a
+  persistent affordance (any surface)," not a dedicated route.
+*/
+:root{
+  --bg:#0a0f0d; --panel:#0e1613; --panel-alt:#0c1210;
+  --border:#1e2b26; --border-strong:#2c3f37;
+  --text:#cfe0d4; --text-dim:#7d9488; --text-mute:#4c5f55;
+  --accent:#39d98a; --risk-amber:#e8a33d;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0; padding:40px 24px 80px; background:var(--bg);
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color:var(--text); display:flex; flex-direction:column; align-items:center; gap:14px;
+}
+.frame{width:640px; background:var(--panel); border:1px solid var(--border-strong); box-shadow:0 0 0 1px #000, 0 20px 60px rgba(0,0,0,.6);}
+.titlebar{display:flex; align-items:center; padding:9px 14px; background:var(--panel-alt); border-bottom:1px solid var(--border); font-size:12px; color:var(--text);}
+.titlebar .close{margin-left:auto; color:var(--text-mute); font-size:11px;}
+fieldset{border:none; margin:0; padding:14px 18px; border-bottom:1px solid var(--border);}
+legend{font-size:9.5px; color:var(--text-mute); text-transform:uppercase; letter-spacing:.04em; padding:0; margin-bottom:8px;}
+.radio-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--text-dim); margin-bottom:7px;}
+.radio-row input{accent-color:var(--accent);}
+.radio-row.selected{color:var(--text);}
+.hint{font-size:10px; color:var(--text-mute); margin:4px 0 0 22px; line-height:1.5;}
+.key-field{margin:8px 0 0 22px; display:flex; gap:8px;}
+.key-field input{background:var(--panel-alt); border:1px solid var(--border-strong); color:var(--text-mute); font-family:inherit; font-size:11px; padding:6px 8px; flex:1;}
+.key-field button, .action-btn{background:transparent; border:1px solid var(--border-strong); color:var(--text-dim); font-family:inherit; font-size:10.5px; padding:6px 10px; cursor:default;}
+.checkbox-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--text-dim); margin-bottom:6px;}
+.checkbox-row input{accent-color:var(--accent);}
+.disclosure{margin:6px 0 10px 22px; padding:8px 12px; border-left:2px solid var(--risk-amber); background:var(--panel-alt); font-size:10px; color:var(--text-dim); line-height:1.5;}
+.disclosure .confirm{display:inline-block; margin-top:6px; border:1px solid var(--risk-amber); color:var(--risk-amber); padding:3px 8px; font-size:10px;}
+</style>
+</head>
+<body>
+
+<div class="frame">
+  <div class="titlebar">Settings<span class="close">[esc] close</span></div>
+
+  <fieldset>
+    <legend>Summary backend</legend>
+    <label class="radio-row selected"><input type="radio" name="backend" checked>Local model (on-device)</label>
+    <label class="radio-row"><input type="radio" name="backend">Cloud (bring your own key)</label>
+    <div class="hint">Switching regenerates summaries only — the graph index is untouched.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>External editor</legend>
+    <label class="radio-row"><input type="radio" name="editor">VS Code</label>
+    <label class="radio-row"><input type="radio" name="editor">JetBrains</label>
+    <label class="radio-row selected"><input type="radio" name="editor" checked>System default</label>
+    <div class="hint">Only VS Code / JetBrains jump to the exact line. System default opens the file through the OS's generic association and cannot jump to a line.</div>
+  </fieldset>
+
+  <fieldset style="border-bottom:none;">
+    <legend>PR-bot ingestion (per project)</legend>
+    <label class="checkbox-row"><input type="checkbox">CodeRabbit</label>
+    <label class="checkbox-row" checked><input type="checkbox" checked>Qodo / PR-Agent</label>
+    <div class="disclosure">
+      Enabling Qodo runs its CLI against this project's PR diff locally. Findings are ingested as a distinct signal family, shown with their origin tool — never merged into deterministic or AI-judgment signals.
+      <span class="confirm">Enable Qodo</span>
+    </div>
+    <button class="action-btn">Run ingestion now</button>
+  </fieldset>
+</div>
+
+</body>
+</html>

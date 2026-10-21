@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>driller — Direction: Terminal Native</title>
+<style>
+/*
+  DIRECTION: TERMINAL NATIVE
+  ---------------------------------------------------------------
+  Hex palette (all colors used in this file):
+  --bg            #0a0f0d   page/app background, near-black w/ green cast
+  --panel         #0e1613   node + panel fill
+  --panel-alt     #0c1210   status bar / input fill
+  --border        #1e2b26   hairline borders (default)
+  --border-strong #2c3f37   hairline borders (hover/focus-weight)
+  --text          #cfe0d4   primary text
+  --text-dim      #7d9488   secondary text (summaries, paths)
+  --text-mute     #4c5f55   tertiary text (hints, placeholders)
+  --accent        #39d98a   bright terminal green — changed/diff/prompt
+  --accent-dim    #1f6b45   affected/blast-radius ring (desaturated accent)
+  --risk-amber    #e8a33d   measured risk overlay (blast radius, complexity)
+  --risk-red      #ef5350   measured risk overlay, severe (coverage gap)
+  --llm-violet    #b48ce0   LLM-judgment badge — visually distinct family
+  --stale-yellow  #d9c65a   staleness indicator
+  --trace-cyan    #4fd8e0   path trace route highlight
+*/
+:root{
+  --bg:#0a0f0d; --panel:#0e1613; --panel-alt:#0c1210;
+  --border:#1e2b26; --border-strong:#2c3f37;
+  --text:#cfe0d4; --text-dim:#7d9488; --text-mute:#4c5f55;
+  --accent:#39d98a; --accent-dim:#1f6b45;
+  --risk-amber:#e8a33d; --risk-red:#ef5350;
+  --llm-violet:#b48ce0; --stale-yellow:#d9c65a; --trace-cyan:#4fd8e0;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0; padding:40px 24px 80px; background:var(--bg);
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color:var(--text);
+  display:flex; flex-direction:column; align-items:center; gap:28px;
+}
+.rationale{
+  max-width:920px; font-size:13px; line-height:1.6; color:var(--text-dim);
+  border-left:2px solid var(--accent); padding:10px 16px; background:var(--panel-alt);
+}
+.rationale b{color:var(--text); font-weight:600;}
+.frame{
+  width:1200px; background:var(--panel); border:1px solid var(--border-strong);
+  box-shadow:0 0 0 1px #000, 0 20px 60px rgba(0,0,0,.6);
+}
+.titlebar{
+  display:flex; align-items:center; gap:10px; padding:7px 12px;
+  background:var(--panel-alt); border-bottom:1px solid var(--border);
+  font-size:11px; color:var(--text-mute);
+}
+.titlebar .dots span{display:inline-block;width:8px;height:8px;margin-right:4px;background:var(--border-strong);}
+.titlebar .dots span:nth-child(1){background:#4a4a4a;}
+.titlebar .path{color:var(--text-dim);}
+.titlebar .branch{margin-left:auto; color:var(--accent);}
+.tabbar{
+  display:flex; gap:0; border-bottom:1px solid var(--border); background:var(--panel-alt);
+}
+.tab{
+  padding:9px 18px; font-size:12px; color:var(--text-mute); border-right:1px solid var(--border);
+  cursor:default;
+}
+.tab.active{color:var(--bg); background:var(--accent); font-weight:600;}
+.searchrow{
+  display:flex; align-items:center; gap:10px; padding:10px 14px;
+  border-bottom:1px solid var(--border); background:var(--bg);
+}
+.searchrow .prompt{color:var(--accent); font-size:13px;}
+.searchrow input{
+  flex:1; background:transparent; border:none; color:var(--text-mute);
+  font-family:inherit; font-size:13px; outline:none;
+}
+.searchrow .hint{font-size:11px; color:var(--text-mute); border:1px solid var(--border); padding:2px 6px;}
+.statusline{
+  display:flex; gap:18px; padding:6px 14px; font-size:11px; color:var(--text-mute);
+  background:var(--panel-alt); border-bottom:1px solid var(--border);
+}
+.statusline b{color:var(--text-dim); font-weight:500;}
+.legend{display:flex; gap:14px; align-items:center;}
+.legend .sw{display:inline-block;width:8px;height:8px;margin-right:4px;vertical-align:middle;}
+.canvas-wrap{position:relative; width:1200px; height:600px; overflow:hidden;
+  background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size:40px 40px; background-position:-1px -1px; opacity:1;
+}
+.canvas-wrap svg{position:absolute; top:0; left:0; z-index:1;}
+.node{
+  position:absolute; width:214px; background:var(--panel);
+  border:1px solid var(--border-strong); z-index:2; padding:10px 11px 9px;
+}
+.node .mod{font-size:10px; color:var(--text-mute); margin-bottom:2px;}
+.node .fn{font-size:13px; color:var(--text); font-weight:600; margin-bottom:5px;}
+.node .fn .paren{color:var(--text-mute); font-weight:400;}
+.node .sum{font-size:10.5px; color:var(--text-dim); line-height:1.45; margin-bottom:7px;}
+.badges{display:flex; flex-wrap:wrap; gap:4px;}
+.badge{font-size:9.5px; padding:2px 5px; border:1px solid; line-height:1.5; white-space:nowrap;}
+.badge.risk{color:var(--risk-amber); border-color:#5c4520; background:rgba(232,163,61,.08);}
+.badge.risk.sev{color:var(--risk-red); border-color:#5c2320; background:rgba(239,83,80,.08);}
+.badge.coderabbit{color:var(--risk-amber); border-color:#5c4520; background:rgba(232,163,61,.08);}
+.badge.llm{color:var(--llm-violet); border-color:#4a2f5c; background:rgba(180,140,224,.08); font-style:italic;}
+.badge.stale{color:var(--stale-yellow); border-color:#5c5520; background:rgba(217,198,90,.08);}
+.node.changed{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent);}
+.node.changed .mod::before{content:"● CHANGED  "; color:var(--accent); font-weight:700;}
+.node.affected{border-color:var(--accent-dim); border-style:dashed;}
+.node.dim{opacity:.42;}
+.cursor{display:inline-block;width:7px;height:13px;background:var(--accent);animation:blink 1.1s steps(1) infinite; vertical-align:-2px;}
+@keyframes blink{0%,49%{opacity:1;}50%,100%{opacity:0;}}
+.canvas-label{position:absolute; font-size:10px; color:var(--text-mute); z-index:2;}
+.footerbar{display:flex; justify-content:space-between; padding:6px 14px; font-size:10.5px; color:var(--text-mute); background:var(--panel-alt); border-top:1px solid var(--border);}
+.section-label{max-width:1200px; font-size:11px; color:var(--text-mute); letter-spacing:.04em; text-transform:uppercase; margin-top:10px;}
+.frame.secondary{width:1200px;}
+.canvas-wrap.small{height:340px;}
+.node.small{padding:7px 9px 6px; width:176px;}
+.node.small .fn{font-size:11.5px;}
+.node.small .sum{display:none;}
+.trace-pill{position:absolute; z-index:3; background:var(--trace-cyan); color:#04211f; font-size:10px; font-weight:700; padding:2px 6px; border:1px solid #04211f;}
+</style>
+</head>
+<body>
+
+<div class="rationale">
+  <b>Terminal Native.</b> Built for the engineer who lives in a multiplexer: sharp corners, monospace everything, a dot-grid canvas like a schematic notebook, and a status/tab bar borrowed straight from tmux. Density is high and chrome is minimal — nothing here reads as "dashboard," it reads as a tool you'd `open` next to a shell. A blinking cursor in the trace prompt is the only motion, implying a live, always-ready command line rather than an animated product.
+</div>
+
+<div class="frame">
+  <div class="titlebar">
+    <span class="dots"><span></span><span></span><span></span></span>
+    <span class="path">driller — code-map.sock</span>
+    <span class="branch">fix/session-refresh-charge-retry</span>
+  </div>
+  <div class="tabbar">
+    <div class="tab active">[1] PR Review Mode</div>
+    <div class="tab">[2] Health Audit Mode</div>
+  </div>
+  <div class="searchrow">
+    <span class="prompt">trace&gt;</span>
+    <input type="text" readonly value="" placeholder="Path Trace — e.g. POST /checkout, PaymentService.charge">
+    <span class="cursor"></span>
+    <span class="hint">⏎ trace</span>
+  </div>
+  <div class="statusline">
+    <span><b>Diff scope</b> #482 · 2 changed nodes</span>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--accent)"></i>changed</span>
+      <span><i class="sw" style="background:var(--accent-dim);border:1px dashed var(--accent-dim)"></i>blast radius</span>
+      <span><i class="sw" style="background:var(--risk-amber)"></i>risk overlay</span>
+      <span><i class="sw" style="background:var(--llm-violet)"></i>AI judgment</span>
+      <span><i class="sw" style="background:var(--stale-yellow)"></i>stale summary</span>
+    </div>
+  </div>
+
+  <div class="canvas-wrap">
+    <span class="canvas-label" style="left:82px; top:250px;">api/routes/</span>
+    <svg width="1200" height="600">
+      <defs>
+        <marker id="arrow1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#3d5148"/></marker>
+      </defs>
+      <line x1="290" y1="300" x2="345" y2="215" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="440" y1="185" x2="620" y2="300" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="730" y1="300" x2="620" y2="440" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="620" y1="510" x2="800" y2="590" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="835" y1="300" x2="835" y2="240" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="945" y1="270" x2="1035" y2="150" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="945" y1="330" x2="1035" y2="330" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+      <line x1="945" y1="380" x2="1035" y2="470" stroke="#3d5148" stroke-width="1.5" marker-end="url(#arrow1)"/>
+    </svg>
+
+    <div class="node dim" style="left:60px; top:280px;">
+      <div class="mod">api/routes/checkout.ts</div>
+      <div class="fn">POST /checkout</div>
+      <div class="sum">Route entry — validates session, then hands off to order creation.</div>
+      <div class="badges"></div>
+    </div>
+
+    <div class="node changed" style="left:330px; top:130px;">
+      <div class="mod">auth/middleware</div>
+      <div class="fn">validateSession<span class="paren">()</span></div>
+      <div class="sum">Confirms JWT signature, refreshes session cookie, attaches user to request context.</div>
+      <div class="badges">
+        <span class="badge stale">⏱ STALE · 3 commits behind</span>
+        <span class="badge llm">✦ AI: TTL edge case unhandled after refresh</span>
+      </div>
+    </div>
+
+    <div class="node affected" style="left:610px; top:270px;">
+      <div class="mod">orders/</div>
+      <div class="fn">OrderController.createOrder<span class="paren">()</span></div>
+      <div class="sum">Builds order from cart, coordinates inventory reserve and payment capture.</div>
+      <div class="badges"></div>
+    </div>
+
+    <div class="node dim" style="left:610px; top:430px;">
+      <div class="mod">inventory/</div>
+      <div class="fn">InventoryService.reserveStock<span class="paren">()</span></div>
+      <div class="sum">Locks stock quantities for cart items ahead of payment capture.</div>
+      <div class="badges"></div>
+    </div>
+
+    <div class="node dim" style="left:790px; top:565px;">
+      <div class="mod">cache/</div>
+      <div class="fn">CacheClient.get<span class="paren">()</span></div>
+      <div class="sum">Redis GET with short-lived local memo.</div>
+      <div class="badges"></div>
+    </div>
+
+    <div class="node changed" style="left:790px; top:150px;">
+      <div class="mod">billing/</div>
+      <div class="fn">PaymentService.charge<span class="paren">()</span></div>
+      <div class="sum">Captures payment via Stripe, applies fraud score, triggers receipt.</div>
+      <div class="badges">
+        <span class="badge risk">◆ Blast Radius: 14 callers</span>
+        <span class="badge risk sev">◆ Coverage Gap: 38%</span>
+        <span class="badge coderabbit">▤ CodeRabbit: possible null on retry path</span>
+      </div>
+    </div>
+
+    <div class="node affected" style="left:1035px; top:90px;">
+      <div class="mod">billing/stripe</div>
+      <div class="fn">StripeClient.createCharge<span class="paren">()</span></div>
+      <div class="sum">Wraps Stripe Charges API, retries on 5xx.</div>
+      <div class="badges"></div>
+    </div>
+
+    <div class="node affected" style="left:1035px; top:280px;">
+      <div class="mod">fraud/</div>
+      <div class="fn">riskScorer.evaluate<span class="paren">()</span></div>
+      <div class="sum">Scores transaction risk from velocity and device signals.</div>
+      <div class="badges">
+        <span class="badge risk">◆ Complexity: cyclomatic 21</span>
+      </div>
+    </div>
+
+    <div class="node affected" style="left:1035px; top:440px;">
+      <div class="mod">notifications/</div>
+      <div class="fn">NotificationService.sendReceipt<span class="paren">()</span></div>
+      <div class="sum">Queues receipt email via notification worker.</div>
+      <div class="badges"></div>
+    </div>
+  </div>
+  <div class="footerbar">
+    <span>9 nodes · 8 edges rendered</span>
+    <span>NORMAL · code-map.sock</span>
+  </div>
+</div>
+
+<div class="section-label">Secondary state — Path Trace executed for "POST /checkout"</div>
+<div class="frame secondary">
+  <div class="titlebar">
+    <span class="dots"><span></span><span></span><span></span></span>
+    <span class="path">driller — code-map.sock</span>
+    <span class="branch">fix/session-refresh-charge-retry</span>
+  </div>
+  <div class="searchrow">
+    <span class="prompt">trace&gt;</span>
+    <input type="text" readonly value="POST /checkout">
+    <span class="hint">6 hops</span>
+  </div>
+  <div class="canvas-wrap small">
+    <svg width="1200" height="340">
+      <defs><marker id="arrow2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--trace-cyan)"/></marker></defs>
+      <line x1="230" y1="120" x2="350" y2="120" stroke="var(--trace-cyan)" stroke-width="2" marker-end="url(#arrow2)"/>
+      <line x1="510" y1="120" x2="630" y2="120" stroke="var(--trace-cyan)" stroke-width="2" marker-end="url(#arrow2)"/>
+      <line x1="790" y1="120" x2="910" y2="120" stroke="var(--trace-cyan)" stroke-width="2" marker-end="url(#arrow2)"/>
+      <line x1="1070" y1="120" x2="1150" y2="120" stroke="var(--trace-cyan)" stroke-width="2" marker-end="url(#arrow2)"/>
+    </svg>
+    <div class="trace-pill" style="left:70px; top:98px;">1</div>
+    <div class="node small" style="left:70px; top:120px; border-color:var(--trace-cyan);"><div class="mod">routes/</div><div class="fn">POST /checkout</div></div>
+    <div class="trace-pill" style="left:350px; top:98px;">2</div>
+    <div class="node small" style="left:350px; top:120px; border-color:var(--trace-cyan);"><div class="mod">auth/middleware</div><div class="fn">validateSession()</div></div>
+    <div class="trace-pill" style="left:630px; top:98px;">3</div>
+    <div class="node small" style="left:630px; top:120px; border-color:var(--trace-cyan);"><div class="mod">orders/</div><div class="fn">createOrder()</div></div>
+    <div class="trace-pill" style="left:910px; top:98px;">4</div>
+    <div class="node small" style="left:910px; top:120px; border-color:var(--trace-cyan);"><div class="mod">billing/</div><div class="fn">PaymentService.charge()</div></div>
+    <div class="node small dim" style="left:1080px; top:230px;"><div class="mod">billing/stripe</div><div class="fn">createCharge() ⏎ hop 5</div></div>
+  </div>
+  <div class="footerbar"><span>route: checkout.ts → validateSession → createOrder → charge → createCharge → sendReceipt</span><span>TRACE</span></div>
+</div>
+
+</body>
+</html>

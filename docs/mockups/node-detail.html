@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>driller — Node Detail</title>
+<style>
+/*
+  RESOLVED SYNTHESIS — Node detail (this pass, 2026-09-23)
+  Governed by: DESIGN.md § Components (node-card, badge family, staleness-
+  indicator, coverage-gap-indicator, actionable-notice); EXPERIENCE.md
+  § Information Architecture (Node detail row: "Summary, staleness state,
+  risk signals, one-click-to-source"), § Interaction Primitives ("One click
+  to source"), § Component Patterns (Signal strip, Staleness Indicator).
+  No source mockup composes this surface — assembled directly from already-
+  decided components/tokens per DESIGN.md's own note, no new pattern
+  invented. Renders as a right-side panel, map kept dimmed behind it, per
+  EXPERIENCE.md: "Selecting a Node opens Node detail without leaving map
+  context (FR-4)."
+*/
+:root{
+  --bg:#0a0f0d; --panel:#0e1613; --panel-alt:#0c1210;
+  --border:#1e2b26; --border-strong:#2c3f37;
+  --text:#cfe0d4; --text-dim:#7d9488; --text-mute:#4c5f55;
+  --accent:#39d98a; --risk-amber:#e8a33d; --risk-red:#ef5350;
+  --llm-violet:#b48ce0; --stale-yellow:#d9c65a;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0; padding:40px 24px 80px; background:var(--bg);
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color:var(--text); display:flex; flex-direction:column; align-items:center; gap:14px;
+}
+.frame{width:1200px; height:600px; background:var(--panel); border:1px solid var(--border-strong); box-shadow:0 0 0 1px #000, 0 20px 60px rgba(0,0,0,.6); display:flex;}
+.map-dim{flex:1; background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px); background-size:40px 40px; opacity:.35; position:relative;}
+.map-dim::after{content:"Code Map (dimmed, still in view)"; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:var(--text-mute); font-size:11px;}
+.panel{width:400px; border-left:1px solid var(--border-strong); background:var(--panel); display:flex; flex-direction:column;}
+.panel-head{padding:12px 16px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:flex-start;}
+.panel-head .close{color:var(--text-mute); font-size:12px; cursor:default;}
+.mod{font-size:9.5px; color:var(--text-mute); margin-bottom:3px;}
+.fn{font-size:16px; color:var(--text); font-weight:600;}
+.fn .paren{color:var(--text-mute); font-weight:400;}
+.section{padding:12px 16px; border-bottom:1px solid var(--border);}
+.section .label{font-size:9.5px; color:var(--text-mute); text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px;}
+.summary{font-size:11px; color:var(--text-dim); line-height:1.6;}
+.stale-row{display:flex; align-items:center; gap:8px; font-size:10.5px; color:var(--stale-yellow); margin-top:8px;}
+.stale-row .glyph{font-weight:700;}
+.regen{margin-top:8px; font-size:10px; color:var(--text-mute); border:1px solid var(--border-strong); padding:4px 8px; display:inline-block; cursor:default;}
+.badges{display:flex; flex-wrap:wrap; gap:6px;}
+.badge{font-size:9.5px; padding:3px 8px; border-radius:9999px; font-weight:700; white-space:nowrap;}
+.badge.risk{color:#241a04; background:var(--risk-amber);}
+.badge.risk.sev{color:#2a0a0a; background:var(--risk-red);}
+.badge.finding{color:#241a04; background:var(--risk-amber);}
+.badge.llm{color:#241635; background:var(--llm-violet); font-style:italic;}
+.source-action{margin:auto 16px 16px; padding:9px 12px; border:1px solid var(--accent); color:var(--accent); font-size:11px; text-align:center; cursor:default;}
+.coverage-note{font-size:10.5px; color:var(--risk-red); display:flex; gap:8px; align-items:flex-start; margin-top:4px;}
+</style>
+</head>
+<body>
+
+<div class="frame">
+  <div class="map-dim"></div>
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <div class="mod">billing/</div>
+        <div class="fn">PaymentService.charge<span class="paren">()</span></div>
+      </div>
+      <span class="close">[esc] close</span>
+    </div>
+
+    <div class="section">
+      <div class="label">Summary</div>
+      <div class="summary">Captures payment via Stripe, applies fraud score, triggers receipt. Called from OrderController.createOrder() after inventory reservation succeeds.</div>
+    </div>
+
+    <div class="section">
+      <div class="label">Risk Overlay</div>
+      <div class="badges">
+        <span class="badge risk">◆ Blast Radius: 14 callers</span>
+        <span class="badge risk sev">◆ Coverage Gap: 38%</span>
+        <span class="badge finding">▤ CodeRabbit: possible null on retry path</span>
+      </div>
+      <div class="coverage-note">◆ Coverage incomplete for this file — read source directly for the ungapped 62%.</div>
+    </div>
+
+    <div class="section">
+      <div class="label">Staleness</div>
+      <div class="stale-row"><span class="glyph">⏱</span> Not stale — generated after the most recent change to this range.</div>
+      <div class="regen">↻ Regenerate on demand</div>
+    </div>
+
+    <div class="section" style="border-bottom:none; flex:1;">
+      <div class="label">Location</div>
+      <div style="font-size:10.5px; color:var(--text-dim);">billing/payment-service.ts — lines 42–71</div>
+    </div>
+
+    <div class="source-action">↗ Open source in configured editor</div>
+  </div>
+</div>
+
+</body>
+</html>
