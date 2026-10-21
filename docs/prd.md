@@ -1,6 +1,6 @@
 # Product Requirements: driller
 
-> Living PRD, tracked in-repo so requirements evolve alongside the code. Distilled from the founder's original [product brief](../../_bmad-output/planning-artifacts/briefs/brief-driller-2026-09-02/brief.md) and [full PRD](../../_bmad-output/planning-artifacts/prds/prd-driller-2026-09-03/prd.md) (2026-09-03), which remain the historical record of *how* these requirements were derived. This file is the current source of truth — update it directly as requirements change; don't fork a v2 alongside it.
+> Living PRD, tracked in-repo so requirements evolve alongside the code. Distilled in September 2026 from the founder's original product brief and full PRD, which are no longer kept anywhere — everything they established was folded into this file, so it is both the current requirements and the only surviving record of them. Update it directly as requirements change; don't fork a v2 alongside it.
 >
 > See [README.md](README.md) for how this fits with the other docs in this folder.
 
@@ -57,7 +57,7 @@ v1 ships as a single Electron desktop application, open-source, built to be used
 
 ## 4. Functional Requirements
 
-Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capability to Architecture Map](arc42.md#capability-to-architecture-map) and by the sprint tracker in `_bmad-output/implementation-artifacts/sprint-status.yaml`.
+Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capability to Architecture Map](arc42.md#capability-to-architecture-map) and by [status.md](status.md), which records what is actually built against each one.
 
 ### 4.1 Project Load & Indexing
 - **FR1 — Load Local Project.** Open a local folder as a driller project. Detects a git repo at the folder root or a parent/child folder and confirms before indexing; shows indexing progress within 5s of folder selection; persists a recent-projects list.
@@ -104,7 +104,7 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 
 ## 6. UX Requirements
 
-Full behavioral and visual design detail lives in the UX design spine (`_bmad-output/planning-artifacts/ux-designs/ux-driller-2026-09-03/`); this section captures only the requirements that constrain scope.
+Full behavioral and visual design detail lives in [EXPERIENCE.md](EXPERIENCE.md) (interaction, journeys, states) and [DESIGN.md](DESIGN.md) (the visual system and its tokens); this section captures only the requirements that constrain scope.
 
 - Dark-first color mode is the primary design target; light mode is secondary/derived.
 - Every code identifier renders in monospace, everywhere, without exception.
@@ -126,7 +126,7 @@ Full behavioral and visual design detail lives in the UX design spine (`_bmad-ou
 
 ## 8. MVP Scope
 
-**In scope for v1**, organized as delivery epics (full story-level breakdown and current status: `_bmad-output/planning-artifacts/epics.md` and `_bmad-output/implementation-artifacts/sprint-status.yaml`):
+**In scope for v1**, organized as delivery epics (what is actually built against each, and what is still open or unverified: [status.md](status.md)):
 
 1. **Open a Project and Explore Its Code Map** — FR1–FR6, FR10, FR16, FR17. The foundational map-before-code experience.
 2. **See Where the Risk Is** — FR7–FR9. Deterministic, LLM-judgment, and ingested-finding overlays.

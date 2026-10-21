@@ -1,6 +1,6 @@
 # Architecture: driller
 
-> Living architecture documentation for driller, following the [arc42](https://arc42.org) template. Distilled from the founder's original [Architecture Spine](../../_bmad-output/planning-artifacts/architecture/architecture-driller-2026-09-03/ARCHITECTURE-SPINE.md) (2026-09-04), which remains the historical record of *why* these decisions were made. This file is the current source of truth for architecture — update it directly as decisions change or new ones are made; don't fork a v2 alongside it.
+> Living architecture documentation for driller, following the [arc42](https://arc42.org) template. Distilled in September 2026 from the founder's original architecture spine, which is no longer kept anywhere — this file is the only surviving record of these decisions, so it carries the *why* as well as the *what*. It is the current source of truth for architecture — update it directly as decisions change or new ones are made; don't fork a v2 alongside it.
 >
 > Requirements (FRs/NFRs referenced throughout) are defined in [prd.md](prd.md). See [README.md](README.md) for how this fits with the other docs in this folder.
 
@@ -200,7 +200,7 @@ AD-2 holds for a community exactly as for an LOD cluster: **its id is renderer-l
 
 ## 9. Architecture Decisions
 
-Full rationale, "prevents" framing, and binding scope for each decision lives in the [original Architecture Spine](../../_bmad-output/planning-artifacts/architecture/architecture-driller-2026-09-03/ARCHITECTURE-SPINE.md) — reproduced here as a condensed index so this document stays the single place to look up *what's decided*, while that file remains the record of *why*. Update both only if a decision materially changes; otherwise treat the spine as frozen history and this table as current.
+This table is the condensed index of *what's decided* — one row per decision, so there is a single place to look one up. The reasoning, the "prevents" framing and each decision's binding scope live in the sections above (chiefly [§4](#4-solution-strategy) and [§8](#8-crosscutting-concepts)), which are where a row's *why* is written down and where an amendment is recorded alongside it. Update a row only when the decision itself materially changes; a correction to how a decision was implemented belongs in §8 with its date.
 
 | AD | Decision |
 | --- | --- |

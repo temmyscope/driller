@@ -6,8 +6,8 @@
  * Path Trace, and the pre-map Recent Projects/Open Folder screen) — this
  * is still the app's only stylesheet.
  *
- * Every color/radius/font value below traces to a named DESIGN.md token
- * (`_bmad-output/planning-artifacts/ux-designs/ux-driller-2026-09-03/DESIGN.md`).
+ * Every color/radius/font value below traces to a named token in
+ * `docs/DESIGN.md`.
  * P3-13 adds `--border-control`: every outlined control and text input
  * edges with it (≥ 3:1); `--border`/`--border-strong` are decorative only.
  *

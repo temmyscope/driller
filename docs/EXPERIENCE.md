@@ -2,8 +2,7 @@
 name: driller
 status: final
 sources:
-  - _bmad-output/planning-artifacts/prds/prd-driller-2026-09-03/prd.md
-  - _bmad-output/planning-artifacts/briefs/brief-driller-2026-09-02/brief.md
+  - prd.md
 updated: 2026-09-23
 ---
 

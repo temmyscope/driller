@@ -1175,7 +1175,7 @@ export interface PrBotConfig {
  * Exists because CBM's `index_repository` has no subfolder include/exclude
  * parameter of its own — only a single whole-root `repo_path` plus its own
  * gitignore-style exclusions — so a mixed repo (real source alongside
- * unrelated tooling/docs/scripts, e.g. BMad planning files) has no way to
+ * unrelated tooling, docs, generated output or scripts) has no way to
  * tell driller which subfolders are actually "the codebase" without this.
  *
  * `includedPaths` are POSIX-relative to the project root (e.g. `["web",
