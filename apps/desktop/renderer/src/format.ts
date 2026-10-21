@@ -26,3 +26,21 @@ export function formatCount(count: number, singular: string, plural: string): st
 export function formatMapCounts(nodes: number, edges: number): string {
   return `${formatCount(nodes, 'Node', 'Nodes')} · ${formatCount(edges, 'edge', 'edges')}`;
 }
+
+/**
+ * Review fix (Story 1.9, Phase 3): every candidate in one `ambiguous`
+ * result shares the exact same `name` by construction (that's why they're
+ * ambiguous) — rendering `candidate.name` alone would make two candidates
+ * indistinguishable, defeating the point of disambiguation. `candidate.id`
+ * is the Node's qualified name (path + symbol, AD-19), so this strips just
+ * the trailing `.<name>` symbol segment (when present) to surface the
+ * distinguishing file/location part alone, e.g. an id of
+ * `…fixtures/path-trace-basic.utilA.helper` for a `helper` candidate
+ * becomes `…fixtures/path-trace-basic.utilA` — falls back to the full `id`
+ * verbatim if it doesn't end with that exact suffix (a defensive case, not
+ * one the current qualified-name scheme is expected to hit).
+ */
+export function formatCandidateLocation(candidate: { id: string; name: string }): string {
+  const symbolSuffix = `.${candidate.name}`;
+  return candidate.id.endsWith(symbolSuffix) ? candidate.id.slice(0, -symbolSuffix.length) : candidate.id;
+}
