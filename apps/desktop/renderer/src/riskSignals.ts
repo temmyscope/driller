@@ -34,9 +34,11 @@ import type {
 /**
  * Story 2.1 (Phase 3): one distinct shape glyph per `DeterministicRiskSignalType`
  * — Accessibility Floor requires shape distinction, never color alone. The
- * five values are geometrically distinct on sight (●/■/▲/◆/⊘) so Story
+ * six values are geometrically distinct on sight (●/■/▲/◆/⊘/⇄) so Story
  * 2.2/2.3's own future families can pick their own equally-distinct shapes
- * without colliding with these (Design Notes). Rendered `aria-hidden` inside
+ * without colliding with these (Design Notes). `⇄` reads as the two-way
+ * movement co-change describes, and shares no stroke with the other five or
+ * with `SEVERE_SIGNAL_GLYPH`. Rendered `aria-hidden` inside
  * each chip — the chip's own `aria-label` carries the accessible name, not
  * this glyph.
  */
@@ -46,6 +48,7 @@ export const DETERMINISTIC_SIGNAL_ICONS: Record<DeterministicRiskSignalType, str
   hotspot: '▲',
   'blast-radius': '◆',
   'test-coverage-gap': '⊘',
+  'co-change': '⇄',
 };
 
 /**
@@ -60,6 +63,8 @@ const DETERMINISTIC_SIGNAL_LABELS: Record<DeterministicRiskSignalType, string> =
   hotspot: 'Hotspot',
   'blast-radius': 'Blast radius',
   'test-coverage-gap': 'Test coverage gap',
+  // Says what the number counts, so the chip cannot read as a score.
+  'co-change': 'Changes with',
 };
 
 /**

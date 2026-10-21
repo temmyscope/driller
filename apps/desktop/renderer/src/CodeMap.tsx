@@ -89,6 +89,7 @@ import type {
   ChangedContract,
   CodeMapEdge,
   CodeMapResult,
+  CoChangingFile,
   CodeMapNode,
   DiffScopeResult,
   FileTopLevelUse,
@@ -4988,6 +4989,7 @@ export const NODE_DETAIL_SECTION_HEADING_IDS = {
   fileTopLevel: 'code-map-node-detail-file-top-level-heading',
   uses: 'code-map-node-detail-uses-heading',
   similar: 'code-map-node-detail-similar-heading',
+  coChange: 'code-map-node-detail-co-change-heading',
   crossSectionCalls: 'code-map-node-detail-cross-section-calls-heading',
   entryPin: 'code-map-node-detail-entry-pin-heading',
   sharedReach: 'code-map-node-detail-shared-reach-heading',
@@ -6143,6 +6145,81 @@ export function NodeTestedBy({
   );
 }
 
+/** How many "Changes with" rows Node detail shows before "+N more". */
+export const NODE_DETAIL_CO_CHANGE_ROWS = 5;
+
+/**
+ * The honest-copy line under "Changes with".
+ *
+ * It must not suggest a structural link. These two files have moved together
+ * in git history; neither necessarily calls, imports or depends on the other,
+ * and saying otherwise would invent a relationship the graph does not have.
+ */
+export const CO_CHANGE_DISCLAIMER =
+  'From git history: these files have changed in the same commits. It does not mean one uses the other.';
+
+/** A co-changing file's history as shown — "32 commits together, 0.89 of the time". */
+export function formatCoChange(entry: CoChangingFile): string {
+  // Floored, so a 0.996 never reads as a flat 1.00; the score is a ratio the
+  // backend computed, never a percentage driller derived.
+  const score = (Math.floor(entry.score * 100 + 1e-9) / 100).toFixed(2);
+  return `${formatCount(entry.coChanges, 'commit', 'commits')} together, ${score} of the time`;
+}
+
+/** The full count: `coChangesWithTotal`, never below what is carried. */
+function coChangeTotal(node: Pick<CodeMapNode, 'coChangesWith' | 'coChangesWithTotal'>): number {
+  return Math.max(node.coChangesWithTotal ?? 0, node.coChangesWith?.length ?? 0);
+}
+
+/** The section heading — "Changes with (N)", N the full count. */
+export function coChangeHeading(node: Pick<CodeMapNode, 'coChangesWith' | 'coChangesWithTotal'>): string {
+  return `Changes with (${coChangeTotal(node)})`;
+}
+
+/**
+ * The files this Node's file moves with. The first
+ * `NODE_DETAIL_CO_CHANGE_ROWS`, then a native `<details>` for the rest, and
+ * always the honest-copy line. Paths only: a file is not a map Node, so
+ * there is nothing to navigate to and no link is offered. Hookless.
+ */
+export function NodeCoChanges({ node }: { node: Pick<CodeMapNode, 'coChangesWith' | 'coChangesWithTotal'> }) {
+  const entries = node.coChangesWith ?? [];
+  const total = coChangeTotal(node);
+  const shown = entries.slice(0, NODE_DETAIL_CO_CHANGE_ROWS);
+  const rest = entries.slice(NODE_DETAIL_CO_CHANGE_ROWS);
+  const more = total - shown.length;
+  const rows = (list: readonly CoChangingFile[]) =>
+    list.map((entry) => (
+      <li key={entry.file} className="code-map__node-detail-co-change-row">
+        <code className="code-map__node-detail-co-change-file">{entry.file}</code>
+        <span className="code-map__node-detail-co-change-history">{formatCoChange(entry)}</span>
+      </li>
+    ));
+  return (
+    <>
+      <ul className="code-map__node-detail-co-change" aria-label="Changes with">
+        {rows(shown)}
+      </ul>
+      {more > 0 && (
+        <details className="code-map__more">
+          <summary>+{more} more</summary>
+          {rest.length > 0 && (
+            <ul className="code-map__node-detail-co-change code-map__more-list" aria-label="Changes with, continued">
+              {rows(rest)}
+            </ul>
+          )}
+          {entries.length < total && (
+            <p className="code-map__more-list">
+              Showing the first {entries.length} of {total}.
+            </p>
+          )}
+        </details>
+      )}
+      <p className="code-map__node-detail-co-change-note">{CO_CHANGE_DISCLAIMER}</p>
+    </>
+  );
+}
+
 /** P4-2 phase 4: how many "Similar implementations" rows Node detail shows before "+N more". */
 export const NODE_DETAIL_SIMILAR_ROWS = 5;
 
@@ -6435,6 +6512,17 @@ export function NodeDetailBody({
             resolveMapNode={resolveMapNode}
             onNavigateToNode={onNavigateToNode}
           />
+        </section>
+      )}
+      {/* The files this one moves with, from the index's FILE_CHANGES_WITH
+          edges only. Only when there are any, so a project with no git
+          history shows no section. History, not structure. */}
+      {(node.coChangesWith?.length ?? 0) > 0 && (
+        <section className="code-map__node-detail-section" aria-labelledby={ids.coChange}>
+          <h3 id={ids.coChange} className="code-map__node-detail-label">
+            {coChangeHeading(node)}
+          </h3>
+          <NodeCoChanges node={node} />
         </section>
       )}
       {/* P4-4 phase 3b: callees in other sections — real whole-scope CALLS

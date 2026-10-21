@@ -72,7 +72,7 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 - **FR6 — Summary Backend Configuration.** Configurable local/on-device model or bring-your-own-key cloud provider. v1 ships at least one of each. No code content is transmitted to any driller-operated server under either configuration. Switching backend regenerates summaries only, never the graph index.
 
 ### 4.4 Risk & complexity overlay
-- **FR7 — Deterministic Signal Overlay.** Complexity, Blast Radius, test coverage gaps, and hotspots. Each is reproducible; toggles independently of the LLM-judgment layer.
+- **FR7 — Deterministic Signal Overlay.** Complexity, Blast Radius, test coverage gaps, and hotspots. *[Added 2026-10-21]* Plus **co-change**: how many files a Node's file has a history of changing alongside, from the backend's own `FILE_CHANGES_WITH` edges. It is the one relationship a diff cannot show — structure says what calls what, history says what moves together — and the reviewer's question is about the file that did *not* change this time. History, never a structural claim: it does not mean either file uses the other. Each is reproducible; toggles independently of the LLM-judgment layer.
 - **FR8 — LLM-Judgment Signal Overlay.** Qualitative risk judgment, visually distinguished from deterministic signals at all times; toggles independently.
 - **FR9 — Ingested PR-Bot Findings.** Findings from configured external AI PR-review bots (e.g. CodeRabbit, Qodo) render as a Risk Overlay signal type. Opt-in per project, disabled by default; a Node with a finding shows the originating tool and finding text; absence of any integration doesn't degrade other overlays.
 

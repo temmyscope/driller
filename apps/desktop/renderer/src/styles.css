@@ -3918,6 +3918,38 @@ code,
   margin-top: 4px;
 }
 
+/* Node detail's "Changes with" rows: the file in monospace, its history
+   beside it, then the muted honest-copy line. Mirrors the "Similar
+   implementations" section above, since both are lists of facts about other
+   files — no link, because a file is not a map Node to navigate to. */
+.code-map__node-detail-co-change,
+.code-map__node-detail-co-change-note {
+  margin: 0;
+  font-size: var(--detail-fine-size);
+  line-height: var(--detail-fine-leading);
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.code-map__node-detail-co-change {
+  margin-top: 4px;
+  padding-left: 16px;
+}
+
+.code-map__node-detail-co-change-file,
+.code-map__node-detail-co-change-history,
+.code-map__node-detail-co-change-note {
+  color: var(--text-mute);
+}
+
+.code-map__node-detail-co-change-history {
+  margin-left: 6px;
+}
+
+.code-map__node-detail-co-change-note {
+  margin-top: 4px;
+}
+
 /* P4-4 phase 3b: Node detail's "Calls into other sections" rows. */
 .code-map__node-detail-cross-section {
   margin: 4px 0 0;

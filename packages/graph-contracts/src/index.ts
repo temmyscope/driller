@@ -1758,7 +1758,8 @@ export type DeterministicRiskSignalType =
   | 'cognitive-complexity'
   | 'hotspot'
   | 'blast-radius'
-  | 'test-coverage-gap';
+  | 'test-coverage-gap'
+  | 'co-change';
 
 /**
  * One deterministic risk signal attached to a `CodeMapNode`. A Node with no
