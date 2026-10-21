@@ -5,6 +5,8 @@
  * `format.test.ts`.
  */
 
+import type { ChangedContract, FoldedType } from '@driller/ipc-contracts';
+
 /**
  * An `en-US` thousands separator ("1,014"). A count that can't be one — a
  * negative, `NaN` or an infinity — renders "—" rather than leaking "NaN" or
@@ -43,4 +45,31 @@ export function formatMapCounts(nodes: number, edges: number): string {
 export function formatCandidateLocation(candidate: { id: string; name: string }): string {
   const symbolSuffix = `.${candidate.name}`;
   return candidate.id.endsWith(symbolSuffix) ? candidate.id.slice(0, -symbolSuffix.length) : candidate.id;
+}
+
+/**
+ * P2-12: Node Detail's module line — the directory of the Node's `file`, with
+ * its trailing slash (`billing/pay.ts` → `billing/`), or `null` for a file at
+ * the project root, whose module line is omitted rather than rendered empty.
+ * Defensive about the path's shape even though AD-19 promises POSIX-relative:
+ * backslashes become `/`, a leading `./` or `/` and a trailing `/` are
+ * ignored, so it never returns `./` or the whole path.
+ */
+export function nodeModuleLine(file: string): string | null {
+  const normalized = file
+    .replace(/\\/g, '/')
+    .replace(/^(?:\.\/|\/)+/, '')
+    .replace(/\/+$/, '');
+  const lastSlash = normalized.lastIndexOf('/');
+  return lastSlash > 0 ? normalized.slice(0, lastSlash + 1) : null;
+}
+
+/** P4-2 phase 3c: "59 dependents" / "1 dependent" — a changed contract's dependent count. */
+export function formatContractDependents(contract: Pick<ChangedContract, 'dependentCount'>): string {
+  return formatCount(contract.dependentCount, 'dependent', 'dependents');
+}
+
+/** P4-2 phase 3b: "interface" / "type", for accessible names and the type detail head. */
+export function foldedTypeNoun(kind: FoldedType['kind']): string {
+  return kind === 'Interface' ? 'interface' : 'type';
 }
