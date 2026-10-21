@@ -38,7 +38,7 @@ import {
   type GraphCommunity,
 } from './communities';
 import type { CommunityBlock } from './communityLayout';
-import type { CanvasPopulation } from './CodeMap';
+import type { CanvasPopulation } from './codeMapTypes';
 import type { CodeMapNode } from '@driller/ipc-contracts';
 
 /**

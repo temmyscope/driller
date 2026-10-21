@@ -131,6 +131,15 @@ import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
 import { samePositions, type CommunityStructure } from './communityLayout';
+import type {
+  CanvasPopulation,
+  CodeMapMode,
+  FoldedCanvasElements,
+  FoldedCanvasNode,
+  NodeDetailState,
+  SourceTarget,
+  SourceViewState,
+} from './codeMapTypes';
 import type { CommunityPartition } from './communities';
 import {
   collapsedCommunityIds,
@@ -287,31 +296,6 @@ export type FetchState =
       crossSectionEdges?: readonly CrossSectionEdgeCount[];
     }
   | { status: 'error'; message: string };
-
-/**
- * What the in-app source viewer opens: a file and line range. A Node is one;
- * P4-2 phase 2's "Tested by" rows open a test, which is not a map Node, and
- * name it with `label` (the test's name, or the test file for a file row)
- * so the viewer's header says what it is showing.
- */
-export type SourceTarget = Pick<CodeMapNode, 'file' | 'startLine' | 'endLine'> & { label?: string };
-
-export type SourceViewState =
-  | { status: 'closed' }
-  | { status: 'loading'; node: SourceTarget }
-  | { status: 'open'; node: SourceTarget; content: string }
-  | { status: 'error'; node: SourceTarget; message: string };
-
-/**
- * The Node Detail panel's own state (Story 1.8, Phase 4) — mirrors
- * `SourceViewState`'s shape, but simpler: opening it never involves an async
- * fetch (everything it shows is already on the fetched `CodeMapNode`), so
- * there's no `'loading'`/`'error'` state of its own here — only whether it's
- * open, and for which Node. `node` is replaced in place (not just read once
- * at open time) once a regenerate succeeds, so the panel reflects the fresh
- * summary/staleness without needing a second lookup.
- */
-export type NodeDetailState = { status: 'closed' } | { status: 'open'; node: CodeMapNode };
 
 /**
  * The Node Detail panel's Regenerate button state — mirrors Settings.tsx's
@@ -632,6 +616,19 @@ export type BlastRadiusState =
 // `revealView.ts` (P4-7d), shared by the Full grid and the Revealed columns,
 // and re-exported from here unchanged.
 export { NODE_COLUMN_GAP, NODE_ROW_GAP };
+
+// The shapes the sibling modules need live in `codeMapTypes.ts`, which is why
+// none of them imports a type back from this file any more. Re-exported here
+// unchanged, so every test that reads them from `./CodeMap` is untouched.
+export type {
+  CanvasPopulation,
+  CodeMapMode,
+  FoldedCanvasElements,
+  FoldedCanvasNode,
+  NodeDetailState,
+  SourceTarget,
+  SourceViewState,
+} from './codeMapTypes';
 
 // FIX-1: a Node card's size when `@xyflow/react` hasn't measured it (a card
 // still folded into an LOD cluster has no DOM, so no `measured` size). An
@@ -2131,39 +2128,6 @@ export function canvasGridSize(mapNodeCount: number, foldedCount: number): numbe
 
 const NO_CONTRACT_DEPENDENTS: ReadonlyMap<string, readonly string[]> = new Map();
 
-/**
- * P4-2 phase 3c: a folded Type/Interface/Module as a render-only canvas
- * card ("Show types & modules"). Deliberately not a `CodeMapNode`: it has
- * no summary, no risk signals, no callers or callees — nothing that could
- * be mistaken for, or counted as, a map Node. `usedByTotal` is a type's
- * full user count (absent for a Module).
- */
-export interface FoldedCanvasNode {
-  folded: true;
-  id: string;
-  name: string;
-  kind: 'Type' | 'Interface' | 'Module';
-  file: string;
-  startLine: number;
-  endLine: number;
-  usedByTotal?: number;
-}
-
-/**
- * P4-2 phase 3c: the folded kinds as render-only canvas elements. `edges`
- * are rebuilt from the folded indexes' real links only — a type's `usedBy`
- * and `refersTo` as `USAGE` edges, a Module's `uses` (with their own kind)
- * and `usesTypes` (`USAGE`) — and only where both ends are drawn. A type's
- * `usedBy` may be capped (`FOLDED_TYPE_IPC_MAX_USED_BY`), so a heavily used
- * type draws at most that many use edges.
- *
- * Nothing here feeds a number: see `canvasPopulation`.
- */
-export interface FoldedCanvasElements {
-  nodes: FoldedCanvasNode[];
-  edges: CodeMapEdge[];
-}
-
 const NO_FOLDED_CANVAS: FoldedCanvasElements = { nodes: [], edges: [] };
 
 /** P4-2 phase 3c: a folded Module's card name — its file's base name. */
@@ -2259,24 +2223,6 @@ export function foldedCanvasElements(
     }
   }
   return { nodes, edges };
-}
-
-/**
- * P4-2 phase 3c: what the canvas draws versus what every number is
- * computed from. `riskNodes`/`riskEdges` are the fetched map as-is — the
- * only input to adjacency, Path Trace, Health Audit and anything else that
- * counts — whatever the toggle says. `canvasNodes`/`canvasEdges` add the
- * folded cards and their edges when `showFolded` is on; they feed only the
- * card layout, LOD (so folded cards cluster and un-cluster like any card)
- * and the rendered edges. Pure.
- */
-export interface CanvasPopulation {
-  riskNodes: readonly CodeMapNode[];
-  riskEdges: readonly CodeMapEdge[];
-  canvasNodes: readonly (CodeMapNode | FoldedCanvasNode)[];
-  canvasEdges: readonly CodeMapEdge[];
-  /** The folded cards drawn (`canvasNodes` minus `riskNodes`); `[]` with the toggle off. */
-  foldedNodes: readonly FoldedCanvasNode[];
 }
 
 const EMPTY_CANVAS_POPULATION: CanvasPopulation = {
@@ -4081,9 +4027,6 @@ export function groupNodesIntoHealthClusters(nodes: readonly CodeMapNode[]): Hea
     remainingClusterCount: Math.max(0, clusters.length - HEALTH_CLUSTER_LIMIT),
   };
 }
-
-/** The three modes `App.tsx` switches between, as one name both this file's prop and its render gates use. */
-export type CodeMapMode = 'codeMap' | 'prReview' | 'healthAudit';
 
 /**
  * P0-2b: which of this component's mutually-exclusive surfaces are on, for a

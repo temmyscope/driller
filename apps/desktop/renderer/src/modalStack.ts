@@ -23,7 +23,7 @@
  * pure function here, unit-tested in `modalStack.test.ts`. The DOM helpers at
  * the bottom are not: the test runner has no DOM (`docs/agent.md`).
  */
-import type { NodeDetailState, SourceViewState } from './CodeMap';
+import type { NodeDetailState, SourceViewState } from './codeMapTypes';
 
 const layers: string[] = [];
 

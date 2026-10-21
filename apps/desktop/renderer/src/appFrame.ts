@@ -15,7 +15,7 @@ import type {
   SectionNodeCount,
 } from '@driller/ipc-contracts';
 
-import type { CodeMapMode } from './CodeMap';
+import type { CodeMapMode } from './codeMapTypes';
 import { formatCount, formatMapCounts } from './format';
 import { deriveSessionView, isStatusForCurrentProject, type SessionAvailability } from './sessionView';
 

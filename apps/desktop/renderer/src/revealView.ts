@@ -25,7 +25,7 @@ import {
   type EntryCandidatesResult,
 } from '@driller/ipc-contracts';
 
-import type { CanvasPopulation } from './CodeMap';
+import type { CanvasPopulation } from './codeMapTypes';
 import type { CommunityStep } from './communityView';
 import { layeredPositions, type LayeredCardSize } from './layered';
 
