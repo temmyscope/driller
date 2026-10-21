@@ -155,7 +155,7 @@ import {
   HealthAuditClusterGrid,
   type HealthClusterGrouping,
 } from './healthAudit';
-import { FoundTraceSteps, RouteExtendsBeyondLine } from './pathTraceSteps';
+import { FoundTraceSteps, pathTraceNotFoundText, RouteExtendsBeyondLine } from './pathTraceSteps';
 import {
   DETERMINISTIC_SIGNAL_ICONS,
   formatDeterministicSignalLabel,
@@ -693,6 +693,7 @@ export {
 // `pathTraceSteps.tsx`. Re-exported here unchanged.
 export {
   CALL_TREE_INDENT_CAP_DEPTH,
+  pathTraceNotFoundText,
   CALLED_BY_PREFIX,
   callTreeIndentPx,
   callTreeOrder,
@@ -11454,7 +11455,7 @@ export function CodeMap({
             {pathTrace.status === 'no-path-found' && (
               <div className="code-map__path-trace-dismissable-notice">
                 <ActionableNotice tone="info" role="status">
-                  No path found for that query.
+                  {pathTraceNotFoundText(section)}
                 </ActionableNotice>
                 {/* Story 1.9 (Phase 4): logs the dismissal (AD-21) and resets
                     the panel to `idle` — also driller's first clear-search

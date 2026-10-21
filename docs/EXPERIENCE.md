@@ -47,7 +47,7 @@ Microcopy speaks in the engineer's own vocabulary — real identifiers, real mod
 |---|---|
 | "PaymentService.charge — Blast Radius: 4 Nodes" | "This function affects a few other things!" |
 | "Summary may be stale — source changed since generation" | "Oops, this summary might be out of date!" |
-| "No path found from `POST /orders` to a database write" | "Hmm, we couldn't find anything 🤷" |
+| `[UPDATED 2026-10-21]` "No path found in indexed code for that query." — and "— this section only." when a section is selected, since the search was bounded to it. Never a bare "No path found", which reads as proof of absence | "Hmm, we couldn't find anything 🤷" / "No path found" |
 | "Coverage incomplete for this file — read source directly" | "We're not 100% sure about this one" |
 | `[ADDED 2026-09-30, P4-4]` "12 edges cross into `web/` — not shown in this section" | "Some connections are hidden" |
 | `[ADDED 2026-09-30, P4-4]` "3 changed Nodes in `api/` — Switch to `api`" | "Heads up — this PR changed other stuff too!" |
@@ -132,7 +132,7 @@ Mirrors PRD §2.3 UJ IDs verbatim.
   3. One changed Node, `PaymentService.charge`, shows a Risk Overlay badge — an ingested finding from Dani's configured PR-bot.
   4. Dani opens that Node's detail and reads its AI summary (not stale — generated after this change) alongside the ingested finding.
   5. Dani runs a Path Trace from the changed function toward the payment-write Node three hops away.
-  - **Climax:** The Path Trace comes back clean — no route from the change to the flagged payment boundary — and Dani has a structural answer, not a guess.
+  - **Climax:** `[CORRECTED 2026-10-21]` The Path Trace finds no route from the change to the flagged payment boundary **in indexed code**, and Dani has structural evidence rather than a guess — evidence about what driller indexed, which is not the same as proof that no such route exists. The index is best-effort (the backend's own language coverage has gaps, a file may be `parse_partial`, and a selected section bounds the search further), so the earlier wording of this climax — "comes back clean" — promised something driller cannot produce. Dani weighs it with the Coverage Gap flags, not instead of them.
   - **Resolution:** Dani approves and merges, in a fraction of the time a full diff read would have taken.
   - **Failure:** If graph coverage is incomplete for a touched file, that Node shows the Coverage Gap state instead of a confident-looking summary (§ State Patterns) — Dani reads that one file directly instead of trusting an absent summary.
 

@@ -296,3 +296,23 @@ export function FoundTraceSteps({
     </div>
   );
 }
+
+/**
+ * What the notice says when a trace finds nothing.
+ *
+ * It states what was searched, never that no path exists. Driller's index is
+ * best-effort — the backend's own language coverage has gaps, a file may be
+ * `parse_partial`, and a selected section bounds the search further — so an
+ * empty result is evidence about indexed code and nothing more. UJ-1's climax
+ * has an engineer approve a change on the strength of a trace coming back
+ * empty, which is exactly the decision this sentence has to be honest for.
+ *
+ * `section` is the selected section, or `null` for the whole scope. The
+ * section is not named here: it is already on the Section bar, and naming an
+ * identifier would need monospace that a plain sentence cannot carry.
+ */
+export function pathTraceNotFoundText(section: string | null): string {
+  return section === null
+    ? 'No path found in indexed code for that query.'
+    : 'No path found in indexed code for that query — this section only.';
+}
