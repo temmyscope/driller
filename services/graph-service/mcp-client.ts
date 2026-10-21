@@ -83,6 +83,12 @@ export interface CodeMapFetchResult {
    * them into `CodeMapNode.similarTo`.
    */
   similarPairs?: SimilarPair[];
+  /**
+   * `FILE_CHANGES_WITH` rows, present only when
+   * `FetchCodeMapOptions.includeCoChanges` asked for it. `co-change.ts`
+   * turns them into each Node's `coChangesWith`.
+   */
+  coChangePairs?: CoChangePair[];
 }
 
 /**
@@ -388,6 +394,33 @@ export async function indexRepository(
     await client.close().catch(() => {});
   }
 }
+
+/**
+ * One `FILE_CHANGES_WITH` edge: two files, how many commits touched both,
+ * and the backend's own coupling score. Rows are taken as the backend gives
+ * them — the floors in `co-change.ts` decide what is reported.
+ */
+export interface CoChangePair {
+  file: string;
+  partner: string;
+  coChanges: number;
+  score: number;
+}
+
+/**
+ * Every `FILE_CHANGES_WITH` edge: two files, the commits that touched both
+ * and the backend's coupling score.
+ *
+ * Deliberately filters on NEITHER property. `co_changes` and
+ * `coupling_score` are both edge properties a backend may not have, and on
+ * this engine a `WHERE` on a missing property drops every row — so a floor
+ * here would silently yield nothing rather than degrade. Both floors are
+ * applied in TypeScript instead (`co-change.ts`), the same reason
+ * `SIMILAR_TO_QUERY` leaves `r.same_file` out of its own `WHERE`. An
+ * unknown relationship type returns `rows: 0` rather than an error, so a
+ * backend without `FILE_CHANGES_WITH` simply yields none.
+ */
+export const CO_CHANGE_QUERY = `MATCH (a:File)-[r:FILE_CHANGES_WITH]->(b:File) WHERE a.file_path IS NOT NULL AND b.file_path IS NOT NULL RETURN a.file_path AS file, b.file_path AS partner, r.co_changes AS coChanges, r.coupling_score AS score`;
 
 /**
  * FIX-6: connects `client` over `transport` (spawn plus `initialize`) within
@@ -709,6 +742,8 @@ export interface FetchCodeMapOptions {
    * Best-effort, like test evidence: a failure leaves it empty.
    */
   includeSimilar?: boolean;
+  /** Also fetch `CO_CHANGE_QUERY` over the same connection. */
+  includeCoChanges?: boolean;
 }
 
 async function runFetchCodeMap(
@@ -778,10 +813,11 @@ export async function runCodeMapQueries(
   const includeTestEvidence = options.includeTestEvidence === true;
   const includeImplements = options.includeImplements === true;
   const includeSimilar = options.includeSimilar === true;
-  if (!includeTestEvidence && !includeImplements && !includeSimilar) {
+  const includeCoChanges = options.includeCoChanges === true;
+  if (!includeTestEvidence && !includeImplements && !includeSimilar && !includeCoChanges) {
     return { nodes: joinedNodes, edges };
   }
-  const [calls, testFiles, implementsLinks, similarPairs] = await Promise.all([
+  const [calls, testFiles, implementsLinks, similarPairs, coChangePairs] = await Promise.all([
     includeTestEvidence
       ? queryTestEvidence(client, project, TEST_EVIDENCE_CALLS_QUERY, parseTestCallEvidenceRow, 'test calls', evidenceTimeoutMs)
       : undefined,
@@ -802,6 +838,17 @@ export async function runCodeMapQueries(
           'Similar implementations',
         )
       : undefined,
+    includeCoChanges
+      ? queryTestEvidence(
+          client,
+          project,
+          CO_CHANGE_QUERY,
+          parseCoChangeRow,
+          'FILE_CHANGES_WITH',
+          evidenceTimeoutMs,
+          'Co-changes',
+        )
+      : undefined,
   ]);
   return {
     nodes: joinedNodes,
@@ -809,6 +856,7 @@ export async function runCodeMapQueries(
     ...(calls !== undefined && testFiles !== undefined ? { testEvidence: { calls, testFiles } } : {}),
     ...(implementsLinks !== undefined ? { implementsLinks } : {}),
     ...(similarPairs !== undefined ? { similarPairs } : {}),
+    ...(coChangePairs !== undefined ? { coChangePairs } : {}),
   };
 }
 
@@ -830,6 +878,29 @@ export function parseSimilarPairRow(row: Record<string, string>): SimilarPair | 
     return undefined;
   }
   return { source, target, score, ...(parseTestFlag(row.sameFile) ? { sameFile: true as const } : {}) };
+}
+
+/**
+ * Parses a `CO_CHANGE_QUERY` row. A row missing either path, or without a
+ * finite commit count and score, is dropped. Neither floor is checked here
+ * (`attachCoChanges` does that) so the floors live in exactly one place.
+ * Exported for tests.
+ */
+export function parseCoChangeRow(row: Record<string, string>): CoChangePair | undefined {
+  const { file, partner } = row;
+  const coChanges = toOptionalSignalValue(row.coChanges);
+  const score = toOptionalSignalValue(row.score);
+  if (
+    typeof file !== 'string' ||
+    file.length === 0 ||
+    typeof partner !== 'string' ||
+    partner.length === 0 ||
+    coChanges === undefined ||
+    score === undefined
+  ) {
+    return undefined;
+  }
+  return { file, partner, coChanges, score };
 }
 
 /** P4-2 phase 3b: parses an `IMPLEMENTS_QUERY` row. Exported for tests. */

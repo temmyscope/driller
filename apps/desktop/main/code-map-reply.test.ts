@@ -45,6 +45,7 @@ describe('toOkCodeMapResult', () => {
       droppedFoldedTypes: 0,
       droppedFoldedModules: 0,
       droppedSimilarTo: 0,
+      droppedCoChangesWith: 0,
       droppedTestCoverageAvailable: 0,
       droppedSections: 0,
       droppedCrossSection: 0,

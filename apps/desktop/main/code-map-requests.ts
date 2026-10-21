@@ -341,6 +341,7 @@ export function routeCodeMapReply(
     droppedFoldedTypes,
     droppedFoldedModules,
     droppedSimilarTo,
+    droppedCoChangesWith,
     droppedTestCoverageAvailable,
     droppedSections,
     droppedCrossSection,
@@ -352,6 +353,7 @@ export function routeCodeMapReply(
     [droppedFoldedTypes, 'malformed folded type'],
     [droppedFoldedModules, 'malformed folded Module'],
     [droppedSimilarTo, 'malformed similar implementation'],
+    [droppedCoChangesWith, 'malformed co-changing file'],
     [droppedTestCoverageAvailable, 'malformed test-coverage flag'],
     [droppedSections, 'malformed section count'],
     // P4-4 phase 3a.

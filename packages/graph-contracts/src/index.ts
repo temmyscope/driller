@@ -1943,6 +1943,19 @@ export interface CodeMapNode {
   /** P4-2 phase 4: how many similar implementations exist before the cap. Present exactly when `similarTo` is; never below `similarTo.length`. */
   similarToTotal?: number;
   /**
+   * The files this Node's file has a history of changing alongside, from the
+   * backend's own `FILE_CHANGES_WITH` edges — never inferred from imports,
+   * names or anything structural. A partner qualifies on both floors
+   * (`CO_CHANGE_MIN_COMMITS`, `CO_CHANGE_MIN_SCORE`); test files are excluded
+   * on either side, since a file changing with its own test is not news.
+   * Sorted by commits (most first), then score, then path; capped at
+   * `CO_CHANGE_MAX_ENTRIES`. Absent when nothing qualifies, including on a
+   * backend without `FILE_CHANGES_WITH` or a project with no git history.
+   */
+  coChangesWith?: CoChangingFile[];
+  /** How many files qualified before the cap. Present exactly when `coChangesWith` is; never below `coChangesWith.length`. */
+  coChangesWithTotal?: number;
+  /**
    * P4-3 phase 5: LCOV line data exists for this Node's file; says nothing
    * about the percentage. `true` only when the project's
    * `coverage/lcov.info` loaded and has an `SF:` section for `file` — the
@@ -2041,6 +2054,50 @@ export interface SimilarImplementation {
   /** The backend's `SIMILAR_TO.jaccard` token-overlap score, 0–1; at least `SIMILAR_TO_MIN_JACCARD`. */
   score: number;
 }
+
+/**
+ * One file this Node's file has changed alongside, from the backend's
+ * `FILE_CHANGES_WITH` edge.
+ *
+ * History, not structure: it says these two files have moved together, not
+ * that either calls or imports the other. That is the point — it is the one
+ * relationship a diff cannot show, and the reason an engineer wants it is to
+ * notice the file that did NOT change this time.
+ */
+export interface CoChangingFile {
+  /** POSIX-relative path of the partner file — never the Node's own file. */
+  file: string;
+  /** Commits that touched both files. At least `CO_CHANGE_MIN_COMMITS`. */
+  coChanges: number;
+  /**
+   * The backend's `FILE_CHANGES_WITH.coupling_score`, 0-1: how often one
+   * changed when the other did. At least `CO_CHANGE_MIN_SCORE`. A score of 1
+   * means they have never changed apart.
+   */
+  score: number;
+}
+
+/**
+ * The fewest shared commits a co-change pair needs before driller reports it.
+ *
+ * Measured on driller's own repository (2026-10-21): the backend emits pairs
+ * from three shared commits up, and the floor sits above that because two or
+ * three commits in common is coincidence, not coupling. At five, 74 pairs
+ * survive on that repository — enough to be informative, far from every file.
+ */
+export const CO_CHANGE_MIN_COMMITS = 5;
+
+/**
+ * The lowest coupling score reported. Below half, the files changed together
+ * less often than apart, which is incidental: on driller's own repository
+ * this is what separates `main/index.ts` ↔ `preload/index.ts` (score 1, never
+ * changed apart) from `main/index.ts` ↔ `styles.css` (0.47, two files that
+ * both change often).
+ */
+export const CO_CHANGE_MIN_SCORE = 0.5;
+
+/** The most `CodeMapNode.coChangesWith` entries carried per Node (and returned by `lookup_node`); `coChangesWithTotal` is the full count. */
+export const CO_CHANGE_MAX_ENTRIES = 20;
 
 /** P4-2 phase 4: the lowest `SIMILAR_TO.jaccard` shown as a similar implementation. */
 export const SIMILAR_TO_MIN_JACCARD = 0.9;

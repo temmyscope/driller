@@ -70,6 +70,9 @@ import {
   ENTRY_CANDIDATE_MAX,
   ENTRY_CANDIDATE_MIN_REACH,
   FOLDED_TYPE_LOOKUP_MAX_USED_BY,
+  CO_CHANGE_MAX_ENTRIES,
+  CO_CHANGE_MIN_COMMITS,
+  CO_CHANGE_MIN_SCORE,
   SIMILAR_TO_MAX_ENTRIES,
   SIMILAR_TO_MIN_JACCARD,
   TESTED_BY_MAX_TESTS,
@@ -399,7 +402,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
 // P5-i (founder 2026-10-15, §2.9): at first release, collapse the unreleased 1.5.0–1.11.0 series into one minor bump — see deferred-work.md's P4-5 release-pipeline note.
-export const MCP_SERVER_VERSION = '1.11.0';
+export const MCP_SERVER_VERSION = '1.12.0';
 
 /**
  * Registers the `lookup_node` tool on `server` — extracted (P4-2 phase 3a,
@@ -439,6 +442,7 @@ export function registerLookupNodeTool(
         `'similarTo', when present, lists other production Functions in other files that the index's own SIMILAR_TO edge marks as near-duplicates of this one ({id, name, file, score}, score being the backend's jaccard token overlap, at least ${SIMILAR_TO_MIN_JACCARD}), highest score first, capped at ${SIMILAR_TO_MAX_ENTRIES} with 'similarToTotal' giving the full count; each id is a Code Map Node id. Similarity is structural (token overlap), not a claim they behave the same; same-file pairs and test code are never listed, and nothing is inferred beyond SIMILAR_TO. An absent 'similarTo' means no such pair was found (or the index has no SIMILAR_TO edges). ` +
         "'testCoverageAvailable': true, when present, means the project's coverage/lcov.info has line data for this Node's file; it says nothing about a percentage, and nothing about whether this Node ran. " +
         "'testCoverageHit': true, when present, means the function was entered at least once by tests (LCOV): a function record (FN/FNDA) starting in this Node's range has a call count above 0, and the file is not newer than the report. It is the only coverage claim made about the Node itself; line hits alone never set it, because loading a module hits a declaration's own line even when no test calls it. An absent 'testCoverageHit' is NOT evidence the Node is untested: the report may lack function records, be older than the file, or not list it. An absent 'testCoverageAvailable' means there is no LCOV data for the file at all (no coverage/lcov.info, an unparseable one, or a report that doesn't list the file). " +
+        `'coChangesWith', when present, lists the files this Node's own file has a history of changing alongside, from the index's own FILE_CHANGES_WITH edges ({file, coChanges, score}, coChanges being the commits that touched both and score how often one changed when the other did, 0-1). It is history, not structure: it does not mean either file calls or imports the other. Only pairs with at least ${CO_CHANGE_MIN_COMMITS} shared commits and a score of at least ${CO_CHANGE_MIN_SCORE} are listed, test files are excluded on both sides, and the Node's own file is never listed; most shared commits first, capped at ${CO_CHANGE_MAX_ENTRIES} with 'coChangesWithTotal' giving the full count. An absent 'coChangesWith' means no pair qualified — including a project with no git history, or an index without FILE_CHANGES_WITH edges. ` +
         "With 'section', the Node is the one the human sees in that section: every deterministic signal's severity and the blast-radius count are computed over that section alone (its own severity cut, and only Nodes and edges inside it); the 'llm-judgment' and 'ingested' signals and the summary come from driller's stored records and are the same with or without a section; and the section-scoped links ('similarTo', 'usesTypes', 'fileTopLevel', 'fileTopLevelTypes', 'calledAtLoadBy', and a folded type's 'usedBy' and type links, or a folded Module's 'uses') name only ids inside the section; 'testedBy' and the test-coverage flags are the same as without a section. " +
         "An id that exists in the whole scope but belongs to another section (a folded Module or type by its file) returns {status: 'not-in-section', nodeId, section, nodeSection}, never not-found; 'nodeSection' is the section that holds it. " +
         `With 'section', 'crossSectionCalls', when present, lists this Node's callees in other sections of the allowlist ({id, name, section}): its real outgoing CALLS edges whose target another section holds (the calls the section's own edges leave out), one entry per callee, sorted by section, then name, capped at ${CROSS_SECTION_CALLS_MAX} with 'crossSectionCallsTotal' giving the full count; look one up with that 'section', or without one. A callee outside the allowlist is never listed, callers in other sections are not listed, and both fields are absent when there is none and always absent without 'section'. ` +
@@ -709,6 +713,8 @@ export function startMcpServer(
   // change, named in `changedContracts` instead).
   // P4-2 phase 4 (1.5.0): `lookup_node`'s Node gains `similarTo` and
   // `similarToTotal` — additive, absent when not applicable.
+  // (1.12.0): `lookup_node`'s Node gains `coChangesWith` and
+  // `coChangesWithTotal` — additive, absent when nothing qualifies.
   // P4-3 phase 5 (1.6.0): `lookup_node`'s Node gains `testCoverageAvailable`
   // and `testCoverageHit` — additive, `true` or absent (never `false`).
   // P4-4 phase 2b (1.7.0): `lookup_node`, `trace_path`, `expand_blast_radius`

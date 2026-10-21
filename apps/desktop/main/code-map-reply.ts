@@ -21,7 +21,9 @@
  * P4-2 phase 4: each Node's `similarTo` is validated per element
  * (`isSimilarImplementation`, `sanitizeNodeSimilarTo`); malformed elements
  * are dropped and counted in `droppedSimilarTo`, and `similarToTotal` is
- * kept consistent with what survives.
+ * kept consistent with what survives. Each Node's `coChangesWith` goes
+ * through the same shape (`isCoChangingFile`,
+ * `sanitizeNodeCoChangesWith`), counted in `droppedCoChangesWith`.
  *
  * P4-3 phase 5: each Node's `testCoverageAvailable` (and, review round 1,
  * `testCoverageHit`) is kept only when it is exactly `true`
@@ -61,6 +63,7 @@ import type {
   GraphServiceCodeMapMessage,
   SectionChangeCount,
   SectionNodeCount,
+  CoChangingFile,
   SimilarImplementation,
   TopLevelChangedFile,
   UnknownSectionResult,
@@ -273,6 +276,52 @@ export function sanitizeNodeSimilarTo(node: CodeMapNode): { node: CodeMapNode; d
     return { node, dropped: 0 };
   }
   return { node: { ...rest, similarTo: kept, similarToTotal: totalOk ? (rawTotal as number) : kept.length }, dropped };
+}
+
+/** A `CoChangingFile` shape: a path, a positive commit count and a 0-1 score. */
+export function isCoChangingFile(value: unknown): value is CoChangingFile {
+  return (
+    isRecord(value) &&
+    isString(value.file) &&
+    value.file.length > 0 &&
+    isFiniteNumber(value.coChanges) &&
+    value.coChanges > 0 &&
+    isFiniteNumber(value.score) &&
+    value.score >= 0 &&
+    value.score <= 1
+  );
+}
+
+/**
+ * A Node with its `coChangesWith` validated per element, the same way
+ * `sanitizeNodeSimilarTo` does: malformed entries are dropped and counted, a
+ * repeated path keeps its first entry (a second would double a row and a
+ * React key), and `coChangesWithTotal` is kept only when it is an integer at
+ * least as large as what survived — otherwise it is recomputed, so the count
+ * can never overstate the list beneath it.
+ */
+export function sanitizeNodeCoChangesWith(node: CodeMapNode): { node: CodeMapNode; dropped: number } {
+  const raw: unknown = node.coChangesWith;
+  const rawTotal: unknown = node.coChangesWithTotal;
+  if (raw === undefined && rawTotal === undefined) {
+    return { node, dropped: 0 };
+  }
+  const { coChangesWith: _entries, coChangesWithTotal: _total, ...rest } = node;
+  const valid = keepValid(raw, isCoChangingFile);
+  const seen = new Set<string>();
+  const kept = valid.kept.filter((entry) => !seen.has(entry.file) && seen.add(entry.file) !== undefined);
+  const dropped = valid.dropped + (valid.kept.length - kept.length);
+  if (kept.length === 0) {
+    return { node: rest, dropped };
+  }
+  const totalOk = Number.isInteger(rawTotal) && (rawTotal as number) >= kept.length;
+  if (dropped === 0 && totalOk) {
+    return { node, dropped: 0 };
+  }
+  return {
+    node: { ...rest, coChangesWith: kept, coChangesWithTotal: totalOk ? (rawTotal as number) : kept.length },
+    dropped,
+  };
 }
 
 /**
@@ -522,6 +571,7 @@ export function toOkCodeMapResult(message: CodeMapReply): {
   droppedFoldedModules: number;
   /** P4-2 phase 4: how many `similarTo` elements, across all Nodes, were malformed and dropped. */
   droppedSimilarTo: number;
+  droppedCoChangesWith: number;
   /** P4-3 phase 5: how many `testCoverageAvailable` / `testCoverageHit` values were malformed (or a hit without the flag), stripped. */
   droppedTestCoverageAvailable: number;
   /** P4-4 phase 1b: how many `sections` elements were malformed and dropped. */
@@ -591,6 +641,7 @@ export function toOkCodeMapResult(message: CodeMapReply): {
       : keepSectionCounts(rawCrossEdges, isCrossSectionEdgeCount);
   let droppedCrossSection = crossEdges.dropped;
   let droppedSimilarTo = 0;
+  let droppedCoChangesWith = 0;
   let droppedTestCoverageAvailable = 0;
   const nodes = Array.isArray(message.nodes)
     ? message.nodes.map((node) => {
@@ -599,7 +650,9 @@ export function toOkCodeMapResult(message: CodeMapReply): {
         }
         const sanitized = sanitizeNodeSimilarTo(node);
         droppedSimilarTo += sanitized.dropped;
-        const flagged = sanitizeNodeTestCoverageAvailable(sanitized.node);
+        const coChanged = sanitizeNodeCoChangesWith(sanitized.node);
+        droppedCoChangesWith += coChanged.dropped;
+        const flagged = sanitizeNodeTestCoverageAvailable(coChanged.node);
         droppedTestCoverageAvailable += flagged.dropped;
         const crossChecked = sanitizeNodeCrossSectionCalls(flagged.node, section);
         droppedCrossSection += crossChecked.dropped;
@@ -623,6 +676,7 @@ export function toOkCodeMapResult(message: CodeMapReply): {
     droppedFoldedTypes,
     droppedFoldedModules,
     droppedSimilarTo,
+    droppedCoChangesWith,
     droppedTestCoverageAvailable,
     droppedSections,
     droppedCrossSection,

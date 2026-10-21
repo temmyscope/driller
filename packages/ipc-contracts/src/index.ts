@@ -73,6 +73,7 @@ export type {
   FoldedTypeUserKindCount,
   TypeUse,
   SimilarImplementation,
+  CoChangingFile,
   CodeMapEdgeKind,
   CodeMapEdge,
   DiffScopeResult,
@@ -102,6 +103,9 @@ export {
   ENTRY_PINS_MAX,
   FOLDED_TYPE_IPC_MAX_USED_BY,
   SIMILAR_TO_MAX_ENTRIES,
+  CO_CHANGE_MAX_ENTRIES,
+  CO_CHANGE_MIN_COMMITS,
+  CO_CHANGE_MIN_SCORE,
   SIMILAR_TO_MIN_JACCARD,
   TESTED_BY_MAX_TESTS,
 } from '@driller/graph-contracts';

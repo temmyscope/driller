@@ -385,7 +385,7 @@ describe('P5-a: HEAD drift through index.ts', { skip: !GIT_AVAILABLE && 'git is 
     assert.deepEqual(JSON.parse(reply.content[0]!.text), driftError(indexed, current));
     await handler({ projectPath: PROJECT, baseRef: 'main' });
     assert.equal(headChangedSince(from).length, 1);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.11.0', 'no result shape change');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.12.0', 'P5-a itself changed no result shape; 1.12.0 is co-change’s additive Node field');
     await settle();
   });
 });

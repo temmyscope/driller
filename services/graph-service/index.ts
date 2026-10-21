@@ -2296,6 +2296,7 @@ async function resolveRawForRequest(project: string, projectRoot: string, force:
     includeTestedBy: true,
     includeImplements: true,
     includeSimilar: true,
+    includeCoChanges: true,
   });
   // P2-5: captured once, so the scope reported with the map is exactly the
   // one the pipeline's filter used.

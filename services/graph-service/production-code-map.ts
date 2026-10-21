@@ -14,8 +14,15 @@ import type { FoldedModule, FoldedType } from '@driller/graph-contracts';
 
 import { attachFoldedModuleLinks, foldModules } from './fold-modules';
 import { attachTypeUses, foldTypes, splitModuleTypeUses } from './fold-types';
-import { fetchCodeMap, type CodeMapFetchResult, type FetchCodeMapOptions, type SimilarPair } from './mcp-client';
+import {
+  fetchCodeMap,
+  type CoChangePair,
+  type CodeMapFetchResult,
+  type FetchCodeMapOptions,
+  type SimilarPair,
+} from './mcp-client';
 import { toProjectRelativePosixPath } from './project-path';
+import { attachCoChanges } from './co-change';
 import { attachSimilar } from './similar';
 import { attachTestedBy } from './tested-by';
 import { excludeTestCode, isTestPath } from './test-code';
@@ -79,6 +86,8 @@ export interface ProductionCodeMapOptions {
    * and `lookup_node`); Path Trace doesn't need it.
    */
   includeSimilar?: boolean;
+  /** Also fetch `FILE_CHANGES_WITH` and attach each Node's `coChangesWith`. */
+  includeCoChanges?: boolean;
 }
 
 /** `fetchProductionCodeMap`'s result: the production map plus its folded Modules. */
@@ -93,6 +102,12 @@ export interface ProductionCodeMapResult extends CodeMapFetchResult {
    * (`attachSimilar` on the scoped Nodes names only scoped Nodes).
    */
   similarPairs: SimilarPair[];
+  /**
+   * The raw `FILE_CHANGES_WITH` pairs (`[]` unless `includeCoChanges`), so
+   * the Code Map handler can re-attach `coChangesWith` after its scope
+   * filter, for the same reason `similarPairs` is kept.
+   */
+  coChangePairs: CoChangePair[];
 }
 
 /**
@@ -125,11 +140,13 @@ export async function fetchProductionCodeMap(
   const includeTestEvidence = options.includeTestedBy === true;
   const includeImplements = options.includeImplements === true;
   const includeSimilar = options.includeSimilar === true;
-  const { nodes, edges, testEvidence, implementsLinks, similarPairs } = await fetch(project, undefined, {
+  const includeCoChanges = options.includeCoChanges === true;
+  const { nodes, edges, testEvidence, implementsLinks, similarPairs, coChangePairs } = await fetch(project, undefined, {
     excludeFile: (file) => isTestPath(normalizeFile(projectRoot, file, `${context} hotspot file`)),
     ...(includeTestEvidence ? { includeTestEvidence } : {}),
     ...(includeImplements ? { includeImplements } : {}),
     ...(includeSimilar ? { includeSimilar } : {}),
+    ...(includeCoChanges ? { includeCoChanges } : {}),
   });
   const normalizedNodes = nodes.map((node) => ({
     ...node,
@@ -157,12 +174,15 @@ export async function fetchProductionCodeMap(
     foldedTypes,
   );
   const pairs = includeSimilar ? (similarPairs ?? []) : [];
+  const coChanges = includeCoChanges ? (coChangePairs ?? []) : [];
   const withTypeUses = attachTypeUses(attachFoldedModuleLinks(types.nodes, foldedModules), foldedTypes);
+  const withSimilar = includeSimilar ? attachSimilar(withTypeUses, pairs) : withTypeUses;
   return {
-    nodes: includeSimilar ? attachSimilar(withTypeUses, pairs) : withTypeUses,
+    nodes: includeCoChanges ? attachCoChanges(withSimilar, coChanges) : withSimilar,
     edges: types.edges,
     foldedModules,
     foldedTypes,
     similarPairs: pairs,
+    coChangePairs: coChanges,
   };
 }

@@ -614,9 +614,9 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(src.slice(start, end), /\n {2}registerListEntryCandidatesTool\(server\);/);
   });
 
-  it('the tool: name, version 1.11.0, the description’s promises, and its input rules', () => {
+  it('the tool: name, version 1.12.0, the description’s promises, and its input rules', () => {
     assert.ok(mcp);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.11.0');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.12.0');
     const tool = registerTool();
     assert.equal(tool.name, 'list_entry_candidates');
     const description = tool.config.description ?? '';
