@@ -35,6 +35,8 @@
 export interface CommunityInputNode {
   id: string;
   name: string;
+  /** Project-root-relative POSIX path, as `CodeMapNode.file` already carries it. Used to label a community. */
+  file: string;
 }
 
 /** A directed edge. Direction is kept for fan-in (labelling) and dropped for the partition itself. */
@@ -50,6 +52,54 @@ export interface CommunityInputEdge {
  */
 export const UNREFERENCED_COMMUNITY_ID = 'community:unreferenced';
 export const UNREFERENCED_COMMUNITY_LABEL = 'unreferenced in indexed code';
+
+/**
+ * The community holding every group too small to be a module that had
+ * nothing to merge into — islands of two or three Nodes that call each other
+ * and nothing else in indexed code.
+ *
+ * Why they are pooled rather than each given a card. A real call graph's
+ * community sizes have a long thin tail: on driller's own repository the
+ * fourteen largest communities hold about 98% of the connected Nodes, and
+ * the remaining twenty-seven hold twenty-two Nodes between them, fourteen of
+ * them bare pairs. Drawing a card per island put most of the map's cards in
+ * service of 2% of its code. `mergeSmallCommunities` cannot fold these away
+ * — they survive precisely because they have no neighbour — so pooling is
+ * what is left, and it is also the honest statement: they are not modules.
+ *
+ * Their calls are all internal by construction, so this community's cohesion
+ * computes to 1. That figure is arithmetically true and says nothing about
+ * quality — it is a bag of unrelated pairs, not a tight module — which is
+ * why the label leads with what it actually is.
+ */
+export const ISOLATED_COMMUNITY_ID = 'community:isolated';
+
+/**
+ * A community is named after the file holding its members only when that file
+ * holds at least this share of them; otherwise it keeps its hub's identifier.
+ *
+ * Measured, not guessed. On driller's own repository the file holding most of
+ * a community's members holds a median 72% of them (up to 100%), so a file
+ * names most communities well — `src/CodeMap.tsx` says far more than `get` or
+ * `onClick`. On a Go API in the same graph backend the median is 27% (as low
+ * as 6%), where a file label would overclaim badly: a 35-member community
+ * whose biggest file holds 2 of them is not that file. The threshold is what
+ * keeps the label honest on both; above it the file really is where the
+ * community lives, below it the identifier is all driller can defend.
+ *
+ * EXPERIENCE.md's voice rule allows either — "real identifiers, real module
+ * paths" — and forbids inventing a name for the group, which is why neither
+ * branch ever composes one.
+ */
+export const COMMUNITY_FILE_LABEL_MIN_SHARE = 0.5;
+
+/** `3 isolated groups` — the count is always stated, never "some". */
+export function isolatedCommunityLabel(groupCount: number): string {
+  return `${groupCount} isolated group${groupCount === 1 ? '' : 's'}`;
+}
+
+/** Fewer than this many sub-floor islands are left as they are: pooling one group into a bag of groups says less than the group did. */
+export const MIN_ISOLATED_GROUPS_TO_POOL = 2;
 
 /**
  * Below this many Nodes with call edges, the map is not partitioned at all:
@@ -230,6 +280,70 @@ function aggregate(level: Level, community: readonly number[], count: number): L
 }
 
 /**
+ * Where two or more communities ended up with the same name, each gets its
+ * hub's file added, so no two cards on the map read alike.
+ *
+ * This is not hypothetical. Go's constructor convention makes `New` the hub
+ * of many unrelated groups: in one service measured here, three of four
+ * communities were all called `New`, which tells the engineer nothing and
+ * makes two of the three cards unidentifiable. The qualifier is the hub's own
+ * file, so both halves are real — EXPERIENCE.md forbids inventing a name for
+ * a group, not stating two true things about it.
+ */
+function qualifyRepeatedLabels(built: readonly GraphCommunity[], hubOf: ReadonlyMap<string, CommunityHub>): void {
+  const seen = new Map<string, number>();
+  for (const community of built) {
+    seen.set(community.label, (seen.get(community.label) ?? 0) + 1);
+  }
+  for (const community of built) {
+    const hub = hubOf.get(community.id);
+    if (hub === undefined || (seen.get(community.label) ?? 0) < 2) {
+      continue;
+    }
+    // The qualifier is whichever true fact the name did not already use: a
+    // file named by its hub, a hub named by its file. Qualifying a file with
+    // another file ("CodeMap.tsx (format.ts)") reads as two places at once.
+    const qualifier = hub.usedFile ? hub.name : hub.file;
+    if (qualifier !== community.label) {
+      community.label = `${community.label} (${qualifier})`;
+    }
+  }
+}
+
+/** A community's hub, and whether its name came from the file or the hub itself. */
+interface CommunityHub {
+  name: string;
+  file: string;
+  usedFile: boolean;
+}
+
+/**
+ * A community's name: the file holding most of its members when that file
+ * holds at least `COMMUNITY_FILE_LABEL_MIN_SHARE` of them, otherwise the
+ * hub's own identifier. Never a name driller composed itself.
+ *
+ * The file wins when it earns it because it identifies the group far better
+ * than a generic hub does — a community centred on `get` or `onClick` says
+ * nothing, where `src/revealView.ts` says where to look. Ties on the modal
+ * file go to the lexicographically first path, so the choice is deterministic.
+ */
+function communityLabel(
+  members: readonly number[],
+  representative: number,
+  sorted: readonly CommunityInputNode[],
+): { label: string; hub: CommunityHub } {
+  const counts = new Map<string, number>();
+  for (const index of members) {
+    const file = sorted[index]!.file;
+    counts.set(file, (counts.get(file) ?? 0) + 1);
+  }
+  const [file, count] = [...counts.entries()].sort((a, b) => b[1] - a[1] || compareIds(a[0], b[0]))[0]!;
+  const usedFile = count / members.length >= COMMUNITY_FILE_LABEL_MIN_SHARE;
+  const hub = sorted[representative]!;
+  return { label: usedFile ? file : hub.name, hub: { name: hub.name, file: hub.file, usedFile } };
+}
+
+/**
  * Folds every community under `MIN_COMMUNITY_MEMBERS` into the community it
  * shares most edges with, smallest first, until none is left that has a
  * neighbour to join. Mutates `membersByLabel` and `labelOfIndex`.
@@ -403,28 +517,77 @@ export function detectCommunities(
   connected.forEach((index, local) => labelOfIndex.set(index, assignment[local]!));
   mergeSmallCommunities(membersByLabel, labelOfIndex, directed);
 
+  // Every island still under the floor is pooled into one community
+  // (`ISOLATED_COMMUNITY_ID`), so the map's cards go to its modules rather
+  // than to its tail. They take part in the edge counting below like any
+  // other community, so their internal calls are still counted.
+  const isolatedLabels = [...membersByLabel.entries()].filter(
+    ([, members]) => members.length < MIN_COMMUNITY_MEMBERS,
+  );
+  const isolated: number[] = [];
+  if (isolatedLabels.length >= MIN_ISOLATED_GROUPS_TO_POOL) {
+    for (const [label, members] of isolatedLabels) {
+      isolated.push(...members);
+      membersByLabel.delete(label);
+    }
+  }
+
+  // In-community in-degree: a community's hub is what its own members call
+  // most, not whatever symbol is most popular across the whole map. Global
+  // fan-in picked map-wide accessors (`current`, `get`) over the group's own
+  // centre.
+  const inCommunityFanIn = new Array<number>(sorted.length).fill(0);
+  for (const { from, to } of directed) {
+    const fromLabel = labelOfIndex.get(from);
+    if (fromLabel !== undefined && fromLabel === labelOfIndex.get(to)) {
+      inCommunityFanIn[to] = inCommunityFanIn[to]! + 1;
+    }
+  }
+
   const communityOfIndex = new Map<number, string>();
   const built: GraphCommunity[] = [];
-  for (const members of membersByLabel.values()) {
-    // The representative — and so the label and the id — is the highest
-    // fan-in member, id breaking the tie.
-    const representative = [...members].sort(
-      (a, b) => fanIn[b]! - fanIn[a]! || compareIds(sorted[a]!.id, sorted[b]!.id),
-    )[0]!;
-    const id = `community:${sorted[representative]!.id}`;
-    const memberIds = members.map((index) => sorted[index]!.id).sort(compareIds);
-    for (const index of members) {
-      communityOfIndex.set(index, id);
+  /** Each community's hub, for `qualifyRepeatedLabels`. */
+  const hubOf = new Map<string, CommunityHub>();
+  if (isolated.length > 0) {
+    const memberIds = isolated.map((index) => sorted[index]!.id).sort(compareIds);
+    for (const index of isolated) {
+      communityOfIndex.set(index, ISOLATED_COMMUNITY_ID);
     }
     built.push({
-      id,
-      label: sorted[representative]!.name,
+      id: ISOLATED_COMMUNITY_ID,
+      label: isolatedCommunityLabel(isolatedLabels.length),
       memberIds,
       internalEdges: 0,
       externalEdges: 0,
       cohesion: 0,
     });
   }
+  for (const members of membersByLabel.values()) {
+    // The representative — and so the id — is the member its own community
+    // calls most, global fan-in then id breaking the tie.
+    const representative = [...members].sort(
+      (a, b) =>
+        inCommunityFanIn[b]! - inCommunityFanIn[a]! ||
+        fanIn[b]! - fanIn[a]! ||
+        compareIds(sorted[a]!.id, sorted[b]!.id),
+    )[0]!;
+    const id = `community:${sorted[representative]!.id}`;
+    const memberIds = members.map((index) => sorted[index]!.id).sort(compareIds);
+    for (const index of members) {
+      communityOfIndex.set(index, id);
+    }
+    const named = communityLabel(members, representative, sorted);
+    built.push({
+      id,
+      label: named.label,
+      memberIds,
+      internalEdges: 0,
+      externalEdges: 0,
+      cohesion: 0,
+    });
+    hubOf.set(id, named.hub);
+  }
+  qualifyRepeatedLabels(built, hubOf);
 
   const byId = new Map(built.map((community) => [community.id, community]));
   const linkCounts = new Map<string, CommunityLink>();
@@ -453,9 +616,14 @@ export function detectCommunities(
     community.cohesion = total === 0 ? 0 : community.internalEdges / total;
   }
 
-  const communities = built.sort(
-    (a, b) => b.memberIds.length - a.memberIds.length || compareIds(a.id, b.id),
-  );
+  // Largest module first; the pooled islands sit after every real module,
+  // whatever their combined size, and the unreferenced community after them.
+  const communities = built.sort((a, b) => {
+    if (a.id === ISOLATED_COMMUNITY_ID || b.id === ISOLATED_COMMUNITY_ID) {
+      return a.id === ISOLATED_COMMUNITY_ID ? 1 : -1;
+    }
+    return b.memberIds.length - a.memberIds.length || compareIds(a.id, b.id);
+  });
   const communityOfNode = new Map<string, string>();
   for (const [index, id] of communityOfIndex) {
     communityOfNode.set(sorted[index]!.id, id);

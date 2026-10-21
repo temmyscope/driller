@@ -26,7 +26,8 @@ import {
 import type { LayeredCardSize } from './layered';
 
 const id = (name: string) => `src/${name}.ts::${name}`;
-const nodesOf = (...names: string[]): CommunityInputNode[] => names.map((name) => ({ id: id(name), name }));
+const nodesOf = (...names: string[]): CommunityInputNode[] =>
+  names.map((name) => ({ id: id(name), name, file: `src/${name}.ts` }));
 const edgesOf = (...pairs: [string, string][]): CommunityInputEdge[] =>
   pairs.map(([source, target]) => ({ source: id(source), target: id(target) }));
 

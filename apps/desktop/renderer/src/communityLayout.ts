@@ -63,11 +63,16 @@ export interface Point {
   y: number;
 }
 
-/** One community's laid-out extent — what a collapsed community card would stand over. */
+/** One community's laid-out extent — what a collapsed community card stands over. */
 export interface CommunityBlock {
   communityId: string;
   label: string;
+  /** The cards this block lays out: its member Nodes, or just its own community card when collapsed. */
   cardIds: readonly string[];
+  /** Whether this block is drawn as one community card instead of its members. */
+  collapsed: boolean;
+  /** How many Nodes the community holds, whether or not they are drawn. */
+  memberCount: number;
   x: number;
   y: number;
   width: number;
@@ -235,11 +240,18 @@ function gridBlock(
  * lays them out. `cardSizeOf` gives React Flow's measurement for a card, or
  * `undefined` before it has one — in which case the block falls back to the
  * grid pitch, exactly as `layoutPosition` did.
+ *
+ * `collapsed` names the communities drawn as a single community card instead
+ * of their members (`communityView.ts`): such a block lays out one card,
+ * under the community's own id, so the collapsed view is compact and the
+ * expanded one is unchanged. Empty by default — every community laid out by
+ * its members, which is what Full did before the collapsed view existed.
  */
 export function communityPositions(
   structure: CommunityStructure,
   extraCardIds: readonly string[] = [],
   cardSizeOf: (cardId: string) => LayeredCardSize | undefined = () => undefined,
+  collapsed: ReadonlySet<string> = new Set(),
 ): CommunityPlacement {
   const { partition, callees, inDegree } = structure;
   if (partition.communities.length === 0 && extraCardIds.length === 0) {
@@ -249,10 +261,24 @@ export function communityPositions(
   // Each block laid out from its own origin; tiled once every size is known.
   const laidOut: { block: Omit<CommunityBlock, 'x' | 'y'>; positions: Map<string, Point> }[] = [];
   for (const community of partition.communities) {
+    const common = {
+      communityId: community.id,
+      label: community.label,
+      memberCount: community.memberIds.length,
+    };
+    if (collapsed.has(community.id)) {
+      // One card, under the community's own id, at the block's origin.
+      const { positions, width, height } = gridBlock([community.id], cardSizeOf);
+      laidOut.push({
+        block: { ...common, cardIds: [community.id], collapsed: true, width, height },
+        positions,
+      });
+      continue;
+    }
     if (community.id === UNREFERENCED_COMMUNITY_ID) {
       const { positions, width, height } = gridBlock(community.memberIds, cardSizeOf);
       laidOut.push({
-        block: { communityId: community.id, label: community.label, cardIds: community.memberIds, width, height },
+        block: { ...common, cardIds: community.memberIds, collapsed: false, width, height },
         positions,
       });
       continue;
@@ -270,9 +296,9 @@ export function communityPositions(
     );
     laidOut.push({
       block: {
-        communityId: community.id,
-        label: community.label,
+        ...common,
         cardIds: community.memberIds,
+        collapsed: false,
         width: result.width,
         height: result.height,
       },
@@ -282,7 +308,16 @@ export function communityPositions(
   if (extraCardIds.length > 0) {
     const { positions, width, height } = gridBlock(extraCardIds, cardSizeOf);
     laidOut.push({
-      block: { communityId: FOLDED_BLOCK_ID, label: FOLDED_BLOCK_LABEL, cardIds: extraCardIds, width, height },
+      block: {
+        communityId: FOLDED_BLOCK_ID,
+        label: FOLDED_BLOCK_LABEL,
+        cardIds: extraCardIds,
+        // Not a community: it has no card of its own and never collapses.
+        collapsed: false,
+        memberCount: extraCardIds.length,
+        width,
+        height,
+      },
       positions,
     });
   }
@@ -332,6 +367,8 @@ export interface CommunityLayoutInput {
   /** The render-only folded Type/Module cards, in the order the canvas lays them out. */
   extraCardIds?: readonly string[];
   cardSizeOf?: (cardId: string) => LayeredCardSize | undefined;
+  /** Communities drawn as one community card instead of their members; none by default. */
+  collapsed?: ReadonlySet<string>;
 }
 
 /** `communityStructure` and `communityPositions` in one call, for a caller with nothing to memoize. */
@@ -341,7 +378,7 @@ export function communityLayout(input: CommunityLayoutInput): CommunityLayout {
     return EMPTY_COMMUNITY_LAYOUT;
   }
   const structure = communityStructure(input.nodes, input.edges);
-  return { structure, ...communityPositions(structure, extraCardIds, input.cardSizeOf) };
+  return { structure, ...communityPositions(structure, extraCardIds, input.cardSizeOf, input.collapsed) };
 }
 
 /**

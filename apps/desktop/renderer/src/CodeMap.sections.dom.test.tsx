@@ -90,6 +90,18 @@ function props(overrides: Partial<CodeMapProps> = {}): CodeMapProps {
 }
 
 /** The drawn card text of a Node (inside a React Flow Node). */
+/**
+ * Full map draws every Node: the collapsed community view's "All Nodes"
+ * (`CommunityViewToggle`). A no-op on a map too small to group, where the
+ * toggle is not shown and every Node is drawn already.
+ */
+function showAllNodes(): void {
+  const all = screen.queryByRole('button', { name: 'All Nodes' });
+  if (all !== null) {
+    fireEvent.click(all);
+  }
+}
+
 function findCard(name: string): Promise<HTMLElement> {
   return screen.findByText(name, { selector: '.react-flow__node .code-map__node *' }, FIND);
 }
@@ -366,7 +378,10 @@ describe('CodeMap: switching section from Node detail (replaces the crossSection
     const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
     await findCard(S.handler.name);
     rerender(<CodeMap {...props({ section: 'web' })} />);
-    await waitFor(() => assert.ok(drawnNames().length > 0 && drawnNames().every((id) => id.startsWith('fixture://'))), FIND);
+    await waitFor(() => {
+      showAllNodes();
+      assert.ok(drawnNames().length > 0 && drawnNames().every((id) => id.startsWith('fixture://')));
+    }, FIND);
     await waitFor(() => assert.notEqual(document.querySelector<HTMLElement>('.react-flow')?.style.visibility, 'hidden'), FIND);
     assert.equal(cardOf(target.id), null, 'the target card is culled');
 
@@ -1018,9 +1033,11 @@ describe('CodeMap: Path Trace and the diff are sent with the section on screen (
 });
 
 describe('CodeMap: per-section first fit and empty notice (replaces the sectionBar CodeMap pins)', () => {
+  // The fit the canvas owes on opening: the collapsed community view, which
+  // is what it draws before anything is expanded.
   function expectedFit(map: CodeMapOk): string {
     const fit = initialViewport({
-      nodes: [...fullMapPositions(map)].map(([id, position]) => ({ id, position })),
+      nodes: [...fullMapPositions(map, [], 'default')].map(([id, position]) => ({ id, position })),
       cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
       viewport: { width: elementSize.width, height: elementSize.height },
       minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
@@ -1046,7 +1063,9 @@ describe('CodeMap: per-section first fit and empty notice (replaces the sectionB
     await waitFor(() => assert.equal(viewportTransform(), expectedFit(api)), FIND);
 
     rerender(<CodeMap {...props({ section: 'web' })} />);
-    await waitFor(() => assert.ok(drawnNames().some((id) => id.startsWith('fixture://'))), FIND);
+    // `includes`, not `startsWith`: in the collapsed community view the drawn
+    // cards are the communities, whose ids carry their representative Node's.
+    await waitFor(() => assert.ok(drawnNames().some((id) => id.includes('fixture://'))), FIND);
     assert.notEqual(expectedFit(web), expectedFit(api));
     await waitFor(() => assert.equal(viewportTransform(), expectedFit(web)), FIND);
   });

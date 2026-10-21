@@ -23,6 +23,8 @@ import type { LayeredCardSize } from './layered';
 export interface FullLayoutNode {
   id: string;
   name: string;
+  /** Project-root-relative POSIX path — a community may be named after the file its members share. */
+  file: string;
 }
 
 /**
@@ -64,15 +66,22 @@ export function fullStructureOf(
  * card sizes React Flow has measured so far. `gridSize` mirrors
  * `canvasGridSize`: the map Nodes alone when there are any, so the folded
  * cards do not change the fallback grid the Nodes would use.
+ *
+ * `collapsed` names the communities drawn as one community card instead of
+ * their members; `ids` then holds that card's id in place of theirs, so it
+ * is always exactly what the canvas draws.
  */
 export function fullGridOf(
   structure: CommunityStructure,
   nodes: readonly FullLayoutNode[],
   extraCardIds: readonly string[],
   cardSizeOf: (cardId: string) => LayeredCardSize | undefined,
+  collapsed: ReadonlySet<string> = new Set(),
 ): FullGrid {
-  const ids = [...nodes.map((node) => node.id), ...extraCardIds];
-  const placed = communityPositions(structure, extraCardIds, cardSizeOf);
+  const placed = communityPositions(structure, extraCardIds, cardSizeOf, collapsed);
+  // A collapsed community lays out one card under its own id, in place of its
+  // members, so the ids Full draws follow the blocks rather than `nodes`.
+  const ids = [...placed.blocks.flatMap((block) => [...block.cardIds])];
   return {
     ids,
     idSet: new Set(ids),

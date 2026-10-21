@@ -1329,6 +1329,7 @@ code,
    distinguishable layers. Applied to every Node card (and cluster), changed
    or not, so focus reads the same everywhere on the canvas. */
 .code-map__node:focus-visible,
+.code-map__community:focus-visible,
 .code-map__cluster:focus-visible {
   outline: 2px solid var(--text);
   outline-offset: 3px;
@@ -2014,6 +2015,71 @@ code,
 .code-map__cluster:hover {
   border-color: var(--accent);
   color: var(--text);
+}
+
+/* A collapsed community card (`communityView.ts`). Told apart from an LOD
+   cluster by shape, not colour alone: a cluster is a dashed pill, this is a
+   square-cornered panel with a solid rule down its leading edge, like the
+   blocks it stands for. Deliberately NOT accent-bordered — accent means
+   "changed" (and keyboard focus) on this canvas and nothing else. */
+.code-map__community {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-mute);
+  background: var(--panel-alt);
+  min-width: 180px;
+  max-width: 320px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.code-map__community:hover {
+  border-left-color: var(--text);
+}
+
+.code-map__community-kind {
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+
+.code-map__community-label {
+  /* Monospace comes from the `<code>` element itself, as `.code-map__node-id`
+     relies on — every code identifier renders in monospace (EXPERIENCE.md). */
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.code-map__community-nodes,
+.code-map__community-cohesion,
+.code-map__community-outside {
+  font-size: 0.72rem;
+  color: var(--text-mute);
+}
+
+.code-map__community-outside {
+  color: var(--text);
+}
+
+/* The counted traffic between two collapsed cards. A distinct dash pattern
+   from every real map edge, so a community link is never read as a call
+   edge; its count rides as the edge's own visible label. */
+.code-map__edge--community-link path {
+  stroke: var(--text-mute);
+  stroke-dasharray: 2 3;
+}
+
+/* The notice saying why there are no community cards. Quiet: it sits in the
+   canvas Panel beside the status line, not over the map. */
+.code-map__community-notice {
+  max-width: 34rem;
 }
 
 .code-map__cluster-count {

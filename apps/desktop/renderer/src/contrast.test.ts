@@ -215,6 +215,7 @@ const CONTROLS = [
 const DECORATIVE_CARDS = new Set([
   '.code-map__node', // Node card: `--panel` fill + `--border-strong` card edge
   '.code-map__cluster', // cluster card: `--panel` fill, dashed edge
+  '.code-map__community', // collapsed community card: `--panel-alt` fill plus a 3px `--text-mute` leading rule
   '.code-map__health-card', // Health Audit cluster card
   '.settings-panel', // modal frame
   '.code-map__node-detail-panel', // side-panel frame

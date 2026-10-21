@@ -10,7 +10,8 @@ import { samePositions } from './communityLayout';
 import { fullGridOf, fullStructureOf, type FullLayoutNode } from './fullLayout';
 
 const id = (name: string) => `src/${name}.ts::${name}`;
-const nodesOf = (...names: string[]): FullLayoutNode[] => names.map((name) => ({ id: id(name), name }));
+const nodesOf = (...names: string[]): FullLayoutNode[] =>
+  names.map((name) => ({ id: id(name), name, file: `src/${name}.ts` }));
 
 const CHAIN = {
   nodes: nodesOf('a1', 'a2', 'a3'),

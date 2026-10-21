@@ -9,8 +9,12 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  COMMUNITY_FILE_LABEL_MIN_SHARE,
   detectCommunities,
+  isolatedCommunityLabel,
+  ISOLATED_COMMUNITY_ID,
   MIN_COMMUNITY_MEMBERS,
+  MIN_ISOLATED_GROUPS_TO_POOL,
   MIN_NODES_TO_PARTITION,
   UNREFERENCED_COMMUNITY_ID,
   UNREFERENCED_COMMUNITY_LABEL,
@@ -19,7 +23,10 @@ import {
 } from './communities';
 
 const id = (name: string) => `src/${name}.ts::${name}`;
-const nodesOf = (...names: string[]): CommunityInputNode[] => names.map((name) => ({ id: id(name), name }));
+const nodesOf = (...names: string[]): CommunityInputNode[] =>
+  // One file per Node, so the modal-file share stays below
+  // `COMMUNITY_FILE_LABEL_MIN_SHARE` and these fixtures keep identifier labels.
+  names.map((name) => ({ id: id(name), name, file: `src/${name}.ts` }));
 const edgesOf = (...pairs: [string, string][]): CommunityInputEdge[] =>
   pairs.map(([source, target]) => ({ source: id(source), target: id(target) }));
 
@@ -262,7 +269,7 @@ describe('detectCommunities on a graph with known module structure', () => {
     const name = (module: number, index: number) => `m${module}f${index}`;
     for (let module = 0; module < MODULES; module += 1) {
       for (let index = 0; index < PER_MODULE; index += 1) {
-        nodes.push({ id: id(name(module, index)), name: name(module, index) });
+        nodes.push({ id: id(name(module, index)), name: name(module, index), file: `src/${name(module, index)}.ts` });
       }
       for (let index = 0; index < PER_MODULE; index += 1) {
         const next = (index + 1) % PER_MODULE;
@@ -318,6 +325,7 @@ describe('detectCommunities keeps the map readable on a leaf-heavy graph', () =>
     const nodes: CommunityInputNode[] = Array.from({ length: nodeCount }, (_unused, index) => ({
       id: id(`f${index}`),
       name: `f${index}`,
+      file: `src/f${index}.ts`,
     }));
     const edges: CommunityInputEdge[] = [];
     const hubs = Math.max(1, Math.floor(nodeCount / 12));
@@ -360,7 +368,7 @@ describe('detectCommunities keeps the map readable on a leaf-heavy graph', () =>
     assert.equal(communityOfNode.size, nodes.length, 'every Node is still placed');
   });
 
-  it('leaves an island below the floor alone — it has no neighbour to join', () => {
+  it('leaves a lone island below the floor as its own community — there is no bag to pool it into', () => {
     const { nodes, edges } = leafHeavy(1334);
     const island = nodesOf('islandA', 'islandB');
     const { communities } = detectCommunities(
@@ -371,5 +379,263 @@ describe('detectCommunities keeps the map readable on a leaf-heavy graph', () =>
     assert.ok(found, 'the island is a community of its own');
     assert.deepEqual([...found.memberIds], [id('islandA'), id('islandB')]);
     assert.notEqual(found.id, UNREFERENCED_COMMUNITY_ID, 'it has an edge, so it is not unreferenced');
+  });
+});
+
+describe('detectCommunities pools the tail of islands', () => {
+  /** `size` disconnected pairs, plus one clique big enough to partition the map. */
+  function islandsBesideAModule(islandCount: number) {
+    const nodes: CommunityInputNode[] = [];
+    const edges: CommunityInputEdge[] = [];
+    for (let index = 0; index < MIN_NODES_TO_PARTITION; index += 1) {
+      nodes.push(...nodesOf(`hub${index}`));
+    }
+    for (let from = 0; from < MIN_NODES_TO_PARTITION; from += 1) {
+      for (let to = from + 1; to < MIN_NODES_TO_PARTITION; to += 1) {
+        edges.push(...edgesOf([`hub${from}`, `hub${to}`]));
+      }
+    }
+    for (let island = 0; island < islandCount; island += 1) {
+      nodes.push(...nodesOf(`i${island}a`, `i${island}b`));
+      edges.push(...edgesOf([`i${island}a`, `i${island}b`]));
+    }
+    return { nodes, edges };
+  }
+
+  it('folds every sub-floor island into one community, named with how many', () => {
+    const { nodes, edges } = islandsBesideAModule(6);
+    const { communities, communityOfNode } = detectCommunities(nodes, edges);
+    const pooled = communities.find((community) => community.id === ISOLATED_COMMUNITY_ID);
+    assert.ok(pooled, 'the islands are pooled');
+    assert.equal(pooled.label, isolatedCommunityLabel(6));
+    assert.equal(pooled.memberIds.length, 12, 'all six pairs are in it');
+    for (let island = 0; island < 6; island += 1) {
+      assert.equal(communityOfNode.get(id(`i${island}a`)), ISOLATED_COMMUNITY_ID);
+    }
+    assert.equal(
+      communities.filter((community) => community.memberIds.length < MIN_COMMUNITY_MEMBERS).length,
+      0,
+      'no sub-floor community is left drawing a card of its own',
+    );
+  });
+
+  it('counts the pooled community’s own calls, and reports no traffic to anything else', () => {
+    const { nodes, edges } = islandsBesideAModule(6);
+    const { communities, links } = detectCommunities(nodes, edges);
+    const pooled = communities.find((community) => community.id === ISOLATED_COMMUNITY_ID)!;
+    assert.equal(pooled.internalEdges, 6, 'one call inside each pair');
+    assert.equal(pooled.externalEdges, 0, 'islands call nothing outside — that is why they survived');
+    assert.equal(
+      links.filter(
+        (link) =>
+          link.sourceCommunityId === ISOLATED_COMMUNITY_ID || link.targetCommunityId === ISOLATED_COMMUNITY_ID,
+      ).length,
+      0,
+    );
+  });
+
+  it('sorts after every real module, and before the unreferenced community', () => {
+    const { nodes, edges } = islandsBesideAModule(6);
+    const { communities } = detectCommunities([...nodes, ...nodesOf('lonely')], edges);
+    const ids = communities.map((community) => community.id);
+    const pooledAt = ids.indexOf(ISOLATED_COMMUNITY_ID);
+    const unreferencedAt = ids.indexOf(UNREFERENCED_COMMUNITY_ID);
+    assert.ok(pooledAt > 0, 'at least one real module comes first');
+    assert.equal(pooledAt, ids.length - 2);
+    assert.equal(unreferencedAt, ids.length - 1);
+    for (const community of communities.slice(0, pooledAt)) {
+      assert.ok(community.memberIds.length >= MIN_COMMUNITY_MEMBERS);
+    }
+  });
+
+  it('leaves a single island alone rather than pooling one group into a bag of groups', () => {
+    const { nodes, edges } = islandsBesideAModule(1);
+    assert.equal(MIN_ISOLATED_GROUPS_TO_POOL, 2, 'this test encodes the threshold it is checking');
+    const { communities } = detectCommunities(nodes, edges);
+    assert.equal(communities.find((community) => community.id === ISOLATED_COMMUNITY_ID), undefined);
+    const island = communities.find((community) => community.memberIds.includes(id('i0a')))!;
+    assert.deepEqual([...island.memberIds], [id('i0a'), id('i0b')]);
+  });
+
+  it('places every Node exactly once, pooled or not', () => {
+    const { nodes, edges } = islandsBesideAModule(6);
+    const { communities, communityOfNode } = detectCommunities([...nodes, ...nodesOf('lonely')], edges);
+    const members = communities.flatMap((community) => [...community.memberIds]);
+    assert.equal(members.length, nodes.length + 1);
+    assert.equal(new Set(members).size, nodes.length + 1);
+    assert.equal(communityOfNode.size, nodes.length + 1);
+  });
+
+  it('states the group count in singular and plural', () => {
+    assert.equal(isolatedCommunityLabel(1), '1 isolated group');
+    assert.equal(isolatedCommunityLabel(14), '14 isolated groups');
+  });
+});
+
+describe('detectCommunities names a community by what it can defend', () => {
+  /** A clique of `size`, with `inOneFile` of its members sharing `sharedFile`. */
+  function cliqueAcrossFiles(size: number, inOneFile: number, sharedFile = 'src/home.ts') {
+    const nodes: CommunityInputNode[] = Array.from({ length: size }, (_unused, index) => ({
+      id: id(`m${index}`),
+      name: `m${index}`,
+      file: index < inOneFile ? sharedFile : `src/other${index}.ts`,
+    }));
+    const edges: CommunityInputEdge[] = [];
+    for (let from = 0; from < size; from += 1) {
+      for (let to = from + 1; to < size; to += 1) {
+        edges.push(...edgesOf([`m${from}`, `m${to}`]));
+      }
+    }
+    return { nodes, edges };
+  }
+
+  it('uses the file when it holds a majority of the members', () => {
+    const size = MIN_NODES_TO_PARTITION;
+    const { nodes, edges } = cliqueAcrossFiles(size, Math.ceil(size * 0.8));
+    const { communities } = detectCommunities(nodes, edges);
+    const home = communities.find((community) => community.memberIds.includes(id('m0')))!;
+    assert.equal(home.label, 'src/home.ts');
+  });
+
+  it('keeps the hub’s identifier when no file holds a majority', () => {
+    const size = MIN_NODES_TO_PARTITION;
+    const { nodes, edges } = cliqueAcrossFiles(size, Math.floor(size * 0.2));
+    const { communities } = detectCommunities(nodes, edges);
+    const community = communities.find((c) => c.memberIds.includes(id('m0')))!;
+    const names = new Set(nodes.map((node) => node.name));
+    assert.ok(names.has(community.label), `${community.label} is a member identifier, not a path`);
+  });
+
+  it('switches at the stated share, not somewhere near it', () => {
+    assert.equal(COMMUNITY_FILE_LABEL_MIN_SHARE, 0.5, 'this test encodes the threshold it checks');
+    const size = 40;
+    const justUnder = detectCommunities(...Object.values(cliqueAcrossFiles(size, 19)) as [CommunityInputNode[], CommunityInputEdge[]]);
+    const atShare = detectCommunities(...Object.values(cliqueAcrossFiles(size, 20)) as [CommunityInputNode[], CommunityInputEdge[]]);
+    const labelFor = (result: ReturnType<typeof detectCommunities>) =>
+      result.communities.find((c) => c.memberIds.includes(id('m0')))!.label;
+    assert.notEqual(labelFor(justUnder), 'src/home.ts', '19 of 40 is under half');
+    assert.equal(labelFor(atShare), 'src/home.ts', '20 of 40 is half');
+  });
+
+  it('never composes a name of its own — the label is always a real path or a real identifier', () => {
+    const { nodes, edges } = cliqueAcrossFiles(MIN_NODES_TO_PARTITION, MIN_NODES_TO_PARTITION);
+    const { communities } = detectCommunities(nodes, edges);
+    const paths = new Set(nodes.map((node) => node.file));
+    const names = new Set(nodes.map((node) => node.name));
+    for (const community of communities) {
+      assert.ok(paths.has(community.label) || names.has(community.label), community.label);
+    }
+  });
+
+  it('names a community after the member its own community calls most', () => {
+    // A star: every other member calls `m0`, so `m0` has an in-community
+    // in-degree of 39 and everyone else 0. Each Node sits in its own file, so
+    // the label is an identifier rather than a path.
+    const size = MIN_NODES_TO_PARTITION;
+    const nodes = nodesOf(...Array.from({ length: size }, (_unused, index) => `m${index}`));
+    const edges = Array.from({ length: size - 1 }, (_unused, index) =>
+      edgesOf([`m${index + 1}`, 'm0']),
+    ).flat();
+    const { communities, communityOfNode } = detectCommunities(nodes, edges);
+    const community = communities.find((c) => c.id === communityOfNode.get(id('m0')))!;
+    assert.ok(community.memberIds.length > 1, 'the star is one community, not a lone Node');
+    assert.equal(community.label, 'm0', `named ${community.label}`);
+  });
+
+  it('ties on the modal file go to the first path, so the label is deterministic', () => {
+    const size = MIN_NODES_TO_PARTITION;
+    const nodes: CommunityInputNode[] = Array.from({ length: size }, (_unused, index) => ({
+      id: id(`m${index}`),
+      name: `m${index}`,
+      file: index % 2 === 0 ? 'src/bbb.ts' : 'src/aaa.ts',
+    }));
+    const edges: CommunityInputEdge[] = [];
+    for (let from = 0; from < size; from += 1) {
+      for (let to = from + 1; to < size; to += 1) {
+        edges.push(...edgesOf([`m${from}`, `m${to}`]));
+      }
+    }
+    const forward = detectCommunities(nodes, edges);
+    const reversed = detectCommunities([...nodes].reverse(), [...edges].reverse());
+    const labelOf = (r: ReturnType<typeof detectCommunities>) =>
+      r.communities.find((c) => c.memberIds.includes(id('m0')))!.label;
+    // Exactly half each: under the threshold is false, so the modal file wins
+    // and must be the same one whichever order the Nodes arrive in.
+    assert.equal(labelOf(forward), labelOf(reversed));
+    assert.equal(labelOf(forward), 'src/aaa.ts');
+  });
+});
+
+describe('detectCommunities never leaves two communities reading alike', () => {
+  /** `count` separate groups whose hub is called `New` in each — Go's constructor convention. */
+  function groupsWithTheSameHubName(count: number) {
+    const nodes: CommunityInputNode[] = [];
+    const edges: CommunityInputEdge[] = [];
+    const per = Math.ceil(MIN_NODES_TO_PARTITION / count) + 4;
+    for (let group = 0; group < count; group += 1) {
+      const dir = `pkg${group}`;
+      nodes.push({ id: `${dir}/new.go::New`, name: 'New', file: `${dir}/new.go` });
+      for (let index = 0; index < per; index += 1) {
+        nodes.push({ id: `${dir}/f${index}.go::f${index}`, name: `f${index}`, file: `${dir}/f${index}.go` });
+        edges.push({ source: `${dir}/f${index}.go::f${index}`, target: `${dir}/new.go::New` });
+      }
+      // A ring, so each group is cohesive enough to stay its own community.
+      for (let index = 0; index < per; index += 1) {
+        edges.push({
+          source: `${dir}/f${index}.go::f${index}`,
+          target: `${dir}/f${(index + 1) % per}.go::f${(index + 1) % per}`,
+        });
+      }
+    }
+    return { nodes, edges };
+  }
+
+  it('qualifies a repeated name with its hub’s file', () => {
+    const { nodes, edges } = groupsWithTheSameHubName(3);
+    const { communities } = detectCommunities(nodes, edges);
+    const labels = communities.map((community) => community.label);
+    assert.equal(new Set(labels).size, labels.length, `two communities read alike: ${labels.join(' / ')}`);
+    const repeated = communities.filter((community) => community.label.startsWith('New ('));
+    assert.ok(repeated.length >= 2, `expected qualified New labels, got ${labels.join(' / ')}`);
+    for (const community of repeated) {
+      // An identifier label is qualified by its hub's file.
+      assert.match(community.label, /^New \(pkg\d\/new\.go\)$/);
+    }
+  });
+
+  it('leaves a name alone when nothing else shares it', () => {
+    const { nodes, edges } = groupsWithTheSameHubName(1);
+    const { communities } = detectCommunities(nodes, edges);
+    for (const community of communities) {
+      assert.doesNotMatch(community.label, /\(/, `${community.label} was qualified with nothing to disambiguate`);
+    }
+  });
+});
+
+describe('a repeated file label is qualified by its hub, not another path', () => {
+  it('names two communities sharing one big file by the hub each centres on', () => {
+    // Two cohesive groups whose members mostly live in one oversized file —
+    // driller's own `CodeMap.tsx` holds four such communities.
+    const nodes: CommunityInputNode[] = [];
+    const edges: CommunityInputEdge[] = [];
+    const big = 'src/Big.tsx';
+    for (const group of ['p', 'q']) {
+      const size = MIN_NODES_TO_PARTITION / 2 + 2;
+      for (let index = 0; index < size; index += 1) {
+        nodes.push({ id: `${big}::${group}${index}`, name: `${group}${index}`, file: big });
+      }
+      for (let from = 0; from < size; from += 1) {
+        for (let to = from + 1; to < size; to += 1) {
+          edges.push({ source: `${big}::${group}${from}`, target: `${big}::${group}${to}` });
+        }
+      }
+    }
+    const { communities } = detectCommunities(nodes, edges);
+    const labels = communities.map((community) => community.label);
+    assert.equal(new Set(labels).size, labels.length, `two communities read alike: ${labels.join(' / ')}`);
+    for (const label of labels) {
+      assert.match(label, /^src\/Big\.tsx \([pq]\d+\)$/, `${label} is the file qualified by its hub identifier`);
+      assert.doesNotMatch(label, /\(src\//, 'never one path qualified by another');
+    }
   });
 });

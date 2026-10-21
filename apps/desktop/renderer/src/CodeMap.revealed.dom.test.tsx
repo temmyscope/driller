@@ -170,6 +170,18 @@ function showFull(): void {
   fireEvent.click(toggleButton('Full map'));
 }
 
+/**
+ * Full map draws every Node: the collapsed community view's "All Nodes"
+ * (`CommunityViewToggle`). A no-op on a map too small to group, where the
+ * toggle is not shown and every Node is drawn already.
+ */
+function showAllNodes(): void {
+  const all = screen.queryByRole('button', { name: 'All Nodes' });
+  if (all !== null) {
+    fireEvent.click(all);
+  }
+}
+
 /** The Panel's status line (the one live region Revealed speaks through). */
 function revealStatus(): HTMLElement {
   const line = document.querySelector<HTMLElement>('.code-map__reveal-status');
@@ -332,6 +344,7 @@ describe('Toggling Revealed (replaces the Revealed-branch and listing-fetch pins
     render(<CodeMap {...props({ onMapState: (_project, state) => reports.push(state) })} />);
     await waitFor(() => {
       measure();
+      showAllNodes();
       assert.ok(drawnIds().length > hubs.length);
     }, FIND);
     showRevealed();
@@ -1016,6 +1029,7 @@ describe('A toggle resets the cluster expansions (replaces the toggle wiring pin
   it('a cluster expanded in Full is a cluster again after Revealed and back', { timeout: 2 * BUDGET.timeout }, async () => {
     const map = syntheticMapForClusters();
     await mountClusters(map);
+    showAllNodes();
     const cluster = expandableCluster();
     const clusterId = cluster.getAttribute('data-id') ?? '';
     fireEvent.click(cluster);

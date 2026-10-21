@@ -63,7 +63,7 @@
  * the shared `ActionableNotice` shape (P1-7).
  */
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FocusEvent, type FormEvent, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FocusEvent, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import {
   Background,
   BaseEdge,
@@ -131,6 +131,34 @@ import { formatCount, formatCountNumber } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
 import { samePositions, type CommunityStructure } from './communityLayout';
+import type { CommunityPartition } from './communities';
+import {
+  collapsedCommunityIds,
+  communityCardAriaLabel,
+  communityCardCohesionText,
+  communityCardNodesText,
+  communityCardOutsideText,
+  communityCards,
+  communityLinkEdges,
+  communityViewApplies,
+  communityViewMode,
+  communityViewNotice,
+  communityViewPopulation,
+  expandedForMode,
+  formatCommunityAnnouncement,
+  formatCommunityHistoryAnnouncement,
+  isCommunityCardId,
+  isCommunityLinkEdgeId,
+  NO_EXPANDED_COMMUNITIES,
+  partitionNodeCount,
+  planCommunityToggle,
+  type CommunityCard,
+  type CommunityLinkEdge,
+  type CommunityStep,
+  type CommunityViewMode,
+  type CommunityViewNotice,
+  type ExpandedCommunities,
+} from './communityView';
 import { fullGridOf, fullStructureOf, type FullGrid } from './fullLayout';
 import { SECTION_SWITCH_UNAVAILABLE_HINT, selectedSectionTabId } from './SectionBar';
 import {
@@ -2289,6 +2317,9 @@ export function canvasPopulation(
 export function activateCanvasCard(flowNode: CodeMapAnyFlowNode, expandCluster: (cluster: Cluster) => void): void {
   if (flowNode.type === 'codeMapCluster') {
     expandCluster(flowNode.data.cluster);
+  } else if (flowNode.type === 'codeMapCommunity') {
+    // A collapsed community opens to its own Nodes; it has no Node detail.
+    flowNode.data.onToggle(flowNode.data.card.id, 'expand');
   } else if (flowNode.type === 'codeMapFolded') {
     flowNode.data.onActivate(flowNode.data.folded);
   } else if (flowNode.type === 'codeMapRevealRef') {
@@ -2464,6 +2495,26 @@ export function sharedReachFlowEdges(edges: readonly RevealRelationEdge[]): Flow
 }
 
 /**
+ * The counted call traffic between two collapsed community cards. The count
+ * is the edge's visible `label` — text, never width or colour alone
+ * (Accessibility Floor) — and its `ariaLabel` says it in full, qualified "in
+ * indexed code". Not a map edge: never highlight-threaded, never
+ * re-anchored on a cluster.
+ */
+export function communityLinkFlowEdges(edges: readonly CommunityLinkEdge[]): FlowEdge[] {
+  return edges.map((edge) => ({
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    label: edge.label,
+    ariaLabel: edge.ariaLabel,
+    className: 'code-map__edge code-map__edge--community-link',
+    selectable: false,
+    focusable: false,
+  }));
+}
+
+/**
  * P4-7h: the shared-reach edge — an arc through the empty gutter left of
  * column 0 (`sharedReachArc`), from the active card's left side to the
  * partner's, its "shares N" label at the apex. Both cards are candidates in
@@ -2527,6 +2578,8 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 const EMPTY_LOD_RESULT: ComputeLODResult = { fullNodeIds: new Set(), clusters: [] };
 const EMPTY_FLOW_NODES: CodeMapAnyFlowNode[] = [];
 const EMPTY_FLOW_EDGES: FlowEdge[] = [];
+/** Stable empty reference for the community cards, same precedent as the two above. */
+const EMPTY_COMMUNITY_FLOW_NODES: CodeMapCommunityFlowNode[] = [];
 
 /** Edge key for `pathTraceHighlight`'s `edgeKeys` (Story 1.9, Phase 2) — matches `toFlowEdges`'s own `id` separator. */
 function pathEdgeKey(source: string, target: string): string {
@@ -3279,11 +3332,75 @@ export function RevealEdgeLegend() {
 }
 
 /** P4-7h: the canvas Node id an element sits in (React Flow's `data-id` on the Node wrapper), or `null`. */
+/**
+ * Why the collapsed community view shows no community cards, when it shows
+ * none: one community holding the whole map, a map that is entirely
+ * unreferenced, or too few Nodes to be worth grouping. Each is a real
+ * outcome of a real partition, not a failure — so it states what is true in
+ * one sentence and offers no action (EXPERIENCE.md's Actionable Notice
+ * shape), rather than leaving the absence of cards unexplained.
+ *
+ * No live-region role: this is a steady state, and the Panel's one
+ * `role="status"` line owns the announcements (every expand, collapse and
+ * Back/Forward goes through it).
+ *
+ * MUST STAY HOOKLESS (rendered in tests).
+ */
+export function CommunityNoticeLine({ notice }: { notice: CommunityViewNotice }) {
+  return (
+    <ActionableNotice tone="info" className="code-map__community-notice">
+      {notice.sentence}
+    </ActionableNotice>
+  );
+}
+
 export function canvasNodeIdOf(target: EventTarget | null): string | null {
   if (typeof Element === 'undefined' || !(target instanceof Element)) {
     return null;
   }
   return target.closest('.react-flow__node')?.getAttribute('data-id') ?? null;
+}
+
+/**
+ * The canvas Panel's "Grouped / All Nodes" control — Full map's collapsed
+ * community view, or every Node as Full always drew it. Two buttons in a
+ * group, the active one `aria-pressed`, mirroring the Revealed/Full toggle
+ * beside it. Shown only where the view applies (`communityViewApplies`), so
+ * a map too small to group never offers a choice that would do nothing.
+ *
+ * Switching here is not a history step, exactly as the Revealed/Full toggle
+ * is not: it is which view you are in, not a step within one. Expanding or
+ * collapsing ONE community is the step (`planCommunityToggle`).
+ *
+ * Hookless.
+ */
+export function CommunityViewToggle({
+  mode,
+  onChange,
+}: {
+  mode: CommunityViewMode;
+  onChange: (mode: CommunityViewMode) => void;
+}) {
+  return (
+    <div className="code-map__reveal-toggle" role="group" aria-label="Community view">
+      <button
+        type="button"
+        className="code-map__reveal-toggle-option"
+        aria-pressed={mode === 'grouped'}
+        onClick={() => onChange('grouped')}
+      >
+        Grouped
+      </button>
+      <button
+        type="button"
+        className="code-map__reveal-toggle-option"
+        aria-pressed={mode === 'all'}
+        onClick={() => onChange('all')}
+      >
+        All Nodes
+      </button>
+    </div>
+  );
 }
 
 export function RevealViewToggle({
@@ -3691,6 +3808,21 @@ type CodeMapClusterFlowNode = FlowNode<
     affectedCount?: number;
   },
   'codeMapCluster'
+>;
+
+/**
+ * One collapsed community's card (`communityView.ts`). NOT an LOD cluster
+ * (spatial, `codeMapCluster` above) and NOT a Health Audit cluster
+ * (directory-grouped) — arc42.md §8 names all three. Its id is the
+ * community's own, which is renderer-local and never reaches a Graph
+ * Service call (AD-2).
+ */
+type CodeMapCommunityFlowNode = FlowNode<
+  {
+    card: CommunityCard;
+    onToggle: (communityId: string, action: CommunityStep) => void;
+  },
+  'codeMapCommunity'
 >;
 
 /**
@@ -4523,14 +4655,23 @@ export const CODE_MAP_CANVAS_HEIGHT = 'calc(100% - var(--code-map-table-height))
 export function CodeMapCanvasFrame({
   canvasRef,
   children,
+  onKeyDown,
 }: {
   canvasRef: (element: HTMLDivElement | null) => void;
   children: ReactNode;
+  /** Keys a card did not handle itself bubble to here — the collapsed community view's `−`. */
+  onKeyDown?: (event: KeyboardEvent<HTMLDivElement>) => void;
 }) {
   return (
     // Review round 1: `tabIndex={-1}` — the fallback focus target after a
     // cross-section switch whose card never renders (`cardFocusStep`).
-    <div className="code-map__canvas" ref={canvasRef} style={{ height: CODE_MAP_CANVAS_HEIGHT }} tabIndex={-1}>
+    <div
+      className="code-map__canvas"
+      ref={canvasRef}
+      style={{ height: CODE_MAP_CANVAS_HEIGHT }}
+      tabIndex={-1}
+      onKeyDown={onKeyDown}
+    >
       {children}
     </div>
   );
@@ -6577,7 +6718,59 @@ export function CodeMapClusterCard({ data }: NodeProps<CodeMapClusterFlowNode>) 
   );
 }
 
-type CodeMapAnyFlowNode = CodeMapCardFlowNode | CodeMapClusterFlowNode;
+/**
+ * A collapsed community's card: what the call graph grouped, named by the
+ * community's own most-called member, with its Node count and its cohesion
+ * as the real counts it comes from (never a derived percentage — the
+ * discipline that kept a fabricated "74% gap" off the Health Audit row).
+ * Activating it, or `+`, opens the community to its Nodes.
+ *
+ * MUST STAY HOOKLESS (rendered in tests).
+ */
+export function CodeMapCommunityCard({ data }: Pick<NodeProps<CodeMapCommunityFlowNode>, 'data'>) {
+  const { card, onToggle } = data;
+  const outside = communityCardOutsideText(card.externalEdges);
+  return (
+    <div
+      className="code-map__community"
+      tabIndex={0}
+      role="button"
+      aria-expanded={false}
+      aria-label={communityCardAriaLabel(card)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onToggle(card.id, 'expand');
+          return;
+        }
+        // `+`/`=` expands and `−`/`-` says it is already collapsed — never
+        // with Ctrl, Cmd or Alt held, so app and browser zoom are untouched
+        // (`revealDrillKey`, shared with the Revealed view).
+        const key = revealDrillKey(event);
+        if (key !== null) {
+          event.preventDefault();
+          onToggle(card.id, key === 'expand' ? 'expand' : 'collapse');
+        }
+      }}
+    >
+      <Handle type="target" position={Position.Left} />
+      <span className="code-map__community-kind">community</span>
+      <code className="code-map__community-label">{card.label}</code>
+      <span className="code-map__community-nodes">{communityCardNodesText(card.memberCount)}</span>
+      <span className="code-map__community-cohesion">
+        {communityCardCohesionText(card.internalEdges, card.externalEdges)}
+      </span>
+      {outside !== null && (
+        <span className="code-map__community-outside" aria-hidden="true">
+          ↗ {outside}
+        </span>
+      )}
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+}
+
+type CodeMapAnyFlowNode = CodeMapCardFlowNode | CodeMapClusterFlowNode | CodeMapCommunityFlowNode;
 
 /**
  * P4-2 phase 3c: a folded kind's card ("Show types & modules"): kind, name,
@@ -6623,6 +6816,7 @@ export function CodeMapFoldedCard({ data }: Pick<NodeProps<CodeMapFoldedFlowNode
 const nodeTypes = {
   codeMapNode: CodeMapNodeCard,
   codeMapCluster: CodeMapClusterCard,
+  codeMapCommunity: CodeMapCommunityCard,
   codeMapFolded: CodeMapFoldedCard,
   codeMapRevealRef: CodeMapRevealRefCard,
   codeMapRevealStub: CodeMapRevealStubCard,
@@ -11044,6 +11238,15 @@ export function CodeMap({
     fullCardSizesKeyRef.current = currentRevealKey;
     fullCardSizesRef.current = new Map();
   }
+  // --- the collapsed community view (`communityView.ts`) ----------------
+  // Which communities are drawn as their own Nodes. Session state, never
+  // persisted; empty — the default — collapses every one of them, which is
+  // the whole point of the view: a readable number of labelled cards instead
+  // of every Node at once.
+  const [expandedCommunities, setExpandedCommunities] = useState<ExpandedCommunities>(NO_EXPANDED_COMMUNITIES);
+  const communityPartitionRef = useRef<CommunityPartition | null>(null);
+  const expandedCommunitiesKeyRef = useRef<string | null>(null);
+
   const fullStructure = useMemo<CommunityStructure | null>(
     () =>
       revealDrawn || fetchState.status !== 'ready'
@@ -11051,6 +11254,152 @@ export function CodeMap({
         : fullStructureOf(population.riskNodes, population.riskEdges),
     [revealDrawn, fetchState.status, population],
   );
+  communityPartitionRef.current = fullStructure?.partition ?? null;
+
+  // A new map (project or section) starts collapsed again: the previous
+  // map's community ids mean nothing here. Cleared in an effect rather than
+  // during render, so no render reads a set built for another map.
+  useEffect(() => {
+    if (expandedCommunitiesKeyRef.current === currentRevealKey) {
+      return;
+    }
+    expandedCommunitiesKeyRef.current = currentRevealKey;
+    setExpandedCommunities(NO_EXPANDED_COMMUNITIES);
+  }, [currentRevealKey]);
+
+  const collapsedCommunities = useMemo(
+    () =>
+      fullStructure === null
+        ? EMPTY_ID_SET
+        : collapsedCommunityIds(fullStructure.partition, expandedCommunities),
+    [fullStructure, expandedCommunities],
+  );
+
+  // What the canvas draws: the Nodes of expanded communities only. Every
+  // number still reads `riskNodes`/`riskEdges`, which this passes through as
+  // the very same arrays (`communityView.ts`'s boundary, the Revealed
+  // view's too).
+  const fullPopulation = useMemo(
+    () =>
+      fullStructure === null
+        ? null
+        : communityViewPopulation(population, collapsedCommunities, fullStructure.partition.communityOfNode),
+    [population, collapsedCommunities, fullStructure],
+  );
+
+  /** The Actionable Notice this view owes, or `null`. Both cases are real partitions, not failures. */
+  const communityNotice = useMemo<CommunityViewNotice | null>(
+    () => (fullStructure === null ? null : communityViewNotice(fullStructure.partition)),
+    [fullStructure],
+  );
+
+  /**
+   * One expand or collapse: a single Back step, pushed into the same
+   * renderer-local history a Revealed drill step uses, and announced through
+   * the same one `role="status"` region.
+   */
+  const toggleCommunity = useCallback(
+    (communityId: string, action?: CommunityStep) => {
+      const partition = communityPartitionRef.current;
+      if (partition === null) {
+        return;
+      }
+      setExpandedCommunities((previous) => {
+        const plan = planCommunityToggle(partition, previous, communityId, action);
+        if (plan.kind === 'none') {
+          announceReveal(plan.text);
+          return previous;
+        }
+        setHistory((history) =>
+          pushHistoryEntry(history, {
+            kind: 'community',
+            before: previous,
+            after: plan.next,
+            communityId,
+            label: plan.label,
+            memberCount: plan.memberCount,
+            step: plan.step,
+          }),
+        );
+        announceReveal(formatCommunityAnnouncement(plan.step, plan.label, plan.memberCount));
+        return plan.next;
+      });
+    },
+    [announceReveal],
+  );
+
+  /**
+   * Back or Forward over a community step. The restored set is intersected
+   * with the communities this map actually has, so an entry left over from a
+   * map that has since changed restores what still exists rather than
+   * resurrecting ids that are gone.
+   */
+  const applyCommunityHistoryMove = useCallback(
+    (move: Extract<HistoryMove, { kind: 'community' }>) => {
+      const partition = communityPartitionRef.current;
+      const live = new Set(
+        [...move.restore].filter((id) => partition?.communities.some((community) => community.id === id) === true),
+      );
+      setExpandedCommunities(live);
+      setHistory((previous) => ({ ...previous, index: move.index }));
+      announceReveal(
+        formatCommunityHistoryAnnouncement(move.how, move.entry.step, move.entry.label, move.entry.memberCount),
+      );
+    },
+    [announceReveal],
+  );
+
+  const communityMode = useMemo<CommunityViewMode>(
+    () => (fullStructure === null ? 'all' : communityViewMode(fullStructure.partition, expandedCommunities)),
+    [fullStructure, expandedCommunities],
+  );
+  const communityApplies = fullStructure !== null && communityViewApplies(fullStructure.partition);
+  const changeCommunityMode = useCallback(
+    (next: CommunityViewMode) => {
+      const partition = communityPartitionRef.current;
+      if (partition === null) {
+        return;
+      }
+      setExpandedCommunities(expandedForMode(partition, next));
+      announceReveal(
+        next === 'all'
+          ? `Showing all ${communityCardNodesText(partitionNodeCount(partition))}`
+          : `Showing ${partition.communities.length} communities`,
+      );
+    },
+    [announceReveal],
+  );
+
+  /**
+   * `−` on a focused Node card collapses the community that Node is in.
+   *
+   * While a community is open it has no card of its own to press `−` on, and
+   * the focused Node is what the engineer is looking at — the same shape as
+   * the Revealed view, where `−` on a card collapses what it opened. `+` is
+   * handled by the community card itself. Never with Ctrl, Cmd or Alt held
+   * (`revealDrillKey`), so app and browser zoom are untouched, and only in
+   * Full: Revealed's own `−` already owns the key there.
+   */
+  const handleCanvasKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      if (revealDrawn || fullStructure === null || revealDrillKey(event) !== 'collapse') {
+        return;
+      }
+      const cardId = canvasNodeIdOf(event.target);
+      // A community card handles both keys itself.
+      if (cardId === null || isCommunityCardId(cardId)) {
+        return;
+      }
+      const communityId = fullStructure.partition.communityOfNode.get(cardId);
+      if (communityId === undefined) {
+        return;
+      }
+      event.preventDefault();
+      toggleCommunity(communityId, 'collapse');
+    },
+    [revealDrawn, fullStructure, toggleCommunity],
+  );
+
   const fullGrid = useMemo<FullGrid | null>(() => {
     if (fullStructure === null) {
       return null;
@@ -11061,9 +11410,10 @@ export function CodeMap({
       population.riskNodes,
       population.foldedNodes.map((folded) => folded.id),
       (id) => sizes.get(id),
+      collapsedCommunities,
     );
     // `fullCardSizesVersion`: a batch of sizes that moved a card; `currentRevealKey`: the map's sizes were cleared.
-  }, [fullStructure, population, fullCardSizesVersion, currentRevealKey]);
+  }, [fullStructure, population, fullCardSizesVersion, currentRevealKey, collapsedCommunities]);
   fullGridRef.current = fullGrid;
 
   const flowNodes = useMemo(
@@ -11071,7 +11421,7 @@ export function CodeMap({
       fetchState.status === 'ready'
         ? revealCanvas === null
           ? layoutNodes(
-              population.riskNodes,
+              fullPopulation?.mapNodes ?? population.riskNodes,
               activateNode,
               showNeighbors,
               openSourceForNode,
@@ -11082,7 +11432,7 @@ export function CodeMap({
               showLlmJudgment,
               showIngestedFindings,
               renderChangedIds,
-              population.foldedNodes,
+              fullPopulation?.foldedNodes ?? population.foldedNodes,
               activateFoldedNode,
               contractDependentsById,
               fullGrid === null
@@ -11136,15 +11486,47 @@ export function CodeMap({
   const flowEdges = useMemo(
     () =>
       revealCanvas === null
-        ? toFlowEdges(population.canvasEdges)
+        ? toFlowEdges(fullPopulation?.canvasEdges ?? population.canvasEdges)
         : [
             ...toFlowEdges(revealCanvas.population.canvasEdges),
             ...revealRefConnectorEdges(revealCanvas.reveal.auxCards),
           ],
-    [population, revealCanvas],
+    [population, fullPopulation, revealCanvas],
   );
   // FIX-2: the map's real `CALLS` edges, for the `'found'` trace highlight.
   const callEdges = useMemo(() => callEdgesOf(population.riskEdges), [population]);
+
+  /**
+   * One card per collapsed community, at its block's own position. Kept out
+   * of `flowNodes` on purpose: these cards are already aggregates, so they
+   * must never be swept into an LOD cluster that would relabel them "Cluster
+   * of N Nodes". They are laid out and fitted (`lodInputNodes` below
+   * includes them) and drawn directly in `renderedNodes`.
+   */
+  const communityFlowNodes = useMemo<CodeMapCommunityFlowNode[]>(() => {
+    if (fullGrid === null || fullStructure === null) {
+      return EMPTY_COMMUNITY_FLOW_NODES;
+    }
+    const cards = communityCards(fullGrid.blocks, fullStructure.partition);
+    if (cards.length === 0) {
+      return EMPTY_COMMUNITY_FLOW_NODES;
+    }
+    return cards.map((card) => ({
+      id: card.id,
+      type: 'codeMapCommunity' as const,
+      position: fullGrid.positions.get(card.id) ?? card.position,
+      data: { card, onToggle: toggleCommunity },
+    }));
+  }, [fullGrid, fullStructure, toggleCommunity]);
+
+  /** The counted call traffic between two collapsed community cards. */
+  const communityEdges = useMemo<FlowEdge[]>(
+    () =>
+      fullStructure === null || collapsedCommunities.size === 0
+        ? EMPTY_FLOW_EDGES
+        : communityLinkFlowEdges(communityLinkEdges(fullStructure.partition, collapsedCommunities)),
+    [fullStructure, collapsedCommunities],
+  );
 
   const flowNodesById = useMemo(() => {
     const byId = new Map<string, CodeMapCardFlowNode>();
@@ -11337,6 +11719,19 @@ export function CodeMap({
   // cards (canvas only), so they go through LOD — clustered and revealed —
   // and reach `visibleNodeIds` like any card; nothing that counts reads this.
   const lodInputNodes = useMemo<LODInputNode[]>(
+    () => [...flowNodes, ...communityFlowNodes].map((flowNode) => ({ id: flowNode.id, position: flowNode.position })),
+    [flowNodes, communityFlowNodes],
+  );
+
+  /**
+   * What `computeLOD` may cluster: the Node and folded cards alone. A
+   * collapsed community card is already an aggregate of the call graph's own
+   * making, so bucketing it with its neighbours by on-screen proximity would
+   * relabel it "Cluster of N Nodes" — the exact conflation arc42.md §8
+   * forbids. `lodInputNodes` above still carries them, because the first fit
+   * and `centerOnNode` must see every card that is drawn.
+   */
+  const lodClusterableNodes = useMemo<LODInputNode[]>(
     () => flowNodes.map((flowNode) => ({ id: flowNode.id, position: flowNode.position })),
     [flowNodes],
   );
@@ -11378,7 +11773,7 @@ export function CodeMap({
       mode === 'healthAudit'
         ? EMPTY_LOD_RESULT
         : computeLOD({
-            nodes: lodInputNodes,
+            nodes: lodClusterableNodes,
             zoom: zoomBand,
             threshold: LOD_ZOOM_THRESHOLD,
             viewportBounds: { x: boundsX, y: boundsY, width: worldWidth, height: worldHeight },
@@ -11386,7 +11781,7 @@ export function CodeMap({
     // Depends on the individual quantized numbers, not a `viewportBounds`
     // object literal — a fresh object every render would defeat memoization
     // even when its numeric contents are unchanged.
-    [mode, lodInputNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
+    [mode, lodClusterableNodes, zoomBand, boundsX, boundsY, worldWidth, worldHeight],
   );
 
   // Story 1.9 (Phase 2): the `found` trace's Node ids and (FIX-2) every real
@@ -11520,6 +11915,14 @@ export function CodeMap({
       nodes.push(clusterNode);
     }
 
+    // The collapsed community cards, drawn as they are: never clustered
+    // (they are not in `lodClusterableNodes`), never highlight-threaded
+    // (a community carries no risk, no blast radius and no path).
+    for (const communityNode of communityFlowNodes) {
+      nodes.push(communityNode);
+      visibleNodeIds.add(communityNode.id);
+    }
+
     // P3-11: see `assembleRenderedEdges` — card-to-card edges, plus a
     // changed Node's edges re-anchored on a cluster, all highlight-threaded.
     const edges = assembleRenderedEdges({
@@ -11536,6 +11939,7 @@ export function CodeMap({
     mode,
     lodResult,
     flowNodesById,
+    communityFlowNodes,
     expandedClusterIds,
     expandCluster,
     flowEdges,
@@ -11578,8 +11982,15 @@ export function CodeMap({
     [revealCanvas, hoveredCandidateId, focusedCandidateId],
   );
   const canvasEdges = useMemo(
-    () => withSharedReachEdges(renderedEdges, sharedReachEdges, renderedVisibleIds),
-    [renderedEdges, sharedReachEdges, renderedVisibleIds],
+    () =>
+      // The community link edges join the same filter the shared-reach ones
+      // do: drawn only while both their cards are.
+      withSharedReachEdges(
+        withSharedReachEdges(renderedEdges, communityEdges, renderedVisibleIds),
+        sharedReachEdges,
+        renderedVisibleIds,
+      ),
+    [renderedEdges, communityEdges, sharedReachEdges, renderedVisibleIds],
   );
 
   const handleNodeClick: NodeMouseHandler<CodeMapAnyFlowNode> = useCallback(
@@ -11727,6 +12138,13 @@ export function CodeMap({
       if (isRevealConnectorEdgeId(edge.id)) {
         return;
       }
+      // A community link edge joins two community cards, not a Node pair, so
+      // it never navigates — and its endpoints are community ids, which must
+      // never reach `navigateToNode`, the history or a Graph Service call
+      // (AD-2), exactly as a cluster id must not.
+      if (isCommunityLinkEdgeId(edge.id)) {
+        return;
+      }
       // P3-11: a synthetic cluster edge's rendered endpoints include a
       // cluster id, which must never reach `navigateToNode` — resolve on the
       // real Node pair it stands in for. `navigateToNode` → `centerOnNode`
@@ -11754,7 +12172,14 @@ export function CodeMap({
       historyFocusRequestRef.current = null;
       return;
     }
-    const stepIds = move.kind === 'center' ? [move.id] : [move.centerId, move.entry.focusId];
+    // A community step happens in place and names no Node, so it asks for
+    // no card focus — the focused card is the one that was just pressed.
+    const stepIds =
+      move.kind === 'center' ? [move.id] : move.kind === 'community' ? [] : [move.centerId, move.entry.focusId];
+    if (stepIds.length === 0) {
+      historyFocusRequestRef.current = null;
+      return;
+    }
     historyFocusRequestRef.current = { button, stepIds, at: Date.now() };
   };
   const goBack = useCallback(() => {
@@ -11762,6 +12187,10 @@ export function CodeMap({
     recordHistoryFocusRequest('back', historyBackButtonRef.current, move);
     if (move.kind === 'reveal') {
       applyRevealHistoryMove(move);
+      return;
+    }
+    if (move.kind === 'community') {
+      applyCommunityHistoryMove(move);
       return;
     }
     if (move.kind !== 'center') {
@@ -11782,13 +12211,17 @@ export function CodeMap({
       return;
     }
     setHistory((previous) => ({ ...previous, index: nextIndex }));
-  }, [history, centerOnNode, applyRevealHistoryMove, mode]);
+  }, [history, centerOnNode, applyRevealHistoryMove, applyCommunityHistoryMove, mode]);
 
   const goForward = useCallback(() => {
     const move = historyMove(history, 'forward', { skipReveals: mode !== 'codeMap' });
     recordHistoryFocusRequest('forward', historyForwardButtonRef.current, move);
     if (move.kind === 'reveal') {
       applyRevealHistoryMove(move);
+      return;
+    }
+    if (move.kind === 'community') {
+      applyCommunityHistoryMove(move);
       return;
     }
     if (move.kind !== 'center') {
@@ -11804,7 +12237,7 @@ export function CodeMap({
       return;
     }
     setHistory((previous) => ({ ...previous, index: nextIndex }));
-  }, [history, centerOnNode, applyRevealHistoryMove, mode]);
+  }, [history, centerOnNode, applyRevealHistoryMove, applyCommunityHistoryMove, mode]);
 
   // FIX-1: the map's measured size — this component's ResizeObserver first,
   // then `@xyflow/react`'s store — or 0×0 when neither has measured yet.
@@ -13166,7 +13599,7 @@ export function CodeMap({
         // metrics table's band — and the element the ResizeObserver
         // measures, so fits, LOD bounds and zoom-to-reveal all see the canvas
         // the user sees, and `<Controls>`/the signal toggles sit above the table.
-        <CodeMapCanvasFrame canvasRef={setCanvasElement}>
+        <CodeMapCanvasFrame canvasRef={setCanvasElement} onKeyDown={handleCanvasKeyDown}>
           <ReactFlow<CodeMapAnyFlowNode>
             style={{ width: '100%', height: '100%', visibility: awaitingFirstFit ? 'hidden' : undefined }}
             nodes={renderedNodes}
@@ -13329,6 +13762,14 @@ export function CodeMap({
                   <p className="code-map__reveal-status" role="status">
                     {revealStatus}
                   </p>
+                  {/* Full map's collapsed community view: grouped cards, or
+                      every Node as Full always drew it. */}
+                  {!revealDrawn && communityApplies && (
+                    <CommunityViewToggle mode={communityMode} onChange={changeCommunityMode} />
+                  )}
+                  {/* Full map's collapsed community view, when it has no
+                      community cards to show and owes the reason. */}
+                  {!revealDrawn && communityNotice !== null && <CommunityNoticeLine notice={communityNotice} />}
                   {/* P4-7h: the shared-reach edge's legend, Revealed only. */}
                   {revealDrawn && <RevealEdgeLegend />}
                 </>

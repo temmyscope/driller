@@ -26,6 +26,7 @@ import {
 } from '@driller/ipc-contracts';
 
 import type { CanvasPopulation } from './CodeMap';
+import type { CommunityStep } from './communityView';
 import { layeredPositions, type LayeredCardSize } from './layered';
 
 // The grid spacing and the card pitch now live in `layered.ts`, with the
@@ -1748,9 +1749,36 @@ export type HistoryEntry =
       step: RevealStep;
       key: string;
       mapStamp: readonly CodeMapEdge[];
+    }
+  | {
+      kind: 'community';
+      before: ReadonlySet<string>;
+      after: ReadonlySet<string>;
+      communityId: string;
+      label: string;
+      memberCount: number;
+      step: CommunityStep;
     };
 
+/**
+ * One collapsed-community expand or collapse (`communityView.ts`), so it is
+ * one Back step exactly as a Revealed drill step is. It restores a set of
+ * expanded community ids rather than a `RevealState`, and it centres on
+ * nothing: the step happens in place, where the card already is.
+ *
+ * It carries no `key`/`mapStamp`, unlike a reveal entry: a community
+ * snapshot is a set of community ids, so a map change cannot make it name
+ * something that no longer exists in a harmful way — restoring intersects
+ * with the live partition and keeps what is still there
+ * (`applyCommunityHistoryMove`). There is nothing to rebase.
+ */
 export type RevealHistoryEntry = Extract<HistoryEntry, { kind: 'reveal' }>;
+export type CommunityHistoryEntry = Extract<HistoryEntry, { kind: 'community' }>;
+
+/** A history entry that is undone by Back rather than navigated past — a reveal or a community step. */
+export function isStepHistoryEntry(entry: HistoryEntry | undefined): entry is RevealHistoryEntry | CommunityHistoryEntry {
+  return entry?.kind === 'reveal' || entry?.kind === 'community';
+}
 
 /** The Back/Forward history: the entries in order, and the current one (`-1`: before the first). */
 export interface NavigationHistory {
@@ -1931,6 +1959,14 @@ export type HistoryMove =
       restore: RevealState;
       index: number;
       centerId: string;
+    }
+  | {
+      kind: 'community';
+      how: RevealHistoryHow;
+      entry: CommunityHistoryEntry;
+      /** The expanded-community ids to restore. */
+      restore: ReadonlySet<string>;
+      index: number;
     };
 
 export function historyMove(
@@ -1950,9 +1986,17 @@ export function historyMove(
   }
   if (direction === 'back') {
     const current = history.stack[history.index];
+    if (current?.kind === 'community') {
+      return { kind: 'community', how: 'undo', entry: current, restore: current.before, index: history.index - 1 };
+    }
     if (current?.kind === 'reveal') {
       const landing = history.stack[history.index - 1];
-      const centerId = landing === undefined ? current.focusId : landing.kind === 'node' ? landing.id : landing.focusId;
+      const centerId =
+        landing === undefined || landing.kind === 'community'
+          ? current.focusId
+          : landing.kind === 'node'
+            ? landing.id
+            : landing.focusId;
       return { kind: 'reveal', how: 'undo', entry: current, restore: current.before, index: history.index - 1, centerId };
     }
     if (history.index <= 0) {
@@ -1969,9 +2013,13 @@ export function historyMove(
   if (target.kind === 'node') {
     return { kind: 'center', id: target.id, index };
   }
+  const how: RevealHistoryHow = direction === 'back' ? 'return' : 'redo';
+  if (target.kind === 'community') {
+    return { kind: 'community', how, entry: target, restore: target.after, index };
+  }
   return {
     kind: 'reveal',
-    how: direction === 'back' ? 'return' : 'redo',
+    how,
     entry: target,
     restore: target.after,
     index,

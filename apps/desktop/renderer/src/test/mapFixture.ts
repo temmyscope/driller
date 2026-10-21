@@ -38,7 +38,8 @@ import type {
   RiskSignal,
 } from '@driller/ipc-contracts';
 import { listEntryCandidates } from '@driller/graph-contracts';
-import { communityLayout } from '../communityLayout';
+import { communityPositions, communityStructure } from '../communityLayout';
+import { collapsedCommunityIds } from '../communityView';
 import { generateSyntheticCodeMap } from '../devFixture';
 
 function fn(file: string, name: string, startLine: number, endLine: number): CodeMapNode {
@@ -487,7 +488,7 @@ export function sharedReachListing(pinnedIds: readonly string[] = []): FoundList
  * order when the community layout landed, and a test that still computes
  * the old grid is asserting a layout the app no longer has.
  *
- * No card size is passed because the DOM tests measure every card at
+ * `view` says which of Full's two states to lay out. No card size is passed because the DOM tests measure every card at
  * `NODE_CARD_FALLBACK_WIDTH`×`NODE_CARD_FALLBACK_HEIGHT`, which is exactly
  * the grid pitch, so a measured card sits where an unmeasured one does
  * (`communityLayout.test.ts` pins that).
@@ -495,6 +496,13 @@ export function sharedReachListing(pinnedIds: readonly string[] = []): FoundList
 export function fullMapPositions(
   map: CodeMapOk,
   foldedCardIds: readonly string[] = [],
+  view: 'all-nodes' | 'default' = 'all-nodes',
 ): ReadonlyMap<string, { x: number; y: number }> {
-  return communityLayout({ nodes: map.nodes, edges: map.edges, extraCardIds: foldedCardIds }).positions;
+  const structure = communityStructure(map.nodes, map.edges);
+  // `'default'`: the collapsed community view the canvas opens in, whose
+  // cards are one per community. `'all-nodes'`: every Node laid out, which is
+  // what the "All Nodes" toggle shows and what Full drew before the
+  // collapsed view existed. They are the same on a map too small to group.
+  const collapsed = view === 'default' ? collapsedCommunityIds(structure.partition) : new Set<string>();
+  return communityPositions(structure, foldedCardIds, () => undefined, collapsed).positions;
 }
