@@ -209,3 +209,153 @@ export function hasVisibleRiskSignals(signals: RiskSignal[], toggles: RiskSignal
   }
   return toggles.showIngestedFindings && selectIngestedSignals(signals).length > 0;
 }
+
+/**
+ * P0-1 (2026-09-24): every risk-signal section a Node can show, in one
+ * shared renderer.
+ *
+ * Lifted verbatim out of `CodeMapNodeCard` (which now calls it) so the Node
+ * Detail panel renders the *same* glyphs, labels, chips, callout and list
+ * rather than a second, drifting copy — the spec's "extracted and shared,
+ * never forked". Both surfaces therefore also honor the same three
+ * map-level family toggles by construction.
+ *
+ * Renders `null` when nothing is visible, so neither surface ever produces
+ * an empty row/container.
+ *
+ * Exported only so `CodeMap.blastRadius.test.ts` can render the canvas chip
+ * strip directly (P0-5). That test calls this as a plain function, so it must
+ * stay HOOKLESS — same pact as `HealthAuditClusterRow`.
+ */
+export function NodeRiskSignalSections({
+  signals,
+  toggles,
+}: {
+  signals: RiskSignal[];
+  toggles: RiskSignalFamilyToggles;
+}) {
+  const deterministicSignals = selectDeterministicSignals(signals);
+  const llmJudgmentSignal = selectLlmJudgmentSignal(signals);
+  const ingestedSignals = selectIngestedSignals(signals);
+  const visibleIngestedSignals = ingestedSignals.slice(0, MAX_RENDERED_INGESTED_FINDINGS);
+  const hiddenIngestedSignalCount = ingestedSignals.length - visibleIngestedSignals.length;
+
+  if (!hasVisibleRiskSignals(signals, toggles)) {
+    return null;
+  }
+
+  return (
+    <>
+      {/* Story 2.1 (Phase 3): the deterministic risk-signal strip — one chip
+          per `riskSignals` entry with `family === 'deterministic'`, gated on
+          the map-level toggle AND on actually having at least one such
+          signal (Boundaries & Constraints: "A Node with `riskSignals: []`
+          ... renders no signal strip at all — never an empty row"). Each
+          chip: `role="img"` — `aria-label` alone on a bare, non-interactive
+          `<span>` (implicit role `generic`) is not reliably exposed to
+          assistive technology; `role="img"` is the standard fix for a static
+          icon+label combination. `title` gives sighted mouse users — who
+          never see `aria-label` — the same glyph -> meaning mapping via the
+          native hover tooltip. An unrecognized `signal.type` (e.g. a runtime
+          value from a future backend build that doesn't match this
+          renderer's still-five-member union) falls back to `'?'`/the raw
+          type string rather than rendering a literal "undefined". */}
+      {toggles.showDeterministicSignals && deterministicSignals.length > 0 && (
+        <div className="code-map__node-signal-strip">
+          {deterministicSignals.map((signal) => {
+            const label = formatDeterministicSignalLabel(signal);
+            const icon = DETERMINISTIC_SIGNAL_ICONS[signal.type] ?? '?';
+            return (
+              <span
+                key={signal.type}
+                className={
+                  signal.severity === 'severe'
+                    ? 'code-map__signal-chip code-map__signal-chip--severe'
+                    : 'code-map__signal-chip'
+                }
+                role="img"
+                aria-label={label}
+                title={label}
+              >
+                {signal.severity === 'severe' && <span aria-hidden="true">{SEVERE_SIGNAL_GLYPH}</span>}
+                <span aria-hidden="true">{icon}</span>
+                {formatCountNumber(signal.value)}
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {/* Story 2.2 (Phase 3): the LLM-judgment risk-signal callout — rendered
+          after the deterministic strip above, gated on its own independent
+          toggle AND on the Node actually carrying an `'llm-judgment'` signal
+          (never an empty/placeholder callout). Deliberately never
+          `.code-map__signal-chip`'s classes — dashed border, icon+full
+          sentence, not a solid-border pill (FR8/UX-DR7: "no shared visual
+          language between the two families"). The visible copy leads with
+          "AI judgment:" so it reads as an inference, never with a
+          deterministic signal's unqualified-measurement confidence. The
+          blank/whitespace-only guard closes the gap between "never an
+          empty/placeholder callout" and what the JSX actually checked. */}
+      {toggles.showLlmJudgment && llmJudgmentSignal !== undefined && llmJudgmentSignal.judgment.trim().length > 0 && (
+        <p className="code-map__llm-judgment" title={`AI judgment: ${llmJudgmentSignal.judgment}`}>
+          <span aria-hidden="true">✦</span> AI judgment: {llmJudgmentSignal.judgment}
+        </p>
+      )}
+      {/* Story 2.3 (Phase 4): the ingested-PR-bot-findings callout — its own
+          distinct visual treatment (Boundaries & Constraints: "never
+          `.code-map__signal-chip`'s classes, never llm-judgment's callout
+          classes"), gated on its own independent toggle AND on the Node
+          actually carrying at least one `'ingested'` signal. Each finding is
+          its own row, always naming its severity as real visible text —
+          never color/icon alone (Accessibility Floor) — plus the originating
+          tool and finding text (FR9, AD-12). Rows are capped at
+          `MAX_RENDERED_INGESTED_FINDINGS` plus an explicit "+N more" line
+          when more exist — never an unbounded wall of inline comments
+          (UX-DR27). `key={index}` (review-pattern precedent: `toFlowEdges`
+          keys on index too) since a raw ingested finding carries no
+          identifier of its own to key by. */}
+      {toggles.showIngestedFindings && ingestedSignals.length > 0 && (
+        <ul className="code-map__ingested-findings">
+          {visibleIngestedSignals.map((signal, index) => (
+            <li
+              key={index}
+              className="code-map__ingested-finding"
+              title={`${signal.sourceTool} (${signal.severity}): ${signal.finding}`}
+            >
+              <span aria-hidden="true">⚑</span>
+              <span className="code-map__ingested-finding-severity">{signal.severity}</span>
+              <span className="code-map__ingested-finding-tool">{signal.sourceTool}:</span>
+              <span className="code-map__ingested-finding-text">{signal.finding}</span>
+            </li>
+          ))}
+          {hiddenIngestedSignalCount > 0 && (
+            <li className="code-map__ingested-findings-more">+{hiddenIngestedSignalCount} more</li>
+          )}
+        </ul>
+      )}
+    </>
+  );
+}
+
+/**
+ * P2-12: how many of a Node's risk signals the map-level overlay toggles are
+ * hiding — the signals in a family whose toggle is off (a blank LLM judgment,
+ * which never renders anyway, is not counted). Lets the Risk Overlay section
+ * tell "nothing to show" apart from "hidden by the toggles".
+ */
+export function countToggleHiddenSignals(signals: RiskSignal[], toggles: RiskSignalFamilyToggles): number {
+  let hidden = 0;
+  if (!toggles.showDeterministicSignals) {
+    hidden += selectDeterministicSignals(signals).length;
+  }
+  if (!toggles.showLlmJudgment) {
+    const judgment = selectLlmJudgmentSignal(signals);
+    if (judgment !== undefined && judgment.judgment.trim().length > 0) {
+      hidden += 1;
+    }
+  }
+  if (!toggles.showIngestedFindings) {
+    hidden += selectIngestedSignals(signals).length;
+  }
+  return hidden;
+}
