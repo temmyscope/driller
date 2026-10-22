@@ -41,6 +41,16 @@ export const SEVERE_PERCENTILE_TOP_FRACTION = 0.1;
 export const BLAST_RADIUS_SEVERE_FLOOR = 10;
 export const HOTSPOT_SEVERE_FLOOR = 10;
 
+/**
+ * The fewest co-changing files that can make a Node severe, whatever the
+ * percentile says. A file moving with one or two others is ordinary; the
+ * floor keeps a quiet repository, where the top decile might be two
+ * partners, from reporting ordinary coupling as severe — the same guard
+ * `BLAST_RADIUS_SEVERE_FLOOR` and `HOTSPOT_SEVERE_FLOOR` give their own
+ * percentile signals.
+ */
+export const CO_CHANGE_SEVERE_FLOOR = 3;
+
 /** A deterministic signal as `buildRiskSignals` builds it: not yet rated. */
 export type UnratedDeterministicRiskSignal = Omit<DeterministicRiskSignal, 'severity'>;
 /** `buildRiskSignals`' output: `RiskSignal` with deterministic entries still unrated. */
@@ -130,6 +140,15 @@ export function buildRiskSignals(
   if (coverage !== undefined && hasCoverageGap(coverage, node.file, node.startLine, node.endLine)) {
     signals.push({ family: 'deterministic', type: 'test-coverage-gap', value: 1, location });
   }
+  // How many files this Node's file has a history of changing alongside
+  // (`co-change.ts`). The value is `coChangesWithTotal` — the true count,
+  // not the capped list the Node carries — and the signal is absent rather
+  // than zero when the file moves with nothing, so a quiet file shows no
+  // chip instead of one that says "0".
+  const coChangeCount = node.coChangesWithTotal ?? node.coChangesWith?.length ?? 0;
+  if (coChangeCount > 0) {
+    signals.push({ family: 'deterministic', type: 'co-change', value: coChangeCount, location });
+  }
 
   // Story 2.2 (Phase 2) / Story 2.3 (Phase 4): the record-backed tail —
   // persisted LLM judgment, then ingested PR-bot findings, unchanged. P0-4:
@@ -184,6 +203,7 @@ function percentileCut(values: readonly number[]): number | undefined {
 export interface PercentileCuts {
   blastRadius: number | undefined;
   hotspot: number | undefined;
+  coChange: number | undefined;
 }
 
 function isSevereByPercentile(value: number, cut: number | undefined, floor: number): boolean {
@@ -211,6 +231,8 @@ export function classifyDeterministicSeverity(
       return isSevereByPercentile(signal.value, cuts.hotspot, HOTSPOT_SEVERE_FLOOR) ? 'severe' : 'moderate';
     case 'test-coverage-gap':
       return 'moderate';
+    case 'co-change':
+      return isSevereByPercentile(signal.value, cuts.coChange, CO_CHANGE_SEVERE_FLOOR) ? 'severe' : 'moderate';
     default: {
       const unhandled: never = type;
       throw new Error(`classifyDeterministicSeverity: unhandled deterministic signal type ${String(unhandled)}`);
@@ -230,6 +252,7 @@ export function classifyDeterministicSeverity(
 function computePercentileCuts(nodesSignals: readonly (readonly UnratedRiskSignal[])[]): PercentileCuts {
   const blastRadiusValues: number[] = [];
   const hotspotByFile = new Map<string, number>();
+  const coChangeByFile = new Map<string, number>();
   for (const signals of nodesSignals) {
     for (const signal of signals) {
       if (signal.family !== 'deterministic') {
@@ -243,10 +266,20 @@ function computePercentileCuts(nodesSignals: readonly (readonly UnratedRiskSigna
         // order-dependent.
         const previous = hotspotByFile.get(signal.location.file);
         hotspotByFile.set(signal.location.file, previous === undefined ? signal.value : Math.max(previous, signal.value));
+      } else if (signal.type === 'co-change' && Number.isFinite(signal.value)) {
+        // Per FILE, like hotspot and for the same reason: co-change is a
+        // property of the file, so counting it per Node would let one
+        // coupled, many-Node file fill the whole top decile by itself.
+        const previous = coChangeByFile.get(signal.location.file);
+        coChangeByFile.set(signal.location.file, previous === undefined ? signal.value : Math.max(previous, signal.value));
       }
     }
   }
-  return { blastRadius: percentileCut(blastRadiusValues), hotspot: percentileCut([...hotspotByFile.values()]) };
+  return {
+    blastRadius: percentileCut(blastRadiusValues),
+    hotspot: percentileCut([...hotspotByFile.values()]),
+    coChange: percentileCut([...coChangeByFile.values()]),
+  };
 }
 
 /**

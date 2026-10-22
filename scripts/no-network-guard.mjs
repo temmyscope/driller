@@ -153,4 +153,11 @@ function install() {
 
 if (testFile === undefined || !allowListedFiles().includes(testFile)) {
   install();
+  // P5-c review round 1: the e2e harness's positive control. With this set
+  // (only the harness's `appEnv` sets it), each guarded process says so on
+  // stderr, so a run can prove the Graph Service's guard output was
+  // captured before trusting "no host refused".
+  if (process.env.DRILLER_NETWORK_GUARD_ANNOUNCE === '1') {
+    process.stderr.write(`NetworkGuardActive: ${testFileLabel}\n`);
+  }
 }

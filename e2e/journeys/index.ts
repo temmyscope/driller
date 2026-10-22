@@ -1,7 +1,8 @@
 /**
  * P4-8i: every journey `npm run e2e` runs, in order. The smoke journey
  * (P4-8h) comes first; each P4-8i journey cites its tracker row id(s) in
- * `rows`, which `--only` and `--report` use.
+ * `rows`, which `--only` and `--report` use. Later specs append their own
+ * journeys (FIX-7, P5-a).
  */
 import { createFixtureProject } from '../fixtureProject';
 import type { Journey } from '../journey';
@@ -15,6 +16,7 @@ import { p4_4i } from './p4-4i.e2e';
 import { p4_7de } from './p4-7de.e2e';
 import { p4_7g } from './p4-7g.e2e';
 import { fix_7 } from './fix-7.e2e';
+import { p5_a } from './p5-a.e2e';
 
 /** P4-8h's smoke journey, as the P0-3 "Close project" row. */
 export const smoke: Journey = {
@@ -29,4 +31,4 @@ export const smoke: Journey = {
   })),
 };
 
-export const JOURNEYS: readonly Journey[] = [smoke, p0_5, p1_5_6, p2_1, p2_5, p4_3c, p4_4i, p4_7de, p4_7g, fix_7];
+export const JOURNEYS: readonly Journey[] = [smoke, p0_5, p1_5_6, p2_1, p2_5, p4_3c, p4_4i, p4_7de, p4_7g, fix_7, p5_a];

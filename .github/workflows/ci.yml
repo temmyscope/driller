@@ -1,6 +1,6 @@
 # CI gates (P4-8b): typecheck, lint and `npm test` on every push to main and
-# every pull request, on Node 22 (the `engines` floor) and the `.nvmrc`
-# version (the founder's local major).
+# every pull request, on Node 22 (the `engines` floor, 22.22.2+) and the
+# `.nvmrc` version (24 LTS).
 #
 # Each gate is its own job (the `gate` matrix axis), so a failure names its
 # gate, and `fail-fast: false` keeps one gate's failure from cancelling the
@@ -34,7 +34,8 @@ concurrency:
 
 jobs:
   gate:
-    name: ${{ matrix.gate }} (Node ${{ matrix.node }})
+    # The `.nvmrc` leg is named by the Node it resolves to (24 LTS).
+    name: ${{ matrix.gate }} (Node ${{ matrix.node == '.nvmrc' && '24 (.nvmrc)' || matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -85,8 +86,8 @@ jobs:
           if-no-files-found: ignore
 
   # P4-8i: `npm run e2e -- --report` drives the real dev app (electron-forge
-  # start) over CDP on the founder's platform. Manual trigger only; never on
-  # push or pull_request (Ask First). No secrets: the run selects the cloud
+  # start) over CDP on the founder's platform, on the `.nvmrc` Node (24 LTS).
+  # Manual trigger only; never on push or pull_request (Ask First). No secrets: the run selects the cloud
   # backend with no key, and the harness refuses non-loopback network inside
   # the app (the local-model download is expected to be refused).
   e2e:
@@ -103,7 +104,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node (.nvmrc)
+      - name: Set up Node 24 (.nvmrc)
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc

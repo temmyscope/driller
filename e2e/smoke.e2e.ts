@@ -105,4 +105,32 @@ export const smokeJourney: readonly Step<SmokeContext>[] = [
       await until(() => button.evaluate((element) => element === document.activeElement));
     },
   },
+  {
+    // P5-g (founder 5.3): `mainWindowOptions` sets minWidth/minHeight 640×480.
+    // Last, so a failure here can't skip the steps above. Electron's DevTools
+    // server has no `Browser.getWindowForTarget`/`setWindowBounds` (live pass
+    // 2026-10-19), so the resize goes through the page's own
+    // `window.resizeTo`: Electron turns it into a `content-bounds-updated`
+    // event whose default resizes the BrowserWindow through the same
+    // native bounds path a drag ends in, where the minimum size applies.
+    name: 'The window clamps a 400×300 resize to its 640×480 minimum',
+    run: async ({ page }) => {
+      const outer = () => page.evaluate(() => ({ width: window.outerWidth, height: window.outerHeight }));
+      const before = await outer();
+      // First prove the path resizes at all (a no-op would pass the clamp check vacuously).
+      await page.evaluate(() => window.resizeTo(900, 700));
+      await until(async () => {
+        const size = await outer();
+        return size.width === 900 && size.height === 700;
+      }, 5_000).catch(async () => {
+        const size = await outer();
+        throw new Error(`window.resizeTo(900, 700) left the window at ${size.width}×${size.height} (was ${before.width}×${before.height}): no resize path`);
+      });
+      await page.evaluate(() => window.resizeTo(400, 300));
+      await realSleep(500);
+      const size = await outer();
+      if (size.width !== 640 || size.height !== 480) throw new Error(`a 400×300 resize left the window at ${size.width}×${size.height}, not clamped to 640×480`);
+      await page.evaluate(({ width, height }) => window.resizeTo(width, height), before);
+    },
+  },
 ];

@@ -32,7 +32,6 @@ import {
   CodeMap,
   CROSS_SECTION_MISS_TEXT_ID,
   initialViewport,
-  layoutPosition,
   LOD_ZOOM_THRESHOLD,
   MAP_MAX_ZOOM,
   NODE_CARD_FALLBACK_HEIGHT,
@@ -43,7 +42,7 @@ import {
 } from './CodeMap';
 import { SectionBar } from './SectionBar';
 import { createFakeDrillerApi, deferred, type Deferred, type DrillerStubs, type FakeDrillerApi } from './test/fakeDrillerApi';
-import { SECTION_NODES, sectionedMap, syntheticMap, type CodeMapOk, type SectionName } from './test/mapFixture';
+import { fullMapPositions, SECTION_NODES, sectionedMap, syntheticMap, type CodeMapOk, type SectionName } from './test/mapFixture';
 
 // `cleanupAfterEach` also lets a viewport animation still running finish (bounded) before the unmount.
 afterEach(cleanupAfterEach);
@@ -91,6 +90,18 @@ function props(overrides: Partial<CodeMapProps> = {}): CodeMapProps {
 }
 
 /** The drawn card text of a Node (inside a React Flow Node). */
+/**
+ * Full map draws every Node: the collapsed community view's "All Nodes"
+ * (`CommunityViewToggle`). A no-op on a map too small to group, where the
+ * toggle is not shown and every Node is drawn already.
+ */
+function showAllNodes(): void {
+  const all = screen.queryByRole('button', { name: 'All Nodes' });
+  if (all !== null) {
+    fireEvent.click(all);
+  }
+}
+
 function findCard(name: string): Promise<HTMLElement> {
   return screen.findByText(name, { selector: '.react-flow__node .code-map__node *' }, FIND);
 }
@@ -281,6 +292,39 @@ describe('CodeMap: the section prop (replaces the sectionScopedOps prop/ref pin)
   });
 });
 
+// P5-d: main supersedes a waiting Code Map request when a later one for
+// another section arrives; that caller gets this explicit result (the same
+// text as main's `SUPERSEDED_RESULT`, `code-map-requests.ts`).
+const SUPERSEDED: CodeMapResult = { status: 'error', message: 'Superseded by a later Code Map request.' };
+
+describe('CodeMap: a fast run of switches main coalesces (P5-d)', () => {
+  it('all → api → web, api superseded: shows web, with no error and nothing said about it', BUDGET, async () => {
+    const maps = deferredMaps();
+    const fake = codeMapFake({ getCodeMap: maps.stub });
+    const { rerender } = render(<CodeMap {...props({ section: null })} />);
+    rerender(<CodeMap {...props({ section: 'api' })} />);
+    rerender(<CodeMap {...props({ section: 'web' })} />);
+    assert.deepEqual(fake.calls.getCodeMap, [[undefined], ['api'], ['web']]);
+
+    // Main's order: api is superseded the moment web arrives, then the
+    // whole scope (in flight) answers, then web.
+    await act(async () => {
+      maps.replies[1]!.resolve(SUPERSEDED);
+    });
+    assertAbsent(screen.queryByRole('alert'), 'an error notice while web loads');
+    assert.equal(document.body.textContent?.includes('Superseded'), false, 'nothing flashes');
+    await act(async () => {
+      maps.replies[0]!.resolve(sectionedMap(null));
+    });
+    await act(async () => {
+      maps.replies[2]!.resolve(sectionedMap('web'));
+    });
+    await waitForDrawn([S.layout.id, S.render.id]);
+    assertAbsent(screen.queryByRole('alert'), 'an error notice');
+    assert.equal(document.body.textContent?.includes('Superseded'), false, 'the superseded result is never shown or announced');
+  });
+});
+
 describe('CodeMap: switching section from Node detail (replaces the crossSection wiring pins)', () => {
   it('offers the callee’s section on a section map only, and asks for the switch with the callee', BUDGET, async () => {
     codeMapFake({
@@ -334,7 +378,10 @@ describe('CodeMap: switching section from Node detail (replaces the crossSection
     const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
     await findCard(S.handler.name);
     rerender(<CodeMap {...props({ section: 'web' })} />);
-    await waitFor(() => assert.ok(drawnNames().length > 0 && drawnNames().every((id) => id.startsWith('fixture://'))), FIND);
+    await waitFor(() => {
+      showAllNodes();
+      assert.ok(drawnNames().length > 0 && drawnNames().every((id) => id.startsWith('fixture://')));
+    }, FIND);
     await waitFor(() => assert.notEqual(document.querySelector<HTMLElement>('.react-flow')?.style.visibility, 'hidden'), FIND);
     assert.equal(cardOf(target.id), null, 'the target card is culled');
 
@@ -986,9 +1033,11 @@ describe('CodeMap: Path Trace and the diff are sent with the section on screen (
 });
 
 describe('CodeMap: per-section first fit and empty notice (replaces the sectionBar CodeMap pins)', () => {
-  function expectedFit(nodeCount: number): string {
+  // The fit the canvas owes on opening: the collapsed community view, which
+  // is what it draws before anything is expanded.
+  function expectedFit(map: CodeMapOk): string {
     const fit = initialViewport({
-      nodes: Array.from({ length: nodeCount }, (_, index) => ({ id: String(index), position: layoutPosition(index, nodeCount) })),
+      nodes: [...fullMapPositions(map, [], 'default')].map(([id, position]) => ({ id, position })),
       cardSize: { width: NODE_CARD_FALLBACK_WIDTH, height: NODE_CARD_FALLBACK_HEIGHT },
       viewport: { width: elementSize.width, height: elementSize.height },
       minReadableZoom: ROUTE_MIN_READABLE_ZOOM,
@@ -1002,20 +1051,23 @@ describe('CodeMap: per-section first fit and empty notice (replaces the sectionB
   it('each section’s map gets its own first fit', BUDGET, async () => {
     // `api` has 2 Nodes; `web` 40, which a 2-Node fit would leave off screen.
     const web = syntheticMap({ nodes: 40 });
+    const api = sectionedMap('api');
     codeMapFake({
       getCodeMap: async (section) =>
         section === 'web'
           ? { ...web, appliedScope: ['api', 'web'], section: 'web', sections: sectionedMap('web').sections }
-          : sectionedMap('api'),
+          : api,
     });
     const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
     await findCard(S.handler.name);
-    await waitFor(() => assert.equal(viewportTransform(), expectedFit(2)), FIND);
+    await waitFor(() => assert.equal(viewportTransform(), expectedFit(api)), FIND);
 
     rerender(<CodeMap {...props({ section: 'web' })} />);
-    await waitFor(() => assert.ok(drawnNames().some((id) => id.startsWith('fixture://'))), FIND);
-    assert.notEqual(expectedFit(40), expectedFit(2));
-    await waitFor(() => assert.equal(viewportTransform(), expectedFit(40)), FIND);
+    // `includes`, not `startsWith`: in the collapsed community view the drawn
+    // cards are the communities, whose ids carry their representative Node's.
+    await waitFor(() => assert.ok(drawnNames().some((id) => id.includes('fixture://'))), FIND);
+    assert.notEqual(expectedFit(web), expectedFit(api));
+    await waitFor(() => assert.equal(viewportTransform(), expectedFit(web)), FIND);
   });
 
   it('an empty section names the section, never the indexing-scope notice', BUDGET, async () => {

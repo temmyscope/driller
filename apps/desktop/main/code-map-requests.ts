@@ -8,7 +8,8 @@
  *  - a call for the section already in flight (or already waiting) shares
  *    that request's promise (e.g. a fast double-click on Retry);
  *  - a call for any other section waits for the in-flight request to
- *    settle, then sends its own — two in flight could cross;
+ *    settle, then sends its own — two in flight could cross — and replaces
+ *    any other waiting section (P5-d, below);
  *  - the reply's echoed `section` is checked against the in-flight request
  *    by the caller (`replySection` names it) before it settles that request.
  *
@@ -18,6 +19,22 @@
  * A reply whose echoed section is not the in-flight request's is stale (a
  * reply to a request that already timed out): it is logged and dropped,
  * and the in-flight request keeps waiting for its own.
+ *
+ * P5-b founder decision 2: a request may be `force`d (the map's Retry): the
+ * Graph Service then re-reads the map instead of serving its raw cache. A
+ * forced request never shares an unforced one already sent (that one may be
+ * cache-served); it waits and is sent with `force`. A waiting request for the
+ * same section is shared and upgraded to `force`, and an unforced call may
+ * share a forced one.
+ *
+ * P5-d (founder decision 2.1, coalesce to latest): the renderer applies
+ * only its latest reply, so a waiting request for another section is wasted
+ * work. Every call first settles each waiting request for a section other
+ * than its own with `SUPERSEDED_RESULT`, then shares or queues as above; a
+ * waiting request for its own section is kept and shared (with its `force`,
+ * so a waiting Retry is never folded into an unforced call). The request in
+ * flight can't be recalled (replies carry no request id), so a fast run of
+ * switches sends at most two: the one in flight and the latest.
  *
  * Every request resolves, never rejects: no Graph Service, a throwing
  * `send`, its own timeout, or the caller settling it with an error all give
@@ -33,15 +50,22 @@ export type CodeMapRequestKey = string | null;
 export interface CodeMapRequesterDeps {
   /** Whether a Graph Service is running to send to. */
   isRunning: () => boolean;
-  /** Posts `graphService:getCodeMap` for `section` (omitted for `null`). May throw. */
-  send: (section: CodeMapRequestKey) => void;
+  /**
+   * Posts `graphService:getCodeMap` for `section` (omitted for `null`), with
+   * `force: true` only when `force` (P5-b founder decision 2). May throw.
+   */
+  send: (section: CodeMapRequestKey, force: boolean) => void;
   /** The backstop for a request with no reply and no exit, armed when it is sent. */
   timeoutMs: number;
 }
 
 export interface CodeMapRequester {
-  /** Queues (or shares) a Code Map request for `section`; omitted means the whole scope. */
-  request: (section?: string) => Promise<CodeMapResult>;
+  /**
+   * Queues (or shares) a Code Map request for `section`; omitted means the
+   * whole scope. `force` (P5-b founder decision 2): bypass the Graph
+   * Service's raw map cache.
+   */
+  request: (section?: string, force?: boolean) => Promise<CodeMapResult>;
   /** The section of the request awaiting a reply; `undefined` when none is. */
   inFlightSection: () => CodeMapRequestKey | undefined;
   /**
@@ -60,9 +84,17 @@ export interface CodeMapRequester {
 
 interface PendingCodeMapRequest {
   key: CodeMapRequestKey;
+  force: boolean;
   promise: Promise<CodeMapResult>;
   resolve: (result: CodeMapResult) => void;
 }
+
+/**
+ * P5-d: what a waiting Code Map request gets when a later request for
+ * another section replaces it. The renderer never shows it: its caller has
+ * already been overtaken by that later request (request-id guard).
+ */
+export const SUPERSEDED_RESULT: CodeMapResult = { status: 'error', message: 'Superseded by a later Code Map request.' };
 
 const NOT_RUNNING: CodeMapResult = { status: 'error', message: 'Graph Service is not running.' };
 const TIMED_OUT: CodeMapResult = {
@@ -105,7 +137,7 @@ export function createCodeMapRequester(deps: CodeMapRequesterDeps): CodeMapReque
       // A backstop only: it never keeps the process alive on its own.
       inFlightTimer.unref?.();
       try {
-        deps.send(next.key);
+        deps.send(next.key, next.force);
       } catch (error) {
         if (inFlight === next) {
           settleInFlight({
@@ -117,13 +149,26 @@ export function createCodeMapRequester(deps: CodeMapRequesterDeps): CodeMapReque
     }
   }
 
-  const request = (section?: string): Promise<CodeMapResult> => {
+  const request = (section?: string, force = false): Promise<CodeMapResult> => {
     const key: CodeMapRequestKey = section ?? null;
-    if (inFlight && inFlight.key === key) {
+    // P5-d: coalesce to latest. Every waiting request for another section is
+    // superseded; one for this section stays and is shared below.
+    for (let index = waiting.length - 1; index >= 0; index -= 1) {
+      const pending = waiting[index]!;
+      if (pending.key !== key) {
+        waiting.splice(index, 1);
+        pending.resolve(SUPERSEDED_RESULT);
+      }
+    }
+    // P5-b founder decision 2: a forced call never shares an unforced
+    // request already sent (it may be served from the cache).
+    if (inFlight && inFlight.key === key && (inFlight.force || !force)) {
       return inFlight.promise;
     }
     const queued = waiting.find((pending) => pending.key === key);
     if (queued) {
+      // Not sent yet: a forced call upgrades it.
+      queued.force ||= force;
       return queued.promise;
     }
     if (!inFlight && !deps.isRunning()) {
@@ -133,7 +178,7 @@ export function createCodeMapRequester(deps: CodeMapRequesterDeps): CodeMapReque
     const promise = new Promise<CodeMapResult>((settle) => {
       resolve = settle;
     });
-    waiting.push({ key, promise, resolve });
+    waiting.push({ key, force, promise, resolve });
     startNext();
     return promise;
   };
@@ -163,6 +208,32 @@ export function parseCodeMapSectionArg(value: unknown): { ok: true; section?: st
   }
   return typeof value === 'string' ? { ok: true, section: value } : { ok: false };
 }
+
+/**
+ * P5-b founder decision 2: the `codeMap:get` options argument, validated:
+ * `undefined`, or a plain object whose `force` is absent or a boolean (no
+ * other key). Anything else is malformed and nothing is sent.
+ */
+export function parseCodeMapOptionsArg(value: unknown): { ok: true; force: boolean } | { ok: false } {
+  if (value === undefined) {
+    return { ok: true, force: false };
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { ok: false };
+  }
+  const keys = Object.keys(value);
+  if (keys.some((key) => key !== 'force')) {
+    return { ok: false };
+  }
+  const force = (value as { force?: unknown }).force;
+  if (force !== undefined && typeof force !== 'boolean') {
+    return { ok: false };
+  }
+  return { ok: true, force: force === true };
+}
+
+/** P5-b founder decision 2: the reply to a malformed `codeMap:get` options argument (nothing is sent). */
+export const INVALID_CODE_MAP_OPTIONS_RESULT: CodeMapResult = { status: 'error', message: 'Invalid Code Map request options.' };
 
 /** The reply to a malformed `codeMap:get` argument (nothing is sent). */
 export const INVALID_SECTION_RESULT: CodeMapResult = { status: 'error', message: 'Invalid section.' };
@@ -270,6 +341,7 @@ export function routeCodeMapReply(
     droppedFoldedTypes,
     droppedFoldedModules,
     droppedSimilarTo,
+    droppedCoChangesWith,
     droppedTestCoverageAvailable,
     droppedSections,
     droppedCrossSection,
@@ -281,6 +353,7 @@ export function routeCodeMapReply(
     [droppedFoldedTypes, 'malformed folded type'],
     [droppedFoldedModules, 'malformed folded Module'],
     [droppedSimilarTo, 'malformed similar implementation'],
+    [droppedCoChangesWith, 'malformed co-changing file'],
     [droppedTestCoverageAvailable, 'malformed test-coverage flag'],
     [droppedSections, 'malformed section count'],
     // P4-4 phase 3a.

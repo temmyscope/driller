@@ -16,10 +16,13 @@ import {
   createPlainFixture,
   createScratchDiffFixture,
   createSectionedFixture,
+  createSevenTypesFixture,
   editFile,
   readUserDataJson,
   SCRATCH_BASE_REF,
   seedUserData,
+  SEVEN_TYPE_NAMES,
+  SEVEN_TYPES_BRANCH,
   WEB_SECTION_FILES,
 } from './fixtureProject';
 import { LANDING_LIMIT_MS, makeTempDir, removeTempDirs, TEMP_PREFIXES, type StepResult } from './harness';
@@ -99,10 +102,10 @@ describe('formatReport', () => {
 });
 
 describe('JOURNEYS', () => {
-  it('covers P0-3 (smoke), the 8 P4-8i row groups and FIX-7’s regressions, each journey with a unique id', () => {
+  it('covers P0-3 (smoke), the 8 P4-8i row groups, FIX-7’s regressions and P5-a, each journey with a unique id', () => {
     assert.deepEqual(
       JOURNEYS.flatMap((j) => j.rows),
-      ['P0-3', 'P0-5', 'P1-5/6', 'P2-1', 'P2-5', 'P4-3c', 'P4-4i', 'P4-7d', 'P4-7e', 'P4-7g', 'P2-4', 'P3-11/12', 'P4-7e', 'FIX-5'],
+      ['P0-3', 'P0-5', 'P1-5/6', 'P2-1', 'P2-5', 'P4-3c', 'P4-4i', 'P4-7d', 'P4-7e', 'P4-7g', 'P2-4', 'P3-11/12', 'P4-7e', 'FIX-5', 'P5-f', 'P5-a'],
     );
     assert.equal(new Set(JOURNEYS.map((j) => j.id)).size, JOURNEYS.length);
   });
@@ -159,6 +162,21 @@ describe('fixture variants', () => {
     assert.equal(git(dir, ['diff', '--name-only', SCRATCH_BASE_REF, 'HEAD']), 'entry.ts');
     assert.match(readFileSync(path.join(dir, 'entry.ts'), 'utf8'), /serviceB\(\);\n {2}serviceA\(\);\n\}/);
     assert.equal(git(dir, ['status', '--porcelain']), '');
+  });
+
+  it('createSevenTypesFixture (P5-a): on main; seventypes is one commit ahead, adding a field to each of the 7 interfaces in types.ts', () => {
+    const dir = createSevenTypesFixture(SOURCE);
+    made.push(dir);
+    assert.equal(git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']), SCRATCH_BASE_REF);
+    assert.equal(git(dir, ['status', '--porcelain']), '');
+    assert.equal(git(dir, ['diff', '--name-only', SCRATCH_BASE_REF, SEVEN_TYPES_BRANCH]), 'types.ts');
+    assert.equal(git(dir, ['rev-list', '--count', `${SCRATCH_BASE_REF}..${SEVEN_TYPES_BRANCH}`]), '1');
+    const added = git(dir, ['diff', '--unified=0', SCRATCH_BASE_REF, SEVEN_TYPES_BRANCH])
+      .split('\n')
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+    assert.deepEqual(added, Array.from({ length: SEVEN_TYPE_NAMES.length }, () => '+  field3: string;'));
+    const types = git(dir, ['show', `${SEVEN_TYPES_BRANCH}:types.ts`]);
+    assert.deepEqual([...types.matchAll(/^export interface (\w+) \{$/gm)].map((m) => m[1]), [...SEVEN_TYPE_NAMES]);
   });
 
   it('editFile refuses an edit that changes nothing', () => {

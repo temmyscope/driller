@@ -1,7 +1,7 @@
 /**
  * FIX-7 journey: the 2026-10-11 batched live pass's regressions, checked in
  * the real app on the scratch repo (handleRequest edited on `review`, base
- * `main`) — tracker rows **P2-4**, **P3-11/12**, **P4-7e** and **FIX-5**.
+ * `main`) — tracker rows **P2-4**, **P3-11/12**, **P4-7e**, **FIX-5** and **P5-f**.
  *
  * 1. Path Trace `handleRequest`, then its callee pill (P2-4's neighbour
  *    trace): every lit edge's VISIBLE path (`.react-flow__edge-path`)
@@ -11,6 +11,10 @@
  * 2. Revealed, expand handleRequest with the mouse: no two cards' boxes
  *    overlap, and each "Expand callees" button is the topmost element at its
  *    own centre (the live pass found 3 of 12 covered by the card below).
+ *    P5-f: every Node card is at most 320 px wide (layout width) with no
+ *    child past its right edge, and a plain edge (handleRequest → serviceA,
+ *    unlit) paints `--border-strong` at 1.5px — DESIGN.md `canvas-edge`,
+ *    where it used to paint React Flow's rgb(62,62,62) 1px.
  * 3. Back pressed with the mouse at the start of history: Back disables and
  *    focus lands on handleRequest's card, not <body>.
  * 4. PR Review against `main`: every drawn edge leaving the changed handleRequest
@@ -65,12 +69,17 @@ async function paintOf(page: Page, from: string, to: string, token: string): Pro
 const describePaint = (from: string, to: string, paint: Paint, token: string) =>
   `${from}→${to} paints ${paint.stroke} ${paint.width}; ${token} is ${paint.expected}`;
 
-/** Waits until each `[from, to]` edge's visible path paints `token` at 2px. */
-async function expectPainted(page: Page, pairs: readonly (readonly [string, string])[], token: string): Promise<void> {
+/** Waits until each `[from, to]` edge's visible path paints `token` at `width` (2px: a lit edge). */
+async function expectPainted(
+  page: Page,
+  pairs: readonly (readonly [string, string])[],
+  token: string,
+  width = '2px',
+): Promise<void> {
   for (const [from, to] of pairs) {
     await eventually(
       () => paintOf(page, from, to, token),
-      (paint) => paint.stroke === paint.expected && paint.width === '2px',
+      (paint) => paint.stroke === paint.expected && paint.width === width,
       (paint) => describePaint(from, to, paint, token),
       10_000,
     );
@@ -107,6 +116,46 @@ async function cardBoxes(page: Page): Promise<CardBox[]> {
     if (box !== null) boxes.push({ name: (await c.getAttribute('aria-label')) ?? '?', ...box });
   }
   return boxes;
+}
+
+/** P5-f: DESIGN.md `node-card.maxWidth`, plus a pixel for subpixel rounding. */
+const CARD_MAX_WIDTH = 321;
+
+interface CardFit {
+  name: string;
+  /** The card's layout width in CSS px (`offsetWidth`: unscaled by the canvas zoom, unlike `boundingBox()`). */
+  width: number;
+  /** Each child whose right edge passes the card's, as `<tag>.<class> +Npx`. */
+  overflowing: string[];
+}
+
+/** Every drawn Node card's layout width and any child that overflows its right edge (P5-f, 7.2). */
+async function cardFits(page: Page): Promise<CardFit[]> {
+  const cards = await canvas(page).getByRole('button', { name: /, open Node detail$/ }).all();
+  const fits: CardFit[] = [];
+  for (const c of cards) {
+    fits.push(
+      await c.evaluate((element) => {
+        const right = element.getBoundingClientRect().right;
+        const overflowing: string[] = [];
+        // Every descendant, so a chip inside the wrapping strip counts too.
+        const walk = (parent: Element): void => {
+          for (const child of Array.from(parent.children)) {
+            // React Flow's connection handles sit ON the card's border by
+            // design (half outside, +2.8 px); they're edge anchors, not
+            // content. Live pass 2026-10-19: they're the only overflow left.
+            if (child.classList.contains('react-flow__handle')) continue;
+            const past = child.getBoundingClientRect().right - right;
+            if (past > 1) overflowing.push(`${child.tagName.toLowerCase()}.${child.getAttribute('class') ?? ''} +${past.toFixed(1)}px`);
+            walk(child);
+          }
+        };
+        walk(element);
+        return { name: element.getAttribute('aria-label') ?? '?', width: (element as HTMLElement).offsetWidth, overflowing };
+      }),
+    );
+  }
+  return fits;
 }
 
 function overlaps(boxes: readonly CardBox[]): string[] {
@@ -148,7 +197,7 @@ const ROUTE = [
 
 export const fix_7: Journey = {
   id: 'fix-7',
-  rows: ['P2-4', 'P3-11/12', 'P4-7e', 'FIX-5'],
+  rows: ['P2-4', 'P3-11/12', 'P4-7e', 'FIX-5', 'P5-f'],
   title: 'lit edges paint their token; Revealed cards never overlap; Back at the start focuses the card',
   prepare: (env) => ({ projectPath: createScratchDiffFixture(env.fixtureSource) }),
   steps: [
@@ -168,7 +217,12 @@ export const fix_7: Journey = {
     {
       name: 'P2-4: handleRequest’s callee pill lights its call edges, painted --trace-cyan at 2px',
       run: async ({ page }) => {
-        await card(page, 'handleRequest').first().getByRole('button', { name: /^\d+ calls? — show the callees of handleRequest$/ }).click();
+        // Keyboard, not the mouse: in Full's fixed 260×110 grid the row below
+        // (a 2-line-wrapped "Cloud is selected…" card since P5-f's 320 px cap)
+        // covers this pill, so a mouse can't reach it — deferred-work
+        // "P5-f / Full grid overlap — 2026-10-19" (Ask First: Full's pitch).
+        // P2-4's check is the paint, which the keyboard path exercises alike.
+        await card(page, 'handleRequest').first().getByRole('button', { name: /^\d+ calls? — show the callees of handleRequest$/ }).press('Enter');
         await expectPainted(page, ROUTE.slice(0, 2), '--trace-cyan');
         // The neighbour trace replaced the route: serviceA → repository is no longer lit.
         await expectNotPainted(page, 'serviceA', 'repository', '--trace-cyan');
@@ -178,7 +232,7 @@ export const fix_7: Journey = {
       },
     },
     {
-      name: 'P4-7e: Revealed, expand handleRequest with the mouse → no two cards overlap; no Expand button is covered',
+      name: 'P4-7e / P5-f: Revealed, expand handleRequest with the mouse → no two cards overlap; no Expand button is covered; cards ≤ 320 px; a plain edge paints --border-strong 1.5px',
       run: async ({ page }) => {
         await viewButton(page, 'Revealed').click();
         await until(async () => (await viewButton(page, 'Revealed').getAttribute('aria-pressed')) === 'true', 'Revealed not pressed');
@@ -192,6 +246,19 @@ export const fix_7: Journey = {
             `${boxes.length} cards; overlapping: ${overlaps(boxes).join(', ') || 'none'}; covered: ${covered.join(', ') || 'none'}`,
           10_000,
         );
+        // P5-f (7.2): no card is wider than the 320 px cap, and nothing inside one overflows it.
+        await eventually(
+          () => cardFits(page),
+          (fits) => fits.length >= 3 && fits.every((fit) => fit.width <= CARD_MAX_WIDTH && fit.overflowing.length === 0),
+          (fits) =>
+            fits
+              .filter((fit) => fit.width > CARD_MAX_WIDTH || fit.overflowing.length > 0)
+              .map((fit) => `"${fit.name}" ${fit.width}px${fit.overflowing.length > 0 ? `, overflowing: ${fit.overflowing.join(', ')}` : ''}`)
+              .join('; ') || `${fits.length} cards`,
+          10_000,
+        );
+        // P5-f (7.1): a plain (unlit) edge paints DESIGN.md `canvas-edge` on its visible path.
+        await expectPainted(page, [['handleRequest', 'serviceA']], '--border-strong', '1.5px');
       },
     },
     {
@@ -220,8 +287,16 @@ export const fix_7: Journey = {
         await switchMode(page, 'PR Review');
         await computeDiffScope(page, SCRATCH_BASE_REF);
         await page.getByRole('status').filter({ hasText: /— 1 changed Node\.$/ }).waitFor({ state: 'visible' });
-        const leaving = await canvas(page).getByRole('group', { name: /^Edge from \S*\bhandleRequest to / }).all();
-        if (leaving.length === 0) throw new Error('no edge leaving handleRequest is drawn');
+        // Fit first: the canvas draws only edges in view, and after FIX-5's
+        // Back and the metrics table opening, handleRequest can sit off-screen
+        // (live pass 2026-10-19: 2 of 3 full runs, "no edge … is drawn").
+        await canvas(page).getByRole('button', { name: 'Fit View', exact: true }).click();
+        const leaving = await eventually(
+          () => canvas(page).getByRole('group', { name: /^Edge from \S*\bhandleRequest to / }).all(),
+          (edges) => edges.length > 0,
+          () => 'no edge leaving handleRequest is drawn',
+          10_000,
+        );
         const targets = await Promise.all(
           leaving.map(async (e) => /\b(\w+)$/.exec((await e.getAttribute('aria-label')) ?? '')?.[1] ?? '?'),
         );

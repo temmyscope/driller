@@ -4,18 +4,23 @@
  * `codeMap:get` argument check.
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import type { CodeMapResult, GraphServiceCodeMapMessage } from '@driller/ipc-contracts';
 
 import {
   createCodeMapRequester,
+  INVALID_CODE_MAP_OPTIONS_RESULT,
   INVALID_SECTION_RESULT,
   isCodeMapMessage,
   MALFORMED_REPLY_RESULT,
+  parseCodeMapOptionsArg,
   parseCodeMapSectionArg,
   PROJECT_CHANGED_RESULT,
   routeCodeMapReply,
+  SUPERSEDED_RESULT,
   type CodeMapRequestKey,
   type CodeMapRequesterDeps,
 } from './code-map-requests';
@@ -122,15 +127,17 @@ describe('createCodeMapRequester', () => {
     assert.equal(requester.inFlightSection(), undefined);
   });
 
-  it('a waiting request for the same section is shared too, and order is kept', { timeout: 5_000 }, async () => {
+  it('a waiting request for the same section is shared too; a later other section supersedes it (P5-d)', { timeout: 5_000 }, async () => {
     const { requester, sent } = setup();
     void requester.request('api');
     const web = requester.request('web');
+    assert.equal(requester.request('web'), web, 'the waiting web request is shared');
+    // P5-d (coalesce to latest): before P5-d the whole scope queued behind
+    // web and both were sent in order; now it supersedes the waiting web.
     const whole = requester.request();
-    assert.equal(requester.request('web'), web);
+    assert.deepEqual(await web, SUPERSEDED_RESULT);
     requester.settleInFlight(okFor('api'));
-    requester.settleInFlight(okFor('web'));
-    assert.deepEqual(sent, ['api', 'web', null]);
+    assert.deepEqual(sent, ['api', null]);
     requester.settleInFlight(okFor(null));
     assert.deepEqual(await whole, okFor(null));
   });
@@ -187,6 +194,103 @@ describe('createCodeMapRequester', () => {
   });
 });
 
+// P5-d (founder decision 2.1): queued requests coalesce to the latest.
+describe('coalescing to the latest request (P5-d)', () => {
+  it('the superseded result is the explicit, resolved error', () => {
+    assert.deepEqual(SUPERSEDED_RESULT, { status: 'error', message: 'Superseded by a later Code Map request.' });
+  });
+
+  it('apps in flight; services, then packages: services is superseded, packages is sent after apps (2 sends)', { timeout: 5_000 }, async () => {
+    const { requester, sent } = setup();
+    const apps = requester.request('apps');
+    const services = requester.request('services');
+    const packages = requester.request('packages');
+    assert.deepEqual(await services, SUPERSEDED_RESULT, 'settled at once, before apps replies');
+    assert.equal(await isSettled(packages), false);
+    assert.deepEqual(sent, ['apps']);
+    requester.settleInFlight(okFor('apps'));
+    assert.deepEqual(await apps, okFor('apps'), 'the in-flight request keeps its own reply');
+    assert.deepEqual(sent, ['apps', 'packages']);
+    requester.settleInFlight(okFor('packages'));
+    assert.deepEqual(await packages, okFor('packages'));
+    assert.equal(requester.inFlightSection(), undefined);
+  });
+
+  it('apps in flight; services, then apps: services is superseded, the second apps shares the in-flight promise (1 send)', { timeout: 5_000 }, async () => {
+    const { requester, sent } = setup();
+    const apps = requester.request('apps');
+    const services = requester.request('services');
+    const appsAgain = requester.request('apps');
+    assert.equal(appsAgain, apps, 'back to the section in flight: shared');
+    assert.deepEqual(await services, SUPERSEDED_RESULT);
+    requester.settleInFlight(okFor('apps'));
+    assert.deepEqual(await appsAgain, okFor('apps'));
+    assert.deepEqual(sent, ['apps'], 'nothing else is sent');
+    assert.equal(requester.inFlightSection(), undefined);
+  });
+
+  it('apps in flight; services twice: one waiting entry, shared (2 sends)', { timeout: 5_000 }, async () => {
+    const { requester, sent } = setup();
+    void requester.request('apps');
+    const services = requester.request('services');
+    assert.equal(requester.request('services'), services);
+    assert.equal(await isSettled(services), false, 'a same-section waiter is never superseded');
+    requester.settleInFlight(okFor('apps'));
+    assert.deepEqual(sent, ['apps', 'services']);
+    requester.settleInFlight(okFor('services'));
+    assert.deepEqual(await services, okFor('services'));
+  });
+
+  it('a run of N switches while one is in flight sends at most one more; every superseded caller settles', { timeout: 5_000 }, async () => {
+    const { requester, sent } = setup();
+    const apps = requester.request('apps');
+    const run = ['services', 'apps', 'packages', 'services', 'web', 'packages', 'docs'].map((section) => ({
+      section,
+      promise: requester.request(section),
+    }));
+    requester.settleInFlight(okFor('apps'));
+    assert.deepEqual(sent, ['apps', 'docs'], 'the one in flight and the latest');
+    requester.settleInFlight(okFor('docs'));
+    assert.deepEqual(await apps, okFor('apps'));
+    for (const { section, promise } of run.slice(0, -1)) {
+      // The switch back to apps shared the in-flight request; the others were superseded.
+      assert.deepEqual(await promise, section === 'apps' ? okFor('apps') : SUPERSEDED_RESULT, section);
+    }
+    assert.deepEqual(await run.at(-1)!.promise, okFor('docs'));
+  });
+
+  it('nothing in flight: a request is sent at once (unchanged)', () => {
+    const { requester, sent } = setup();
+    void requester.request('apps');
+    assert.deepEqual(sent, ['apps']);
+  });
+
+  it('a waiting forced request (the map’s Retry) is never folded into an unforced call for its section', { timeout: 5_000 }, async () => {
+    const sent: [CodeMapRequestKey, boolean][] = [];
+    const requester = createCodeMapRequester({
+      isRunning: () => true,
+      send: (section, force) => {
+        sent.push([section, force]);
+      },
+      timeoutMs: 60_000,
+    });
+    const plain = requester.request('apps');
+    const retry = requester.request('apps', true);
+    assert.notEqual(retry, plain, 'waits behind the unforced request in flight');
+    // An unforced call for apps shares the in-flight request and supersedes
+    // only other sections: the waiting forced apps stays.
+    assert.equal(requester.request('apps'), plain);
+    assert.equal(await isSettled(retry), false);
+    requester.settleInFlight(okFor('apps'));
+    assert.deepEqual(sent, [
+      ['apps', false],
+      ['apps', true],
+    ]);
+    requester.settleInFlight(okFor('apps'));
+    assert.deepEqual(await retry, okFor('apps'));
+  });
+});
+
 describe('parseCodeMapSectionArg', () => {
   it('accepts no argument (the whole scope) or a string section', () => {
     assert.deepEqual(parseCodeMapSectionArg(undefined), { ok: true });
@@ -209,11 +313,11 @@ describe('failWaiting (review round 1: an index request is sent)', () => {
   it('settles every waiting request with the explicit error; the one in flight is untouched', { timeout: 5_000 }, async () => {
     const { requester, sent } = setup();
     const api = requester.request('api');
+    // P5-d: at most one other section waits (a later one supersedes it), so
+    // the waiting request here is web alone (it was web, then the whole scope).
     const web = requester.request('web');
-    const whole = requester.request();
     requester.failWaiting(PROJECT_CHANGED_RESULT);
     assert.deepEqual(await web, PROJECT_CHANGED_RESULT);
-    assert.deepEqual(await whole, PROJECT_CHANGED_RESULT);
     assert.equal(requester.inFlightSection(), 'api');
     assert.equal(await isSettled(api), false);
     requester.settleInFlight(okFor('api'));
@@ -346,3 +450,88 @@ describe('routeCodeMapReply (review round 1)', () => {
   });
 });
 
+
+// P5-b founder decision 2: the map's Retry forces a fresh read.
+describe('forced Code Map requests (P5-b founder decision 2)', () => {
+  function forcedSetup() {
+    const sent: [CodeMapRequestKey, boolean][] = [];
+    const requester = createCodeMapRequester({
+      isRunning: () => true,
+      send: (section, force) => {
+        sent.push([section, force]);
+      },
+      timeoutMs: 60_000,
+    });
+    return { requester, sent };
+  }
+
+  it('sends force only for a forced request', () => {
+    const { requester, sent } = forcedSetup();
+    void requester.request('api');
+    requester.settleInFlight(okFor('api'));
+    void requester.request('api', true);
+    requester.settleInFlight(okFor('api'));
+    void requester.request(undefined, true);
+    assert.deepEqual(sent, [
+      ['api', false],
+      ['api', true],
+      [null, true],
+    ]);
+  });
+
+  it('a forced call never shares an unforced request already sent; it is sent with force once that settles', async () => {
+    const { requester, sent } = forcedSetup();
+    const plain = requester.request('api');
+    const forced = requester.request('api', true);
+    assert.notEqual(forced, plain);
+    assert.deepEqual(sent, [['api', false]]);
+    requester.settleInFlight(okFor('api'));
+    assert.deepEqual(sent, [
+      ['api', false],
+      ['api', true],
+    ]);
+    assert.equal(await isSettled(forced), false, 'the forced call waits for its own reply');
+    requester.settleInFlight(okFor('api'));
+    assert.deepEqual(await forced, okFor('api'));
+  });
+
+  it('an unforced call shares a forced request in flight; a waiting request is shared and upgraded to force', () => {
+    const { requester, sent } = forcedSetup();
+    const forced = requester.request('api', true);
+    assert.equal(requester.request('api'), forced, 'an unforced call may share a forced one');
+    const waitingPlain = requester.request('web');
+    assert.equal(requester.request('web', true), waitingPlain, 'the waiting web request is shared');
+    requester.settleInFlight(okFor('api'));
+    assert.deepEqual(sent, [
+      ['api', true],
+      ['web', true],
+    ]);
+  });
+
+  it('parseCodeMapOptionsArg: absent or {force: boolean} only', () => {
+    assert.deepEqual(parseCodeMapOptionsArg(undefined), { ok: true, force: false });
+    assert.deepEqual(parseCodeMapOptionsArg({}), { ok: true, force: false });
+    assert.deepEqual(parseCodeMapOptionsArg({ force: true }), { ok: true, force: true });
+    assert.deepEqual(parseCodeMapOptionsArg({ force: false }), { ok: true, force: false });
+    for (const bad of [null, true, 'force', 1, [], { force: 'yes' }, { force: 1 }, { force: true, extra: 1 }]) {
+      assert.deepEqual(parseCodeMapOptionsArg(bad), { ok: false }, JSON.stringify(bad));
+    }
+    assert.deepEqual(INVALID_CODE_MAP_OPTIONS_RESULT, { status: 'error', message: 'Invalid Code Map request options.' });
+  });
+
+  it('main validates the options before sending, and puts force on the message only when set (source)', () => {
+    const main = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+    const handler = main.slice(main.indexOf('ipcMain.handle(IpcChannels.codeMapGet'), main.indexOf('ipcMain.handle(IpcChannels.sourceReadRange'));
+    assert.match(handler, /\(_event, section: unknown, options: unknown\)/);
+    assert.match(handler, /const parsedOptions = parseCodeMapOptionsArg\(options\);/);
+    assert.match(handler, /parsedOptions\.ok \? requestCodeMap\(parsed\.section, parsedOptions\.force\) : Promise\.resolve\(INVALID_CODE_MAP_OPTIONS_RESULT\)/);
+    assert.match(main, /\.\.\.\(force \? \{ force: true as const \} : \{\}\),/);
+    assert.match(main, /return codeMapRequests\.request\(section, force\);/);
+  });
+
+  it('preload passes {force: true} only when forced; every other call is unchanged (source)', () => {
+    const preload = readFileSync(fileURLToPath(new URL('../preload/index.ts', import.meta.url)), 'utf8');
+    assert.match(preload, /options\?\.force === true\s*\? ipcRenderer\.invoke\(IpcChannels\.codeMapGet, section, \{ force: true \}\)/);
+    assert.match(preload, /: section === undefined\s*\? ipcRenderer\.invoke\(IpcChannels\.codeMapGet\)\s*: ipcRenderer\.invoke\(IpcChannels\.codeMapGet, section\)/);
+  });
+});

@@ -15,6 +15,7 @@ import {
   type BlastRadiusExpansionResult,
   type EntryCandidatesResult,
   type EntryPinUpdateResult,
+  type GetCodeMapOptions,
   type CloudBackend,
   type CodeMapResult,
   type DiagnosticLogEntry,
@@ -143,10 +144,14 @@ const drillerApi: DrillerApi = {
 
   // P4-4 phase 1b: the section is passed only when given, so an omitted one
   // reaches main as no argument at all (the whole scope).
-  getCodeMap: (section?: string): Promise<CodeMapResult> =>
-    section === undefined
-      ? ipcRenderer.invoke(IpcChannels.codeMapGet)
-      : ipcRenderer.invoke(IpcChannels.codeMapGet, section),
+  // P5-b founder decision 2: `{force: true}` (the map's Retry) is passed as a
+  // second argument, only when set; every other call is unchanged.
+  getCodeMap: (section?: string, options?: GetCodeMapOptions): Promise<CodeMapResult> =>
+    options?.force === true
+      ? ipcRenderer.invoke(IpcChannels.codeMapGet, section, { force: true })
+      : section === undefined
+        ? ipcRenderer.invoke(IpcChannels.codeMapGet)
+        : ipcRenderer.invoke(IpcChannels.codeMapGet, section),
 
   readSourceRange: (file: string, startLine: number, endLine: number): Promise<ReadSourceRangeResult> =>
     ipcRenderer.invoke(IpcChannels.sourceReadRange, file, startLine, endLine),

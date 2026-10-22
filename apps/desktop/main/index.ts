@@ -45,6 +45,7 @@ import {
   type GraphServiceGetCodeMapRequest,
   type GraphServiceListEntryCandidatesResultMessage,
   type GraphServiceEntryPinsMissingMessage,
+  type GraphServiceHeadChangedMessage,
   type GraphServicePathTraceResultMessage,
   type GraphServiceRegenerateNodeRequest,
   type GraphServiceRetryModelRequest,
@@ -78,20 +79,25 @@ import {
   setCloudApiKey,
 } from './backend-settings';
 import { buildAppMenu, nextZoomFactor, zoomDirectionForInput, type ZoomDirection } from './app-menu';
+import { mainWindowOptions } from './window-options';
 import { toValidatedDiffScopeResult } from './code-map-reply';
 import {
   createCodeMapRequester,
+  INVALID_CODE_MAP_OPTIONS_RESULT,
   INVALID_SECTION_RESULT,
   isCodeMapMessage,
+  parseCodeMapOptionsArg,
   parseCodeMapSectionArg,
   PROJECT_CHANGED_RESULT,
   routeCodeMapReply,
 } from './code-map-requests';
 import { appendDiagnosticLogEntry } from './diagnostic-log';
+import { saveActiveBackend } from './backend-switch-save';
 import { getEditorPreference, setEditorPreference } from './editor-settings';
 import { detectGitRepo } from './git-detect';
 import {
   buildBackendSwitchedRequest,
+  buildCheckHeadRequest,
   buildIndexRequest,
   buildSetEntryPinsRequest,
   createEntryCandidatesRelay,
@@ -111,6 +117,7 @@ import {
   parseOperationSectionArg,
 } from './section-operations';
 import { createDiffScopeCarryRelay, isDiffScopeCarryResultMessage } from './diff-scope-carry-relay';
+import { e2eHooksEnabled, headChangedAction, isHeadChangedMessage, tagHeadMove, type PendingHeadMove } from './head-drift';
 import { relayKeyChange } from './key-change-relay';
 import { getPrBotConfig, setPrBotEnabled } from './pr-bot-settings';
 import { resolveProjectScopeSave } from './project-scope-save';
@@ -142,6 +149,9 @@ let isGraphServiceShuttingDown = false;
 // error) can re-send the index request without requiring the user to
 // re-pick the folder.
 let currentProjectPath: string | null = null;
+// P5-a review round 1: the HEAD move behind a re-index main requested
+// (`handleHeadChanged`), until that re-index's `indexed`/`error`.
+let pendingHeadMove: PendingHeadMove | undefined;
 // The in-flight `codeMap:get` renderer request (Story 1.3) lives in
 // `codeMapRequests` (declared below, after its timeout): `requestCodeMap`
 // posts a fire-and-forget `graphService:getCodeMap` message to the
@@ -152,7 +162,8 @@ let currentProjectPath: string | null = null;
 // Retry) shares the one in-flight result instead of getting an immediate,
 // spurious "already in progress" failure (review finding). P4-4 phase 1b: a
 // caller for another section waits for it to settle, then sends its own
-// (`code-map-requests.ts`).
+// (`code-map-requests.ts`); P5-d: and supersedes any other section still
+// waiting, so only the latest is sent next.
 
 // A pure backstop, slightly exceeding `fetchCodeMap`'s own internal timeout
 // (mcp-client.ts's `DEFAULT_TIMEOUT_MS`, 30 minutes) — for a hang that
@@ -169,13 +180,15 @@ const CODE_MAP_REQUEST_TIMEOUT_MS = 30 * 60 * 1000 + 10_000;
 // section (`code-map-requests.ts`).
 const codeMapRequests = createCodeMapRequester({
   isRunning: () => graphService !== null,
-  send: (section) => {
+  send: (section, force) => {
     if (!graphService) {
       throw new Error('Graph Service is not running.');
     }
     graphService.postMessage({
       type: 'graphService:getCodeMap',
       ...(section === null ? {} : { section }),
+      // P5-b founder decision 2: only on a forced request (the map's Retry).
+      ...(force ? { force: true as const } : {}),
     } satisfies GraphServiceGetCodeMapRequest);
   },
   timeoutMs: CODE_MAP_REQUEST_TIMEOUT_MS,
@@ -858,6 +871,7 @@ function spawnGraphService(): void {
         | GraphServiceDiffScopeCarryResultMessage
         | GraphServiceListEntryCandidatesResultMessage
         | GraphServiceEntryPinsMissingMessage
+        | GraphServiceHeadChangedMessage
         | ModelStatusMessage
         | SummaryProgressMessage
         | LlmJudgmentProgressMessage
@@ -908,6 +922,14 @@ function spawnGraphService(): void {
         logMissingEntryPins(message.projectPath, message.nodeIds);
         return;
       }
+      // P5-a (founder decision 6.1): the open project's checkout moved since
+      // it was indexed — re-send its index request exactly as a reopen would
+      // (backend, key, scope, pins). For a project no longer open, or with no
+      // running Graph Service, it is logged and ignored.
+      if (isHeadChangedMessage(message)) {
+        handleHeadChanged(message);
+        return;
+      }
       // P4-7c: validated at the process boundary by the relay.
       if (isListEntryCandidatesResultMessage(message)) {
         entryCandidatesRelay.settleReply(message.requestId, message.result, message.section);
@@ -933,12 +955,18 @@ function spawnGraphService(): void {
         sendMcpServerStatus(message);
         return;
       }
-      sendGraphServiceStatus(message);
+      // P5-a review round 1: a HEAD-triggered re-index's statuses carry the
+      // move, so the renderer says why PR Review reset.
+      const tagged = tagHeadMove(message, pendingHeadMove, currentProjectPath);
+      pendingHeadMove = tagged.pending;
+      sendGraphServiceStatus(tagged.status);
     },
   );
 
   graphService.on('exit', (code: number) => {
     graphService = null;
+    // P5-a review round 1: the re-index it was running is gone with it.
+    pendingHeadMove = undefined;
     // A request still outstanding when the subprocess exits will never get
     // its reply now — settle it as an explicit failure rather than leaving
     // the renderer's `getCodeMap()` promise hanging (matrix: "Map data
@@ -1042,6 +1070,36 @@ function sendIndexRequest(projectPath: string): void {
 }
 
 /**
+ * P5-a: routes a validated `graphService:headChanged` (`headChangedAction`):
+ * a re-index of the open project through `sendIndexRequest`, or a log line.
+ */
+function handleHeadChanged(message: GraphServiceHeadChangedMessage): void {
+  const running = graphService !== null && !isGraphServiceShuttingDown;
+  if (headChangedAction(message, currentProjectPath, running) === 'reindex' && currentProjectPath !== null) {
+    console.info(
+      `Checkout moved since ${currentProjectPath} was indexed (HEAD ${message.indexedHead.slice(0, 7)} → ${message.currentHead.slice(0, 7)}); re-indexing.`,
+    );
+    pendingHeadMove = { path: currentProjectPath, indexedHead: message.indexedHead, currentHead: message.currentHead };
+    sendIndexRequest(currentProjectPath);
+    return;
+  }
+  console.warn(`Ignored a HEAD change for ${message.path}: not the open project, or the Graph Service is not running.`);
+}
+
+/**
+ * P5-a: when a window regains focus, asks the Graph Service whether the open
+ * project's checkout moved since it was indexed (it answers only on drift,
+ * with `graphService:headChanged`). Nothing without an open project or a
+ * running Graph Service.
+ */
+function checkHeadOnFocus(): void {
+  if (graphService === null || isGraphServiceShuttingDown || currentProjectPath === null) {
+    return;
+  }
+  graphService.postMessage(buildCheckHeadRequest(currentProjectPath));
+}
+
+/**
  * P2-6: after a successful key save or removal, relays the current key state
  * to a running Graph Service when Cloud is active and a project is open, so
  * a replaced or removed key takes effect without a re-index. Best-effort —
@@ -1077,10 +1135,12 @@ function relayKeyChangeToGraphService(): boolean {
  * spurious "already in progress" failure — both callers see the same
  * eventual result. P4-4 phase 1b: `section` (omitted = the whole scope); an
  * overlapping call for another section is sent only once the in-flight one
- * settles, so each caller gets its own section's reply.
+ * settles, so each caller gets its own section's reply. P5-d: a waiting call
+ * for another section is settled with `SUPERSEDED_RESULT` when a later call
+ * arrives, so the latest caller always gets its own section's reply.
  */
-function requestCodeMap(section?: string): Promise<CodeMapResult> {
-  return codeMapRequests.request(section);
+function requestCodeMap(section?: string, force = false): Promise<CodeMapResult> {
+  return codeMapRequests.request(section, force);
 }
 
 /**
@@ -1877,11 +1937,16 @@ function registerIpcHandlers(): void {
     return { ok: true };
   });
 
-  ipcMain.handle(IpcChannels.codeMapGet, (_event, section: unknown): Promise<CodeMapResult> => {
+  ipcMain.handle(IpcChannels.codeMapGet, (_event, section: unknown, options: unknown): Promise<CodeMapResult> => {
     // P4-4 phase 1b: a non-string section from the renderer is rejected
     // here and never sent to the Graph Service.
     const parsed = parseCodeMapSectionArg(section);
-    return parsed.ok ? requestCodeMap(parsed.section) : Promise.resolve(INVALID_SECTION_RESULT);
+    if (!parsed.ok) {
+      return Promise.resolve(INVALID_SECTION_RESULT);
+    }
+    // P5-b founder decision 2: `{force}` (the map's Retry), validated here.
+    const parsedOptions = parseCodeMapOptionsArg(options);
+    return parsedOptions.ok ? requestCodeMap(parsed.section, parsedOptions.force) : Promise.resolve(INVALID_CODE_MAP_OPTIONS_RESULT);
   });
 
   ipcMain.handle(
@@ -1941,7 +2006,9 @@ function registerIpcHandlers(): void {
     if (backend !== 'local' && backend !== 'cloud') {
       return;
     }
-    setActiveBackend(backend);
+    // P5-g: a failed save logs its raw error locally and rejects with the
+    // actionable message only — the notice never shows a userData path.
+    saveActiveBackend(backend, { save: setActiveBackend, log: appendDiagnosticLogEntry });
     // Story 1.6 (Phase 2): relay the switch to a running Graph Service only
     // when a project is actually open — a no-op backend change before any
     // project has ever been opened has nothing to clear/re-queue, and the
@@ -2374,19 +2441,15 @@ let pendingMenuOpenFolder = false;
 const DEV_ICON_PATH = app.isPackaged ? undefined : path.join(app.getAppPath(), 'assets', 'icon', 'icon.png');
 
 const createWindow = (): BrowserWindow => {
-  const win = new BrowserWindow({
-    width: 1100,
-    height: 720,
-    ...(DEV_ICON_PATH && process.platform !== 'darwin' ? { icon: DEV_ICON_PATH } : {}),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      // P2-9: open at the remembered zoom, with no 100% flash first.
+  // P5-g: the options (and the 640×480 minimum) live in `window-options.ts`.
+  const win = new BrowserWindow(
+    mainWindowOptions({
+      iconPath: DEV_ICON_PATH,
+      platform: process.platform,
+      preloadPath: path.join(__dirname, 'preload.js'),
       zoomFactor: uiSettings.getZoomFactor(),
-    },
-  });
+    }),
+  );
   mainWindow = win;
   mainWindowLoaded = false;
 
@@ -2496,6 +2559,21 @@ app.on('ready', () => {
   installAppMenu();
   createWindow();
 });
+
+// P5-a (founder decision 6.1): a checkout or commit made outside the app is
+// noticed when the user comes back to it.
+app.on('browser-window-focus', () => {
+  checkHeadOnFocus();
+});
+
+// P5-a review round 1: the e2e journey's deterministic refocus — SIGUSR2
+// emits the real `browser-window-focus` (dev app under the e2e harness only;
+// see `e2eHooksEnabled`).
+if (e2eHooksEnabled(app.isPackaged, process.env)) {
+  process.on('SIGUSR2', () => {
+    app.emit('browser-window-focus', undefined, mainWindow);
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

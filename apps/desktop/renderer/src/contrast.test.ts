@@ -215,6 +215,7 @@ const CONTROLS = [
 const DECORATIVE_CARDS = new Set([
   '.code-map__node', // Node card: `--panel` fill + `--border-strong` card edge
   '.code-map__cluster', // cluster card: `--panel` fill, dashed edge
+  '.code-map__community', // collapsed community card: `--panel-alt` fill plus a 3px `--text-mute` leading rule
   '.code-map__health-card', // Health Audit cluster card
   '.settings-panel', // modal frame
   '.code-map__node-detail-panel', // side-panel frame
@@ -436,5 +437,43 @@ describe('styles.css floated-toolbar collision layout (FIX-4)', () => {
       '@container code-map (width < 1040px)',
       '@container code-map (width < 600px)',
     ]);
+  });
+});
+
+// P5-f (founder decision 7.1): plain canvas edges now paint DESIGN.md
+// `canvas-edge` (`--border-strong`, 1.5px) instead of React Flow's dark
+// default (#3e3e3e, 1px). Informational only: an edge is not a control's
+// only cue, so WCAG 1.4.11's 3:1 is never asserted here. The founder's
+// Ask First: if plain edges read too faint on a dense map, `--border-control`
+// (≥ 3:1) replaces it, amending DESIGN.md. Recorded so a token change shows.
+describe('plain canvas-edge stroke against the canvas (P5-f, informational)', () => {
+  const REACT_FLOW_DARK_EDGE = '#3e3e3e';
+  it('--border-strong on --bg is ≈1.72:1, next to React Flow’s #3e3e3e at ≈1.81:1', (t) => {
+    const [strong] = hexDefinitionsOf('--border-strong');
+    const [bg] = hexDefinitionsOf('--bg');
+    const ours = contrastRatio(strong!, bg!);
+    const before = contrastRatio(REACT_FLOW_DARK_EDGE, bg!);
+    t.diagnostic(`--border-strong ${strong} on --bg ${bg}: ${ours.toFixed(2)}:1; ${REACT_FLOW_DARK_EDGE}: ${before.toFixed(2)}:1`);
+    assert.equal(Number(ours.toFixed(2)), 1.72);
+    assert.equal(Number(before.toFixed(2)), 1.81);
+  });
+});
+
+// P5-i (founder decision 3.23): `--shared-reach-edge`, now documented in
+// DESIGN.md (`colors.shared-reach-edge`, `components.reveal-shared-reach-edge`),
+// draws Revealed's shared-reach arc through the canvas gutter left of
+// column 0, so it sits on `--bg`. Its "shares N" label carries the meaning,
+// but the dotted stroke must stay visible: WCAG 1.4.11's 3:1 against every
+// `--bg` definition (≈8.19:1 today).
+describe('styles.css shared-reach edge token (P5-i)', () => {
+  it('every --shared-reach-edge definition is at least 3:1 against every --bg definition', () => {
+    const failures: string[] = [];
+    for (const edge of hexDefinitionsOf('--shared-reach-edge')) {
+      for (const background of hexDefinitionsOf('--bg')) {
+        const ratio = contrastRatio(edge, background);
+        if (ratio < 3) failures.push(`--shared-reach-edge ${edge} on --bg ${background} is ${ratio.toFixed(3)}:1`);
+      }
+    }
+    assert.deepEqual(failures, []);
   });
 });

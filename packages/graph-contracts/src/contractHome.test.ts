@@ -74,6 +74,7 @@ const MOVED_GRAPH_SHAPES = [
   'FoldedModule',
   'TopLevelChangedFile',
   'SimilarImplementation',
+  'CoChangingFile',
 ] as const;
 
 /**
@@ -87,6 +88,10 @@ const CONTRACT_CONSTANTS = [
   'SIMILAR_TO_MAX_ENTRIES',
   // P4-4 phase 3a: bounds `CodeMapNode.crossSectionCalls`.
   'CROSS_SECTION_CALLS_MAX',
+  // The two floors and the cap bounding `CodeMapNode.coChangesWith`.
+  'CO_CHANGE_MIN_COMMITS',
+  'CO_CHANGE_MIN_SCORE',
+  'CO_CHANGE_MAX_ENTRIES',
 ] as const;
 
 /** P4-4 phase 1b (AD-13 "Section scope"): the section result state and the per-section Node count. */

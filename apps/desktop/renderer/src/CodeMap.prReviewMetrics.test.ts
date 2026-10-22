@@ -2380,3 +2380,89 @@ describe('P4-3g review round 1', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// P5-g (founder 1.7): inert sort headers on a contract-only table
+// ---------------------------------------------------------------------------
+
+describe('P5-g: a contract-only table has inert sort headers', () => {
+  const headerButtonsOf = (els: RenderedElement[]) =>
+    byType(renderTree(byType(els, 'thead')[0]?.props.children), 'button');
+  const headerCellsOf = (els: RenderedElement[]) =>
+    renderTree(byType(els, 'thead')[0]?.props.children).filter((e) => e.type === 'th');
+  const statusText = (els: RenderedElement[]) => textOf(els.find((e) => e.props.role === 'status'));
+  const indicatorsOf = (els: RenderedElement[]) =>
+    els.filter((e) => e.props.className === 'code-map__metrics-sort-indicator');
+  const noteOf = (els: RenderedElement[]) => byType(els, 'tr').filter((tr) => tr.props.className === 'code-map__metrics-sort-note');
+  const renderSorting = (
+    table: PrReviewMetricRows,
+    sort: PrReviewMetricSort | null,
+    onSort: (sort: PrReviewMetricSort) => void,
+  ) =>
+    renderTree(
+      PrReviewMetricsTable({
+        ...table,
+        blastRadiusStatus: 'idle',
+        changedContracts: [CODE_MAP_NODE],
+        changedContractsApproximate: false,
+        sort,
+        onSort,
+        onActivateNode: () => {},
+        onOpenType: () => {},
+      }),
+    );
+
+  it('sort null, click "blast radius": no onSort, every header aria-disabled, no aria-sort, empty announcement', () => {
+    const calls: PrReviewMetricSort[] = [];
+    const els = renderSorting(emptyNodeTable(), null, (s) => calls.push(s));
+    const buttons = headerButtonsOf(els);
+    assert.equal(buttons.length, PR_REVIEW_METRIC_COLUMNS.length);
+    for (const button of buttons) {
+      assert.equal(button.props['aria-disabled'], 'true');
+      assert.equal(button.props.disabled, undefined, 'never native disabled');
+      (button.props.onClick as () => void)();
+    }
+    assert.deepEqual(calls, []);
+    assert.ok(headerCellsOf(els).every((th) => th.props['aria-sort'] === undefined));
+    assert.equal(statusText(els), '');
+  });
+
+  it('a user sort set earlier, rows re-resolved to 0: rendered unsorted — no aria-sort, no arrow, empty announcement, no note', () => {
+    const els = renderSorting({ ...emptyNodeTable(), hiddenAffectedCount: 3 }, sortBy('blastRadius', 'descending'), () => {});
+    assert.ok(headerCellsOf(els).every((th) => th.props['aria-sort'] === undefined));
+    assert.deepEqual(indicatorsOf(els), []);
+    assert.equal(statusText(els), '');
+    assert.deepEqual(noteOf(els), []);
+    assert.ok(headerButtonsOf(els).every((b) => b.props['aria-disabled'] === 'true'));
+    // The header names and the bar note are unchanged.
+    assert.ok(headerButtonsOf(els).some((b) => textOf(b).includes(METRIC_BAR_HEADER_NOTE)));
+  });
+
+  it('rows return with the sort still set: sorted as before, aria-sort and the announcement back', () => {
+    const els = renderSorting(SORTABLE, sortBy('blastRadius', 'descending'), () => {});
+    const cells = headerCellsOf(els);
+    assert.equal(cells.filter((th) => th.props['aria-sort'] === 'descending').length, 1);
+    assert.equal(statusText(els), formatMetricSortAnnouncement(sortBy('blastRadius', 'descending')));
+    assert.ok(headerButtonsOf(els).every((b) => b.props['aria-disabled'] === undefined));
+  });
+
+  it('one Node row + contracts: a header click sorts as today', () => {
+    const one = buildPrReviewMetricRows(THREE.slice(0, 1), new Set([THREE[0]!.id]), null, 0);
+    const calls: PrReviewMetricSort[] = [];
+    const els = renderSorting(one, null, (s) => calls.push(s));
+    const blast = headerButtonsOf(els).find((b) => textOf(b).includes('blast radius'))!;
+    assert.equal(blast.props['aria-disabled'], undefined);
+    (blast.props.onClick as () => void)();
+    assert.deepEqual(calls, [nextPrReviewMetricSort(null, 'blastRadius')]);
+  });
+
+  it('styles.css: an inert header is muted with no pointer, and takes no hover colour', () => {
+    const css = readFileSync(fileURLToPath(new URL('./styles.css', import.meta.url)), 'utf8');
+    const rule = /\n\.code-map__metrics-sort\[aria-disabled='true'\] \{([^}]*)\}/.exec(css)?.[1];
+    assert.ok(rule);
+    assert.match(rule, /opacity: 0\.55;/);
+    assert.match(rule, /cursor: default;/);
+    assert.ok(css.includes(".code-map__metrics-sort:not([aria-disabled='true']):hover {"));
+    assert.ok(!css.includes('\n.code-map__metrics-sort:hover {'));
+  });
+});

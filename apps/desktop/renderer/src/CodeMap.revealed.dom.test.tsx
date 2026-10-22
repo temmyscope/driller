@@ -23,10 +23,8 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import type { CodeMapResult, EntryCandidatesResult, PathTraceResult } from '@driller/ipc-contracts';
 import type { MapFooterState } from './appFrame';
 import {
-  canvasGridSize,
   CodeMap,
   initialViewport,
-  layoutPosition,
   LOD_ZOOM_THRESHOLD,
   MAP_MAX_ZOOM,
   NODE_CARD_FALLBACK_HEIGHT,
@@ -60,6 +58,7 @@ import {
   syntheticMap,
   type CodeMapOk,
   type SectionName,
+  fullMapPositions,
 } from './test/mapFixture';
 
 afterEach(cleanupAfterEach);
@@ -171,6 +170,18 @@ function showFull(): void {
   fireEvent.click(toggleButton('Full map'));
 }
 
+/**
+ * Full map draws every Node: the collapsed community view's "All Nodes"
+ * (`CommunityViewToggle`). A no-op on a map too small to group, where the
+ * toggle is not shown and every Node is drawn already.
+ */
+function showAllNodes(): void {
+  const all = screen.queryByRole('button', { name: 'All Nodes' });
+  if (all !== null) {
+    fireEvent.click(all);
+  }
+}
+
 /** The Panel's status line (the one live region Revealed speaks through). */
 function revealStatus(): HTMLElement {
   const line = document.querySelector<HTMLElement>('.code-map__reveal-status');
@@ -232,10 +243,9 @@ function fitTransform(positions: readonly { x: number; y: number }[]): string {
   return `translate(${fit.x}px,${fit.y}px) scale(${fit.zoom})`;
 }
 
-/** Where Full lays out each Node of a map (`layoutPosition` over the fetched order, as `layoutNodes` without `positionOf`). */
-function fullGrid(map: CodeMapOk): Map<string, { x: number; y: number }> {
-  const gridSize = canvasGridSize(map.nodes.length, 0);
-  return new Map(map.nodes.map((node, index) => [node.id, layoutPosition(index, gridSize)]));
+/** Where Full lays out each Node of a map — the community layout, as `positionOf` hands it to `layoutNodes`. */
+function fullGrid(map: CodeMapOk): ReadonlyMap<string, { x: number; y: number }> {
+  return fullMapPositions(map);
 }
 
 /** Waits for an animated viewport move (React Flow's `setCenter`/route fit) to end. */
@@ -334,6 +344,7 @@ describe('Toggling Revealed (replaces the Revealed-branch and listing-fetch pins
     render(<CodeMap {...props({ onMapState: (_project, state) => reports.push(state) })} />);
     await waitFor(() => {
       measure();
+      showAllNodes();
       assert.ok(drawnIds().length > hubs.length);
     }, FIND);
     showRevealed();
@@ -804,6 +815,9 @@ describe('Navigating to a Node Revealed doesn’t draw switches to Full (replace
     await waitForDrawn(drilled);
     assert.equal(fake.calls.listEntryCandidates.length, 1);
     assert.equal(revealStatus().textContent, '', 'a toggle clears the switch line');
+    // P5-b (Node 22 act flake): the toggle's fit is still moving the view;
+    // let it finish inside the test's own wait, not in the teardown.
+    await settleViewport();
   });
 
   it('a Path Trace search through hidden Nodes: Full, the line, the route lit', BUDGET, async () => {
@@ -1010,9 +1024,12 @@ describe('The switch line clears (replaces the status-clear pin)', () => {
 });
 
 describe('A toggle resets the cluster expansions (replaces the toggle wiring pin)', () => {
-  it('a cluster expanded in Full is a cluster again after Revealed and back', BUDGET, async () => {
+  // P5-d chore: usually 1.2–2.3 s, it overran its ~3 s budget once under
+  // full-suite load (P5-c's run); the doubled budget its siblings use.
+  it('a cluster expanded in Full is a cluster again after Revealed and back', { timeout: 2 * BUDGET.timeout }, async () => {
     const map = syntheticMapForClusters();
     await mountClusters(map);
+    showAllNodes();
     const cluster = expandableCluster();
     const clusterId = cluster.getAttribute('data-id') ?? '';
     fireEvent.click(cluster);

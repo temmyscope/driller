@@ -63,7 +63,10 @@ const usage = (source: string, target: string): CodeMapEdge => ({ source, target
  *  - test code (by path, and by the backend flag) that would be the top
  *    candidate and would take `handleRequest`'s place if it leaked through;
  *  - `lib.tool`, outside the scope, calling into api (a candidate only on
- *    the unscoped fetch).
+ *    the unscoped fetch);
+ *  - P5-e: `api.getters` in `api/scoped-code-map-harness.ts` → both
+ *    services and helpers (reach 6, so it would rank above
+ *    `handleRequest`): on the map, but never a candidate.
  */
 const FIXTURE: CodeMapFetchResult = {
   nodes: [
@@ -80,6 +83,7 @@ const FIXTURE: CodeMapFetchResult = {
     fn('web.body', 'web/app.ts'),
     fn('web.footer', 'web/app.ts'),
     fn('lib.tool', 'lib/tool.ts'),
+    fn('api.getters', 'api/scoped-code-map-harness.ts'),
     fn('api.entrySpec', 'api/entry.test.ts'),
     fn('web.flagged', 'web/support.ts', { isTest: true }),
     fn('mod:web/main', 'web/main.ts', { kind: 'Module', endLine: 10 }),
@@ -100,6 +104,11 @@ const FIXTURE: CodeMapFetchResult = {
     calls('lib.tool', 'api.serviceB'),
     calls('lib.tool', 'api.helper1'),
     calls('lib.tool', 'api.helper2'),
+    // P5-e: a harness — its Node stays on the map, never a candidate.
+    calls('api.getters', 'api.serviceA'),
+    calls('api.getters', 'api.serviceB'),
+    calls('api.getters', 'api.helper1'),
+    calls('api.getters', 'api.helper2'),
     // Test code: dropped with its Nodes.
     calls('api.entrySpec', 'api.handleRequest'),
     calls('api.entrySpec', 'api.helper1'),
@@ -248,6 +257,9 @@ describe('P4-7c: guards', () => {
   it('a generation change mid-compute discards the result and memoizes nothing', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const module = indexModule;
+    // P5-b: a fresh map (a same-scope request is served from the raw cache,
+    // which keeps the previous test's whole-scope memo).
+    await index(PROJECT);
     setScope([]);
     await requestMap();
     module.setEntryCandidatesListerForTests((nodes, edges) => {
@@ -308,8 +320,10 @@ describe('P4-7c review round 1: a stale fetch landing after an index', () => {
     it(`after an index of ${target}, the stale map is never listed (refreshing), nor memoized`, { timeout: 30_000 }, async () => {
       assert.ok(indexModule);
       const module = indexModule;
+      // P5-b: the raw cache is cleared, so the request below is a real fetch
+      // (a current same-scope cache would serve it without one).
+      await index(PROJECT);
       setScope(['api', 'web']);
-      await requestMap();
       const gate = deferred();
       harness.__harnessFetchGate = gate.promise;
       const fetchesBefore = harness.__harnessFetchCount ?? 0;
@@ -350,6 +364,9 @@ describe('P4-7c: the whole scope', () => {
       const reply = await requestMap();
       const result = indexModule.computeEntryCandidatesResult(PROJECT);
       assert.deepEqual(result, listEntryCandidates(reply.nodes, reply.edges), scope.join(','));
+      // P5-e: the harness Node is on the map, never a candidate.
+      assert.ok(reply.nodes.some((mapNode) => mapNode.id === 'api.getters'));
+      assert.ok(!ids(result).includes('api.getters'));
       for (const id of ids(result)) {
         assert.ok(!TEST_IDS.has(id), `${id} is test code`);
         assert.doesNotMatch(candidate(result, id)!.file, /\.test\.ts$/);
@@ -378,6 +395,8 @@ describe('P4-7c: the whole scope', () => {
   it('memoized per map: a repeat call does no walk; a refetch or a re-index recomputes on the new map', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const module = indexModule;
+    // P5-b: a fresh map, so no memo is carried over from the previous test.
+    await index(PROJECT);
     setScope(['api', 'web']);
     await requestMap();
     const counter = countListings();
@@ -390,7 +409,10 @@ describe('P4-7c: the whole scope', () => {
       assert.equal(module.peekEntryCandidatesMemoForTests().whole, first);
 
       // A refetch over a different graph: recomputed, never the stale memo.
+      // P5-b: a refetch is a scope save (a same-scope request is served from
+      // the raw cache); every CYCLIC Node is in api.
       harness.__harnessFixtureOverride = CYCLIC;
+      setScope(['api']);
       await requestMap();
       assert.equal(module.peekEntryCandidatesMemoForTests().whole, undefined, 'dropped with the replaced map');
       assert.deepEqual(module.computeEntryCandidatesResult(PROJECT), { status: 'none' }, 'a cyclic project has no candidate');
@@ -533,6 +555,9 @@ describe('P4-7c: with a section (founder decision 2026-10-04)', () => {
       assert.deepEqual([...(module.peekEntryCandidatesMemoForTests().sections?.keys() ?? [])], ['api', 'web']);
       assert.equal(counter.count(), 2, 'one walk per section');
       assert.equal(module.peekEntryCandidatesMemoForTests().whole, undefined, 'a section call never fills the whole-scope memo');
+      // P5-b: a refetch is a scope save (here a reorder); a same-scope
+      // request is served from the raw cache and keeps the memo.
+      setScope(['web', 'api']);
       await requestMap();
       assert.equal(module.peekEntryCandidatesMemoForTests().sections, undefined, 'dropped with the replaced raw cache');
       assert.deepEqual(module.computeEntryCandidatesResult(PROJECT, 'api'), api);
@@ -572,6 +597,13 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.equal(result.status, 'found');
     assert.ok(ids(result).includes('api.handleRequest'));
     assert.ok(ids(result).every((id) => !TEST_IDS.has(id)));
+    // P5-e: the harness root is left out on both transports alike.
+    for (const section of [undefined, 'api']) {
+      const ipc = (await viaIpc(PROJECT, section)).result as EntryCandidatesResult;
+      const agent = JSON.parse(await viaMcp({ projectPath: PROJECT, ...(section === undefined ? {} : { section }) })) as EntryCandidatesResult;
+      assert.ok(!ids(ipc).includes('api.getters') && !ids(agent).includes('api.getters'), String(section));
+      assert.deepEqual(ids(agent), ids(ipc));
+    }
   });
 
   it('review round 1: startMcpServer registers list_entry_candidates (source)', () => {
@@ -582,9 +614,9 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(src.slice(start, end), /\n {2}registerListEntryCandidatesTool\(server\);/);
   });
 
-  it('the tool: name, version 1.11.0, the description’s promises, and its input rules', () => {
+  it('the tool: name, version 1.12.0, the description’s promises, and its input rules', () => {
     assert.ok(mcp);
-    assert.equal(mcp.MCP_SERVER_VERSION, '1.11.0');
+    assert.equal(mcp.MCP_SERVER_VERSION, '1.12.0');
     const tool = registerTool();
     assert.equal(tool.name, 'list_entry_candidates');
     const description = tool.config.description ?? '';
@@ -605,6 +637,8 @@ describe('P4-7c: IPC and MCP parity', () => {
     assert.match(description, /Only the 50 strongest pairs are returned here; 'relationsTotal' is how many pairs there are/);
     assert.match(description, /\{status: 'found', candidates, totalQualifying, relations, relationsTotal, hiddenPinIds\?\}/);
     assert.match(description, /USAGE counts as a caller/);
+    // P5-e: the harness/fixture rule.
+    assert.match(description, /Files whose name contains 'harness' or 'fixture' are never suggested \(pin one to list it\)\./);
     assert.match(description, /Load-time calls from a file's top level .* do NOT count as callers/);
     assert.match(description, /at most 12/);
     assert.match(description, /fewer than 3/);

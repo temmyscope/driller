@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { after, describe, it } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   E2E_WALL_LIMIT_MS,
@@ -33,12 +33,16 @@ import {
   findCbmProcesses,
   forgeStartCommand,
   formatStepTable,
+  graphServiceGuardCaptured,
   groupMembers,
+  huggingFaceHosts,
   isCbmCommand,
+  isElectronMainCommand,
   isPortFree,
   killProcessGroup,
   listProcesses,
   makeTempDir,
+  noHuggingFaceHostCheck,
   parseDevToolsUrl,
   parsePs,
   realUserDataDir,
@@ -115,6 +119,16 @@ describe('parsePs / CBM detection', () => {
     assert.equal(isCbmCommand('pgrep -fl codebase-memory-mcp'), false);
     assert.equal(isCbmCommand('less /x/codebase-memory-mcp/bin.js.orig'), false);
     assert.equal(isCbmCommand('node C:\\x\\codebase-memory-mcp\\bin.js daemon stop'), true);
+  });
+
+  it('P5-a review round 1: isElectronMainCommand picks Electron main, never its --type= helpers or forge', () => {
+    const bin = '/repo/app/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron';
+    assert.equal(isElectronMainCommand(`${bin} . --remote-debugging-port=0 --user-data-dir=/tmp/u`), true);
+    assert.equal(isElectronMainCommand('/repo/node_modules/electron/dist/electron .'), true);
+    assert.equal(isElectronMainCommand('C:\\repo\\node_modules\\electron\\dist\\electron.exe .'), true);
+    assert.equal(isElectronMainCommand(`/repo/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer`), false);
+    assert.equal(isElectronMainCommand(`${bin} --type=utility --utility-sub-type=node.mojom.NodeService`), false);
+    assert.equal(isElectronMainCommand('/usr/local/bin/node /repo/node_modules/@electron-forge/cli/dist/electron-forge-start.js -- --remote-debugging-port=0'), false);
   });
 
   it('never lists the harness itself', () => {
@@ -580,6 +594,8 @@ describe('spawn environment', () => {
     assert.equal(env.TMP, '/tmp/driller-e2e-tmp-1');
     assert.equal(env.HOME, '/Users/me');
     assert.match(env.NODE_OPTIONS!, /no-network-guard|g\.mjs/);
+    assert.equal(env.DRILLER_E2E_HOOKS, '1', 'P5-a review round 1: the dev-only focus hook');
+    assert.equal(env.DRILLER_NETWORK_GUARD_ANNOUNCE, '1', 'P5-c review round 1: the guard marker (positive control)');
     assert.equal(base.ELECTRON_RUN_AS_NODE, '1');
     assert.equal(base.TMPDIR, '/var/x');
   });
@@ -600,6 +616,74 @@ describe('spawn environment', () => {
     ].join('\n');
     assert.deepEqual(refusedHosts(output), ['cdn-lfs.hf.co', 'huggingface.co']);
     assert.deepEqual(refusedHosts('all quiet'), []);
+  });
+
+  it('P5-c: picks out the Hugging Face hosts, including subdomains, and nothing else', () => {
+    assert.deepEqual(huggingFaceHosts(['api.anthropic.com', 'cdn-lfs.hf.co', 'huggingface.co', 'HF.CO', 'notahf.co', 'huggingface.co.evil.test', 'cas-bridge.xethub.hf.co:443']), [
+      'cdn-lfs.hf.co',
+      'huggingface.co',
+      'HF.CO',
+      'cas-bridge.xethub.hf.co:443',
+    ]);
+    assert.deepEqual(huggingFaceHosts([]), []);
+  });
+
+  const GUARD_LINE = 'NetworkGuardActive: .vite/build/graph-service.js';
+
+  it('P5-c: the teardown check fails when the network guard refused a Hugging Face host', () => {
+    const output = [
+      GUARD_LINE,
+      'NetworkDisabledInTests: graph-service.js attempted non-loopback network access (huggingface.co, cdn-lfs.hf.co); failing the file.',
+    ].join('\n');
+    const failed = noHuggingFaceHostCheck(output);
+    assert.equal(failed.ok, false);
+    assert.equal(failed.error, 'the network guard refused cdn-lfs.hf.co, huggingface.co');
+    assert.match(failed.name, /No Hugging Face host contacted/);
+    assert.deepEqual(noHuggingFaceHostCheck(`${GUARD_LINE}\nNetworkDisabledInTests: example.test (in main.js: …)`), {
+      name: failed.name,
+      ok: true,
+      ms: 0,
+      error: undefined,
+    });
+  });
+
+  it("P5-c review round 1: the check fails when the Graph Service's guard output wasn't captured (positive control)", () => {
+    const missing = noHuggingFaceHostCheck('NetworkGuardActive: node_modules/@electron-forge/cli/dist/electron-forge-start.js\nall quiet');
+    assert.equal(missing.ok, false);
+    assert.equal(missing.error, "the Graph Service's network-guard output was not captured (no NetworkGuardActive marker)");
+    assert.equal(graphServiceGuardCaptured(GUARD_LINE), true);
+    assert.equal(graphServiceGuardCaptured('[main] NetworkGuardActive: graph-service.js'), false, 'only a line of its own');
+    assert.equal(graphServiceGuardCaptured('NetworkGuardActive: graph-service.json'), false);
+  });
+
+  it('P5-c review round 1: the guard prints its marker only when asked, naming the guarded script', async () => {
+    const dir = makeTempDir('driller-e2e-guard-marker-');
+    made.push(dir);
+    const script = path.join(dir, 'graph-service.js');
+    writeFileSync(script, '');
+    const guard = fileURLToPath(new URL('../scripts/no-network-guard.mjs', import.meta.url));
+    const stderrOf = (announce: boolean) =>
+      new Promise<string>((resolve, reject) => {
+        const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: '' };
+        if (announce) env.DRILLER_NETWORK_GUARD_ANNOUNCE = '1';
+        else delete env.DRILLER_NETWORK_GUARD_ANNOUNCE;
+        const child = spawn(process.execPath, [`--import=${pathToFileURL(guard).href}`, script], { cwd: dir, env, stdio: ['ignore', 'ignore', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        child.on('error', reject);
+        child.on('close', () => resolve(stderr));
+      });
+    const announced = await stderrOf(true);
+    assert.equal(graphServiceGuardCaptured(announced), true, announced);
+    assert.doesNotMatch(await stderrOf(false), /NetworkGuardActive/);
+  });
+
+  it('P5-c: run.ts adds the check over the whole app output to every journey, and no longer calls a refusal expected (source)', () => {
+    const run = readFileSync(fileURLToPath(new URL('./run.ts', import.meta.url)), 'utf8');
+    assert.match(run, /const appOutput = outputs\.map\(\(o\) => o\(\)\)\.join\('\\n'\);\s*const refused = refusedHosts\(appOutput\);\s*const checks: StepResult\[\] = \[[\s\S]*?noHuggingFaceHostCheck\(appOutput\),\s*\];/);
+    assert.doesNotMatch(run, /expected, e\.g\. the local-model download/);
   });
 });
 

@@ -1,4 +1,4 @@
-import type { CodeMapMode } from './CodeMap';
+import type { CodeMapMode } from './codeMapTypes';
 
 type Mode = CodeMapMode;
 

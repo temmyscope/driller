@@ -694,6 +694,12 @@ describe('graphService:scopeChanged through index.ts', () => {
   it('P4-3 phase 5: testCoverageAvailable only for files LCOV lists, testCoverageHit only with FN proof, the same in the map reply and lookup_node', { timeout: 20_000 }, async () => {
     send({ type: 'graphService:scopeChanged', path: PROJECT, includedPaths: [] });
     const coverageDir = path.join(PROJECT, 'coverage');
+    // P5-b: a same-scope request is served from the raw cache, so a new LCOV
+    // report is read by the first fetch after a re-index.
+    const refetchMap = async (): Promise<Posted> => {
+      await index(PROJECT, []);
+      return fetchMap();
+    };
     const flags = (reply: Posted) =>
       Object.fromEntries(
         (reply.nodes ?? []).map((node) => [
@@ -723,12 +729,12 @@ describe('graphService:scopeChanged through index.ts', () => {
     try {
       // No coverage/lcov.info: no Node has the flag.
       rmSync(coverageDir, { recursive: true, force: true });
-      assert.deepEqual(flags(await fetchMap()), NONE);
+      assert.deepEqual(flags(await refetchMap()), NONE);
 
       // Malformed (no SF: section parses): no flags either.
       mkdirSync(coverageDir, { recursive: true });
       writeFileSync(path.join(coverageDir, 'lcov.info'), 'not lcov at all\nDA:1,1\n');
-      assert.deepEqual(flags(await fetchMap()), NONE);
+      assert.deepEqual(flags(await refetchMap()), NONE);
 
       // web/a.ts: w's function called (flag + hit); app/b.ts listed with
       // nothing hit (a: flag + gap); webapp/d.ts: line 1 hit by module load
@@ -743,7 +749,7 @@ describe('graphService:scopeChanged through index.ts', () => {
           '',
         ].join('\n'),
       );
-      const map = await fetchMap();
+      const map = await refetchMap();
       assert.deepEqual(flags(map), {
         w: [true, true, 'no-gap'],
         a: [true, 'absent', 'gap'],
@@ -758,7 +764,7 @@ describe('graphService:scopeChanged through index.ts', () => {
       const { deriveLiveNode } = await import('./live-node');
       // P4-4 phase 2b: bumped again for the optional `section`; P4-7c: and
       // again for `list_entry_candidates`; P4-7g/P4-7h: pins, then relations.
-      assert.equal(MCP_SERVER_VERSION, '1.11.0');
+      assert.equal(MCP_SERVER_VERSION, '1.12.0');
       let handler: ((args: { nodeId: string }) => Promise<{ content: { text: string }[] }>) | undefined;
       let description = '';
       registerLookupNodeTool(
@@ -791,7 +797,7 @@ describe('graphService:scopeChanged through index.ts', () => {
       // P4-3f review round 1: web/a.ts edited after the report — w loses the
       // hit; its flag and (absent) gap signal are unchanged.
       utimesSync(path.join(PROJECT, 'web/a.ts'), new Date(), new Date(Date.now() + 60_000));
-      assert.deepEqual(flags(await fetchMap()).w, [true, 'absent', 'no-gap']);
+      assert.deepEqual(flags(await refetchMap()).w, [true, 'absent', 'no-gap']);
     } finally {
       rmSync(coverageDir, { recursive: true, force: true });
       for (const file of sources) {
@@ -799,7 +805,7 @@ describe('graphService:scopeChanged through index.ts', () => {
       }
     }
     // With the report gone again, the next fetch drops every flag.
-    assert.deepEqual(flags(await fetchMap()), NONE);
+    assert.deepEqual(flags(await refetchMap()), NONE);
   });
 
   it('P4-2 phase 3b: folded types follow the indexing scope, and name only in-scope users', { timeout: 20_000 }, async () => {
@@ -931,6 +937,9 @@ describe('graphService:scopeChanged through index.ts', () => {
       writeFileSync(path.join(repo, 'web/a.ts'), 'w();\n');
       git('add', '.');
       git('commit', '-q', '-m', 'function change');
+      // P5-a: HEAD moved since the index, so re-index first (as the app does).
+      await index(repo);
+      await fetchMap();
       const mixed = await computeDiffScopeResult(repo, 'main');
       assert.deepEqual(mixed, {
         status: 'resolved',
@@ -993,7 +1002,13 @@ describe('graphService:scopeChanged through index.ts', () => {
         ],
       );
       const { computeDiffScopeResult } = await import('./index');
-      const diff = async () => {
+      const diff = async (reindex = true) => {
+        // P5-a: each branch moved HEAD since the last index, so re-index
+        // first (as the app does on a checkout).
+        if (reindex) {
+          await index(repo);
+          await fetchMap();
+        }
         const result = await computeDiffScopeResult(repo, 'main');
         assert.equal(result.status, 'resolved');
         const { resolvedBaseRef: _base, ...rest } = result as Extract<typeof result, { status: 'resolved' }>;
@@ -1042,9 +1057,12 @@ describe('graphService:scopeChanged through index.ts', () => {
       // Dependents follow the indexing scope: with only web/ in scope, a (in
       // app/) is gone, and the count says so.
       git('checkout', '-q', 'inside');
+      // P5-a: re-indexed at this HEAD before the scope change (an index
+      // request from this test carries no scope).
+      await index(repo);
       send({ type: 'graphService:scopeChanged', path: repo, includedPaths: ['web'] });
       await fetchMap();
-      assert.deepEqual(await diff(), {
+      assert.deepEqual(await diff(false), {
         status: 'resolved',
         nodeIds: [],
         changedContracts: [{ ...T_CONTRACT, dependentCount: 1, dependentIds: ['w'] }],

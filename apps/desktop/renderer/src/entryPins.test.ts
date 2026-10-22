@@ -362,7 +362,7 @@ describe('review round 1: a pin change keeps the reveal steps that still apply',
     const { landed, rebase } = relistOnto(s2, [candidate('handleRequest', 4)]);
     const next = rebaseRevealHistory(chained, { key, mapStamp: PTB_EDGES, previous: s2, landed, rebase });
     assert.deepEqual(
-      next.stack.map((entry) => (entry.kind === 'reveal' ? entry.focusId : entry.id)),
+      next.stack.map((entry) => (entry.kind === 'reveal' ? entry.focusId : entry.kind === 'node' ? entry.id : entry.communityId)),
       ['handleRequest'],
     );
     assert.equal(next.index, 0);

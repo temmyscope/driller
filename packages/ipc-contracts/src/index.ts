@@ -73,6 +73,7 @@ export type {
   FoldedTypeUserKindCount,
   TypeUse,
   SimilarImplementation,
+  CoChangingFile,
   CodeMapEdgeKind,
   CodeMapEdge,
   DiffScopeResult,
@@ -102,6 +103,9 @@ export {
   ENTRY_PINS_MAX,
   FOLDED_TYPE_IPC_MAX_USED_BY,
   SIMILAR_TO_MAX_ENTRIES,
+  CO_CHANGE_MAX_ENTRIES,
+  CO_CHANGE_MIN_COMMITS,
+  CO_CHANGE_MIN_SCORE,
   SIMILAR_TO_MIN_JACCARD,
   TESTED_BY_MAX_TESTS,
 } from '@driller/graph-contracts';
@@ -196,6 +200,18 @@ export type GraphServiceState =
 // (P4-6) and re-exported above.
 // ---------------------------------------------------------------------------
 
+/**
+ * P5-a review round 1: why a re-index runs — the open project's checkout
+ * moved from `indexedHead` to `currentHead` (full commit SHAs). Main adds it
+ * to the `indexing`/`indexed` statuses of the re-index it started for a
+ * `graphService:headChanged`, so the renderer can say so (never a silent
+ * reset of PR Review). The Graph Service itself never sets it.
+ */
+export interface HeadMove {
+  indexedHead: string;
+  currentHead: string;
+}
+
 export type GraphServiceStatusMessage =
   | { state: 'starting'; pid?: number; at: string }
   | { state: 'alive'; pid?: number; at: string }
@@ -205,6 +221,8 @@ export type GraphServiceStatusMessage =
       at: string;
       /** Absolute path of the project this indexing attempt is for. */
       path: string;
+      /** P5-a review round 1: set by main on a HEAD-triggered re-index. */
+      headMoved?: HeadMove;
     }
   | {
       state: 'indexed';
@@ -229,6 +247,8 @@ export type GraphServiceStatusMessage =
        * result into an `error` status.
        */
       coverage?: IndexCoverageSummary;
+      /** P5-a review round 1: set by main on a HEAD-triggered re-index. */
+      headMoved?: HeadMove;
     }
   | {
       state: 'exited';
@@ -258,6 +278,8 @@ export type GraphServiceStatusMessage =
        * subprocess-level errors unrelated to any particular index attempt.
        */
       elapsedMs?: number;
+      /** P5-a review round 1: set by main when a HEAD-triggered re-index fails. */
+      headMoved?: HeadMove;
     };
 
 /** Message main sends to ask the Graph Service subprocess to shut down cleanly. */
@@ -341,6 +363,32 @@ export interface GraphServiceEntryPinsMissingMessage {
   type: 'graphService:entryPinsMissing';
   projectPath: string;
   nodeIds: string[];
+}
+
+/**
+ * P5-a (founder decision 6.1): main asks the Graph Service whether the open
+ * project's checkout moved since it was indexed — sent when the app window
+ * regains focus. The Graph Service answers only on drift, with
+ * `GraphServiceHeadChangedMessage`; otherwise it posts nothing.
+ */
+export interface GraphServiceCheckHeadRequest {
+  type: 'graphService:checkHead';
+  /** Absolute, OS-native project root (main's `currentProjectPath`). */
+  path: string;
+}
+
+/**
+ * P5-a: the Graph Service found HEAD at `currentHead` while the index it
+ * serves was taken at `indexedHead` (both full commit SHAs). Posted at most
+ * once per distinct `currentHead`, never while an index is in flight. Main
+ * re-sends the index request for `path` when it is the open project and the
+ * Graph Service is running; anything else is logged and ignored.
+ */
+export interface GraphServiceHeadChangedMessage {
+  type: 'graphService:headChanged';
+  path: string;
+  indexedHead: string;
+  currentHead: string;
 }
 
 /**
@@ -532,6 +580,21 @@ export interface GraphServiceGetCodeMapRequest {
    * Omitted means the whole scope (never the string `"all"`).
    */
   section?: string;
+  /**
+   * P5-b founder decision 2: `true` bypasses the raw map cache and re-reads
+   * the map from the backend (the map's Retry). Omitted on every other
+   * request (a section switch or a reload is served from the cache).
+   */
+  force?: true;
+}
+
+/**
+ * P5-b founder decision 2: options for `DrillerApi.getCodeMap`. `force`
+ * re-reads the map from the backend instead of serving it from the Graph
+ * Service's raw cache — the map's Retry buttons only.
+ */
+export interface GetCodeMapOptions {
+  force?: boolean;
 }
 
 /**
@@ -793,6 +856,16 @@ export interface BackendConfig {
 }
 
 /**
+ * P5-g (founder approval 2026-10-15, from the P3-5 live run): the message a
+ * `setActiveBackend` rejection carries when main couldn't persist the
+ * choice — actionable, and never the raw store error (a rename error names
+ * the full userData file path). Main writes the raw error to the local
+ * diagnostic log only (`'backend-setting-save-failed'`).
+ */
+export const BACKEND_SETTING_SAVE_FAILED_MESSAGE =
+  "the backend setting couldn't be saved — check that the app's data folder is writable";
+
+/**
  * Result of a `setCloudApiKey` attempt:
  *  - `'ok'`: stored as ciphertext.
  *  - `'warning'`: Linux with no secure keystore and no acknowledgment yet —
@@ -1015,6 +1088,21 @@ export type DiagnosticLogEntry =
       /** P4-7g review round 1: the project the pin belongs to (local only, AD-21). */
       projectPath: string;
       nodeId: string;
+    }
+  | {
+      /**
+       * P5-g (founder approval 2026-10-15): persisting the active backend
+       * failed (e.g. the settings file's rename was refused). Written by
+       * main only; the renderer is shown
+       * `BACKEND_SETTING_SAVE_FAILED_MESSAGE`, never this raw error.
+       */
+      eventType: 'backend-setting-save-failed';
+      /** ISO-8601 timestamp of the failed save. */
+      timestamp: string;
+      /** The backend the user tried to switch to. */
+      backend: CloudBackend;
+      /** The raw store error's message (it may name userData paths — local only, AD-21). */
+      error: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +1179,7 @@ export interface PrBotConfig {
  * Exists because CBM's `index_repository` has no subfolder include/exclude
  * parameter of its own — only a single whole-root `repo_path` plus its own
  * gitignore-style exclusions — so a mixed repo (real source alongside
- * unrelated tooling/docs/scripts, e.g. BMad planning files) has no way to
+ * unrelated tooling, docs, generated output or scripts) has no way to
  * tell driller which subfolders are actually "the codebase" without this.
  *
  * `includedPaths` are POSIX-relative to the project root (e.g. `["web",
@@ -1576,8 +1664,12 @@ export interface DrillerApi {
    *
    * P4-4 phase 1b: `section` (one indexing-scope allowlist entry) maps that
    * section alone; omitted means the whole scope.
+   *
+   * P5-b founder decision 2: `options.force` re-reads the map from the
+   * backend (the map's Retry); without it the Graph Service may serve the
+   * request from its raw cache.
    */
-  getCodeMap: (section?: string) => Promise<CodeMapResult>;
+  getCodeMap: (section?: string, options?: GetCodeMapOptions) => Promise<CodeMapResult>;
   /**
    * Reads a Node's exact source line range off disk, read-only (FR3/FR17
    * groundwork) — `file` is the Node's POSIX-relative path (AD-19),
@@ -1606,7 +1698,10 @@ export interface DrillerApi {
    * this machine is Linux with no secure OS keystore.
    */
   getBackendConfig: () => Promise<BackendConfig>;
-  /** Sets the active summary backend (local/cloud) choice. */
+  /**
+   * Sets the active summary backend (local/cloud) choice. P5-g: when the
+   * choice can't be saved it rejects with `BACKEND_SETTING_SAVE_FAILED_MESSAGE`.
+   */
   setActiveBackend: (backend: CloudBackend) => Promise<void>;
   /**
    * Attempts to store a cloud API key as ciphertext. On Linux with no

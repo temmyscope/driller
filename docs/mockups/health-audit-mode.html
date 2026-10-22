@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>driller — Health Audit Mode</title>
+<style>
+/*
+  RESOLVED SYNTHESIS — Health Audit Mode (this pass, 2026-09-23)
+  Governed by: DESIGN.md § Brand & Style, Colors, Shapes, Components
+  (health-cluster-card, sync-status, canvas — unused here); EXPERIENCE.md
+  § Information Architecture (Health Audit Mode row), § Component Patterns
+  ("Health Audit cluster card", "Sync status").
+  Structure sourced from mockups/direction-modern-saas.html's Health Audit
+  secondary state (the only source mockup to depict this surface); restyled
+  sharp/flat/mono per the resolved terminal-native base — no gradients, no
+  rounded corners except badges, no card elevation.
+*/
+:root{
+  --bg:#0a0f0d; --panel:#0e1613; --panel-alt:#0c1210;
+  --border:#1e2b26; --border-strong:#2c3f37;
+  --text:#cfe0d4; --text-dim:#7d9488; --text-mute:#4c5f55;
+  --accent:#39d98a; --risk-amber:#e8a33d; --risk-red:#ef5350;
+  --healthy:#2f9e6e;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0; padding:40px 24px 80px; background:var(--bg);
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color:var(--text); display:flex; flex-direction:column; align-items:center; gap:14px;
+}
+.frame{width:1200px; background:var(--panel); border:1px solid var(--border-strong); box-shadow:0 0 0 1px #000, 0 20px 60px rgba(0,0,0,.6);}
+.titlebar{display:flex; align-items:center; gap:10px; padding:7px 12px; background:var(--panel-alt); border-bottom:1px solid var(--border); font-size:11px; color:var(--text-mute);}
+.titlebar .dots span{display:inline-block;width:8px;height:8px;margin-right:4px;background:var(--border-strong);}
+.titlebar .dots span:nth-child(1){background:#4a4a4a;}
+.titlebar .path{color:var(--text-dim);}
+.tabbar{display:flex; gap:0; border-bottom:1px solid var(--border); background:var(--panel-alt);}
+.tab{padding:9px 18px; font-size:11px; color:var(--text-mute); border-right:1px solid var(--border);}
+.tab.active{color:var(--bg); background:var(--accent); font-weight:600;}
+.statusline{display:flex; gap:18px; padding:6px 14px; font-size:11px; color:var(--text-mute); background:var(--panel-alt); border-bottom:1px solid var(--border);}
+.statusline b{color:var(--text-dim); font-weight:500;}
+.clusters{display:flex; gap:14px; padding:18px 14px 22px;}
+.cluster-card{flex:1; background:var(--panel); border:1px solid var(--border-strong); padding:12px 14px 10px;}
+.cluster-card h3{margin:0 0 10px; font-size:11px; font-weight:700; display:flex; align-items:center; gap:7px; text-transform:uppercase; letter-spacing:.03em;}
+.cluster-card .heat-dot{width:8px; height:8px; flex-shrink:0;}
+.cluster-card .heat-label{color:var(--text-mute); font-weight:400; text-transform:none; letter-spacing:0; margin-left:auto;}
+.cluster-row{display:flex; justify-content:space-between; gap:10px; font-size:10.5px; color:var(--text-dim); padding:6px 0; border-top:1px solid var(--border);}
+.cluster-row:first-of-type{border-top:none;}
+.cluster-row b{color:var(--text); font-weight:600;}
+.cluster-row .val{font-weight:700; white-space:nowrap;}
+.footerbar{display:flex; justify-content:space-between; padding:6px 14px; font-size:10.5px; color:var(--text-mute); background:var(--panel-alt); border-top:1px solid var(--border);}
+.section-label{max-width:1200px; font-size:11px; color:var(--text-mute); letter-spacing:.04em; text-transform:uppercase; margin-top:10px;}
+</style>
+</head>
+<body>
+
+<div class="section-label">Health Audit Mode — whole-repo view, risk signals clustered by module (no path change selected)</div>
+<div class="frame">
+  <div class="titlebar">
+    <span class="dots"><span></span><span></span><span></span></span>
+    <span class="path">driller — code-map.sock — whole repository</span>
+  </div>
+  <div class="tabbar">
+    <div class="tab">[1] PR Review Mode</div>
+    <div class="tab active">[2] Health Audit Mode</div>
+  </div>
+  <div class="statusline">
+    <span><b>34 nodes scanned</b> · 3 clusters · 6 hotspots</span>
+  </div>
+
+  <div class="clusters">
+    <div class="cluster-card">
+      <h3><span class="heat-dot" style="background:var(--risk-red)"></span>auth cluster<span class="heat-label">hot</span></h3>
+      <div class="cluster-row"><b>validateSession()</b><span class="val" style="color:var(--risk-red)">◆ 61% gap</span></div>
+      <div class="cluster-row"><b>SessionStore.set()</b><span class="val" style="color:var(--risk-red)">◆ 2 hotspots</span></div>
+      <div class="cluster-row"><b>AuthMiddleware.authenticate()</b><span class="val" style="color:var(--risk-amber)">◆ complexity 17</span></div>
+    </div>
+    <div class="cluster-card">
+      <h3><span class="heat-dot" style="background:var(--risk-amber)"></span>payments cluster<span class="heat-label">warm</span></h3>
+      <div class="cluster-row"><b>PaymentService.charge()</b><span class="val" style="color:var(--risk-amber)">◆ radius 14</span></div>
+      <div class="cluster-row"><b>riskScorer.evaluate()</b><span class="val" style="color:var(--risk-amber)">◆ complexity 21</span></div>
+      <div class="cluster-row"><b>RefundService.issue()</b><span class="val" style="color:var(--risk-red)">◆ 74% gap</span></div>
+    </div>
+    <div class="cluster-card">
+      <h3><span class="heat-dot" style="background:var(--healthy)"></span>notifications cluster<span class="heat-label">cool</span></h3>
+      <div class="cluster-row"><b>NotificationService.sendReceipt()</b><span class="val" style="color:var(--healthy)">healthy</span></div>
+      <div class="cluster-row"><b>WebhookDispatcher.emit()</b><span class="val" style="color:var(--healthy)">healthy</span></div>
+    </div>
+  </div>
+
+  <div class="footerbar">
+    <span>34 nodes · 3 clusters</span>
+    <span>Last full scan 14 min ago</span>
+  </div>
+</div>
+
+</body>
+</html>

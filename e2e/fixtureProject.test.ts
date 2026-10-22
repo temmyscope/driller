@@ -68,7 +68,7 @@ describe('seedUserData', () => {
 });
 
 describe('smokeJourney', () => {
-  it('walks landing → Recent Projects → map → Path Trace → Close project, in that order', () => {
+  it('walks landing → Recent Projects → map → Path Trace → Close project, then (P5-g) the minimum-size resize, in that order', () => {
     const names = smokeJourney.map((step) => step.name);
     assert.deepEqual(names, [
       'Landing shows "Open a folder"',
@@ -78,6 +78,7 @@ describe('smokeJourney', () => {
       'Main wrote the temp userData, not the real one',
       'Path Trace "handleRequest" highlights its path',
       'Close project → Recent Projects, focus on "Open a folder"',
+      'The window clamps a 400×300 resize to its 640×480 minimum',
     ]);
     assert.equal(smokeJourney[0]!.limitMs, LANDING_LIMIT_MS);
   });

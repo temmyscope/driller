@@ -29,7 +29,7 @@ import type { CodeMapEdge } from '@driller/graph-contracts';
 import { isFileInScope } from './project-scope';
 import { buildScopedCodeMap, keepFileForSection } from './scoped-code-map';
 import { goldenStringify } from './scoped-code-map-fixture';
-import { getters, makeFixtureProject, posted, removeHarnessTempDirs, send, startIndexTs, waitFor, type Posted } from './scoped-code-map-harness';
+import { getters, index, makeFixtureProject, posted, removeHarnessTempDirs, send, startIndexTs, waitFor, type Posted } from './scoped-code-map-harness';
 
 const PROJECT = makeFixtureProject();
 const harness = globalThis as { __harnessFetchCount?: number; __harnessFetchGate?: Promise<void> };
@@ -187,6 +187,9 @@ describe('P4-4 phase 1b: getCodeMap(section) through index.ts', () => {
   });
 
   it('a failed fetch echoes the requested section on its error (review round 1)', { timeout: 20_000 }, async () => {
+    // P5-b: no raw cache, so each request below is a real fetch (a current
+    // same-scope cache would serve it; a failed fetch caches nothing).
+    await index(PROJECT);
     setScope(['web', 'api']);
     for (const section of ['api', undefined]) {
       const failed = Promise.reject(new Error('backend down (test)'));
@@ -202,6 +205,23 @@ describe('P4-4 phase 1b: getCodeMap(section) through index.ts', () => {
         harness.__harnessFetchGate = undefined;
       }
     }
+  });
+
+  it('P5-b: switching back to a section is served from the raw cache with the same section reply', { timeout: 20_000 }, async () => {
+    const counters = globalThis as { __harnessFetchCount?: number; __harnessLcovCount?: number };
+    const io = () => [counters.__harnessFetchCount ?? 0, counters.__harnessLcovCount ?? 0];
+    await index(PROJECT);
+    setScope(['web', 'api']);
+    const before = io();
+    const fetched = await requestMap('api');
+    assert.deepEqual(io(), [before[0]! + 1, before[1]! + 1], 'the first request after indexed fetches');
+    assert.ok(Array.isArray(fetched.crossSectionEdges) && fetched.crossSectionEdges.length > 0, 'the fixture has cross-section edges');
+    const afterFetch = io();
+    const web = await requestMap('web');
+    assert.equal(web.section, 'web');
+    const back = await requestMap('api');
+    assert.deepEqual(io(), afterFetch, 'no fetch and no LCOV load on either switch');
+    assert.equal(goldenStringify(back), goldenStringify(fetched));
   });
 
   it('a malformed section gets an explicit error reply', { timeout: 20_000 }, async () => {

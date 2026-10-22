@@ -534,6 +534,13 @@ export function computeBlastRadiusHopDistances(
 // point": every "no callers" and every reach count comes from the real
 // edges passed in, nothing from names, exports or CBM's `is_entry_point`.
 //
+// P5-e (founder decision 3.2): a Node in a harness or fixture file
+// (`isEntryCandidateExcludedFile`: the file's base name contains `harness`
+// or `fixture`, any case) is never a heuristic root — code only tests drive
+// but outside test-named files. It stays on the map, still counts as a
+// caller (so what it calls never becomes caller-free), and a pin still
+// lists it.
+//
 // Test code never reaches here: callers pass `fetchProductionCodeMap`'s
 // output (P4-2), which has already dropped test Nodes and their edges. A
 // section's candidates (AD-13 "(f) per section") come from calling this
@@ -671,6 +678,21 @@ export function entryReachAdjacency(nodes: PathTraceNode[], edges: PathTraceEdge
     nodes,
     edges.filter((edge) => ENTRY_CALLER_EDGE_KINDS.includes(edge.kind)),
   );
+}
+
+/** P5-e: a file base name matching this is never a heuristic entry candidate's. */
+const ENTRY_CANDIDATE_EXCLUDED_BASE_NAME = /harness|fixture/i;
+
+/**
+ * P5-e (founder decision 3.2): `true` when a Node in the project-relative
+ * `file` is never taken as a heuristic entry candidate — the file's base
+ * name (never a directory name: a production `fixtures/` folder holds real
+ * code) contains `harness` or `fixture`, in any case. Such Nodes stay on the
+ * map, still count as callers, and are listed when pinned.
+ */
+export function isEntryCandidateExcludedFile(file: string): boolean {
+  const separator = Math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'));
+  return ENTRY_CANDIDATE_EXCLUDED_BASE_NAME.test(file.slice(separator + 1));
 }
 
 /** `true` when `id` has no caller in `adjacency` other than itself (a self-loop is not a caller). */
@@ -948,7 +970,8 @@ function ranksAhead(a: { id: string; reach: number }, b: { id: string; reach: nu
 /**
  * P4-7: `listEntryCandidates` plus how much walking it did — a seam for
  * `entryCandidates.test.ts` (proving the pruning skips work) and
- * `bench/entryCandidates.bench.ts`. `roots` is the caller-free Node count;
+ * `bench/entryCandidates.bench.ts`. `roots` is the caller-free Node count
+ * (P5-e: Nodes in harness or fixture files left out — never roots);
  * `exactReachWalks` the ids whose reach was walked in full, in walk order.
  *
  * Ranking without walking every root in full:
@@ -980,7 +1003,8 @@ export function listEntryCandidatesWithWork(
   const ordered = [...nodesById.values()];
   const roots: number[] = [];
   ordered.forEach((node, index) => {
-    if (hasNoCaller(adjacency, node.id)) {
+    // P5-e: a harness or fixture file's Node is never a heuristic root.
+    if (hasNoCaller(adjacency, node.id) && !isEntryCandidateExcludedFile(node.file)) {
       roots.push(index);
     }
   });
@@ -1129,6 +1153,11 @@ export function listEntryCandidatesWithWork(
  * a forward walk per caller-free Node — in full only while the top
  * `ENTRY_CANDIDATE_MAX` can still change, otherwise only until it reaches
  * `ENTRY_CANDIDATE_MIN_REACH` Nodes (`listEntryCandidatesWithWork`).
+ *
+ * P5-e: a Node whose file's base name contains `harness` or `fixture` (any
+ * case, `isEntryCandidateExcludedFile`) is never a heuristic candidate, nor
+ * counted in `totalQualifying`; it still counts as a caller, and a pin
+ * still lists it.
  *
  * P4-7g: `options.pinnedIds` (the engineer's pins, AD-5 "Entry pins") come
  * first, in pin order, with `reason: {kind: 'pinned'}` and their real reach,
@@ -1729,7 +1758,8 @@ export type DeterministicRiskSignalType =
   | 'cognitive-complexity'
   | 'hotspot'
   | 'blast-radius'
-  | 'test-coverage-gap';
+  | 'test-coverage-gap'
+  | 'co-change';
 
 /**
  * One deterministic risk signal attached to a `CodeMapNode`. A Node with no
@@ -1914,6 +1944,19 @@ export interface CodeMapNode {
   /** P4-2 phase 4: how many similar implementations exist before the cap. Present exactly when `similarTo` is; never below `similarTo.length`. */
   similarToTotal?: number;
   /**
+   * The files this Node's file has a history of changing alongside, from the
+   * backend's own `FILE_CHANGES_WITH` edges — never inferred from imports,
+   * names or anything structural. A partner qualifies on both floors
+   * (`CO_CHANGE_MIN_COMMITS`, `CO_CHANGE_MIN_SCORE`); test files are excluded
+   * on either side, since a file changing with its own test is not news.
+   * Sorted by commits (most first), then score, then path; capped at
+   * `CO_CHANGE_MAX_ENTRIES`. Absent when nothing qualifies, including on a
+   * backend without `FILE_CHANGES_WITH` or a project with no git history.
+   */
+  coChangesWith?: CoChangingFile[];
+  /** How many files qualified before the cap. Present exactly when `coChangesWith` is; never below `coChangesWith.length`. */
+  coChangesWithTotal?: number;
+  /**
    * P4-3 phase 5: LCOV line data exists for this Node's file; says nothing
    * about the percentage. `true` only when the project's
    * `coverage/lcov.info` loaded and has an `SF:` section for `file` — the
@@ -2012,6 +2055,50 @@ export interface SimilarImplementation {
   /** The backend's `SIMILAR_TO.jaccard` token-overlap score, 0–1; at least `SIMILAR_TO_MIN_JACCARD`. */
   score: number;
 }
+
+/**
+ * One file this Node's file has changed alongside, from the backend's
+ * `FILE_CHANGES_WITH` edge.
+ *
+ * History, not structure: it says these two files have moved together, not
+ * that either calls or imports the other. That is the point — it is the one
+ * relationship a diff cannot show, and the reason an engineer wants it is to
+ * notice the file that did NOT change this time.
+ */
+export interface CoChangingFile {
+  /** POSIX-relative path of the partner file — never the Node's own file. */
+  file: string;
+  /** Commits that touched both files. At least `CO_CHANGE_MIN_COMMITS`. */
+  coChanges: number;
+  /**
+   * The backend's `FILE_CHANGES_WITH.coupling_score`, 0-1: how often one
+   * changed when the other did. At least `CO_CHANGE_MIN_SCORE`. A score of 1
+   * means they have never changed apart.
+   */
+  score: number;
+}
+
+/**
+ * The fewest shared commits a co-change pair needs before driller reports it.
+ *
+ * Measured on driller's own repository (2026-10-21): the backend emits pairs
+ * from three shared commits up, and the floor sits above that because two or
+ * three commits in common is coincidence, not coupling. At five, 74 pairs
+ * survive on that repository — enough to be informative, far from every file.
+ */
+export const CO_CHANGE_MIN_COMMITS = 5;
+
+/**
+ * The lowest coupling score reported. Below half, the files changed together
+ * less often than apart, which is incidental: on driller's own repository
+ * this is what separates `main/index.ts` ↔ `preload/index.ts` (score 1, never
+ * changed apart) from `main/index.ts` ↔ `styles.css` (0.47, two files that
+ * both change often).
+ */
+export const CO_CHANGE_MIN_SCORE = 0.5;
+
+/** The most `CodeMapNode.coChangesWith` entries carried per Node (and returned by `lookup_node`); `coChangesWithTotal` is the full count. */
+export const CO_CHANGE_MAX_ENTRIES = 20;
 
 /** P4-2 phase 4: the lowest `SIMILAR_TO.jaccard` shown as a similar implementation. */
 export const SIMILAR_TO_MIN_JACCARD = 0.9;

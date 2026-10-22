@@ -46,6 +46,7 @@ import type { ProductionCodeMapResult } from './production-code-map';
 import { toProjectRelativePosixPath } from './project-path';
 import { isFileInScope, sectionOfFile } from './project-scope';
 import { attachProjectRiskSignals } from './risk-signals';
+import { attachCoChanges } from './co-change';
 import { attachSimilar } from './similar';
 import { annotateNodesWithSummaryState } from './summary-generator';
 
@@ -518,13 +519,17 @@ export function buildScopedCodeMap(
   keepFile: KeepFile,
   getRecord: (id: string) => NodeRecord | undefined = getNodeRecord,
 ): ScopedCodeMap {
-  const { nodes: fetchedNodes, similarPairs } = raw.fetched;
+  const { nodes: fetchedNodes, similarPairs, coChangePairs } = raw.fetched;
   // 1–4a. The scope filter, folded type / Module scoping and folded-Module
   // links (`scopeRawCodeMap`, shared with `buildSectionCallGraph`).
   const { linkedNodes, edges, foldedTypes, foldedModules } = scopeRawCodeMap(raw, keepFile);
-  // 4. Each Node's type uses and similar implementations are re-derived
-  // from the scoped set.
-  const preSignalNodes = attachSimilar(attachTypeUses(linkedNodes, foldedTypes), similarPairs);
+  // 4. Each Node's type uses, similar implementations and co-changing files
+  // are re-derived from the scoped set, so none of them names a Node or file
+  // the scope dropped.
+  const preSignalNodes = attachCoChanges(
+    attachSimilar(attachTypeUses(linkedNodes, foldedTypes), similarPairs),
+    coChangePairs,
+  );
   // 5. Summary state from the record store and the index's coverage gaps.
   const annotatedNodes = annotateNodesWithSummaryState(preSignalNodes, raw.coverageGapFiles, getRecord);
   // 6. Blast-radius adjacency over this file set's edges, built once.

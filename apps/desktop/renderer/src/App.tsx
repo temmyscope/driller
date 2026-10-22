@@ -11,6 +11,7 @@ import type {
   RecentProject,
 } from '@driller/ipc-contracts';
 import { ActionableNotice } from './ActionableNotice';
+import { headMoveNoticeClearsOnUserAction, nextHeadMoveNotice, type HeadMoveNotice } from './headMoveNotice';
 import { formatElapsedMs, hasCoverageGap, statusLineText } from './statusLine';
 import {
   INITIAL_FRAME_MAP_STATE,
@@ -53,6 +54,7 @@ import {
 } from './appFrame';
 import { CodeMap, createLatestRequestGuard, type CodeMapMode } from './CodeMap';
 import { createMenuOpenFolderHandler } from './menuOpenFolder';
+import { visibleModelStatus } from './modelStatusView';
 import { openModalLayers } from './modalStack';
 import { ModeSwitcher } from './ModeSwitcher';
 import { SECTION_PANEL_ID, SectionBar, selectedSectionTabId, showSectionBar } from './SectionBar';
@@ -133,6 +135,8 @@ export function DegradedSessionNotice({ showRetry, onRetry }: { showRetry: boole
 export function App() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[] | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
+  // P5-a review round 1: why the map re-indexed — the checkout moved.
+  const [headMoveNotice, setHeadMoveNotice] = useState<HeadMoveNotice | null>(null);
   const [isOpening, setIsOpening] = useState(false);
   // Story 1.6 (Phase 1): the Settings panel — driller's first Settings UI
   // surface, opened via the gear-icon button in the header below.
@@ -439,7 +443,10 @@ export function App() {
   // sees the cleared (`pending`) state, same as `lookup_node`.
   const handleBackendSwitched = useCallback(() => {
     commitSessionMap(applyBackendSwitchedToSessionMap(sessionMapRef.current));
-  }, [commitSessionMap]);
+    // P5-c review round 1: the model badge follows the backend at once
+    // (hidden under Cloud), not only when Settings closes.
+    refetchBackendConfig();
+  }, [commitSessionMap, refetchBackendConfig]);
 
   // P2-1: Settings reports each scope save main handed to the running Graph
   // Service. The scope is a query-time filter, so the loaded map is refetched
@@ -476,6 +483,7 @@ export function App() {
         return;
       }
       setGraphServiceStatus(status);
+      setHeadMoveNotice((current) => nextHeadMoveNotice(current, status));
       const next = applyStatusToSessionMap(sessionMapRef.current, status);
       if (next !== sessionMapRef.current) {
         commitSessionMap(next);
@@ -527,6 +535,7 @@ export function App() {
     // fresh advisory of its own for a newly-opened project if/when it's
     // actually warranted again.
     setHardwareAdvisories(new Set());
+    setHeadMoveNotice(null);
     switch (result.status) {
       case 'opened':
         setNotice(null);
@@ -780,6 +789,7 @@ export function App() {
     setFrameSync(applyProjectClosedToFrameSync);
     setGraphServiceStatus(null);
     setNotice(null);
+    setHeadMoveNotice(null);
     setHardwareAdvisories(new Set());
     // P2-2: with no project open the (disabled) switcher shows Code Map, not
     // the closed project's mode; the first-open rule picks again on open.
@@ -788,6 +798,26 @@ export function App() {
     setPendingSectionFocus(null);
     focusOpenFolderAfterCloseRef.current = true;
   }, [commitSessionMap, commitSectionShell]);
+
+  // P5-a review round 1: once its re-index has ended, the checkout-moved
+  // notice goes on the next user action (a pointer press or a key). The press
+  // clears it when it ENDS (`pointerup`), not when it starts: removing the
+  // notice row on `pointerdown` moved everything below it up mid-press, so
+  // the release landed on another element and the press never became a
+  // click (live pass 2026-10-19: "Compute diff scope" did nothing).
+  const headMoveNoticeClears = headMoveNoticeClearsOnUserAction(headMoveNotice);
+  useEffect(() => {
+    if (!headMoveNoticeClears) {
+      return undefined;
+    }
+    const clear = () => setHeadMoveNotice(null);
+    window.addEventListener('pointerup', clear, true);
+    window.addEventListener('keydown', clear, true);
+    return () => {
+      window.removeEventListener('pointerup', clear, true);
+      window.removeEventListener('keydown', clear, true);
+    };
+  }, [headMoveNoticeClears]);
 
   // P2-3: the window title follows the titlebar.
   const title = deriveTitle({ currentProjectPath });
@@ -925,6 +955,8 @@ export function App() {
   // while the local model attempt is still in flight or hasn't been
   // observed yet this session.
   const localUnusable = modelStatus?.state === 'error';
+  // P5-c review round 1: never a model badge under Cloud (see `visibleModelStatus`).
+  const shownModelStatus = visibleModelStatus(modelStatus, backendConfig?.activeBackend);
   const hasCloudKey = backendConfig?.hasCloudKey ?? false;
   // "cloud selected, no key" — the currently *active* backend is cloud but
   // has no key to generate with, regardless of whether local happens to be
@@ -1185,6 +1217,12 @@ export function App() {
             {/* No nested `role="alert"` — the enclosing `role="status"` region
                 announces it. */}
             {notice?.kind === 'error' && <ActionableNotice tone="error">{notice.message}</ActionableNotice>}
+            {/* P5-a review round 1: never a silent reset — why it re-indexed. */}
+            {headMoveNotice !== null && (
+              <ActionableNotice tone={headMoveNotice.phase === 'failed' ? 'warning' : headMoveNotice.phase === 'reindexing' ? 'progress' : 'info'}>
+                {headMoveNotice.text}
+              </ActionableNotice>
+            )}
           </div>
 
           <section
@@ -1245,10 +1283,10 @@ export function App() {
         </footer>
       )}
 
-      {showServiceFooters && modelStatus && (
+      {showServiceFooters && shownModelStatus && (
         <footer className="model-status" role="status">
-          <ModelStatusBadge status={modelStatus} />
-          {modelStatus.state === 'error' && (
+          <ModelStatusBadge status={shownModelStatus} />
+          {shownModelStatus.state === 'error' && (
             // P1-3: its own model-only retry path — no restart, no
             // re-index, map untouched (see `handleRetryLocalModel`).
             <button type="button" className="model-status__retry" onClick={handleRetryLocalModel}>

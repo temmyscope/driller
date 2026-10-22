@@ -138,6 +138,28 @@ export async function resolveGitToplevel(dir: string): Promise<string | undefine
 }
 
 /**
+ * P5-a (founder decision 6.1, 2026-10-15): the commit HEAD points at in
+ * `projectRoot` (`git rev-parse --verify --quiet HEAD`, read-only, with the
+ * same short timeout as every other git call here), or `undefined` when
+ * there is none to compare: not a git repository, an unborn HEAD (no commit
+ * yet), git missing, a timeout, or any other failed call. Never throws.
+ * `undefined` never counts as a HEAD change (the drift check in `index.ts`
+ * runs only when both HEADs are defined).
+ */
+export async function readHeadCommit(projectRoot: string): Promise<string | undefined> {
+  // `runSafeSubprocess` never rejects: every failure is a non-`stdout` result.
+  const result = await runSafeSubprocess('git', ['rev-parse', '--verify', '--quiet', 'HEAD'], {
+    cwd: projectRoot,
+    timeoutMs: GIT_SUBPROCESS_TIMEOUT_MS,
+  });
+  if (!('stdout' in result)) {
+    return undefined;
+  }
+  const head = result.stdout.trim();
+  return head.length > 0 ? head : undefined;
+}
+
+/**
  * P4-4 phase 3b (founder decision 2026-10-04): whether PR Review's base ref
  * `ref` carries from the folder `fromDir` to `toDir` on a section switch:
  * `same-repository` when both folders resolve to the same git top-level;

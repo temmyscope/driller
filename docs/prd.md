@@ -1,6 +1,6 @@
 # Product Requirements: driller
 
-> Living PRD, tracked in-repo so requirements evolve alongside the code. Distilled from the founder's original [product brief](../../_bmad-output/planning-artifacts/briefs/brief-driller-2026-09-02/brief.md) and [full PRD](../../_bmad-output/planning-artifacts/prds/prd-driller-2026-09-03/prd.md) (2026-09-03), which remain the historical record of *how* these requirements were derived. This file is the current source of truth — update it directly as requirements change; don't fork a v2 alongside it.
+> Living PRD, tracked in-repo so requirements evolve alongside the code. Distilled in September 2026 from the founder's original product brief and full PRD, which are no longer kept anywhere — everything they established was folded into this file, so it is both the current requirements and the only surviving record of them. Update it directly as requirements change; don't fork a v2 alongside it.
 >
 > See [README.md](README.md) for how this fits with the other docs in this folder.
 
@@ -34,7 +34,7 @@ v1 ships as a single Electron desktop application, open-source, built to be used
 
 ### Key User Journeys
 
-**UJ-1 — Dani approves an agent's change without reading the raw diff.** Dani switches to PR Review Mode, selects a base ref; driller highlights changed Nodes and their Blast Radius. A changed Node carries a Risk Overlay finding from Dani's configured PR-bot. Dani reads the Node's summary and finding, runs a Path Trace to confirm the change never reaches a sensitive boundary, then approves — in a fraction of the time a full diff read would take. *Failure path:* if graph coverage is incomplete for a touched file, that Node shows a Coverage Gap flag instead of a confident summary, so Dani knows to read that file directly.
+**UJ-1 — Dani approves an agent's change without reading the raw diff.** Dani switches to PR Review Mode, selects a base ref; driller highlights changed Nodes and their Blast Radius. A changed Node carries a Risk Overlay finding from Dani's configured PR-bot. Dani reads the Node's summary and finding, runs a Path Trace that finds no route from the change to a sensitive boundary in indexed code, weighs that against the Coverage Gap flags on the touched files, then approves — in a fraction of the time a full diff read would take. *Failure path:* if graph coverage is incomplete for a touched file, that Node shows a Coverage Gap flag instead of a confident summary, so Dani knows to read that file directly.
 
 **UJ-2 — Sam audits an inherited AI-heavy codebase before a handoff.** Sam opens the repo for the first time; driller indexes progressively and lands Sam in Health Audit Mode by default, with hotspots and low-coverage Nodes visible clustered. Sam traces a path from an entry point through the suspect module to confirm the risk is real, then produces a punch list grounded in the actual call graph. *Failure path:* a repo too large to index synchronously still shows a progressively-completing map rather than blocking.
 
@@ -57,7 +57,7 @@ v1 ships as a single Electron desktop application, open-source, built to be used
 
 ## 4. Functional Requirements
 
-Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capability to Architecture Map](arc42.md#capability-to-architecture-map) and by the sprint tracker in `_bmad-output/implementation-artifacts/sprint-status.yaml`.
+Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capability to Architecture Map](arc42.md#capability-to-architecture-map) and by [status.md](status.md), which records what is actually built against each one.
 
 ### 4.1 Project Load & Indexing
 - **FR1 — Load Local Project.** Open a local folder as a driller project. Detects a git repo at the folder root or a parent/child folder and confirms before indexing; shows indexing progress within 5s of folder selection; persists a recent-projects list.
@@ -72,12 +72,12 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 - **FR6 — Summary Backend Configuration.** Configurable local/on-device model or bring-your-own-key cloud provider. v1 ships at least one of each. No code content is transmitted to any driller-operated server under either configuration. Switching backend regenerates summaries only, never the graph index.
 
 ### 4.4 Risk & complexity overlay
-- **FR7 — Deterministic Signal Overlay.** Complexity, Blast Radius, test coverage gaps, and hotspots. Each is reproducible; toggles independently of the LLM-judgment layer.
+- **FR7 — Deterministic Signal Overlay.** Complexity, Blast Radius, test coverage gaps, and hotspots. *[Added 2026-10-21]* Plus **co-change**: how many files a Node's file has a history of changing alongside, from the backend's own `FILE_CHANGES_WITH` edges. It is the one relationship a diff cannot show — structure says what calls what, history says what moves together — and the reviewer's question is about the file that did *not* change this time. History, never a structural claim: it does not mean either file uses the other. Each is reproducible; toggles independently of the LLM-judgment layer.
 - **FR8 — LLM-Judgment Signal Overlay.** Qualitative risk judgment, visually distinguished from deterministic signals at all times; toggles independently.
 - **FR9 — Ingested PR-Bot Findings.** Findings from configured external AI PR-review bots (e.g. CodeRabbit, Qodo) render as a Risk Overlay signal type. Opt-in per project, disabled by default; a Node with a finding shows the originating tool and finding text; absence of any integration doesn't degrade other overlays.
 
 ### 4.5 Path Trace search
-- **FR10 — Path Trace Search.** Search a request/call path (REST, GraphQL, or gRPC entry point) and get a traceable, ordered path. Free-text or structured input; renders as a highlighted route on the map itself, not only a text list; an unfound path states that explicitly.
+- **FR10 — Path Trace Search.** Search a request/call path (REST, GraphQL, or gRPC entry point) and get a traceable, ordered path. Free-text or structured input; renders as a highlighted route on the map itself, not only a text list; an unfound path states that explicitly. *[Corrected 2026-10-21]* A Path Trace result is structural evidence **within the indexed scope**, never proof that no path exists: the Graph Service's index is best-effort, inherits its backend's language coverage gaps, and is bounded to the selected section. An empty result therefore says "no path found in indexed code" and says so in those words — UJ-1 has an engineer approve a change on the strength of one, so the wording cannot overstate what was searched.
 
 ### 4.6 PR Review Mode
 - **FR11 — Git-Scoped Review.** Scope the Code Map to a local git change — diff against a selected branch or commit. Local git only, no platform connection. Changed Nodes are visually distinguished from unchanged ones.
@@ -104,7 +104,7 @@ Grouped by feature area. Each FR is the stable ID referenced by [arc42.md's Capa
 
 ## 6. UX Requirements
 
-Full behavioral and visual design detail lives in the UX design spine (`_bmad-output/planning-artifacts/ux-designs/ux-driller-2026-09-03/`); this section captures only the requirements that constrain scope.
+Full behavioral and visual design detail lives in [EXPERIENCE.md](EXPERIENCE.md) (interaction, journeys, states) and [DESIGN.md](DESIGN.md) (the visual system and its tokens); this section captures only the requirements that constrain scope.
 
 - Dark-first color mode is the primary design target; light mode is secondary/derived.
 - Every code identifier renders in monospace, everywhere, without exception.
@@ -126,7 +126,7 @@ Full behavioral and visual design detail lives in the UX design spine (`_bmad-ou
 
 ## 8. MVP Scope
 
-**In scope for v1**, organized as delivery epics (full story-level breakdown and current status: `_bmad-output/planning-artifacts/epics.md` and `_bmad-output/implementation-artifacts/sprint-status.yaml`):
+**In scope for v1**, organized as delivery epics (what is actually built against each, and what is still open or unverified: [status.md](status.md)):
 
 1. **Open a Project and Explore Its Code Map** — FR1–FR6, FR10, FR16, FR17. The foundational map-before-code experience.
 2. **See Where the Risk Is** — FR7–FR9. Deterministic, LLM-judgment, and ingested-finding overlays.

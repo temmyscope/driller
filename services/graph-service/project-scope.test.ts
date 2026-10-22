@@ -11,6 +11,7 @@ import {
   isFileInScope,
   isScopeChangedRequest,
   resolveIncludedPathsOnIndexSuccess,
+  sameScope,
   sectionOfFile,
   type ScopeState,
 } from './project-scope';
@@ -168,5 +169,27 @@ describe('sectionOfFile', () => {
     assert.deepEqual(Object.fromEntries(counts), { apps: 3, 'apps/web': 2, web: 1, api: 1 });
     const inScope = files.filter((file) => isFileInScope(file, allowlist)).length;
     assert.equal([...counts.values()].reduce((sum, n) => sum + n, 0), inScope);
+  });
+});
+
+// P5-b: the raw map cache serves a Code Map request only while its
+// `appliedScope` is the live allowlist, entry for entry and in order.
+describe('sameScope', () => {
+  it('is true for the same entries in the same order, including two empty scopes', () => {
+    assert.equal(sameScope([], []), true);
+    assert.equal(sameScope(['apps', 'services', 'packages'], ['apps', 'services', 'packages']), true);
+    const scope = ['web'];
+    assert.equal(sameScope(scope, scope), true);
+  });
+
+  it('is false for any difference: an entry added, removed, changed or reordered', () => {
+    assert.equal(sameScope(['web'], []), false);
+    assert.equal(sameScope([], ['web']), false);
+    assert.equal(sameScope(['web', 'api'], ['web']), false);
+    assert.equal(sameScope(['web'], ['web', 'api']), false);
+    assert.equal(sameScope(['web', 'api'], ['web', 'apps']), false);
+    assert.equal(sameScope(['web', 'api'], ['api', 'web']), false);
+    assert.equal(sameScope(['web', 'web'], ['web']), false);
+    assert.equal(sameScope(['web/'], ['web']), false);
   });
 });

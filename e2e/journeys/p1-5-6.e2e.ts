@@ -4,7 +4,8 @@
  *
  * On the scratch repo (handleRequest edited on `review`):
  * 1. PR Review against `main` marks handleRequest changed, with a blast radius.
- * 2. The edit is reverted (a `git revert` commit): computing again says
+ * 2. The edit is reverted (a `git revert` commit, so HEAD moves: after a
+ *    refocus the app re-indexes, P5-a, and says so): computing again says
  *    "No changes to review…" and leaves no changed card, no blast-radius
  *    line and no metrics table, while the map, history and search stay.
  * 3. With `main` renamed away (no main/master/upstream) and a blank base
@@ -29,6 +30,7 @@ import {
   closeProjectButton,
   computeDiffScope,
   eventually,
+  getCodeMapCalls,
   landingStep,
   mapShowsStep,
   metricsTable,
@@ -37,12 +39,16 @@ import {
   readBlastRadiusLine,
   recentProjectButton,
   switchMode,
+  waitForMapRefetch,
 } from './common';
 
 const NO_CHANGES = 'No changes to review — the resolved base ref has no diff against the current working tree.';
 const NOT_A_REPO = "This project isn't a git repository — PR Review Mode needs local git history to compute a diff.";
 const NO_BASE_REF =
   'No base ref could be resolved automatically (no upstream tracking branch or local main/master found) — enter one explicitly above.';
+
+/** P5-a's session notice once the HEAD-triggered re-index has finished. */
+const REINDEXED = /^Checkout moved [0-9a-f]{7} → [0-9a-f]{7} — re-indexed; compute the diff again\.$/;
 
 const state = { plainProject: '' };
 
@@ -89,8 +95,18 @@ export const p1_5_6: Journey = {
     },
     {
       name: 'Revert the edit, compute again: "No changes" notice, highlights cleared, map kept',
-      run: async ({ page, projectPath }) => {
+      run: async (ctx) => {
+        const { page, projectPath, emitWindowFocus } = ctx;
+        // The revert is a commit, so HEAD moves (P5-a): the app re-indexes
+        // when the window regains focus (a diff before that is P5-a's
+        // explicit checkout-changed error, never a diff). Come back to the
+        // app the way a user does, wait for the "re-indexed" notice, then
+        // compute again.
+        const fetches = await getCodeMapCalls(ctx);
         git(projectPath, ['revert', '--no-edit', 'HEAD']);
+        await emitWindowFocus();
+        await page.getByText(REINDEXED).waitFor({ state: 'visible' });
+        await waitForMapRefetch(ctx, fetches);
         await computeDiffScope(page, SCRATCH_BASE_REF);
         await notice(page, NO_CHANGES).waitFor({ state: 'visible' });
         await eventually(

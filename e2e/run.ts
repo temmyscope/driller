@@ -51,6 +51,8 @@ import {
   formatStepTable,
   groupMembers,
   installExitHandlers,
+  noHuggingFaceHostCheck,
+  isElectronMainCommand,
   isPortFree,
   killProcessGroup,
   listProcesses,
@@ -217,6 +219,15 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
     }
   };
 
+  const emitWindowFocus = async () => {
+    if (app === undefined) throw new Error('the app is not running');
+    const mains = groupMembers(listProcesses(), app.pgid).filter((p) => isElectronMainCommand(p.command));
+    if (mains.length !== 1) {
+      throw new Error(`expected one Electron main process in the app's group, found ${mains.length}`);
+    }
+    process.kill(mains[0]!.pid, 'SIGUSR2');
+  };
+
   let finishing: Promise<JourneyOutcome> | undefined;
   const finish = (exitCode: number, reason?: string): Promise<JourneyOutcome> => {
     finishing ??= (async () => {
@@ -225,6 +236,8 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
       let artifacts: string | undefined;
       if (failed) artifacts = await writeArtifacts();
       const report = await teardown();
+      const appOutput = outputs.map((o) => o()).join('\n');
+      const refused = refusedHosts(appOutput);
       const checks: StepResult[] = [
         {
           name: 'Teardown: group killed, own CBM stopped, temp dirs removed, no survivors',
@@ -232,10 +245,11 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
           ms: 0,
           error: report.failures.map((f) => `${f.phase}: ${f.message}`).join(' | ') || undefined,
         },
+        // P5-c: every journey seeds Cloud, so no local-model download.
+        noHuggingFaceHostCheck(appOutput),
       ];
       log(`\n${formatStepTable([...results, ...checks])}`);
-      const refused = refusedHosts(outputs.map((o) => o()).join('\n'));
-      if (refused.length > 0) log(`network guard refused (expected, e.g. the local-model download): ${refused.join(', ')}`);
+      if (refused.length > 0) log(`network guard refused: ${refused.join(', ')}`);
       if (artifacts !== undefined) log(`artifacts: ${artifacts}`);
       const ms = Date.now() - startedAt;
       log(`${journey.id}: ${(ms / 1000).toFixed(1)} s`);
@@ -302,6 +316,7 @@ async function runJourney(journey: Journey, state: RunState): Promise<JourneyOut
       userDataDir,
       relaunch,
       killGraphService,
+      emitWindowFocus,
     } as JourneyContext;
 
     /** Spawn → DevTools URL → CDP → landing → IPC counter, all within `limitMs`. */
