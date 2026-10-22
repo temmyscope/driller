@@ -14,6 +14,7 @@ import {
   type CommunityInputEdge,
   type CommunityInputNode,
   type CommunityPartition,
+  ISOLATED_COMMUNITY_ID,
 } from './communities';
 import { communityPositions, communityStructure, type CommunityBlock } from './communityLayout';
 import {
@@ -211,6 +212,33 @@ describe('a community card states what it holds', () => {
 
   it('says so rather than "0 of 0" when a community has no calls', () => {
     assert.equal(communityCardCohesionText(0, 0), 'no calls in indexed code');
+  });
+
+  it('never claims perfect cohesion for the pooled islands', () => {
+    // Every call in that bag is internal by construction — the islands
+    // survived precisely because they reach nothing outside — so the real
+    // counts would read "6 of 6 calls inside": the healthiest module on the
+    // map, for a bag of unrelated pairs.
+    const pooled = communityCardCohesionText(6, 0, ISOLATED_COMMUNITY_ID);
+    assert.doesNotMatch(pooled, /of \d+ calls inside/, `"${pooled}" reads as cohesion it has not earned`);
+    assert.equal(pooled, 'each group calls only itself');
+  });
+
+  it('still states the real counts for a real module', () => {
+    assert.equal(communityCardCohesionText(12, 3, 'community:src/charge.ts::charge'), '12 of 15 calls inside');
+  });
+
+  it('spells the pooled card out the same way for assistive tech', () => {
+    const spoken = communityCardAriaLabel({
+      id: ISOLATED_COMMUNITY_ID,
+      label: '14 isolated groups',
+      memberCount: 34,
+      internalEdges: 6,
+      externalEdges: 0,
+      position: { x: 0, y: 0 },
+    });
+    assert.match(spoken, /each group calls only itself/);
+    assert.doesNotMatch(spoken, /calls inside/);
   });
 
   it('shows outside traffic only when there is some — never a bare 0', () => {

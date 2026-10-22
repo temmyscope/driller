@@ -4192,7 +4192,7 @@ export function CodeMapCommunityCard({ data }: Pick<NodeProps<CodeMapCommunityFl
       <code className="code-map__community-label">{card.label}</code>
       <span className="code-map__community-nodes">{communityCardNodesText(card.memberCount)}</span>
       <span className="code-map__community-cohesion">
-        {communityCardCohesionText(card.internalEdges, card.externalEdges)}
+        {communityCardCohesionText(card.internalEdges, card.externalEdges, card.id)}
       </span>
       {outside !== null && (
         <span className="code-map__community-outside" aria-hidden="true">

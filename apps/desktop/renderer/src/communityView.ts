@@ -33,6 +33,7 @@
  */
 import {
   MIN_NODES_TO_PARTITION,
+  ISOLATED_COMMUNITY_ID,
   UNREFERENCED_COMMUNITY_ID,
   type CommunityPartition,
   type GraphCommunity,
@@ -222,7 +223,20 @@ export function communityCardNodesText(memberCount: number): string {
  *
  * A community with no calls at all says so instead of "0 of 0".
  */
-export function communityCardCohesionText(internalEdges: number, externalEdges: number): string {
+export function communityCardCohesionText(
+  internalEdges: number,
+  externalEdges: number,
+  communityId?: string,
+): string {
+  // The pooled islands are the one card whose real counts would mislead.
+  // Every call in that bag is internal by construction — those groups
+  // survived the merge precisely because they reach nothing outside — so
+  // "6 of 6 calls inside" would make a bag of unrelated pairs read as the
+  // most cohesive module on the map. What is actually true of it is that
+  // each group only ever calls itself, so that is what it says.
+  if (communityId === ISOLATED_COMMUNITY_ID) {
+    return 'each group calls only itself';
+  }
   const total = internalEdges + externalEdges;
   if (total === 0) {
     return 'no calls in indexed code';
@@ -244,7 +258,7 @@ export function communityCardAriaLabel(card: CommunityCard): string {
   const parts = [
     `Community ${card.label}`,
     communityCardNodesText(card.memberCount),
-    communityCardCohesionText(card.internalEdges, card.externalEdges),
+    communityCardCohesionText(card.internalEdges, card.externalEdges, card.id),
   ];
   if (card.externalEdges > 0) {
     // Spoken in full: the card's own "N out" is shorthand the glyph-free
