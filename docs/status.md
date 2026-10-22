@@ -90,6 +90,7 @@ usefulness, and neither does a state in this table.
 - **Outer per-job retry around summary generation.** `p-retry` was planned in an
   early draft and never built; SDK-level retry is all there is. ([arc42.md §8](arc42.md#8-crosscutting-concepts),
   AD-8.)
+- **Revealed as the default Code Map view.** `[decided 2026-10-22]` Proposed in the 2026-10 assessment as a way off a Full map whose card positions carried no meaning. That premise is gone: Full map is now laid out by the call graph and opens on community cards (`ba062d8`, `72f72af`), so the default it would have replaced no longer exists. Revealed stays opt-in and unchanged. Closed rather than deferred — see `EXPERIENCE.md`'s Revealed row for what would re-open it.
 - **shadcn/ui.** AD-3 names it; it was never adopted and no shadcn, Radix or
   Tailwind dependency exists. Whether AD-3 drops it is a founder decision.
 
