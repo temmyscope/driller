@@ -97,6 +97,16 @@ async function requestMap(section?: string): Promise<Posted> {
 
 let sectionReads: string[] = [];
 
+const harness = globalThis as { __harnessFetchCount?: number; __harnessFetchGate?: Promise<void> };
+
+function deferred(): { promise: Promise<void>; release: () => void } {
+  let release = (): void => {};
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
 /**
  * The four tools' real registered handlers, wired to `index.ts`'s live
  * getters exactly as `startMcpServer` wires them. Every read of the section
@@ -547,5 +557,53 @@ describe('P4-4 phase 2b: the operation tools with a section', () => {
       section: 'docs',
       knownSections: ['web', 'api'],
     });
+  });
+});
+
+/**
+ * Snapshot ownership on the agent surface. `lookup_node` live-derives a
+ * Node's summary, staleness and record-backed signals, so those are never a
+ * fetch-time snapshot — but WHICH Nodes exist came from `activeCodeMapNodes`
+ * unguarded, and a fetch still in flight when an index started lands there a
+ * generation behind. An agent reviewing a PR would then be told about a Node
+ * at the line range the previous index gave it.
+ */
+describe('a stale fetch landing after an index: the agent surface', () => {
+  it('lookup_node reports no indexed map rather than a Node from the previous generation', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    const module = indexModule;
+    setScope(['web', 'api']);
+    await requestMap();
+    // It answers over the live map first.
+    assert.equal(JSON.parse(await callText('lookup_node', { nodeId: 's1' })).status, 'ok');
+
+    // P5-b: clear the raw cache, or the gated request below is served from it.
+    await index(PROJECT);
+    setScope(['web', 'api']);
+    const gate = deferred();
+    harness.__harnessFetchGate = gate.promise;
+    const fetchesBefore = harness.__harnessFetchCount ?? 0;
+    const from = posted.length;
+    send({ type: 'graphService:getCodeMap' });
+    try {
+      await waitFor(() => ((harness.__harnessFetchCount ?? 0) > fetchesBefore ? true : undefined), 'the fetch to start');
+      harness.__harnessFetchGate = undefined;
+      await index(PROJECT);
+    } finally {
+      gate.release();
+    }
+    await waitFor(() => posted.slice(from).find((m) => m.type === 'graphService:codeMap'), 'the stale fetch to land');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.equal(module.getActiveRawCodeMap(), null, 'no current raw cache stamps the cached Nodes');
+    assert.deepEqual(JSON.parse(await callText('lookup_node', { nodeId: 's1' })), {
+      status: 'error',
+      message: 'No project has finished indexing yet.',
+    });
+
+    // The refetch lands and the agent is served again.
+    setScope(['web', 'api']);
+    await requestMap();
+    assert.equal(JSON.parse(await callText('lookup_node', { nodeId: 's1' })).status, 'ok');
   });
 });

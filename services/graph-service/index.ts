@@ -1009,8 +1009,18 @@ try {
   // and record-backed signals re-read from the Node record store through the
   // same code the fetch path uses — so `lookup_node` never serves the
   // fetch-time snapshot `activeCodeMapNodes` holds (FR15 parity).
+  //
+  // Snapshot ownership `[2026-10-25]`: those derived fields were always live,
+  // but WHICH Nodes exist (and their line ranges) came from the cached array
+  // unguarded. A fetch still in flight when an index started lands there a
+  // generation behind, so an agent could be told about a Node at the previous
+  // index's line range. The getter now withholds an unstamped cache, which
+  // `lookupNode` reports as "No project has finished indexing yet." — the same
+  // message it already gives before the first fetch, and the same stamp
+  // `getSectionCodeMap`, diff scope, Blast Radius expansion and entry
+  // candidates ask for.
   closeMcpServer = startMcpServer(
-    () => activeCodeMapNodes,
+    () => (getActiveRawCodeMap() === null ? undefined : activeCodeMapNodes),
     postMcpServerStatus,
     (node) => deriveLiveNode(node, { getRecord: getNodeRecord, coverageGapFiles: coverageGapFileSet }),
     () => activeFoldedModules,
