@@ -31,6 +31,7 @@ import {
   MIN_ZOOM_REAL,
   allNodesOpeningView,
   MAP_MAX_ZOOM,
+  edgeLabelsReadable,
 } from './CodeMap';
 import type { CommunityBlock } from './communityLayout';
 import { renderTree, textOf, type RenderedElement } from './testRender';
@@ -688,5 +689,38 @@ describe('where All Nodes opens', () => {
   it('never opens above the map’s zoom ceiling', () => {
     const tiny = { x: 0, y: 0, width: 10, height: 10 };
     assert.ok(allNodesOpeningView(tiny, [block('one', 1, 0, 0)], DRILLER_VIEWPORT).zoom <= MAP_MAX_ZOOM);
+  });
+});
+
+/**
+ * `[2026-10-25]` React Flow keeps an edge's label at a readable SCREEN size by
+ * counteracting the viewport zoom, so a label does not shrink with the map.
+ * Below the zoom where cards collapse into clusters that stops helping and
+ * starts hurting: on driller's own 33-card map the "N calls" labels painted at
+ * full size over cards reduced to specks, overlapping each other and the
+ * canvas. Hiding them there was, on inspection, the single biggest
+ * readability difference on the whole map.
+ *
+ * The threshold is `LOD_ZOOM_THRESHOLD`, deliberately: it is already the zoom
+ * at which this map stops drawing readable cards, so one idea of "too far out
+ * to read" governs both rather than two that can drift apart.
+ */
+describe('when an edge label is worth drawing', () => {
+  it('draws labels at the zoom where cards are still readable', () => {
+    assert.equal(edgeLabelsReadable(LOD_ZOOM_THRESHOLD), true, 'at the threshold');
+    assert.equal(edgeLabelsReadable(1), true);
+    assert.equal(edgeLabelsReadable(MAP_MAX_ZOOM), true);
+  });
+
+  it('drops them once the cards they annotate have collapsed', () => {
+    assert.equal(edgeLabelsReadable(LOD_ZOOM_THRESHOLD - 0.001), false, 'just under the threshold');
+    assert.equal(edgeLabelsReadable(0.0143), false, 'the zoom driller’s own All Nodes map fits at');
+    assert.equal(edgeLabelsReadable(0), false);
+  });
+
+  it('never claims a nonsense zoom is readable', () => {
+    for (const zoom of [Number.NaN, Number.NEGATIVE_INFINITY, -1]) {
+      assert.equal(edgeLabelsReadable(zoom), false, String(zoom));
+    }
   });
 });

@@ -1466,6 +1466,18 @@ code,
    `--border-control` (3.16:1) — the alternative DESIGN.md itself named for
    this exact case. `contrast.test.ts` now enforces it rather than recording
    it. */
+/* `[2026-10-25]` `@xyflow/react` keeps an edge label at a readable screen size
+   by counteracting the viewport zoom, so it never shrinks with the map. Below
+   `LOD_ZOOM_THRESHOLD` — where cards have collapsed into clusters — that turns
+   the "N calls" labels into full-size text over specks, overlapping each other
+   and the edges they annotate. `edgeLabelsReadable` puts this class on the
+   canvas there. The label is detail; the edge it sits on is the structure, and
+   the structure is what a map this far out is for. */
+.code-map__flow--labels-too-small .react-flow__edge-text,
+.code-map__flow--labels-too-small .react-flow__edge-textwrapper {
+  display: none;
+}
+
 .code-map__edge .react-flow__edge-path {
   stroke: var(--border-control);
   stroke-width: 1.5;

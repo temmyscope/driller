@@ -786,6 +786,26 @@ export const MIN_ZOOM_REAL = 0.1;
 // Nodes actually on screen, never the whole dataset at once.
 export const LOD_ZOOM_THRESHOLD = 0.2;
 
+/**
+ * Whether an edge's "N calls" label is worth drawing at `zoom`.
+ *
+ * `[2026-10-25]` React Flow holds an edge label at a readable SCREEN size by
+ * counteracting the viewport zoom, so it does not shrink with the map. Past
+ * the point where cards collapse into clusters that stops helping: dogfooded
+ * on driller's own 33-card map, the labels painted at full size over cards
+ * reduced to specks, overlapping each other and burying the edges they
+ * annotate. Hiding them below the threshold was the single biggest
+ * readability difference on the map.
+ *
+ * `LOD_ZOOM_THRESHOLD` is reused rather than given its own constant: it is
+ * already the zoom at which this map stops drawing readable cards, so one
+ * idea of "too far out to read" governs both and they cannot drift apart. A
+ * zoom that is not a usable number is treated as not readable.
+ */
+export function edgeLabelsReadable(zoom: number): boolean {
+  return Number.isFinite(zoom) && zoom >= LOD_ZOOM_THRESHOLD;
+}
+
 // FIX-1: the lowest zoom a Path Trace / neighbour-trace fit may land at.
 // `LOD_ZOOM_THRESHOLD` plus a margin, so float drift and `quantizeZoomBand`'s
 // banding can never drop the fitted view back under the threshold (where
@@ -9628,6 +9648,7 @@ export function CodeMap({
         // the user sees, and `<Controls>`/the signal toggles sit above the table.
         <CodeMapCanvasFrame canvasRef={setCanvasElement} onKeyDown={handleCanvasKeyDown}>
           <ReactFlow<CodeMapAnyFlowNode>
+            className={edgeLabelsReadable(viewport.zoom) ? undefined : 'code-map__flow--labels-too-small'}
             style={{ width: '100%', height: '100%', visibility: awaitingFirstFit ? 'hidden' : undefined }}
             nodes={renderedNodes}
             edges={canvasEdges}
