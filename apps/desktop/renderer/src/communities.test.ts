@@ -167,12 +167,17 @@ describe('detectCommunities leaves a small map alone', () => {
     assert.ok(detectCommunities(at.nodes, at.edges).communities.length >= 2);
   });
 
-  it('labels the one community by its most-called member', () => {
+  it('labels the one community by the member that drives it, not the helper they all call', () => {
+    // `[2026-10-25]` This asserted `hot` — the most-called member — until
+    // dogfooding showed what that rule does at scale: driller's three largest
+    // communities came out as `formatCount`, `isTestNode` and `jsonToolResult`,
+    // every one of them a leaf utility. `entry` calls into the group and is
+    // called by nothing, which is what a reviewer wants the card to say.
     const nodes = nodesOf('entry', 'middle', 'hot');
     const edges = edgesOf(['entry', 'hot'], ['middle', 'hot'], ['entry', 'middle']);
     const { communities } = detectCommunities(nodes, edges);
     assert.equal(communities.length, 1);
-    assert.equal(communities[0]!.label, 'hot');
+    assert.equal(communities[0]!.label, 'entry');
   });
 });
 
@@ -527,14 +532,14 @@ describe('detectCommunities names a community by what it can defend', () => {
     }
   });
 
-  it('names a community after the member its own community calls most', () => {
-    // A star: every other member calls `m0`, so `m0` has an in-community
-    // in-degree of 39 and everyone else 0. Each Node sits in its own file, so
-    // the label is an identifier rather than a path.
+  it('names a community after the member that calls the rest of it', () => {
+    // A star the other way up: `m0` calls all 39 others and nothing calls it.
+    // Each Node sits in its own file under one directory, so no path can name
+    // this community (`commonRootDepth`) and the hub rule is what answers.
     const size = MIN_NODES_TO_PARTITION;
     const nodes = nodesOf(...Array.from({ length: size }, (_unused, index) => `m${index}`));
     const edges = Array.from({ length: size - 1 }, (_unused, index) =>
-      edgesOf([`m${index + 1}`, 'm0']),
+      edgesOf(['m0', `m${index + 1}`]),
     ).flat();
     const { communities, communityOfNode } = detectCommunities(nodes, edges);
     const community = communities.find((c) => c.id === communityOfNode.get(id('m0')))!;
@@ -590,17 +595,41 @@ describe('detectCommunities never leaves two communities reading alike', () => {
     return { nodes, edges };
   }
 
-  it('qualifies a repeated name with its hub’s file', () => {
+  it('tells three Go packages apart by package, where all three hubs are called New', () => {
+    // `[2026-10-25]` This used to assert `New (pkg0/new.go)` and friends: Go's
+    // constructor convention made all three hubs `New`, and the only way to
+    // tell the cards apart was to qualify the repeated name. The directory
+    // tier removes the collision at its source — each community is named after
+    // the package its members live in — so nothing needs qualifying.
     const { nodes, edges } = groupsWithTheSameHubName(3);
-    const { communities } = detectCommunities(nodes, edges);
-    const labels = communities.map((community) => community.label);
+    const labels = detectCommunities(nodes, edges).communities.map((community) => community.label);
     assert.equal(new Set(labels).size, labels.length, `two communities read alike: ${labels.join(' / ')}`);
-    const repeated = communities.filter((community) => community.label.startsWith('New ('));
-    assert.ok(repeated.length >= 2, `expected qualified New labels, got ${labels.join(' / ')}`);
-    for (const community of repeated) {
-      // An identifier label is qualified by its hub's file.
-      assert.match(community.label, /^New \(pkg\d\/new\.go\)$/);
+    for (const dir of ['pkg0/', 'pkg1/', 'pkg2/']) {
+      assert.ok(labels.includes(dir), `${dir} missing from ${labels.join(' / ')}`);
     }
+  });
+
+  it('still qualifies a repeated name when no directory can separate them', () => {
+    // Both communities live in the same directory, so `commonRootDepth` rules
+    // a path label out and both fall back to a hub that happens to share a
+    // name — the case the qualifier exists for.
+    const nodes: CommunityInputNode[] = [];
+    const edges: CommunityInputEdge[] = [];
+    const per = Math.ceil(MIN_NODES_TO_PARTITION / 2) + 4;
+    for (const group of [0, 1]) {
+      const hub = { id: `src/new${group}.ts::New`, name: 'New', file: `src/new${group}.ts` };
+      nodes.push(hub);
+      for (let index = 0; index < per; index += 1) {
+        const member = { id: `src/g${group}f${index}.ts::f${index}`, name: `f${index}`, file: `src/g${group}f${index}.ts` };
+        nodes.push(member);
+        edges.push({ source: hub.id, target: member.id });
+        edges.push({ source: member.id, target: `src/g${group}f${(index + 1) % per}.ts::f${(index + 1) % per}` });
+      }
+    }
+    const labels = detectCommunities(nodes, edges).communities.map((community) => community.label);
+    const qualified = labels.filter((label) => label.startsWith('New ('));
+    assert.equal(qualified.length, 2, `expected two qualified New labels, got ${labels.join(' / ')}`);
+    assert.equal(new Set(labels).size, labels.length, labels.join(' / '));
   });
 
   it('leaves a name alone when nothing else shares it', () => {
@@ -637,5 +666,98 @@ describe('a repeated file label is qualified by its hub, not another path', () =
       assert.match(label, /^src\/Big\.tsx \([pq]\d+\)$/, `${label} is the file qualified by its hub identifier`);
       assert.doesNotMatch(label, /\(src\//, 'never one path qualified by another');
     }
+  });
+});
+
+/**
+ * `[2026-10-25]` Found by dogfooding driller on its own repository: of 34
+ * community cards, 11 were named after an incidental helper, and the three
+ * largest — 67, 65 and 56 Nodes, 15% of the map — read `formatCount`,
+ * `isTestNode` and `jsonToolResult`. A reviewer learns nothing from those.
+ *
+ * Two causes. The modal test counted the EXACT file path, so a community
+ * spread over ten files in one directory cleared no majority and fell through;
+ * and the fallback picked the member with the highest in-community in-degree,
+ * which in a large cluster is whatever small utility everything calls.
+ *
+ * These fixtures are two cliques in different parts of a tree, joined by one
+ * edge, and sized past `MIN_NODES_TO_PARTITION` so the map really partitions —
+ * a map whose Nodes all sit in one directory is the degenerate case, and is
+ * covered by the "no label a directory could give" test below.
+ */
+describe('naming a community that no single file dominates', () => {
+  const node = (file: string, name: string): CommunityInputNode => ({ id: `${file}::${name}`, name, file });
+  const link = (a: CommunityInputNode, b: CommunityInputNode): CommunityInputEdge => ({ source: a.id, target: b.id });
+
+  /** A clique over `files` (one Node each), so it is unambiguously one community. */
+  function clique(files: readonly string[], prefix: string) {
+    const nodes = files.map((file, i) => node(file, `${prefix}${i}`));
+    const edges: CommunityInputEdge[] = [];
+    nodes.forEach((from, i) => nodes.forEach((to, j) => i !== j && edges.push(link(from, to))));
+    return { nodes, edges };
+  }
+
+  /** Two cliques joined by a single edge: the shape with one obvious split. */
+  function mapOf(left: readonly string[], right: readonly string[]) {
+    const a = clique(left, 'a');
+    const b = clique(right, 'b');
+    return {
+      nodes: [...a.nodes, ...b.nodes],
+      edges: [...a.edges, ...b.edges, link(a.nodes[0]!, b.nodes[0]!)],
+    };
+  }
+
+  const SERVICE = Array.from({ length: 24 }, (_, i) => `services/graph-service/g${i}.ts`);
+  const labelsOf = (nodes: CommunityInputNode[], edges: CommunityInputEdge[]) =>
+    detectCommunities(nodes, edges).communities.map((c) => c.label);
+
+  it('names it after the directory its members share, not a helper inside it', () => {
+    const renderer = Array.from({ length: 24 }, (_, i) => `apps/desktop/renderer/src/f${i}.ts`);
+    const { nodes, edges } = mapOf(renderer, SERVICE);
+    const labels = labelsOf(nodes, edges);
+    assert.ok(labels.includes('apps/desktop/renderer/src/'), labels.join(' / '));
+    assert.ok(labels.includes('services/graph-service/'), labels.join(' / '));
+  });
+
+  it('prefers the deepest directory that still holds most of them', () => {
+    // 16 in renderer/src, 8 in main: `apps/desktop/` covers all 24, but
+    // `apps/desktop/renderer/src/` already covers a majority and says more.
+    const mixed = [
+      ...Array.from({ length: 16 }, (_, i) => `apps/desktop/renderer/src/f${i}.ts`),
+      ...Array.from({ length: 8 }, (_, i) => `apps/desktop/main/m${i}.ts`),
+    ];
+    assert.ok(labelsOf(...Object.values(mapOf(mixed, SERVICE)) as [CommunityInputNode[], CommunityInputEdge[]])
+      .includes('apps/desktop/renderer/src/'));
+  });
+
+  it('still names it after one file when that file really does hold most of it', () => {
+    const dominated = [
+      ...Array.from({ length: 16 }, () => 'apps/desktop/renderer/src/CodeMap.tsx'),
+      ...Array.from({ length: 8 }, (_, i) => `apps/desktop/main/m${i}.ts`),
+    ];
+    assert.ok(labelsOf(...Object.values(mapOf(dominated, SERVICE)) as [CommunityInputNode[], CommunityInputEdge[]])
+      .includes('apps/desktop/renderer/src/CodeMap.tsx'));
+  });
+
+  it('falls back to a member that drives its community, never one it merely calls', () => {
+    // Spread across unrelated top-level areas, so no path holds a majority.
+    // `orchestrate` calls the workers; `formatCount` is called by all of them —
+    // the shape that produced the bad names on driller's own map.
+    const areas = Array.from({ length: 22 }, (_, i) => `area${i % 11}/w${i}.ts`);
+    const workers = areas.map((file, i) => node(file, `w${i}`));
+    const orchestrate = node('apps/hub.ts', 'orchestrate');
+    const formatCount = node('services/fmt.ts', 'formatCount');
+    const edges: CommunityInputEdge[] = [];
+    for (const worker of workers) {
+      edges.push(link(orchestrate, worker), link(worker, formatCount));
+      for (const other of workers) {
+        if (other !== worker) edges.push(link(worker, other));
+      }
+    }
+    const right = clique(SERVICE, 'b');
+    const nodes = [orchestrate, ...workers, formatCount, ...right.nodes];
+    const labels = labelsOf(nodes, [...edges, ...right.edges, link(orchestrate, right.nodes[0]!)]);
+    assert.ok(labels.includes('orchestrate'), labels.join(' / '));
+    assert.ok(!labels.includes('formatCount'), 'the most-called member must not name it');
   });
 });

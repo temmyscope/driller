@@ -327,20 +327,92 @@ interface CommunityHub {
  * nothing, where `src/revealView.ts` says where to look. Ties on the modal
  * file go to the lexicographically first path, so the choice is deterministic.
  */
-function communityLabel(
+/**
+ * The most specific path a majority of `members` share: the file itself when
+ * one file holds `COMMUNITY_FILE_LABEL_MIN_SHARE` of them, otherwise the
+ * deepest ancestor directory that does. `null` when nothing does.
+ *
+ * `[2026-10-25]` The directory tier was added after dogfooding driller on its
+ * own repository: the exact-file test alone left 11 of 34 cards named after an
+ * incidental helper, because a community spread over ten files in one
+ * directory clears no single-file majority. A directory that holds most of the
+ * members overclaims nothing — it is where the group lives — and it is the
+ * difference between `formatCount` and `apps/desktop/renderer/src/`.
+ *
+ * Deepest wins so the label stays as specific as the members allow:
+ * `apps/desktop/renderer/src/` rather than `apps/`, both of which may clear
+ * the share. Ties go to the larger count, then the lexicographically first
+ * path, so the choice is deterministic.
+ */
+/**
+ * How many leading directory segments EVERY file in the map shares. A
+ * directory at or above this depth is true of every community alike, so it
+ * tells a reviewer nothing about which one they are looking at — a map wholly
+ * inside `src/` must not hand every card the name `src/`. A label has to be
+ * deeper than this to be worth having.
+ */
+function commonRootDepth(sorted: readonly CommunityInputNode[]): number {
+  let common: string[] | null = null;
+  for (const node of sorted) {
+    const dirs = node.file.split('/').slice(0, -1);
+    if (common === null) {
+      common = dirs;
+      continue;
+    }
+    let shared = 0;
+    while (shared < common.length && shared < dirs.length && common[shared] === dirs[shared]) {
+      shared += 1;
+    }
+    common = common.slice(0, shared);
+    if (common.length === 0) {
+      break;
+    }
+  }
+  return common?.length ?? 0;
+}
+
+function modalPathLabel(
   members: readonly number[],
-  representative: number,
   sorted: readonly CommunityInputNode[],
-): { label: string; hub: CommunityHub } {
-  const counts = new Map<string, number>();
+  rootDepth: number,
+): { label: string; modalFile: string } | null {
+  const fileCounts = new Map<string, number>();
+  const dirCounts = new Map<string, number>();
   for (const index of members) {
     const file = sorted[index]!.file;
-    counts.set(file, (counts.get(file) ?? 0) + 1);
+    fileCounts.set(file, (fileCounts.get(file) ?? 0) + 1);
+    const segments = file.split('/');
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      const dir = segments.slice(0, depth).join('/');
+      dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
+    }
   }
-  const [file, count] = [...counts.entries()].sort((a, b) => b[1] - a[1] || compareIds(a[0], b[0]))[0]!;
-  const usedFile = count / members.length >= COMMUNITY_FILE_LABEL_MIN_SHARE;
-  const hub = sorted[representative]!;
-  return { label: usedFile ? file : hub.name, hub: { name: hub.name, file: hub.file, usedFile } };
+  const [modalFile, fileCount] = [...fileCounts.entries()].sort(
+    (a, b) => b[1] - a[1] || compareIds(a[0], b[0]),
+  )[0]!;
+  const enough = (count: number) => count / members.length >= COMMUNITY_FILE_LABEL_MIN_SHARE;
+  if (enough(fileCount)) {
+    return { label: modalFile, modalFile };
+  }
+  const depthOf = (dir: string) => dir.split('/').length;
+  const deepest = [...dirCounts.entries()]
+    .filter(([dir, count]) => enough(count) && depthOf(dir) > rootDepth)
+    .sort((a, b) => depthOf(b[0]) - depthOf(a[0]) || b[1] - a[1] || compareIds(a[0], b[0]))[0];
+  return deepest === undefined ? null : { label: `${deepest[0]}/`, modalFile };
+}
+
+function communityLabel(
+  members: readonly number[],
+  namingHub: number,
+  sorted: readonly CommunityInputNode[],
+  rootDepth: number,
+): { label: string; hub: CommunityHub } {
+  const path = modalPathLabel(members, sorted, rootDepth);
+  const hub = sorted[namingHub]!;
+  return {
+    label: path === null ? hub.name : path.label,
+    hub: { name: hub.name, file: hub.file, usedFile: path !== null },
+  };
 }
 
 /**
@@ -537,13 +609,26 @@ export function detectCommunities(
   // fan-in picked map-wide accessors (`current`, `get`) over the group's own
   // centre.
   const inCommunityFanIn = new Array<number>(sorted.length).fill(0);
+  // `[2026-10-25]` And fan-OUT, for the naming fallback. In-degree answers
+  // "what does this community call most", which is the right question for an
+  // identifier and the wrong one for a name: the most-called member of a large
+  // cluster is a leaf utility. Dogfooded on driller's own map, that rule
+  // labelled the three biggest communities `formatCount`, `isTestNode` and
+  // `jsonToolResult`. Net outflow — calls more than it is called — picks the
+  // member that drives the group instead. Fan-out alone is not enough: in a
+  // clique every member calls every other, so the orchestrator ties with the
+  // workers it calls and loses the tie-break to their mutual traffic.
+  const inCommunityFanOut = new Array<number>(sorted.length).fill(0);
   for (const { from, to } of directed) {
     const fromLabel = labelOfIndex.get(from);
     if (fromLabel !== undefined && fromLabel === labelOfIndex.get(to)) {
       inCommunityFanIn[to] = inCommunityFanIn[to]! + 1;
+      inCommunityFanOut[from] = inCommunityFanOut[from]! + 1;
     }
   }
+  const netOutflow = (index: number) => inCommunityFanOut[index]! - inCommunityFanIn[index]!;
 
+  const rootDepth = commonRootDepth(sorted);
   const communityOfIndex = new Map<number, string>();
   const built: GraphCommunity[] = [];
   /** Each community's hub, for `qualifyRepeatedLabels`. */
@@ -572,11 +657,20 @@ export function detectCommunities(
         compareIds(sorted[a]!.id, sorted[b]!.id),
     )[0]!;
     const id = `community:${sorted[representative]!.id}`;
+    // Deliberately NOT the representative: that one is the id, and an id wants
+    // the stable "most called" member, while a name wants the member that
+    // drives the group. Ties on net outflow go to raw fan-out, then id.
+    const namingHub = [...members].sort(
+      (a, b) =>
+        netOutflow(b) - netOutflow(a) ||
+        inCommunityFanOut[b]! - inCommunityFanOut[a]! ||
+        compareIds(sorted[a]!.id, sorted[b]!.id),
+    )[0]!;
     const memberIds = members.map((index) => sorted[index]!.id).sort(compareIds);
     for (const index of members) {
       communityOfIndex.set(index, id);
     }
-    const named = communityLabel(members, representative, sorted);
+    const named = communityLabel(members, namingHub, sorted, rootDepth);
     built.push({
       id,
       label: named.label,
