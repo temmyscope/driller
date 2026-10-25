@@ -10,6 +10,7 @@ This folder is the in-repo, git-tracked source of truth for what driller is and 
 - **[arc42.md](arc42.md)** — Architecture, in the [arc42](https://arc42.org) format. Constraints, system context, the hexagonal ports-and-adapters strategy, building blocks, runtime and deployment views, crosscutting concepts, the full architecture decision log, and known risks. Read this to understand *how* it's built.
 - **[agent.md](agent.md)** — A short, enforceable checklist of invariants for anyone (AI agent or human) writing code here, plus a repo layout quick-reference. Read this before making a change.
 - **[status.md](status.md)** — What is actually built, what is open, and what has only been claimed rather than verified, each row with the date of its evidence. Read this before assuming a capability behaves as the other docs describe.
+- **[fork-enterprise-backlog.md](fork-enterprise-backlog.md)** — Capabilities requested for a planned **enterprise fork** of driller: a separate repository, forked from this one. Not driller's backlog and not a commitment for this repo; it is here only until the fork has somewhere of its own to keep it.
 - **[DESIGN.md](DESIGN.md)** and **[EXPERIENCE.md](EXPERIENCE.md)** — The visual system (tokens, palette, type) and the interaction/journey spine. The behavioral and visual detail prd.md §6 deliberately leaves out.
 
 ## How these relate
