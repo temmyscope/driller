@@ -99,6 +99,43 @@ usefulness, and neither does a state in this table.
   early draft and never built; SDK-level retry is all there is. ([arc42.md §8](arc42.md#8-crosscutting-concepts),
   AD-8.)
 - **Revealed as the default Code Map view.** `[decided 2026-10-22]` Proposed in the 2026-10 assessment as a way off a Full map whose card positions carried no meaning. That premise is gone: Full map is now laid out by the call graph and opens on community cards (`ba062d8`, `72f72af`), so the default it would have replaced no longer exists. Revealed stays opt-in and unchanged. Closed rather than deferred — see `EXPERIENCE.md`'s Revealed row for what would re-open it.
+- **A cycle / recursion risk signal (the second half of "spend the unused
+  signals").** `[decided 2026-10-25]` The backend does carry the data —
+  `Function` and `Method` each have `recursive`, `self_recursive`,
+  `unguarded_recursion`, `recursion_in_loop`, `loop_depth` and
+  `transitive_loop_depth` — so the premise that it was there was right. It does
+  not survive being measured on driller/app (2,870 functions):
+  - **Every CALLS self-edge is a resolution artifact.** All 37 of them come from
+    `strategy: 'callee_suffix'` at `confidence: 0.50`, the weakest resolver;
+    none from a reliable one. One is a `Map.delete(...)` call resolved back to
+    its own enclosing function. So the call graph contains no trustworthy
+    2-cycle, and a "this is part of a cycle" claim would be built on noise.
+  - **`recursive` (68) contradicts `self_recursive` (25)** and the 43-function
+    gap is those same artifacts. `self_recursive` is AST-derived and accurate —
+    spot-checked against source — and is the one to trust.
+  - **`unguarded_recursion` (11) is a false alarm here.** It means "no numeric
+    depth guard", not "can run away": the flagged functions are structural
+    recursion with explicit base cases (`textOf` has three), and 8 of the 11 are
+    test helpers or tree walkers.
+  - **`transitive_loop_depth` saturates.** Its distribution jumps back up at 8
+    and 10 (12 and 25 functions) with nothing at 9, because it is a reachability
+    maximum over the call graph that is not gated on the callee being invoked
+    inside a loop. 24 of the 25 at depth 10 are test harnesses whose own
+    `loop_depth` is 0; they inherit 10 by mounting `CodeMap`.
+  - **What is left is too small to be a signal.** Genuine self-recursion in
+    driller's own non-test code is three functions out of 2,870
+    (`findGitRootDownward`, `schedule`, `renderNodes`), all deliberate and safe.
+    `loop_depth` is sound (0–3) but nested loops already drive the `complexity`
+    and `cognitive` signals, so a seventh would correlate with two existing ones.
+
+  A signal here would paint a warning glyph on safe code — the same fabricated
+  alarm as the "74% gap" row and the pooled card's 1.00 cohesion, both of which
+  this project removed. Closed rather than deferred. What would re-open it: a
+  backend that resolves self-calls with a real strategy, or `unguarded_recursion`
+  distinguishing a missing base case from a missing depth counter. The adjacency
+  comment in `CodeMap.tsx` that used to call a self-loop "a recursive call" was
+  corrected in the same change.
+
 - **shadcn/ui.** AD-3 names it; it was never adopted and no shadcn, Radix or
   Tailwind dependency exists. Whether AD-3 drops it is a founder decision.
 

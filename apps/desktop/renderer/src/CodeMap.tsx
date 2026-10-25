@@ -6738,9 +6738,17 @@ export function CodeMap({
   // the already-fetched `CodeMapEdge[]` — no new IPC surface.
   //
   // Three review-fix exclusions applied while building it:
-  // - Self-loop edges (`source === target`, a recursive call) are skipped
-  //   entirely — a Node showing itself as its own "called by"/"calls"
-  //   target isn't a real traversal destination.
+  // - Self-loop edges (`source === target`) are skipped entirely — a Node
+  //   showing itself as its own "called by"/"calls" target isn't a real
+  //   traversal destination. `[corrected 2026-10-25]` This comment used to
+  //   call a self-loop "a recursive call". It usually isn't: measured on
+  //   driller/app, all 37 of the backend's CALLS self-edges came from its
+  //   weakest resolver (`strategy: 'callee_suffix'`, `confidence: 0.50`) —
+  //   e.g. a `Map.delete(...)` call resolved back to its own enclosing
+  //   function. Skipping them is still right, but for the opposite reason:
+  //   they are mostly resolution artifacts, not recursion. Genuine
+  //   self-recursion lives in the backend's AST-derived `self_recursive`
+  //   property, which disagrees with these edges and is the one to trust.
   // - A duplicate `(source, target)` pair (two call sites between the same
   //   two functions) is only counted once per direction — an `includes`
   //   check before pushing — so the affordance's `N` reflects distinct
