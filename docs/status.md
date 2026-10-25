@@ -106,21 +106,29 @@ usefulness, and neither does a state in this table.
   grouped layout's relational information lives entirely in those edges, this is
   not a cosmetic row: it is why the map reads as a lattice of cards. Needs a
   contrast decision, not a re-measurement.
-- **`All Nodes` renders an empty map on a real codebase, while saying it is
-  showing everything.** `[2026-10-25, found by dogfooding on driller/app]`
-  Reproducible, and it recovers, so no state is corrupted — toggling
-  Grouped → All Nodes → Grouped gives 34 nodes / 59 edges, then **1 node and 0
-  edges**, then 34 / 59 again. The one rendered node is a
-  `react-flow__node-codeMapCluster` (`cluster:0:2`) reading "37 NODES", so the
-  level-of-detail clustering path produces a single degenerate bubble covering
-  37 of 1,279 Nodes and drops the rest along with every edge. It persists after
-  Fit view, so it is not a viewport artifact; the panel meanwhile reads
-  "Showing all 1279 Nodes", which is the app asserting what the screen
-  contradicts. **Why nothing caught it:** every DOM fixture is below
-  `MIN_NODES_TO_PARTITION` (40) and the e2e journeys run against small fixture
-  projects, so no test in 2,601 unit tests or 11 journeys exercises All Nodes at
-  this scale. The suspect code is the LOD/cluster path in `CodeMap.tsx` — one of
-  the two regions the split left in place.
+- **`All Nodes` still reads as an empty canvas on a real codebase; the data
+  loss behind it is fixed.** `[2026-10-25, found by dogfooding on driller/app]`
+  Originally: Grouped drew 34 nodes and 59 edges, All Nodes drew **one** cluster
+  bubble standing for 28 Nodes and no edges, while the panel read "Showing all
+  1279 Nodes" — 1,251 Nodes represented by nothing. Root cause found and fixed
+  in `eb9de68`: `MIN_ZOOM_REAL` was a flat 0.1, set when driller's own map was
+  ~155 Nodes and fitted at ≈0.29. At 1,279 Nodes the layout spans 13,260 x
+  34,082 units in a 1,100 x 497 viewport and needs ≈0.0146, so `fitView` was
+  clamped, framed a sliver, and `onlyRenderVisibleElements` culled the rest.
+  `mapMinZoom` now takes the lower of the ceiling and the zoom that fits the
+  map. Verified live: zoom reaches 0.0143 and the clusters account for all
+  1,279 (1,086 + 193).
+  **Still open, and still what the user sees.** At fit the whole map collapses
+  into a single cluster bubble drawn at ~1.8% scale, which is invisible — so
+  All Nodes still looks blank even though nothing is now missing. Two causes,
+  both needing a product decision rather than another constant: a cluster
+  bubble is sized in world units, so it shrinks with the zoom that is meant to
+  reveal it; and the layout is 2.6x taller than wide (34,082 x 13,260) where
+  the packer aims for roughly square, which drags the fit zoom far lower than
+  the node count alone requires. The likely answer is that All Nodes should not
+  try to show 1,279 cards at once at all — Grouped is the overview — and should
+  open at a readable zoom (at or above `LOD_ZOOM_THRESHOLD`) rather than
+  fitting everything.
 - **Community names are uninformative on a real codebase.** `[2026-10-25]`
   `communityLabel` takes the modal **exact file path** and uses it only at
   `COMMUNITY_FILE_LABEL_MIN_SHARE` (0.5), else falls back to the hub, where the
