@@ -577,8 +577,11 @@ let activeFoldedTypes: FoldedType[] | undefined;
 // fetch started under. A fetch that was still in flight when an index
 // started (a re-index, or a switch to another project) is never cached here,
 // and `getActiveRawCodeMap` returns `null` for any stamp that is not the
-// active project's current generation. (The Nodes/edges caches keep their
-// pre-existing behaviour: such a fetch still lands in them.)
+// active project's current generation. The Nodes/edges caches still take such
+// a fetch — they are what the reply was built from — so every operation that
+// reads them (entry candidates, diff scope, Blast Radius expansion) asks this
+// stamp first and returns `MAP_REFRESHING_RESULT` when it is absent, rather
+// than answering over a generation-old map. `[2026-10-25]`
 let activeRawCodeMap: ActiveRawCodeMap | undefined;
 
 // Review round 1 (P4-4 phase 1a): bumped when any index starts
@@ -904,8 +907,9 @@ export function computeEntryCandidatesResult(projectPath: string, section?: stri
     // `activeCodeMapNodes`/`activeCodeMapEdges` (never in the raw cache), so
     // without this check a switch to another project (or a re-index) could
     // list — and memoize — the previous map's candidates under the new
-    // project. (Blast Radius expansion has the same inherited race; recorded
-    // in deferred-work.md, not fixed here.)
+    // project. `[2026-10-25]` Diff scope and Blast Radius expansion carried
+    // the same inherited race on their whole-scope path; both now make this
+    // same check, so all three operations refuse a generation-old map.
     if (getActiveRawCodeMap() === null) {
       return MAP_REFRESHING_RESULT;
     }
@@ -3054,6 +3058,15 @@ export async function computeDiffScopeResult(
     if (!nodes) {
       return { status: 'error', message: 'No project has finished indexing yet.' };
     }
+    // Snapshot ownership: as in `computeBlastRadiusExpansionResult` — the
+    // cached Nodes must be stamped by a current raw cache. Checked after the
+    // `checkHeadDrift` await above, so a re-index that started during it is
+    // seen here. Before this, a whole-scope diff computed against the previous
+    // generation's Nodes and returned a full resolved result — changed
+    // contracts, dependent ids and all — with no indication it was stale.
+    if (getActiveRawCodeMap() === null) {
+      return MAP_REFRESHING_RESULT;
+    }
     // P4-4 phase 2a (AD-13 "Section scope"): with a `section`, the inputs —
     // the whole-scope cached Nodes, folded types and folded Modules — are
     // narrowed to that section's files (nearest-section rule) BEFORE any
@@ -3248,6 +3261,17 @@ export function computeBlastRadiusExpansionResult(
       // for a project that isn't (or is no longer) this process's active one
       // must never silently compute against the wrong project's Nodes/Edges.
       return { status: 'error', message: 'The requested project is not the currently active project.' };
+    }
+    // Snapshot ownership: the cached Nodes/edges must be stamped by a current
+    // raw cache (this project, this index generation). A fetch still in flight
+    // when an index started lands in `activeCodeMapNodes`/`activeCodeMapEdges`
+    // but never in the raw cache, so without this a re-index mid-fetch let an
+    // expansion walk the previous generation's adjacency and answer with
+    // confident hop distances. `resolveCachedSectionFilter` below already
+    // refused that way, but only when a `section` was given; this covers the
+    // whole-scope path the same way `computeEntryCandidatesResult` does.
+    if (getActiveRawCodeMap() === null) {
+      return MAP_REFRESHING_RESULT;
     }
     // Captured before the computation below, for the supersession check after
     // it — see `computeDiffScopeResult`'s own identical guard and this

@@ -52,11 +52,19 @@ import {
   keepFileForSection,
   resolveSectionFilter,
 } from './scoped-code-map';
-import { getters, makeFixtureProject, posted, removeHarnessTempDirs, send, startIndexTs, waitFor, type Posted } from './scoped-code-map-harness';
+import { getters, index, makeFixtureProject, posted, removeHarnessTempDirs, send, startIndexTs, waitFor, type Posted } from './scoped-code-map-harness';
 
 const PROJECT = makeFixtureProject();
 const GIT_AVAILABLE = spawnSync('git', ['--version']).status === 0;
-const harness = globalThis as { __harnessFetchCount?: number };
+const harness = globalThis as { __harnessFetchCount?: number; __harnessFetchGate?: Promise<void> };
+
+function deferred(): { promise: Promise<void>; release: () => void } {
+  let release = (): void => {};
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
 
 let indexModule: typeof import('./index') | undefined;
 let computeDiffScope: typeof import('./git-diff-scope').computeDiffScope;
@@ -202,6 +210,9 @@ async function baselineDiffScope(baseRef: string): Promise<DiffScopeResult> {
     ...(changedContracts.length > 0 && approximate ? { changedContractsApproximate: true as const } : {}),
   };
 }
+
+/** `MAP_REFRESHING_RESULT`: the caches are a generation or a scope behind the live map. */
+const REFRESHING = { status: 'error', message: 'The map is refreshing for the new scope — try again.' };
 
 const resolvedDiff = (result: DiffScopeResult): Extract<DiffScopeResult, { status: 'resolved' }> => {
   assert.equal(result.status, 'resolved', JSON.stringify(result));
@@ -462,8 +473,6 @@ describe('P4-4 phase 2a: Blast Radius expansion with a section', () => {
  * section the caches don't know yet is the explicit "refreshing" error.
  */
 describe('P4-4e review round 1: the scope-change drift window', { skip: !GIT_AVAILABLE && 'git is not installed' }, () => {
-  const REFRESHING = { status: 'error', message: 'The map is refreshing for the new scope — try again.' };
-
   it('ownership follows the cached map until the refetch lands', { timeout: 30_000 }, async () => {
     assert.ok(indexModule);
     const compute = indexModule;
@@ -495,5 +504,60 @@ describe('P4-4e review round 1: the scope-change drift window', { skip: !GIT_AVA
     const unknown = { status: 'unknown-section', section: 'api', knownSections: ['web'] };
     assert.deepEqual(await indexModule.computeDiffScopeResult(PROJECT, 'main', 'api'), unknown);
     assert.deepEqual(indexModule.computeBlastRadiusExpansionResult(PROJECT, ['s1'], 'api'), unknown);
+  });
+});
+
+/**
+ * The open "snapshot ownership across cached arrays" item: a Code Map fetch
+ * that was still in flight when an index started still lands in
+ * `activeCodeMapNodes`/`activeCodeMapEdges`, describing the generation before
+ * it. Entry candidates refuses to answer from those (P4-7c); diff scope and
+ * Blast Radius expansion only refused when a `section` was given, because the
+ * refusal came from `resolveCachedSectionFilter`. Without one they answered
+ * from the previous generation's map with no error at all.
+ */
+describe('a stale fetch landing after an index', { skip: !GIT_AVAILABLE && 'git is not installed' }, () => {
+  it('a re-index mid-fetch: neither diff scope nor Blast Radius answers from the old map, section or not', { timeout: 30_000 }, async () => {
+    assert.ok(indexModule);
+    const compute = indexModule;
+    setScope(['web', 'api']);
+    await fetchWholeMap();
+    // The engineer has the map open and both operations answer over it.
+    assert.equal(resolvedDiff(await compute.computeDiffScopeResult(PROJECT, 'main')).nodeIds.length, 4);
+    assert.deepEqual(hopsOf(compute.computeBlastRadiusExpansionResult(PROJECT, ['s1'])), { s2: 1, s3: 2, w1: 1, g0: 2 });
+
+    // A refetch starts; a re-index of the same project (Retry, or a checkout
+    // that moved HEAD) begins before it lands, so what lands is a generation old.
+    // P5-b: the raw cache is cleared first, or it would serve the request below
+    // from cache and there would be no fetch to hold in flight.
+    await index(PROJECT);
+    setScope(['web', 'api']);
+    const gate = deferred();
+    harness.__harnessFetchGate = gate.promise;
+    const fetchesBefore = harness.__harnessFetchCount ?? 0;
+    const from = posted.length;
+    send({ type: 'graphService:getCodeMap' });
+    try {
+      await waitFor(() => ((harness.__harnessFetchCount ?? 0) > fetchesBefore ? true : undefined), 'the fetch to start');
+      harness.__harnessFetchGate = undefined;
+      await index(PROJECT);
+    } finally {
+      gate.release();
+    }
+    await waitFor(() => posted.slice(from).find((m) => m.type === 'graphService:codeMap'), 'the stale fetch to land');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Its Nodes are cached, but no current raw cache stamps them.
+    assert.equal(compute.getActiveRawCodeMap(), null);
+    for (const section of [undefined, 'api'] as const) {
+      assert.deepEqual(await compute.computeDiffScopeResult(PROJECT, 'main', section), REFRESHING, `diff scope / ${section}`);
+      assert.deepEqual(compute.computeBlastRadiusExpansionResult(PROJECT, ['s1'], section), REFRESHING, `blast radius / ${section}`);
+    }
+
+    // The refetch after the index lands, and both answer over the new map again.
+    setScope(['web', 'api']);
+    await fetchWholeMap();
+    assert.equal(resolvedDiff(await compute.computeDiffScopeResult(PROJECT, 'main')).nodeIds.length, 4);
+    assert.deepEqual(hopsOf(compute.computeBlastRadiusExpansionResult(PROJECT, ['s1'])), { s2: 1, s3: 2, w1: 1, g0: 2 });
   });
 });
