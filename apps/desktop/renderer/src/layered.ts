@@ -64,6 +64,17 @@ export interface LayeredCard {
   ranks: readonly number[];
 }
 
+/** Optional shaping for `layeredPositions`. */
+export interface LayeredOptions {
+  /**
+   * Wrap a long hop layer into side-by-side columns so the block comes out
+   * roughly square instead of a tall ribbon. Opt-in: Revealed's own layout is
+   * pinned by a frozen snapshot and its columns are short enough never to have
+   * needed it.
+   */
+  wrapToSquare?: boolean;
+}
+
 /** Where the layout's first column and row begin. */
 export interface LayeredOrigin {
   x: number;
@@ -107,14 +118,20 @@ export function layeredPositions(
   cards: readonly LayeredCard[],
   cardSizeOf: (cardId: string) => LayeredCardSize | undefined = () => undefined,
   origin: LayeredOrigin = { x: 0, y: 0 },
+  options: LayeredOptions = {},
 ): LayeredLayoutResult {
   const byDepth = new Map<number, LayeredCard[]>();
   const seen = new Set<string>();
+  let pitchRowTotal = 0;
+  let pitchColumnTotal = 0;
   for (const card of cards) {
     if (seen.has(card.cardId)) {
       continue;
     }
     seen.add(card.cardId);
+    const pitch = cardPitch(cardSizeOf(card.cardId));
+    pitchRowTotal += pitch.row;
+    pitchColumnTotal += pitch.column;
     const column = byDepth.get(card.depth);
     if (column === undefined) {
       byDepth.set(card.depth, [card]);
@@ -127,6 +144,23 @@ export function layeredPositions(
   const positions = new Map<string, { x: number; y: number }>();
   const parentRow = (card: LayeredCard): number =>
     card.parentId === null ? -1 : (rowOf.get(card.parentId) ?? -1);
+
+  /**
+   * How many cards one column may hold before a layer wraps into another
+   * column beside it, or `undefined` to stack a layer however long it is.
+   *
+   * `[2026-10-25]` A layer laid out as one unbounded column makes a ribbon:
+   * driller's own 213-member community measured 1,800 x 22,412, 12.5:1 tall,
+   * and was 72% of the Full map's height by itself. Wrapping at `rows` makes a
+   * block about as wide as it is tall, because `rows` columns of `rows` cards
+   * is square when `rows = sqrt(cards x columnPitch / rowPitch)` — the pitches
+   * are what convert a count into a distance, so the ratio has to carry them.
+   * Rounded up, and never below one.
+   */
+  const maxRows =
+    options.wrapToSquare === true && seen.size > 0
+      ? Math.max(1, Math.ceil(Math.sqrt((seen.size * (pitchColumnTotal / seen.size)) / (pitchRowTotal / seen.size))))
+      : undefined;
 
   let columnX = origin.x;
   let previousDepth: number | null = null;
@@ -143,19 +177,30 @@ export function layeredPositions(
       (a, b) =>
         parentRow(a) - parentRow(b) || compareRanks(a.ranks, b.ranks) || compareIds(a.cardId, b.cardId),
     );
-    let rowY = origin.y;
-    let columnWidth = NODE_COLUMN_GAP;
-    column.forEach((card, row) => {
-      rowOf.set(card.cardId, row);
-      positions.set(card.cardId, { x: columnX, y: rowY });
-      const pitch = cardPitch(cardSizeOf(card.cardId));
-      rowY += pitch.row;
-      columnWidth = Math.max(columnWidth, pitch.column);
-    });
+    // `rowOf` stays the card's index within its whole LAYER, not within the
+    // sub-column it lands in: the next depth sorts its cards by their parent's
+    // row, and that ordering is about the layer, not about where it wrapped.
+    const perColumn = maxRows ?? column.length;
+    let subColumnX = columnX;
+    let depthWidth = 0;
+    for (let start = 0; start < column.length; start += perColumn) {
+      let rowY = origin.y;
+      let columnWidth = NODE_COLUMN_GAP;
+      for (let offset = 0; offset < perColumn && start + offset < column.length; offset += 1) {
+        const card = column[start + offset]!;
+        rowOf.set(card.cardId, start + offset);
+        positions.set(card.cardId, { x: subColumnX, y: rowY });
+        const pitch = cardPitch(cardSizeOf(card.cardId));
+        rowY += pitch.row;
+        columnWidth = Math.max(columnWidth, pitch.column);
+      }
+      widest = Math.max(widest, subColumnX + columnWidth - origin.x);
+      tallest = Math.max(tallest, rowY - origin.y);
+      subColumnX += columnWidth;
+      depthWidth = subColumnX - columnX;
+    }
     previousDepth = depth;
-    previousColumnWidth = columnWidth;
-    widest = Math.max(widest, columnX + columnWidth - origin.x);
-    tallest = Math.max(tallest, rowY - origin.y);
+    previousColumnWidth = depthWidth;
   }
 
   return { positions, width: widest, height: tallest, rowOf };

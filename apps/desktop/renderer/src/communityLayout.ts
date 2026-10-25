@@ -373,6 +373,12 @@ export function communityPositions(
         ranks: [-(inDegree.get(cardId) ?? 0)],
       })),
       cardSizeOf,
+      undefined,
+      // A community is a block on a tiled map, so its shape matters: an
+      // unwrapped layer made driller's own 213-member community a 12.5:1
+      // ribbon that was 72% of the whole map's height. Revealed does not pass
+      // this — its columns are short, and its layout is a frozen snapshot.
+      { wrapToSquare: true },
     );
     laidOut.push({
       block: {
