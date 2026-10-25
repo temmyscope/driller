@@ -55,7 +55,10 @@ function assertAbsent(element: Element | null | undefined, what: string): void {
 
 /** 8a allows 20 s per test; these finish well under 2 s (doubled under CI, P4-8b's convention). */
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
-const FIND = { timeout: 1_500 };
+// `[2026-10-25]` Scaled for CI like the test budget beside it. A flat inner
+// budget gave every `waitFor` half the allowance, relative to machine speed,
+// that the test around it got — see `4a1c48b` and status.md's row on it.
+const FIND = { timeout: 1_500 * (env.CI === 'true' ? 2 : 1) };
 const PROJECT = '/work/two-sections';
 const S = SECTION_NODES;
 

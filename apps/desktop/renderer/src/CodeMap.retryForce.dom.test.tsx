@@ -9,6 +9,7 @@ import './test/domEnv';
 import { cleanupAfterEach } from './test/domEnv';
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { env } from 'node:process';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { CodeMapResult } from '@driller/ipc-contracts';
 import { CodeMap } from './CodeMap';
@@ -17,7 +18,10 @@ import { FIXTURE_NODES, FIXTURE_PROJECT_PATH, pathTraceBasicMap } from './test/m
 
 afterEach(cleanupAfterEach);
 
-const FIND = { timeout: 1_000 };
+// `[2026-10-25]` Scaled for CI like the test budget beside it. A flat inner
+// budget gave every `waitFor` half the allowance, relative to machine speed,
+// that the test around it got — see `4a1c48b` and status.md's row on it.
+const FIND = { timeout: 1_000 * (env.CI === 'true' ? 2 : 1) };
 
 /** A fake whose `getCodeMap` answers from `replies` in order (the last one repeats). */
 function sequenceFake(replies: (() => CodeMapResult)[]): FakeDrillerApi {

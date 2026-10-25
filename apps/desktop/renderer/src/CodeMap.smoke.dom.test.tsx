@@ -38,7 +38,10 @@ afterEach(cleanupAfterEach);
 /** Spec P4-8c: each smoke mount under 2 s; doubled under CI (P4-8b's convention). */
 const MOUNT_BUDGET_MS = 2_000 * (env.CI === 'true' ? 2 : 1);
 /** `findBy…`/`waitFor` wait this long at most — the fake settles at once. */
-const FIND = { timeout: 1_000 };
+// `[2026-10-25]` Scaled for CI like the test budget beside it. A flat inner
+// budget gave every `waitFor` half the allowance, relative to machine speed,
+// that the test around it got — see `4a1c48b` and status.md's row on it.
+const FIND = { timeout: 1_000 * (env.CI === 'true' ? 2 : 1) };
 
 function mapFake(map: () => CodeMapOk = pathTraceBasicMap): FakeDrillerApi {
   const fake = createFakeDrillerApi({

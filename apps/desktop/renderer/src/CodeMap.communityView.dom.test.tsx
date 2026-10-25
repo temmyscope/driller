@@ -23,7 +23,10 @@ import { FIXTURE_PROJECT_PATH, pathTraceBasicMap, syntheticMap, type CodeMapOk }
 afterEach(cleanupAfterEach);
 
 const BUDGET = { timeout: 4_000 * (env.CI === 'true' ? 2 : 1) };
-const FIND = { timeout: 1_500 };
+// `[2026-10-25]` Scaled for CI like the test budget beside it. A flat inner
+// budget gave every `waitFor` half the allowance, relative to machine speed,
+// that the test around it got — see `4a1c48b` and status.md's row on it.
+const FIND = { timeout: 1_500 * (env.CI === 'true' ? 2 : 1) };
 
 /** A 60-Node synthetic map: above the collapse floor, and several communities. */
 const GROUPED_MAP = () => syntheticMap({ nodes: 60 });

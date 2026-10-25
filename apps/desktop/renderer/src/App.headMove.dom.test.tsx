@@ -20,7 +20,10 @@ import { sectionedMap } from './test/mapFixture';
 afterEach(cleanupAfterEach);
 
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
-const FIND = { timeout: 1_500 };
+// `[2026-10-25]` Scaled for CI like the test budget beside it. A flat inner
+// budget gave every `waitFor` half the allowance, relative to machine speed,
+// that the test around it got — see `4a1c48b` and status.md's row on it.
+const FIND = { timeout: 1_500 * (env.CI === 'true' ? 2 : 1) };
 const PROJECT = '/work/moved-repo';
 const MOVE: HeadMove = { indexedHead: 'a'.repeat(40), currentHead: 'b'.repeat(40) };
 const REINDEXING = 'Checkout moved aaaaaaa → bbbbbbb — re-indexing; compute the diff again when it finishes.';

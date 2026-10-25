@@ -19,7 +19,10 @@ import { sectionedMap } from './test/mapFixture';
 afterEach(cleanupAfterEach);
 
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
-const FIND = { timeout: 1_500 };
+// `[2026-10-25]` Scaled for CI like the test budget beside it. A flat inner
+// budget gave every `waitFor` half the allowance, relative to machine speed,
+// that the test around it got — see `4a1c48b` and status.md's row on it.
+const FIND = { timeout: 1_500 * (env.CI === 'true' ? 2 : 1) };
 const PROJECT = '/work/badge-repo';
 const recent: RecentProject = { path: PROJECT, name: 'badge-repo', lastOpenedAt: '2026-10-18T09:00:00.000Z' };
 const AT = '2026-10-18T10:00:00.000Z';
