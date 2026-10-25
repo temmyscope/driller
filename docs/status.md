@@ -215,9 +215,13 @@ usefulness, and neither does a state in this table.
   decided over a nominal grid from the partition and its links alone. Measured
   live: **measured seating 69 crossings, partition-only seating 222, no seating
   425** — about half the win kept, and all of the stability. The nominal grid
-  is a crude stand-in for shelves it cannot see; **sizing its cells by member
-  count** (partition data, not measurement) is the obvious way to close the
-  gap and has not been tried.
+  is a crude stand-in for shelves it cannot see. **Closing the gap by shaping
+  that grid like the real packer — cells sized by member count, shelf-packed
+  with the fallback pitch and the same `targetWidth` formula — was tried on
+  2026-10-25 and made it worse: 260 crossings against the plain square grid's
+  222.** So the gap is not about the nominal grid's shape. What the measured
+  version had was the real geometry, which is exactly what it may not read;
+  closing this properly needs a different idea, not a better proxy.
 
   **Carries a known latent instability:** it reads the packed slot positions,
   so the seating is a function of measured card sizes, bounded only by never
