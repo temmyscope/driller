@@ -131,18 +131,21 @@ usefulness, and neither does a state in this table.
   overview of All Nodes remains unreadable by construction; Grouped is the
   overview for a map this size. Whether that aspect ratio is worth fixing is
   open.
-- **Community names are uninformative on a real codebase.** `[2026-10-25]`
-  `communityLabel` takes the modal **exact file path** and uses it only at
-  `COMMUNITY_FILE_LABEL_MIN_SHARE` (0.5), else falls back to the hub, where the
-  hub is the member with the highest **in-community in-degree**. Both halves
-  fail at scale: a community spanning ten files in one directory clears no
-  single-file majority (there is no directory-level fallback), and the
-  most-called member of a large cluster is a leaf utility rather than anything
-  representative. On driller/app, 11 of 34 cards are named after an incidental
-  helper, and the three largest communities — 67, 65 and 56 Nodes, 15% of the
-  map between them — are labelled `formatCount`, `isTestNode` and
-  `jsonToolResult`. A reviewer learns nothing from those. In-degree is backwards
-  for naming; the modal *directory* is the obvious first fix.
+- **Community names: fixed.** `[2026-10-25]` Dogfooding put 11 of 34 cards
+  under an incidental helper's name, the three largest among them — 67, 65 and
+  56 Nodes reading `formatCount`, `isTestNode` and `jsonToolResult`. Two
+  causes, both closed in `c3b858b`. The modal test counted the exact file path,
+  so a community spread over ten files in one directory cleared no majority; it
+  now falls to the deepest ancestor directory that holds one, guarded by
+  `commonRootDepth` so a directory every file already shares is never used (a
+  project wholly inside `src/` must not name every card `src/`). And the
+  fallback no longer ranks by in-community in-degree — the most-called member
+  of a large cluster is a leaf utility — but by net outflow, the member that
+  calls more of its community than calls it. The community *id* still uses the
+  old representative, so no id moved and the frozen layout snapshot is
+  untouched. Verified live: no card is named after a bare helper, and the
+  largest community reads `apps/desktop/renderer/src/ (CodeMap)` where it read
+  `onClick`.
 - **Switching Grouped → All Nodes does not re-fit the viewport.** `[2026-10-25]`
   The new mode spans a much larger coordinate space, so the previous zoom leaves
   the canvas apparently blank even where content exists. Separate from the
