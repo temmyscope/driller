@@ -401,7 +401,7 @@ export function registerTracePathTool(server: Pick<McpServer, 'registerTool'>): 
 }
 
 /** The Agent-Facing Query Surface's contract version (semver; see `startMcpServer`). */
-// P5-i (founder 2026-10-15, §2.9): at first release, collapse the unreleased 1.5.0–1.11.0 series into one minor bump — see deferred-work.md's P4-5 release-pipeline note.
+// P5-i (founder 2026-10-15, §2.9): at first release, collapse the unreleased 1.5.0–1.11.0 series into one minor bump.
 export const MCP_SERVER_VERSION = '1.12.0';
 
 /**

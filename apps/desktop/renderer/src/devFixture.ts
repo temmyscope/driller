@@ -119,7 +119,6 @@ export function generateSyntheticCodeMap(nodeCount: number, edgeFanout: number):
       // 3 does); populating this fixture's synthetic edges into a real
       // blast-radius signal so 10k-Node profiling exercises the signal-strip
       // path too is deferred to Phase 3, once that path exists to profile
-      // (`deferred-work.md`).
       riskSignals: [],
     });
   }

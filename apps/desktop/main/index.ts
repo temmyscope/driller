@@ -1693,7 +1693,7 @@ function encodePathForEditorUri(absolutePath: string): string {
  *   it via `shell.openExternal` (exact-line-jump).
  * - `jetbrains` builds `idea://open?file={absolutePath}&line={startLine}`
  *   (IntelliJ IDEA's own scheme, user-confirmed — a product sub-selector is
- *   tracked in `deferred-work.md`, not this phase) via `shell.openExternal`.
+ *   out of scope for this phase) via `shell.openExternal`.
  * - `system-default` calls `shell.openPath(absolutePath)` — the OS's generic
  *   file-open mechanism, no line-jump.
  *
