@@ -40,8 +40,8 @@ usefulness, and neither does a state in this table.
 | **Indexing scope sections** | Shipped | P4-4a–P4-4i; section-local map/operations, outgoing cross-section awareness, remembered section. |
 | **Section-switch latency** | Shipped, live unverified | P5-b (`9406588`, 2026-10-18) serves a same-generation request from the raw cache; bench reports ~11 ms at 2k Nodes and ~59 ms at 10k. The ~5 s switch the 2026-10-13 assessment recorded on driller/app has not been re-measured live since. |
 | **Revealed view / progressive exploration** | Shipped | P4-7a–P4-7h; FIX-5/6/7. Heuristic entry candidates, layered drill-down, history, persistent pins, shared-reach relations. Harness/fixture files excluded as roots (P5-e, `102eaa8`). |
-| **Full map laid out by the call graph** | Shipped | `ba062d8` (2026-10-20). `communities.ts` partitions Nodes by who calls whom; `communityLayout.ts` draws each community as its own block by hop depth. Renderer-local layout only — a community id never reaches a Graph Service call (AD-2). Below 40 connected Nodes the map is not partitioned. |
-| **Collapsed community cards** | Shipped | `72f72af` (2026-10-21). Full opens on one card per community (count, cohesion as two real counts, "↗ N out"; the pooled-islands card says "each group calls only itself" instead, `e8a9eb6`), with a Grouped / All Nodes toggle, pooled islands, and generated community names. Known limit, by design: a link edge draws only between two *collapsed* cards. |
+| **Full map laid out by the call graph** | Shipped | `ba062d8` (2026-10-20). `communities.ts` partitions Nodes by who calls whom; `communityLayout.ts` draws each community as its own block by hop depth. Renderer-local layout only — a community id never reaches a Graph Service call (AD-2). Below 40 connected Nodes the map is not partitioned. Dogfooded on driller/app 2026-10-25: the mechanism works (34 communities over 1,279 Nodes, summing exactly), but the *perceived* result is still a lattice of uniform cards, because collapsed cards are all one size and the relational information is in edges that cannot be seen — see the plain-edge and community-name rows below. |
+| **Collapsed community cards** | Shipped | `72f72af` (2026-10-21). Full opens on one card per community (count, cohesion as two real counts, "↗ N out"; the pooled-islands card says "each group calls only itself" instead, `e8a9eb6`), with a Grouped / All Nodes toggle, pooled islands, and generated community names. Known limit, by design: a link edge draws only between two *collapsed* cards. Verified live on driller/app 2026-10-25: the pooled card reads "20 isolated groups / 42 Nodes / each group calls only itself", and an "unreferenced in indexed code" card appears beside it; the 34 cards' Node counts sum to the status bar's 1,279. |
 | **Local model download gating** | Shipped | P5-c (`f3a9c69`, 2026-10-18). Cloud never downloads the local model; e2e asserts no Hugging Face host is contacted. |
 | **Cloud backend path** | Shipped, live unverified | Key handling (AD-4, P2-10) and switch-failure messaging (P5-g) are in and tested. No recorded real paid cloud call or backend-switch run — assessment 2026-10-13 asks for one before treating this path as verified. |
 | **PR-bot ingestion (CodeRabbit, Qodo)** | Shipped, live unverified | FR9 path exists; no recorded installed-bot run. Carries an open read-only violation, below. |
@@ -87,15 +87,60 @@ usefulness, and neither does a state in this table.
   ([arc42.md §6](arc42.md#6-runtime-view), "Agent query".)
 - **AD-15 performance budgets are unprofiled.** The pipeline exists; no benchmark
   run against those specific numbers is recorded anywhere. Packaged-build
-  startup on the intended platforms is likewise unmeasured.
+  startup on the intended platforms is likewise unmeasured. One live datum
+  `[2026-10-25]`: opening driller/app in the dev build reported "Indexed — 5,501
+  Nodes (1,279 on the map), 27,931 edges · 5s · 1 file partially parsed". That is
+  a warm re-index over an already-indexed project, not a cold one, and it is a
+  single observation rather than a benchmark — but it is the first real number
+  on this row, and the partial-parse disclosure behaved as designed.
 - **Accessibility pass over the review journey is outstanding.** NFR5's two
   floors hold (no color-only distinctions, keyboard traversal exists). Real
   speech output, focus under clustering/culling, and zoom have not been checked
   live; live-region text and fixture assertions do not establish that the spoken
   experience is understandable.
-- **Plain-edge faintness owed a live visual judgement.** P5-f (`42943e7`) paints
-  plain edges at DESIGN.md's `border-strong`; whether that reads correctly on a
-  dense map has not been judged live.
+- **Plain-edge faintness: judged live, verdict negative.** `[2026-10-25]` P5-f
+  (`42943e7`) paints plain edges at DESIGN.md's `border-strong`. Judged on
+  driller/app's own map (34 community cards, 59 drawn edges): the edges are
+  barely perceptible against the near-black canvas, and where they cross — which
+  is most of the canvas — a single edge cannot be followed by eye. Since the
+  grouped layout's relational information lives entirely in those edges, this is
+  not a cosmetic row: it is why the map reads as a lattice of cards. Needs a
+  contrast decision, not a re-measurement.
+- **`All Nodes` renders an empty map on a real codebase, while saying it is
+  showing everything.** `[2026-10-25, found by dogfooding on driller/app]`
+  Reproducible, and it recovers, so no state is corrupted — toggling
+  Grouped → All Nodes → Grouped gives 34 nodes / 59 edges, then **1 node and 0
+  edges**, then 34 / 59 again. The one rendered node is a
+  `react-flow__node-codeMapCluster` (`cluster:0:2`) reading "37 NODES", so the
+  level-of-detail clustering path produces a single degenerate bubble covering
+  37 of 1,279 Nodes and drops the rest along with every edge. It persists after
+  Fit view, so it is not a viewport artifact; the panel meanwhile reads
+  "Showing all 1279 Nodes", which is the app asserting what the screen
+  contradicts. **Why nothing caught it:** every DOM fixture is below
+  `MIN_NODES_TO_PARTITION` (40) and the e2e journeys run against small fixture
+  projects, so no test in 2,601 unit tests or 11 journeys exercises All Nodes at
+  this scale. The suspect code is the LOD/cluster path in `CodeMap.tsx` — one of
+  the two regions the split left in place.
+- **Community names are uninformative on a real codebase.** `[2026-10-25]`
+  `communityLabel` takes the modal **exact file path** and uses it only at
+  `COMMUNITY_FILE_LABEL_MIN_SHARE` (0.5), else falls back to the hub, where the
+  hub is the member with the highest **in-community in-degree**. Both halves
+  fail at scale: a community spanning ten files in one directory clears no
+  single-file majority (there is no directory-level fallback), and the
+  most-called member of a large cluster is a leaf utility rather than anything
+  representative. On driller/app, 11 of 34 cards are named after an incidental
+  helper, and the three largest communities — 67, 65 and 56 Nodes, 15% of the
+  map between them — are labelled `formatCount`, `isTestNode` and
+  `jsonToolResult`. A reviewer learns nothing from those. In-degree is backwards
+  for naming; the modal *directory* is the obvious first fix.
+- **Switching Grouped → All Nodes does not re-fit the viewport.** `[2026-10-25]`
+  The new mode spans a much larger coordinate space, so the previous zoom leaves
+  the canvas apparently blank even where content exists. Separate from the
+  defect above, and would have masked it.
+- **Fit view is illegible at this card count.** `[2026-10-25]` Fitting 34 cards
+  shrinks every label past readability, so the only overview driller offers
+  cannot be read; at a readable zoom roughly a quarter of the cards are off
+  screen.
 - **Similar → Go to needs a dense live recheck** on driller/app. (Assessment
   2026-10-13.)
 - **Product success metrics are unestablished.** Daily founder use, review
