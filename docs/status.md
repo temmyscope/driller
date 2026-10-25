@@ -106,29 +106,31 @@ usefulness, and neither does a state in this table.
   grouped layout's relational information lives entirely in those edges, this is
   not a cosmetic row: it is why the map reads as a lattice of cards. Needs a
   contrast decision, not a re-measurement.
-- **`All Nodes` still reads as an empty canvas on a real codebase; the data
-  loss behind it is fixed.** `[2026-10-25, found by dogfooding on driller/app]`
-  Originally: Grouped drew 34 nodes and 59 edges, All Nodes drew **one** cluster
-  bubble standing for 28 Nodes and no edges, while the panel read "Showing all
-  1279 Nodes" — 1,251 Nodes represented by nothing. Root cause found and fixed
-  in `eb9de68`: `MIN_ZOOM_REAL` was a flat 0.1, set when driller's own map was
-  ~155 Nodes and fitted at ≈0.29. At 1,279 Nodes the layout spans 13,260 x
-  34,082 units in a 1,100 x 497 viewport and needs ≈0.0146, so `fitView` was
-  clamped, framed a sliver, and `onlyRenderVisibleElements` culled the rest.
-  `mapMinZoom` now takes the lower of the ceiling and the zoom that fits the
-  map. Verified live: zoom reaches 0.0143 and the clusters account for all
-  1,279 (1,086 + 193).
-  **Still open, and still what the user sees.** At fit the whole map collapses
-  into a single cluster bubble drawn at ~1.8% scale, which is invisible — so
-  All Nodes still looks blank even though nothing is now missing. Two causes,
-  both needing a product decision rather than another constant: a cluster
-  bubble is sized in world units, so it shrinks with the zoom that is meant to
-  reveal it; and the layout is 2.6x taller than wide (34,082 x 13,260) where
-  the packer aims for roughly square, which drags the fit zoom far lower than
-  the node count alone requires. The likely answer is that All Nodes should not
-  try to show 1,279 cards at once at all — Grouped is the overview — and should
-  open at a readable zoom (at or above `LOD_ZOOM_THRESHOLD`) rather than
-  fitting everything.
+- **`All Nodes` on a large map: both halves now closed.** `[2026-10-25, found
+  by dogfooding on driller/app]` Originally: Grouped drew 34 nodes and 59
+  edges, All Nodes drew **one** cluster bubble standing for 28 Nodes and no
+  edges, while the panel read "Showing all 1279 Nodes" — 1,251 Nodes
+  represented by nothing.
+  - *Data loss* (`eb9de68`): `MIN_ZOOM_REAL` was a flat 0.1, set when driller's
+    own map was ~155 Nodes and fitted at ≈0.29. At 1,279 Nodes the layout spans
+    13,260 x 34,082 units in a 1,100 x 497 viewport and needs ≈0.0146, so
+    `fitView` was clamped, framed a sliver, and `onlyRenderVisibleElements`
+    culled the rest. `mapMinZoom` now takes the lower of the ceiling and the
+    zoom that fits the map. (The 10,000-Node *dev fixture* was never affected:
+    `?fixtureNodes=N` sessions get `MIN_ZOOM_FIXTURE` 0.02. The guard was
+    calibrated against the synthetic worst case and not the real one.)
+  - *Empty appearance* (`ddb8340`): fitting a map that can only be fitted below
+    `LOD_ZOOM_THRESHOLD` shows cluster bubbles at ~1.8% scale. All Nodes now
+    opens on the largest community at `ROUTE_MIN_READABLE_ZOOM` instead, and
+    says so — "Showing all 1281 Nodes — the view opens on onClick, 213 Nodes" —
+    rather than claiming the whole map while showing one part of it.
+  Verified live on driller/app: the switch lands at zoom 0.25 with fourteen
+  real Node cards, their summaries, risk chips and judgments, and no cluster
+  bubbles. **Not addressed, and still true:** the layout is 2.6x taller than
+  wide (34,082 x 13,260) where the packer aims for roughly square, so a fitted
+  overview of All Nodes remains unreadable by construction; Grouped is the
+  overview for a map this size. Whether that aspect ratio is worth fixing is
+  open.
 - **Community names are uninformative on a real codebase.** `[2026-10-25]`
   `communityLabel` takes the modal **exact file path** and uses it only at
   `COMMUNITY_FILE_LABEL_MIN_SHARE` (0.5), else falls back to the hub, where the
