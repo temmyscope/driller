@@ -46,7 +46,7 @@ usefulness, and neither does a state in this table.
 | **Cloud backend path** | Shipped, live unverified | Key handling (AD-4, P2-10) and switch-failure messaging (P5-g) are in and tested. No recorded real paid cloud call or backend-switch run — assessment 2026-10-13 asks for one before treating this path as verified. |
 | **PR-bot ingestion (CodeRabbit, Qodo)** | Shipped, live unverified | FR9 path exists; no recorded installed-bot run. Carries an open read-only violation, below. |
 | **Node 24 LTS / engines** | Shipped | P5-h (`17836f3`, 2026-10-18). `.nvmrc` 24; `engines.node` `^22.22.2 \|\| ^24.15.0 \|\| >=26.0.0`; CI gates on 22.x and the `.nvmrc` 24 leg. |
-| **Verification suite** | Shipped | 2,599 unit and DOM tests across 626 suites, clean typecheck and lint, and all 11 Electron e2e journeys passing against the real app in 253 s with real userData untouched, as of `f3f383a` (2026-10-25). e2e journeys hardened and run three times in a row on Node 24 at `25cfaaa` (2026-10-19). Reproducing the e2e leg means no ambient `codebase-memory-mcp` at all — see below. |
+| **Verification suite** | Shipped | 2,601 unit and DOM tests across 628 suites, clean typecheck and lint, and all 11 Electron e2e journeys passing against the real app in 249 s with real userData untouched, as of `db40a6b` (2026-10-25). e2e journeys hardened and run three times in a row on Node 24 at `25cfaaa` (2026-10-19). Reproducing the e2e leg means no ambient `codebase-memory-mcp` at all — see below. |
 
 ## Open and unverified
 
