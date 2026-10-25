@@ -22,7 +22,7 @@ import {
   FOLDED_BLOCK_ID,
   samePositions,
   type CommunityBlock,
-  relaxBlockSlots,
+  relaxBlockOrder,
 } from './communityLayout';
 import type { LayeredCardSize } from './layered';
 
@@ -54,6 +54,33 @@ function twoCliques(size = MIN_NODES_TO_PARTITION / 2) {
     }
   }
   edges.push(...edgesOf(['a0', 'b0']));
+  return { nodes, edges };
+}
+
+/**
+ * Six cliques, cross-linked so seating is a real choice: the first calls the
+ * last heavily, and two middling pairs call each other. Sized past the
+ * partition floor so the map really partitions.
+ */
+function manyLinkedGroups(size = 8) {
+  const name = (group: number, index: number) => `g${group}n${index}`;
+  const nodes: CommunityInputNode[] = [];
+  const edges: CommunityInputEdge[] = [];
+  for (let group = 0; group < 6; group += 1) {
+    for (let index = 0; index < size; index += 1) {
+      nodes.push(...nodesOf(name(group, index)));
+    }
+    for (let from = 0; from < size; from += 1) {
+      for (let to = from + 1; to < size; to += 1) {
+        edges.push(...edgesOf([name(group, from), name(group, to)]));
+      }
+    }
+  }
+  // Cross-links, weighted by repetition: 0↔5 heavily, 1↔4 and 2↔3 lightly.
+  for (let repeat = 0; repeat < 5; repeat += 1) {
+    edges.push(...edgesOf([name(0, repeat), name(5, repeat)]));
+  }
+  edges.push(...edgesOf([name(1, 0), name(4, 0)], [name(2, 0), name(3, 0)]));
   return { nodes, edges };
 }
 
@@ -224,6 +251,32 @@ describe('communityStructure and communityPositions compose to the same layout',
     assert.deepEqual(placed.blocks, composed.blocks);
   });
 
+  /**
+   * `[2026-10-25]` The partition surviving a re-measure is not enough: WHERE
+   * each community sits has to survive it too. React Flow measures cards as
+   * they mount, and `fullGrid` is recomputed whenever the map is rebuilt — a
+   * trip through Revealed and back, say. If a new measurement can reshuffle
+   * the seating, the map rearranges itself in front of the engineer for no
+   * reason they can see, and every `cluster:<cellX>:<cellY>` id the canvas
+   * derives from card positions moves with it.
+   */
+  it('a re-measure never reshuffles which community sits where', () => {
+    const { nodes, edges } = manyLinkedGroups();
+    const structure = communityStructure(nodes, edges);
+    // The same map, measured two ways: cards the fallback size, then wider and
+    // shorter, as React Flow reports once the real cards have mounted.
+    const seating = (cardSizeOf: (id: string) => { width: number; height: number }) =>
+      communityPositions(structure, [], cardSizeOf)
+        .blocks.slice()
+        .sort((a, b) => a.y - b.y || a.x - b.x)
+        .map((block) => block.communityId);
+    assert.deepEqual(
+      seating(() => ({ width: 200, height: 80 })),
+      seating(() => ({ width: 320, height: 64 })),
+      'the reading order of the communities is the same either way',
+    );
+  });
+
   it('a structure reused across measurements keeps the same partition', () => {
     const { nodes, edges } = twoCliques();
     const structure = communityStructure(nodes, edges);
@@ -239,77 +292,69 @@ describe('communityStructure and communityPositions compose to the same layout',
 
 /**
  * `[2026-10-25]` Measured on driller's own map while dogfooding: 33 community
- * cards and 56 links produced **425 edge crossings** — every link crossing
- * about fifteen others — so no single relation could be followed by eye. The
- * cards were not in the wrong places; they were in the wrong ORDER. Holding
- * the packed slots fixed and only reassigning which community sits in which
- * slot took the same map to 44 crossings, and to 71 once restricted to
- * swapping blocks the packer treats as interchangeable (identical size), with
- * total link length down 48%.
+ * cards and 56 links produced **425 edge crossings** — about fifteen per link
+ * — so no single relation could be followed by eye. The cards were not in the
+ * wrong places; they were in the wrong ORDER, because the packer shelves them
+ * largest-first and size has nothing to do with who calls whom. Seating by
+ * links took the same map to 69.
  *
- * That restriction is what keeps this safe: exchanging two identically-sized
- * blocks leaves the shelf packing bit-for-bit as it was, so this cannot
- * overlap blocks or change the map's extent.
+ * Decided over a NOMINAL square grid, never over the packer's measured slots.
+ * An earlier version read the real slots, which made seating a function of
+ * card measurements — see the re-measure test above for the behaviour that
+ * protects.
  */
-describe('relaxBlockSlots', () => {
-  const block = (communityId: string, width = 320, height = 112) => ({ communityId, width, height });
+describe('relaxBlockOrder', () => {
+  const community = (id: string) => ({ id });
   const link = (sourceCommunityId: string, targetCommunityId: string, count = 1) => ({
     sourceCommunityId,
     targetCommunityId,
     count,
   });
-  /** Four slots in a row, 400 apart. */
-  const ROW = [
-    { x: 0, y: 0 },
-    { x: 400, y: 0 },
-    { x: 800, y: 0 },
-    { x: 1_200, y: 0 },
-  ];
-  const linkLength = (
-    blocks: readonly { communityId: string }[],
-    slotOf: readonly number[],
-    links: readonly { sourceCommunityId: string; targetCommunityId: string; count: number }[],
-  ) => {
-    const at = new Map(blocks.map((b, i) => [b.communityId, ROW[slotOf[i]!]!]));
-    return links.reduce((total, l) => {
-      const a = at.get(l.sourceCommunityId)!;
-      const b = at.get(l.targetCommunityId)!;
-      return total + Math.hypot(a.x - b.x, a.y - b.y) * l.count;
-    }, 0);
+  /** How far apart two communities end up on the nominal grid the order is decided over. */
+  const apart = (order: readonly number[], communities: readonly { id: string }[], a: string, b: string) => {
+    const columns = Math.max(1, Math.ceil(Math.sqrt(communities.length)));
+    const at = (id: string) => {
+      const slot = order[communities.findIndex((c) => c.id === id)]!;
+      return { x: slot % columns, y: Math.floor(slot / columns) };
+    };
+    const p = at(a);
+    const q = at(b);
+    return Math.hypot(p.x - q.x, p.y - q.y);
   };
 
-  it('brings two communities that call each other next to each other', () => {
-    // a and d call each other; the packer put them at opposite ends.
-    const blocks = [block('a'), block('b'), block('c'), block('d')];
+  it('seats two communities that call each other next to each other', () => {
+    const communities = ['a', 'b', 'c', 'd'].map(community);
     const links = [link('a', 'd', 5)];
-    const before = linkLength(blocks, [0, 1, 2, 3], links);
-    const after = linkLength(blocks, relaxBlockSlots(blocks, ROW, links), links);
+    const before = apart([0, 1, 2, 3], communities, 'a', 'd');
+    const after = apart(relaxBlockOrder(communities, links), communities, 'a', 'd');
     assert.ok(after < before, `${after} should be under ${before}`);
-    assert.equal(after, 400 * 5, 'they end up adjacent (400 apart, five calls)');
-  });
-
-  it('never moves a block into a slot the packer sized for a different block', () => {
-    // b is the odd size: it must stay in slot 1 whatever the links want.
-    const blocks = [block('a'), block('b', 200, 80), block('c'), block('d')];
-    const links = [link('b', 'd', 9)];
-    const slotOf = relaxBlockSlots(blocks, ROW, links);
-    assert.equal(slotOf[1], 1, 'the odd-sized block keeps its own slot');
-    assert.equal(new Set(slotOf).size, slotOf.length, 'every slot is used exactly once');
+    assert.equal(after, 1, 'adjacent on the grid');
   });
 
   it('weighs a link by how many calls it carries', () => {
-    // a-b carries one call, a-d carries ten: a belongs beside d.
-    const blocks = [block('a'), block('b'), block('c'), block('d')];
-    const links = [link('a', 'b', 1), link('a', 'd', 10)];
-    const slotOf = relaxBlockSlots(blocks, ROW, links);
-    const at = (id: string) => ROW[slotOf[blocks.findIndex((b) => b.communityId === id)]!]!.x;
-    assert.equal(Math.abs(at('a') - at('d')), 400, 'the heavy link is the short one');
+    const communities = ['a', 'b', 'c', 'd'].map(community);
+    const order = relaxBlockOrder(communities, [link('a', 'b', 1), link('a', 'd', 10)]);
+    assert.ok(
+      apart(order, communities, 'a', 'd') <= apart(order, communities, 'a', 'b'),
+      'the heavy link is the short one',
+    );
+  });
+
+  it('seats every community exactly once', () => {
+    const communities = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map(community);
+    const order = relaxBlockOrder(communities, [link('a', 'g', 4), link('b', 'f', 2)]);
+    assert.deepEqual([...order].sort((x, y) => x - y), communities.map((_c, i) => i));
+  });
+
+  it('ignores a link to a community that is not on this map', () => {
+    const communities = ['a', 'b', 'c'].map(community);
+    assert.deepEqual(relaxBlockOrder(communities, [link('a', 'gone', 9)]), [0, 1, 2]);
   });
 
   it('is deterministic, and leaves a map with no links exactly as it was', () => {
-    const blocks = [block('a'), block('b'), block('c'), block('d')];
+    const communities = ['a', 'b', 'c', 'd'].map(community);
     const links = [link('a', 'd', 3), link('b', 'c', 2)];
-    assert.deepEqual(relaxBlockSlots(blocks, ROW, links), relaxBlockSlots(blocks, ROW, links));
-    assert.deepEqual(relaxBlockSlots(blocks, ROW, []), [0, 1, 2, 3]);
+    assert.deepEqual(relaxBlockOrder(communities, links), relaxBlockOrder(communities, links));
+    assert.deepEqual(relaxBlockOrder(communities, []), [0, 1, 2, 3]);
   });
 });

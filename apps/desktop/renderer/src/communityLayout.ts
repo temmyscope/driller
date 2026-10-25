@@ -249,43 +249,39 @@ function gridBlock(
  * its members, which is what Full did before the collapsed view existed.
  */
 /**
- * Which slot each block should occupy, given the slots the shelf packer
- * produced. Blocks that call each other end up near each other; the packing
- * itself is untouched.
+ * The order to shelve communities in, so ones that call each other sit near
+ * each other. Decided from the partition and its links ALONE — never from a
+ * measured size or a packed position.
  *
- * `[2026-10-25]` Measured while dogfooding driller on its own repository: 33
- * community cards and 56 links drew **425 edge crossings**, about fifteen per
- * link, so no single relation could be followed through the middle of the map.
- * The cards were not badly placed — they were badly ordered. Reassigning which
- * community sits in which already-packed slot, changing no geometry at all,
- * took the same map to 71 crossings and cut total link length by 48%.
+ * `[2026-10-25]` That restriction is the point. Deciding it from the packed
+ * slots made the seating a function of React Flow's card measurements: a
+ * re-measure could flip a swap, move a community across the map, and change
+ * every `cluster:<cellX>:<cellY>` id derived from card positions — the map
+ * rearranging itself in front of the engineer for no visible reason. Sizes may
+ * decide where the shelves break, as they always have; they may not decide who
+ * sits where.
  *
- * Only blocks of identical size are ever exchanged, which is what makes this
- * safe: the packer treats them as interchangeable, so swapping two leaves the
- * shelves bit-for-bit as they were and nothing can overlap or move off the
- * map. It is why the measured figure is 71 rather than the 44 an unrestricted
- * optimiser reaches — a bound worth keeping for a guarantee worth having.
- *
- * Pairwise hill-climbing on the summed call-weighted distance between linked
- * blocks, scored only over the two blocks a swap touches rather than the whole
- * map, so a pass costs O(blocks² × degree) and not O(blocks² × links). Bounded
- * at `maxPasses` and scanned in a fixed order, so it is deterministic and its
- * worst case is predictable; four passes already reached the optimum this
- * heuristic can find on the real map.
+ * Pairwise hill-climbing over a nominal square grid of one cell per community,
+ * standing in for shelves this cannot know yet. Shape alone seats neighbours
+ * together, and shape here depends on nothing but how many communities there
+ * are. Scored only over the two communities a swap touches, so a pass costs
+ * O(communities^2 x degree) rather than O(communities^2 x links); a fixed scan
+ * order and a bounded pass count keep it deterministic with a predictable
+ * worst case.
  */
-export function relaxBlockSlots(
-  blocks: readonly { communityId: string; width: number; height: number }[],
-  slots: readonly Point[],
+export function relaxBlockOrder(
+  communities: readonly { id: string }[],
   links: readonly CommunityLink[],
   maxPasses = 4,
 ): number[] {
-  const slotOf = blocks.map((_block, index) => index);
-  if (blocks.length < 2 || links.length === 0) {
+  const slotOf = communities.map((_community, index) => index);
+  if (communities.length < 2 || links.length === 0) {
     return slotOf;
   }
-  const indexOf = new Map(blocks.map((block, index) => [block.communityId, index]));
-  /** Call-weighted neighbours, by block index. A link to a community off this map is ignored. */
-  const neighbours = blocks.map((): { index: number; weight: number }[] => []);
+  const columns = Math.max(1, Math.ceil(Math.sqrt(communities.length)));
+  const cell = (slot: number) => ({ x: slot % columns, y: Math.floor(slot / columns) });
+  const indexOf = new Map(communities.map((community, index) => [community.id, index]));
+  const neighbours = communities.map((): { index: number; weight: number }[] => []);
   for (const { sourceCommunityId, targetCommunityId, count } of links) {
     const from = indexOf.get(sourceCommunityId);
     const to = indexOf.get(targetCommunityId);
@@ -295,22 +291,17 @@ export function relaxBlockSlots(
     neighbours[from]!.push({ index: to, weight: count });
     neighbours[to]!.push({ index: from, weight: count });
   }
-  const sameSize = (a: number, b: number) =>
-    blocks[a]!.width === blocks[b]!.width && blocks[a]!.height === blocks[b]!.height;
-  const pull = (block: number) => {
-    const here = slots[slotOf[block]!]!;
-    return neighbours[block]!.reduce((total, { index, weight }) => {
-      const there = slots[slotOf[index]!]!;
+  const pull = (community: number) => {
+    const here = cell(slotOf[community]!);
+    return neighbours[community]!.reduce((total, { index, weight }) => {
+      const there = cell(slotOf[index]!);
       return total + Math.hypot(here.x - there.x, here.y - there.y) * weight;
     }, 0);
   };
   for (let pass = 0; pass < maxPasses; pass += 1) {
     let moved = false;
-    for (let a = 0; a < blocks.length; a += 1) {
-      for (let b = a + 1; b < blocks.length; b += 1) {
-        if (!sameSize(a, b)) {
-          continue;
-        }
+    for (let a = 0; a < communities.length; a += 1) {
+      for (let b = a + 1; b < communities.length; b += 1) {
         const before = pull(a) + pull(b);
         [slotOf[a], slotOf[b]] = [slotOf[b]!, slotOf[a]!];
         if (pull(a) + pull(b) < before - 1e-9) {
@@ -424,38 +415,37 @@ export function communityPositions(
       ),
     ),
   );
-  // The shelves, walked once for their slots alone. `relaxBlockSlots` then
-  // decides which block sits in which of them, so blocks that call each other
-  // are near each other; every slot keeps the x/y this walk gave it.
-  const slots: Point[] = [];
+  // `[2026-10-25]` Packed in the order `relaxBlockOrder` gives, which it
+  // decides from the partition and its links ALONE. It used to be decided from
+  // the packed slot positions — measured geometry — so a re-measure could flip
+  // a swap and move a community across the map, taking every
+  // `cluster:<cellX>:<cellY>` id the canvas derives from card positions with
+  // it. Block sizes still decide where the shelves break, as they always have;
+  // what must not move when a card is re-measured is who sits where.
+  const order = relaxBlockOrder(partition.communities, partition.links);
+  const seated = laidOut
+    .map((entry, index) => ({ entry, slot: order[index] ?? index }))
+    .sort((a, b) => a.slot - b.slot);
+
+  const positions = new Map<string, Point>();
+  const blocks: CommunityBlock[] = [];
   let left = 0;
   let rowTop = 0;
   let rowHeight = 0;
-  for (const { block } of laidOut) {
+  for (const { entry } of seated) {
+    const { block, positions: blockPositions } = entry;
     if (left > 0 && left + block.width > targetWidth) {
       left = 0;
       rowTop += rowHeight + COMMUNITY_GAP_Y;
       rowHeight = 0;
     }
-    slots.push({ x: left, y: rowTop });
+    for (const [cardId, at] of blockPositions) {
+      positions.set(cardId, { x: left + at.x, y: rowTop + at.y });
+    }
+    blocks.push({ ...block, x: left, y: rowTop });
     left += block.width + COMMUNITY_GAP_X;
     rowHeight = Math.max(rowHeight, block.height);
   }
-  const slotOf = relaxBlockSlots(
-    laidOut.map(({ block }) => block),
-    slots,
-    partition.links,
-  );
-
-  const positions = new Map<string, Point>();
-  const blocks: CommunityBlock[] = [];
-  laidOut.forEach(({ block, positions: blockPositions }, index) => {
-    const { x, y } = slots[slotOf[index]!]!;
-    for (const [cardId, at] of blockPositions) {
-      positions.set(cardId, { x: x + at.x, y: y + at.y });
-    }
-    blocks.push({ ...block, x, y });
-  });
   return { positions, blocks };
 }
 

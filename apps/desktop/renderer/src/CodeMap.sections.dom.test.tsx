@@ -375,7 +375,6 @@ describe('CodeMap: switching section from Node detail (replaces the crossSection
     // start, so the card is never drawn while the wait lasts.
     const web = syntheticMap({ nodes: 300 });
     const webMap: CodeMapOk = { ...web, appliedScope: ['api', 'web'], section: 'web', sections: sectionedMap('web').sections };
-    const target = web.nodes.at(-1)!;
     codeMapFake({ getCodeMap: async (section) => (section === 'web' ? structuredClone(webMap) : sectionedMap('api')) });
     let consumed = 0;
     const { rerender } = render(<CodeMap {...props({ section: 'api' })} />);
@@ -386,7 +385,14 @@ describe('CodeMap: switching section from Node detail (replaces the crossSection
       assert.ok(drawnNames().length > 0 && drawnNames().every((id) => id.startsWith('fixture://')));
     }, FIND);
     await waitFor(() => assert.notEqual(document.querySelector<HTMLElement>('.react-flow')?.style.visibility, 'hidden'), FIND);
-    assert.equal(cardOf(target.id), null, 'the target card is culled');
+    // `[2026-10-25]` Taken from what the first fit ACTUALLY culled, rather than
+    // assuming the map's last Node is the far one. Which Node is far away
+    // depends on the seating, and the seating is decided by the call graph —
+    // so assuming it tied this test to one particular layout, and it failed
+    // whenever that layout changed for a good reason. What the test is about
+    // is focus falling back when a card never draws, not which card that is.
+    const target = web.nodes.find((node) => cardOf(node.id) === null);
+    assert.ok(target, 'the first fit culls at least one card');
 
     const frames = manualAnimationFrames();
     try {
