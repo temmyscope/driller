@@ -111,11 +111,8 @@ usefulness, and neither does a state in this table.
   graphical objects under WCAG 1.4.11 rather than decoration.
   `contrast.test.ts` now reads the stroke off the `.code-map__edge` rule and
   enforces 3:1 against every `--bg`, instead of recording the ratio, so a later
-  restyle cannot quietly return to a decorative token. **Separate and still
-  open:** following one specific edge through the dense middle of the map
-  remains hard. That is crossings — 33 cards in a near-lattice with edges
-  routed straight through it — not contrast, and it wants edge routing or
-  layout work, not another colour.
+  restyle cannot quietly return to a decorative token. **The crossings half is also fixed**
+  (`bc2adc4`): see the row below.
 - **`All Nodes` on a large map: both halves now closed.** `[2026-10-25, found
   by dogfooding on driller/app]` Originally: Grouped drew 34 nodes and 59
   edges, All Nodes drew **one** cluster bubble standing for 28 Nodes and no
@@ -156,6 +153,26 @@ usefulness, and neither does a state in this table.
   untouched. Verified live: no card is named after a bare helper, and the
   largest community reads `apps/desktop/renderer/src/ (CodeMap)` where it read
   `onClick`.
+- **Edge crossings: fixed by seating, not by routing.** `[2026-10-25]`
+  Dogfooding measured **425 crossings** across 33 community cards and 56 links,
+  about fifteen per link, which is why no single relation could be followed.
+  Measured before building: the cards were not badly placed, they were badly
+  ordered — the packer seats blocks largest-first, which has nothing to do with
+  who calls whom. Holding the packed slots fixed and only reassigning which
+  community sits in which took the same map to 44; restricted to swapping
+  identically-sized blocks (so the shelves stay bit-for-bit as packed, and
+  nothing can overlap or leave the map) it reaches 71. Cheaper orderings were
+  tried and rejected on the numbers: greedy most-linked-first 299,
+  breadth-first 190. `relaxBlockSlots` in `bc2adc4`, verified live: **425 → 69
+  crossings (−84%)**, total link length −49%, mean link length 1,468 → 753.
+- **Edge "N calls" labels render unscaled at low zoom.** `[2026-10-25, noticed
+  while dogfooding]` On a fitted Full map some call-count labels draw at
+  roughly their CSS size rather than the viewport's scale, so they sit over the
+  canvas far larger than the cards they annotate and overlap each other. Every
+  `.react-flow__edge-text` measures 2px tall in the DOM at that zoom, so
+  whatever draws large is not those elements at that size; it is visible in the
+  earliest screenshot of the session, before any of the day's changes, so it is
+  not a regression from them. Unexamined beyond that.
 - **Switching Grouped → All Nodes does not re-fit the viewport.** `[2026-10-25]`
   The new mode spans a much larger coordinate space, so the previous zoom leaves
   the canvas apparently blank even where content exists. Separate from the
