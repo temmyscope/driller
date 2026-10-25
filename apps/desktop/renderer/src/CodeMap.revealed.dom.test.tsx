@@ -74,7 +74,23 @@ function assertAbsent(element: Element | null | undefined, what: string): void {
 
 /** 8a allows 20 s per test; these finish well under 2 s (doubled under CI, P4-8b's convention). */
 const BUDGET = { timeout: 3_000 * (env.CI === 'true' ? 2 : 1) };
-const FIND = { timeout: 1_500 };
+// `[2026-10-25]` Scaled for CI exactly as `BUDGET` above is. The test-level
+// budget was already doubled there for CI's slower machines, but the budget
+// for the waits INSIDE a test was left flat, so on CI every `waitFor` got half
+// the allowance, relative to machine speed, that the test around it got.
+//
+// "a cluster expanded in Full is a cluster again after Revealed and back" is
+// where that first bit: it waits for a 300-Node map to re-cluster after a
+// round trip through Revealed, and on ubuntu-latest that takes longer than
+// 1.5s. The same wait completes under 750ms here, so nothing is wrong with the
+// behaviour — and the layout work first blamed for it has since been reverted
+// with no effect on CI, which is what ruled the production code out.
+//
+// Nothing is loosened by this: no assertion changes, and the test-level
+// timeout (12s for that one) stays far above it. The same flat `FIND` next to
+// a scaled `BUDGET` is in every other DOM test file here; this fixes the one
+// that is failing rather than all of them at once.
+const FIND = { timeout: 1_500 * (env.CI === 'true' ? 2 : 1) };
 const N = FIXTURE_NODES;
 const S = SECTION_NODES;
 const ALL_IDS = Object.values(N).map((node) => node.id);
