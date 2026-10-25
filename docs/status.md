@@ -78,6 +78,24 @@ usefulness, and neither does a state in this table.
   of nodes and edges and is not generation-checked, so the original item's
   "every outgoing UI result, renderer included" is only half met. (Assessment
   2026-10-13, Winston.)
+- **A measured card size must never decide the shape of the layout.**
+  `[2026-10-25]` Learned the hard way: `wrapToSquare` derived its wrap point
+  from the *measured* card pitches, and `fullGrid` is memoized on
+  `currentRevealKey`, so a trip through Revealed and back recomputed the layout
+  with whatever React Flow had measured by then. One measurement arriving in a
+  different batch moved the wrap point, reshaped every block, and changed every
+  `cluster:<cellX>:<cellY>` id the canvas derives from card positions — the map
+  silently rearranging itself, and a red CI on Linux (both Node legs) where the
+  measurement timing differs. Fixed in `92b2526` by deriving the wrap point
+  from the fallback pitch: the card count is the stable part of the question.
+  The same change keyed the All Nodes opening-view effect on the community mode
+  alone, since keying it on layout identity made it re-fire as its own
+  `setCenter` churned that identity. **The rule this leaves:** layout SHAPE
+  decisions (where to wrap, what order to seat in) may read the structure and
+  the card count, never the measurements; only final placement may read a
+  measured size. `relaxBlockSlots` still breaks that rule, as the crossings row
+  above records. Not reproducible on macOS, so the fix is reasoned from the
+  mechanism rather than observed failing and then observed fixed.
 - **Qodo ingestion writes into the user's repo.** PR-Agent writes `review.md`
   into the repo root and driller deletes it afterwards — a live exception to the
   never-write-to-the-user's-repo invariant. See [arc42.md §11](arc42.md#11-risks-and-technical-debt)
@@ -164,6 +182,14 @@ usefulness, and neither does a state in this table.
   tried and rejected on the numbers: greedy most-linked-first 299,
   breadth-first 190. `relaxBlockSlots` in `bc2adc4`, verified live: **425 → 69
   crossings (−84%)**, total link length −49%, mean link length 1,468 → 753.
+  **Carries a known latent instability:** it reads the packed slot positions,
+  so the seating is a function of measured card sizes, bounded only by never
+  swapping blocks of different size. Seating it on a size-independent nominal
+  grid was tried (2026-10-25) and reverted: packing in the relaxed order moves
+  where shelves break, which changes the layout extent, which feeds `minZoom`
+  and loops back into the viewport — it hung `CodeMap.sections.dom.test.tsx`
+  outright. Worth closing properly; the mechanism is the same one the row below
+  describes.
 - **Layout aspect ratio: fixed.** `[2026-10-25]` The Full map came out 2.62:1
   taller than wide where the packer aims for square, and the packer was not the
   cause. Measured: one community's block was 1,800 x 22,412 — 12.5:1 and 72% of
@@ -171,7 +197,9 @@ usefulness, and neither does a state in this table.
   layer out as one unbounded column and that community has 213 members across
   few depths. Packing efficiency was 27%. `wrapToSquare` (`7763208`) wraps a
   long layer into side-by-side sub-columns, with the wrap point derived from
-  the pitches rather than tuned: `rows = sqrt(cards x columnPitch / rowPitch)`.
+  the pitches rather than tuned: `rows = sqrt(cards x columnPitch / rowPitch)`,
+  using the FALLBACK pitch — see the stability row below for why it must not be
+  the measured one.
   Opt-in, and only the community layout opts in — Revealed's frozen snapshot is
   untouched. Live: 11,960x31,322 → 11,440x16,012, so **2.62:1 → 1.40:1** and
   packing **27% → 56%**; the worst block 12.5:1 → 0.8:1. It compounds with the
