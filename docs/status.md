@@ -176,14 +176,19 @@ usefulness, and neither does a state in this table.
   untouched. Live: 11,960x31,322 → 11,440x16,012, so **2.62:1 → 1.40:1** and
   packing **27% → 56%**; the worst block 12.5:1 → 0.8:1. It compounds with the
   readable-zoom opening, which now draws 81 real cards instead of 14.
-- **Edge "N calls" labels render unscaled at low zoom.** `[2026-10-25, noticed
-  while dogfooding]` On a fitted Full map some call-count labels draw at
-  roughly their CSS size rather than the viewport's scale, so they sit over the
-  canvas far larger than the cards they annotate and overlap each other. Every
-  `.react-flow__edge-text` measures 2px tall in the DOM at that zoom, so
-  whatever draws large is not those elements at that size; it is visible in the
-  earliest screenshot of the session, before any of the day's changes, so it is
-  not a regression from them. Unexamined beyond that.
+- **Edge "N calls" labels at low zoom: fixed.** `[2026-10-25]` `@xyflow/react`
+  holds an edge label at a readable *screen* size by counteracting the viewport
+  zoom, so it never shrinks with the map. Below `LOD_ZOOM_THRESHOLD`, where
+  cards have collapsed into clusters, that painted full-size labels over specks,
+  overlapping each other and burying the edges. Fixed in `78be46e`:
+  `edgeLabelsReadable` reuses that same threshold, so one idea of "too far out
+  to read" governs cards and labels together. The earlier note here guessed
+  this was not a regression from the day's work; that held, but the reasoning
+  was wrong — the DOM reports those elements as 2px tall and `elementFromPoint`
+  returns the empty pane over them, so both measurements say nothing is there.
+  Hiding `.react-flow__edge-text` and re-capturing is what proved otherwise.
+  Worth remembering: for a transformed SVG label, the DOM's geometry is not
+  evidence about what is painted.
 - **Switching Grouped → All Nodes does not re-fit the viewport.** `[2026-10-25]`
   The new mode spans a much larger coordinate space, so the previous zoom leaves
   the canvas apparently blank even where content exists. Separate from the
