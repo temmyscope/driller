@@ -133,11 +133,10 @@ usefulness, and neither does a state in this table.
     rather than claiming the whole map while showing one part of it.
   Verified live on driller/app: the switch lands at zoom 0.25 with fourteen
   real Node cards, their summaries, risk chips and judgments, and no cluster
-  bubbles. **Not addressed, and still true:** the layout is 2.6x taller than
-  wide (34,082 x 13,260) where the packer aims for roughly square, so a fitted
-  overview of All Nodes remains unreadable by construction; Grouped is the
-  overview for a map this size. Whether that aspect ratio is worth fixing is
-  open.
+  bubbles. The aspect ratio noted here as
+  unaddressed is since fixed too — see the row below — and All Nodes now opens
+  on 81 real cards rather than 14. Grouped remains the overview for a map this
+  size: a *fitted* All Nodes still lands under `LOD_ZOOM_THRESHOLD`.
 - **Community names: fixed.** `[2026-10-25]` Dogfooding put 11 of 34 cards
   under an incidental helper's name, the three largest among them — 67, 65 and
   56 Nodes reading `formatCount`, `isTestNode` and `jsonToolResult`. Two
@@ -165,6 +164,18 @@ usefulness, and neither does a state in this table.
   tried and rejected on the numbers: greedy most-linked-first 299,
   breadth-first 190. `relaxBlockSlots` in `bc2adc4`, verified live: **425 → 69
   crossings (−84%)**, total link length −49%, mean link length 1,468 → 753.
+- **Layout aspect ratio: fixed.** `[2026-10-25]` The Full map came out 2.62:1
+  taller than wide where the packer aims for square, and the packer was not the
+  cause. Measured: one community's block was 1,800 x 22,412 — 12.5:1 and 72% of
+  the whole layout height by itself — because `layeredPositions` laid each hop
+  layer out as one unbounded column and that community has 213 members across
+  few depths. Packing efficiency was 27%. `wrapToSquare` (`7763208`) wraps a
+  long layer into side-by-side sub-columns, with the wrap point derived from
+  the pitches rather than tuned: `rows = sqrt(cards x columnPitch / rowPitch)`.
+  Opt-in, and only the community layout opts in — Revealed's frozen snapshot is
+  untouched. Live: 11,960x31,322 → 11,440x16,012, so **2.62:1 → 1.40:1** and
+  packing **27% → 56%**; the worst block 12.5:1 → 0.8:1. It compounds with the
+  readable-zoom opening, which now draws 81 real cards instead of 14.
 - **Edge "N calls" labels render unscaled at low zoom.** `[2026-10-25, noticed
   while dogfooding]` On a fitted Full map some call-count labels draw at
   roughly their CSS size rather than the viewport's scale, so they sit over the
