@@ -1433,7 +1433,7 @@ code,
   font-style: normal;
 }
 
-/* DESIGN.md `canvas-edge`: `{colors.border-strong}` stroke, 1.5px width,
+/* DESIGN.md `canvas-edge`: `{colors.border-control}` stroke, 1.5px width,
    cubic-bezier path. `@xyflow/react` v12's default edge type (no `type` set
    on the edge object, confirmed in `toFlowEdges`/`CodeMap.tsx`) is already
    `BezierEdge` — curved paths need no CodeMap.tsx change, only this
@@ -1456,8 +1456,18 @@ code,
    still wins while an edge has focus. The ref connector's dashes and
    opacity (`.code-map__edge--reveal-ref`, on the `<g>`) inherit or apply
    over it. */
+/* `[2026-10-25]` `--border-control`, not `--border-strong`. P5-f's 1.72:1 was
+   accepted as decorative — dimmer, as it turned out, than React Flow's own
+   #3e3e3e default at 1.81:1 — on the grounds that an edge is not a control's
+   only cue. Dogfooding driller on its own repository settled the live
+   judgement DESIGN.md asked for: on 34 cards and 59 edges the strokes cannot
+   be followed by eye. In the grouped view every relation the map shows lives
+   in these edges, so they carry meaning and take WCAG 1.4.11's 3:1, which is
+   `--border-control` (3.16:1) — the alternative DESIGN.md itself named for
+   this exact case. `contrast.test.ts` now enforces it rather than recording
+   it. */
 .code-map__edge .react-flow__edge-path {
-  stroke: var(--border-strong);
+  stroke: var(--border-control);
   stroke-width: 1.5;
 }
 

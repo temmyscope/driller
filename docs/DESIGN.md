@@ -271,7 +271,7 @@ components:
   # Node, so directional flow from the point of change is visible on the
   # edge itself, not just the endpoints.
   canvas-edge:
-    stroke: '{colors.border-strong}'
+    stroke: '{colors.border-control}'
     strokeWidth: 1.5px
     path: cubic-bezier, matches modern-saas mockup's control-point ratio
     # [ADDED 2026-10-15, P5-f] Founder decision 7.1: applies to the edge's
@@ -281,6 +281,15 @@ components:
     # 1.81:1); decorative, not a control's only cue, so 3:1 is not required.
     # If edges read too faint on a dense map, border-control (>= 3:1) is the
     # Ask First alternative.
+    # [CHANGED 2026-10-25] Taken: that alternative, on the founder's say-so
+    # after driller was dogfooded on its own repository. The live judgement
+    # P5-f deferred came back negative — across 34 cards and 59 edges the
+    # strokes cannot be followed, and crossings are unreadable. The premise
+    # that they are decorative no longer holds either: the grouped Full map
+    # carries every relation it shows in these edges and nothing else, which
+    # is WCAG 1.4.11's 3:1 for a meaningful graphical object. border-control
+    # is 3.16:1 on bg, and contrast.test.ts enforces the rule rather than
+    # recording its ratio.
     note: 'stroke and width apply to the visible path; highlight, path-trace and shared-reach strokes override it on that same path'
   canvas-edge-highlighted:
     stroke: '{colors.accent}'

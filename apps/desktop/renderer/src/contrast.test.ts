@@ -446,18 +446,46 @@ describe('styles.css floated-toolbar collision layout (FIX-4)', () => {
 // only cue, so WCAG 1.4.11's 3:1 is never asserted here. The founder's
 // Ask First: if plain edges read too faint on a dense map, `--border-control`
 // (≥ 3:1) replaces it, amending DESIGN.md. Recorded so a token change shows.
-describe('plain canvas-edge stroke against the canvas (P5-f, informational)', () => {
+// `[2026-10-25]` This was informational: it recorded that P5-f's
+// `--border-strong` sits at 1.72:1 on `--bg` and left it at that. Dogfooding
+// driller on its own repository settled the live visual judgement that
+// status.md said was owed — on a map of 34 cards and 59 edges the strokes
+// cannot be followed by eye, and where they cross there is no telling one
+// from another. The grouped view keeps ALL of its relational information in
+// those edges, so this is not decorative: it is WCAG 1.4.11's 3:1 for a
+// graphical object that conveys meaning, the same bar `--shared-reach-edge`
+// and `--border-control` already hold. The recorded numbers stay as the
+// before-measurement; what changed is that the rule must now clear the bar.
+describe('plain canvas-edge stroke against the canvas (P5-f)', () => {
   const REACT_FLOW_DARK_EDGE = '#3e3e3e';
-  it('--border-strong on --bg is ≈1.72:1, next to React Flow’s #3e3e3e at ≈1.81:1', (t) => {
+
+  it('records what P5-f shipped: dimmer than React Flow’s own default', () => {
     const [strong] = hexDefinitionsOf('--border-strong');
     const [bg] = hexDefinitionsOf('--bg');
-    const ours = contrastRatio(strong!, bg!);
-    const before = contrastRatio(REACT_FLOW_DARK_EDGE, bg!);
-    t.diagnostic(`--border-strong ${strong} on --bg ${bg}: ${ours.toFixed(2)}:1; ${REACT_FLOW_DARK_EDGE}: ${before.toFixed(2)}:1`);
-    assert.equal(Number(ours.toFixed(2)), 1.72);
-    assert.equal(Number(before.toFixed(2)), 1.81);
+    assert.equal(Number(contrastRatio(strong!, bg!).toFixed(2)), 1.72);
+    assert.equal(Number(contrastRatio(REACT_FLOW_DARK_EDGE, bg!).toFixed(2)), 1.81);
   });
-});
+
+  it('strokes the plain canvas edge with a token that clears 3:1 against every --bg', () => {
+    const strokes = RULES.filter((rule) =>
+      rule.selectors.some((selector) => /\.code-map__edge\b/.test(selector) && /\.react-flow__edge-path/.test(selector)),
+    ).flatMap((rule) => rule.declarations.filter(([property]) => property === 'stroke').map(([, value]) => value));
+    assert.ok(strokes.length > 0, 'the plain canvas edge sets a stroke in styles.css');
+
+    const failures: string[] = [];
+    for (const stroke of strokes) {
+      const token = /^var\((--[\w-]+)\)$/.exec(stroke)?.[1];
+      assert.ok(token !== undefined, `the canvas edge strokes with a token, not ${stroke}`);
+      for (const edge of hexDefinitionsOf(token)) {
+        for (const background of hexDefinitionsOf('--bg')) {
+          const ratio = contrastRatio(edge, background);
+          if (ratio < 3) failures.push(`${token} ${edge} on --bg ${background} is ${ratio.toFixed(2)}:1`);
+        }
+      }
+    }
+    assert.deepEqual(failures, []);
+  });
+});;
 
 // P5-i (founder decision 3.23): `--shared-reach-edge`, now documented in
 // DESIGN.md (`colors.shared-reach-edge`, `components.reveal-shared-reach-edge`),

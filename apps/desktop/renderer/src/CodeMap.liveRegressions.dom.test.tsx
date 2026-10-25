@@ -254,7 +254,7 @@ describe('FIX-7: a lit edge paints its visible path (P2-4, P3-11/12)', () => {
 // P5-f (founder decision 7.1): a plain edge paints DESIGN.md `canvas-edge`
 
 describe('P5-f: a plain edge paints DESIGN.md canvas-edge on its visible path (7.1)', () => {
-  it('every plain Full-map edge paints --border-strong, 1.5px (was React Flow’s #3e3e3e, 1px)', BUDGET, async () => {
+  it('every plain Full-map edge paints --border-control, 1.5px (was --border-strong at 1.72:1)', BUDGET, async () => {
     fake();
     await mountFull();
     loadRealStylesheets();
@@ -264,9 +264,13 @@ describe('P5-f: a plain edge paints DESIGN.md canvas-edge on its visible path (7
       assert.ok(drawn.length > 0, 'edges are drawn');
       return drawn;
     }, FIND);
-    const strong = token('--border-strong');
+    // `[2026-10-25]` --border-control, not --border-strong: dogfooding found
+    // the 1.72:1 stroke unfollowable on a dense map, and the grouped view
+    // carries every relation it shows in these edges. `contrast.test.ts`
+    // enforces the 3:1 this now clears.
+    const plain = token('--border-control');
     for (const edge of edges) {
-      assert.deepEqual(paintedStroke(edge), { stroke: strong, width: '1.5' }, `${edge.getAttribute('data-id')} paints canvas-edge`);
+      assert.deepEqual(paintedStroke(edge), { stroke: plain, width: '1.5' }, `${edge.getAttribute('data-id')} paints canvas-edge`);
     }
   });
 
@@ -286,7 +290,7 @@ describe('P5-f: a plain edge paints DESIGN.md canvas-edge on its visible path (7
       assert.deepEqual(paintedStroke(edge), { stroke: token('--trace-cyan'), width: '2' });
     }
     for (const edge of [...document.querySelectorAll('.react-flow__edge')].filter((e) => !lit.includes(e))) {
-      assert.deepEqual(paintedStroke(edge), { stroke: token('--border-strong'), width: '1.5' });
+      assert.deepEqual(paintedStroke(edge), { stroke: token('--border-control'), width: '1.5' });
     }
   });
 
@@ -305,7 +309,7 @@ describe('P5-f: a plain edge paints DESIGN.md canvas-edge on its visible path (7
     const path = edge.querySelector('.react-flow__edge-path')!;
     const selected = substituteVars('var(--xy-edge-stroke-selected-default)', path);
     assert.notEqual(selected, '');
-    assert.notEqual(selected, token('--border-strong'));
+    assert.notEqual(selected, token('--border-control'));
     assert.equal(paintedStroke(edge).stroke, selected);
   });
 
@@ -323,7 +327,7 @@ describe('P5-f: a plain edge paints DESIGN.md canvas-edge on its visible path (7
       assert.ok(found, 'the ref connector is drawn');
       return found;
     }, FIND);
-    assert.deepEqual(paintedStroke(connector), { stroke: token('--border-strong'), width: '1.5' });
+    assert.deepEqual(paintedStroke(connector), { stroke: token('--border-control'), width: '1.5' });
     const path = connector.querySelector('.react-flow__edge-path')!;
     assert.equal(getComputedStyle(path).getPropertyValue('stroke-dasharray').trim(), '3 4', 'the path inherits the dashes');
     assert.equal(getComputedStyle(connector).getPropertyValue('opacity').trim(), '0.5');
