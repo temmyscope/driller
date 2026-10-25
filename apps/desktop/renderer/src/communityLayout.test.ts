@@ -22,7 +22,6 @@ import {
   FOLDED_BLOCK_ID,
   samePositions,
   type CommunityBlock,
-  relaxBlockSlots,
 } from './communityLayout';
 import type { LayeredCardSize } from './layered';
 
@@ -234,82 +233,5 @@ describe('communityStructure and communityPositions compose to the same layout',
       large.blocks.map((block) => [block.communityId, [...block.cardIds]]),
       'measuring cards never repartitions the map',
     );
-  });
-});
-
-/**
- * `[2026-10-25]` Measured on driller's own map while dogfooding: 33 community
- * cards and 56 links produced **425 edge crossings** — every link crossing
- * about fifteen others — so no single relation could be followed by eye. The
- * cards were not in the wrong places; they were in the wrong ORDER. Holding
- * the packed slots fixed and only reassigning which community sits in which
- * slot took the same map to 44 crossings, and to 71 once restricted to
- * swapping blocks the packer treats as interchangeable (identical size), with
- * total link length down 48%.
- *
- * That restriction is what keeps this safe: exchanging two identically-sized
- * blocks leaves the shelf packing bit-for-bit as it was, so this cannot
- * overlap blocks or change the map's extent.
- */
-describe('relaxBlockSlots', () => {
-  const block = (communityId: string, width = 320, height = 112) => ({ communityId, width, height });
-  const link = (sourceCommunityId: string, targetCommunityId: string, count = 1) => ({
-    sourceCommunityId,
-    targetCommunityId,
-    count,
-  });
-  /** Four slots in a row, 400 apart. */
-  const ROW = [
-    { x: 0, y: 0 },
-    { x: 400, y: 0 },
-    { x: 800, y: 0 },
-    { x: 1_200, y: 0 },
-  ];
-  const linkLength = (
-    blocks: readonly { communityId: string }[],
-    slotOf: readonly number[],
-    links: readonly { sourceCommunityId: string; targetCommunityId: string; count: number }[],
-  ) => {
-    const at = new Map(blocks.map((b, i) => [b.communityId, ROW[slotOf[i]!]!]));
-    return links.reduce((total, l) => {
-      const a = at.get(l.sourceCommunityId)!;
-      const b = at.get(l.targetCommunityId)!;
-      return total + Math.hypot(a.x - b.x, a.y - b.y) * l.count;
-    }, 0);
-  };
-
-  it('brings two communities that call each other next to each other', () => {
-    // a and d call each other; the packer put them at opposite ends.
-    const blocks = [block('a'), block('b'), block('c'), block('d')];
-    const links = [link('a', 'd', 5)];
-    const before = linkLength(blocks, [0, 1, 2, 3], links);
-    const after = linkLength(blocks, relaxBlockSlots(blocks, ROW, links), links);
-    assert.ok(after < before, `${after} should be under ${before}`);
-    assert.equal(after, 400 * 5, 'they end up adjacent (400 apart, five calls)');
-  });
-
-  it('never moves a block into a slot the packer sized for a different block', () => {
-    // b is the odd size: it must stay in slot 1 whatever the links want.
-    const blocks = [block('a'), block('b', 200, 80), block('c'), block('d')];
-    const links = [link('b', 'd', 9)];
-    const slotOf = relaxBlockSlots(blocks, ROW, links);
-    assert.equal(slotOf[1], 1, 'the odd-sized block keeps its own slot');
-    assert.equal(new Set(slotOf).size, slotOf.length, 'every slot is used exactly once');
-  });
-
-  it('weighs a link by how many calls it carries', () => {
-    // a-b carries one call, a-d carries ten: a belongs beside d.
-    const blocks = [block('a'), block('b'), block('c'), block('d')];
-    const links = [link('a', 'b', 1), link('a', 'd', 10)];
-    const slotOf = relaxBlockSlots(blocks, ROW, links);
-    const at = (id: string) => ROW[slotOf[blocks.findIndex((b) => b.communityId === id)]!]!.x;
-    assert.equal(Math.abs(at('a') - at('d')), 400, 'the heavy link is the short one');
-  });
-
-  it('is deterministic, and leaves a map with no links exactly as it was', () => {
-    const blocks = [block('a'), block('b'), block('c'), block('d')];
-    const links = [link('a', 'd', 3), link('b', 'c', 2)];
-    assert.deepEqual(relaxBlockSlots(blocks, ROW, links), relaxBlockSlots(blocks, ROW, links));
-    assert.deepEqual(relaxBlockSlots(blocks, ROW, []), [0, 1, 2, 3]);
   });
 });
