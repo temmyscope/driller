@@ -122,16 +122,11 @@ export function layeredPositions(
 ): LayeredLayoutResult {
   const byDepth = new Map<number, LayeredCard[]>();
   const seen = new Set<string>();
-  let pitchRowTotal = 0;
-  let pitchColumnTotal = 0;
   for (const card of cards) {
     if (seen.has(card.cardId)) {
       continue;
     }
     seen.add(card.cardId);
-    const pitch = cardPitch(cardSizeOf(card.cardId));
-    pitchRowTotal += pitch.row;
-    pitchColumnTotal += pitch.column;
     const column = byDepth.get(card.depth);
     if (column === undefined) {
       byDepth.set(card.depth, [card]);
@@ -157,9 +152,19 @@ export function layeredPositions(
    * are what convert a count into a distance, so the ratio has to carry them.
    * Rounded up, and never below one.
    */
+  // `[2026-10-25]` The ratio comes from the FALLBACK pitch, never from the
+  // measured one. React Flow re-measures cards as they mount, and a wrap point
+  // read from those measurements reshapes every block the moment a measurement
+  // moves — which moves every card, and with them every `cluster:<cellX>:<cellY>`
+  // id the canvas derives from card positions. That is a layout that
+  // rearranges itself for no reason the engineer can see, and it broke a test
+  // that expected a cluster to still be there after a trip through Revealed.
+  // Card count is the stable part of the question, so it is the only part the
+  // wrap point is allowed to ask about.
+  const nominal = cardPitch(undefined);
   const maxRows =
     options.wrapToSquare === true && seen.size > 0
-      ? Math.max(1, Math.ceil(Math.sqrt((seen.size * (pitchColumnTotal / seen.size)) / (pitchRowTotal / seen.size))))
+      ? Math.max(1, Math.ceil(Math.sqrt((seen.size * nominal.column) / nominal.row)))
       : undefined;
 
   let columnX = origin.x;

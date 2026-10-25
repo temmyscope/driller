@@ -7747,28 +7747,39 @@ export function CodeMap({
    * layout. Fires once per switch (the ref is cleared as it applies), so it
    * never fights the user's own panning afterwards.
    */
+  const layoutBoundsRef = useRef(layoutBounds);
+  layoutBoundsRef.current = layoutBounds;
   useEffect(() => {
-    if (!pendingAllNodesOpenRef.current) {
+    if (!pendingAllNodesOpenRef.current || communityMode !== 'all') {
       return;
     }
     const instance = reactFlowInstanceRef.current;
-    if (instance === null || fullGrid === null || layoutBounds.width <= 0 || containerSize.width <= 0) {
+    const grid = fullGridRef.current;
+    const bounds = layoutBoundsRef.current;
+    const container = containerSize;
+    if (instance === null || grid === null || bounds.width <= 0 || container.width <= 0) {
       return;
     }
     pendingAllNodesOpenRef.current = false;
-    const opening = allNodesOpeningView(layoutBounds, fullGrid.blocks, containerSize);
+    const opening = allNodesOpeningView(bounds, grid.blocks, container);
     instance.setCenter(opening.center.x, opening.center.y, { zoom: opening.zoom, duration: 300 });
     if (opening.openedOn !== undefined) {
       // Never leave the earlier "Showing all N Nodes" standing alone when the
       // view in fact opens on one community: that is the map asserting more
       // than the screen shows.
       announceReveal(
-        `Showing all ${communityCardNodesText(partitionNodeCount(fullGrid.structure.partition))} — the view opens on ${
+        `Showing all ${communityCardNodesText(partitionNodeCount(grid.structure.partition))} — the view opens on ${
           opening.openedOn.label
         }, ${communityCardNodesText(opening.openedOn.memberCount)}`,
       );
     }
-  }, [fullGrid, layoutBounds, containerSize, announceReveal]);
+    // `[2026-10-25]` Deliberately keyed on the MODE alone, with the layout read
+    // through refs. Keying it on `layoutBounds`/`fullGrid` made it fire again
+    // every time their identity churned — and `setCenter` moves the viewport,
+    // which churns them — so a caller that re-enters All Nodes inside a
+    // `waitFor` retry loop (as the section tests do) could never settle: each
+    // retry re-armed the flag and the effect animated the viewport again.
+  }, [communityMode, announceReveal]);
 
   /**
    * What `computeLOD` may cluster: the Node and folded cards alone. A
