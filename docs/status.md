@@ -78,6 +78,19 @@ usefulness, and neither does a state in this table.
   of nodes and edges and is not generation-checked, so the original item's
   "every outgoing UI result, renderer included" is only half met. (Assessment
   2026-10-13, Winston.)
+- **A CI-only failure is not evidence about the code until the code is ruled
+  out.** `[2026-10-25]` "a cluster expanded in Full is a cluster again after
+  Revealed and back" failed on ubuntu-latest and passed on macOS. It was
+  diagnosed twice as a layout bug, and two measured improvements were reverted
+  for it, before the obvious check settled it: with the revert on `origin/main`
+  CI failed *identically*. The cause was `FIND`, the budget for every `waitFor`
+  inside a test, which stayed flat at 1.5s while `BUDGET` beside it doubled for
+  CI — so on CI each inner wait had half the allowance, relative to machine
+  speed, of the test around it. Reproduced by shrinking `FIND` locally. Fixed
+  in `4a1c48b` for that file; **the same flat `FIND` beside a scaled `BUDGET`
+  is in every other DOM test file here**, so the next CI-only timeout is
+  probably this again. Rule of thumb earned: before blaming a change, push the
+  revert and see whether CI notices.
 - **A measured card size must never decide the shape of the layout.**
   `[2026-10-25]` Learned the hard way: `wrapToSquare` derived its wrap point
   from the *measured* card pitches, and `fullGrid` is memoized on
@@ -170,7 +183,7 @@ usefulness, and neither does a state in this table.
   untouched. Verified live: no card is named after a bare helper, and the
   largest community reads `apps/desktop/renderer/src/ (CodeMap)` where it read
   `onClick`.
-- **Edge crossings: measured, fixed, then reverted.** `[2026-10-25]`
+- **Edge crossings: fixed by seating, not by routing.** `[2026-10-25]`
   Dogfooding measured **425 crossings** across 33 community cards and 56 links,
   about fifteen per link, which is why no single relation could be followed.
   Measured before building: the cards were not badly placed, they were badly
@@ -182,14 +195,11 @@ usefulness, and neither does a state in this table.
   tried and rejected on the numbers: greedy most-linked-first 299,
   breadth-first 190. `relaxBlockSlots` in `bc2adc4`, verified live: **425 → 69
   crossings (−84%)**, total link length −49%, mean link length 1,468 → 753.
-  **Reverted in `d8ce609`.** It decided seating from the packed slot positions,
-  which are measured geometry, and that is the rule below: a re-measure could
-  move a community across the map and change the `cluster:<cellX>:<cellY>` ids
-  the canvas derives from card positions. Reverted together with the wrapping
-  below, because seating landed first and "wrapping without seating" is a
-  combination that never existed — creating it hung
-  `CodeMap.sections.dom.test.tsx`, which steps animation frames by hand. The
-  measurements stand and the win is worth re-landing, decided from the
+  Reverted in `d8ce609` on a wrong diagnosis and re-landed in `e5f93d1`: CI
+  failed identically with the revert on `origin/main`, which ruled this out —
+  the cause was a `waitFor` budget CI never scaled (`4a1c48b`). **Open design
+  debt:** it still decides seating from the packed slot positions, which are
+  measured geometry, against the rule below. To be paid deliberately, from the
   partition and the card count alone.
 
   **Carries a known latent instability:** it reads the packed slot positions,
@@ -200,7 +210,7 @@ usefulness, and neither does a state in this table.
   and loops back into the viewport — it hung `CodeMap.sections.dom.test.tsx`
   outright. Worth closing properly; the mechanism is the same one the row below
   describes.
-- **Layout aspect ratio: measured, fixed, then reverted.** `[2026-10-25]` The Full map came out 2.62:1
+- **Layout aspect ratio: fixed.** `[2026-10-25]` The Full map came out 2.62:1
   taller than wide where the packer aims for square, and the packer was not the
   cause. Measured: one community's block was 1,800 x 22,412 — 12.5:1 and 72% of
   the whole layout height by itself — because `layeredPositions` laid each hop
@@ -214,11 +224,9 @@ usefulness, and neither does a state in this table.
   untouched. Live: 11,960x31,322 → 11,440x16,012, so **2.62:1 → 1.40:1** and
   packing **27% → 56%**; the worst block 12.5:1 → 0.8:1. It compounds with the
   readable-zoom opening, which now draws 81 real cards instead of 14.
-  **Reverted in `d8ce609`**, with the seating above. `92b2526` had already made
-  the wrap point size-independent and CI stayed red on the same test, so the
-  seating was the remaining cause and the pair went back together. Re-landing
-  this one is the easier half: the wrap point is already derived from the card
-  count rather than the measurements.
+  Reverted in `d8ce609` with the seating above and re-landed in `e5f93d1`;
+  neither was the cause. `92b2526`'s size-independent wrap point came back with
+  it, so this one already obeys the rule below.
 - **Edge "N calls" labels at low zoom: fixed.** `[2026-10-25]` `@xyflow/react`
   holds an edge label at a readable *screen* size by counteracting the viewport
   zoom, so it never shrinks with the map. Below `LOD_ZOOM_THRESHOLD`, where
