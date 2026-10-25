@@ -29,7 +29,10 @@ import {
   routeViewport,
   mapMinZoom,
   MIN_ZOOM_REAL,
+  allNodesOpeningView,
+  MAP_MAX_ZOOM,
 } from './CodeMap';
+import type { CommunityBlock } from './communityLayout';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
 /** The trace props `FoundTraceSteps` takes — the same `FoundPathTrace` fields the component's own props use. */
@@ -623,5 +626,67 @@ describe("the map's zoom floor", () => {
   it('is always a usable zoom, never zero or negative', () => {
     const floor = mapMinZoom(DRILLER_ALL_NODES, DRILLER_VIEWPORT, MIN_ZOOM_REAL);
     assert.ok(floor > 0 && Number.isFinite(floor), String(floor));
+  });
+});
+
+/**
+ * Where All Nodes opens. Fitting the whole layout is right for a map small
+ * enough to read fitted, and wrong for a large one: driller's own 1,279-Node
+ * layout fits at ≈0.014, far under `LOD_ZOOM_THRESHOLD`, where every card is a
+ * cluster bubble drawn at ~1.8% scale — an empty-looking canvas. Below the
+ * readable floor the view centres on the largest community instead, so the
+ * mode opens somewhere a reviewer can actually read.
+ */
+describe('where All Nodes opens', () => {
+  const DRILLER_LAYOUT = { x: 0, y: 0, width: 13_260, height: 34_082 };
+  const DRILLER_VIEWPORT = { width: 1_100, height: 497.1875 };
+
+  const block = (communityId: string, memberCount: number, x: number, y: number): CommunityBlock => ({
+    communityId,
+    label: communityId,
+    cardIds: [],
+    collapsed: false,
+    memberCount,
+    x,
+    y,
+    width: 400,
+    height: 300,
+  });
+
+  const DRILLER_BLOCKS = [
+    block('c-small', 9, 0, 0),
+    block('c-biggest', 67, 2_000, 8_000),
+    block('c-middle', 43, 500, 20_000),
+  ];
+
+  it('opens on the largest community, readable, when the whole map cannot be', () => {
+    const view = allNodesOpeningView(DRILLER_LAYOUT, DRILLER_BLOCKS, DRILLER_VIEWPORT);
+    assert.equal(view.fitted, false, 'this map cannot be opened fitted and still be read');
+    assert.ok(view.zoom >= LOD_ZOOM_THRESHOLD, `zoom ${view.zoom} must clear the cluster threshold`);
+    assert.deepEqual(view.center, { x: 2_000 + 200, y: 8_000 + 150 }, 'the centre of the 67-Node community');
+  });
+
+  it('still opens fitted on a map small enough to read whole', () => {
+    const small = { x: 0, y: 0, width: 1_500, height: 600 };
+    const view = allNodesOpeningView(small, [block('only', 12, 0, 0)], DRILLER_VIEWPORT);
+    assert.equal(view.fitted, true);
+    assert.deepEqual(view.center, { x: 750, y: 300 }, 'the centre of the layout');
+    assert.ok(view.zoom >= LOD_ZOOM_THRESHOLD);
+  });
+
+  it('breaks a tie on size by community id, so the same map always opens the same way', () => {
+    const tied = [block('b-second', 50, 9_000, 9_000), block('a-first', 50, 1_000, 1_000)];
+    const view = allNodesOpeningView(DRILLER_LAYOUT, tied, DRILLER_VIEWPORT);
+    assert.deepEqual(view.center, { x: 1_200, y: 1_150 }, 'the lower id wins');
+  });
+
+  it('centres on the layout when there is no community to open on', () => {
+    const view = allNodesOpeningView(DRILLER_LAYOUT, [], DRILLER_VIEWPORT);
+    assert.deepEqual(view.center, { x: 6_630, y: 17_041 });
+  });
+
+  it('never opens above the map’s zoom ceiling', () => {
+    const tiny = { x: 0, y: 0, width: 10, height: 10 };
+    assert.ok(allNodesOpeningView(tiny, [block('one', 1, 0, 0)], DRILLER_VIEWPORT).zoom <= MAP_MAX_ZOOM);
   });
 });

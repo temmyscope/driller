@@ -125,7 +125,7 @@ import {
 } from './format';
 import { MODAL_FOCUS_FALLBACK_ID, nodeDetailOverlayOpen, sourceOverlayOpen } from './modalStack';
 import { useModalLayer } from './useModalLayer';
-import { samePositions, type CommunityStructure } from './communityLayout';
+import { samePositions, type CommunityBlock, type CommunityStructure } from './communityLayout';
 import {
   buildPrReviewMetricRows,
   canvasResizeEffect,
@@ -1072,6 +1072,56 @@ export function mapMinZoom(extent: Size, viewport: Size, ceiling: number): numbe
     return ceiling;
   }
   return boundsFitZoom(extent, viewport, ceiling);
+}
+
+/**
+ * Where All Nodes opens, now that it no longer simply fits the whole layout.
+ *
+ * `[2026-10-25]` Fitting is right for a map that can be read fitted, and wrong
+ * for one that cannot. driller's own 1,279-Node layout fits at ≈0.014 — far
+ * under `LOD_ZOOM_THRESHOLD` — where every card is a cluster bubble drawn at
+ * about 1.8% scale: the canvas looks empty even though nothing is missing from
+ * it. Grouped is the overview for a map that size; All Nodes is for reading
+ * actual cards, so below the readable floor it opens *somewhere* rather than
+ * at *everywhere*, centred on the largest community.
+ *
+ * `fitted` says which of the two happened, so the caller can tell the user
+ * that the view starts on one community rather than the whole map.
+ * Deterministic: the largest community wins, ties broken on id, so the same
+ * map always opens the same way.
+ */
+export function allNodesOpeningView(
+  layout: Rect,
+  blocks: readonly CommunityBlock[],
+  viewport: Size,
+): { center: Point; zoom: number; fitted: boolean; openedOn?: { label: string; memberCount: number } } {
+  const layoutCenter = { x: layout.x + layout.width / 2, y: layout.y + layout.height / 2 };
+  const fitZoom =
+    isUsableSize(layout) && isUsableSize(viewport)
+      ? boundsFitZoom(layout, viewport, MAP_MAX_ZOOM)
+      : ROUTE_MIN_READABLE_ZOOM;
+  if (fitZoom >= ROUTE_MIN_READABLE_ZOOM) {
+    return { center: layoutCenter, zoom: fitZoom, fitted: true };
+  }
+  let largest: CommunityBlock | undefined;
+  for (const candidate of blocks) {
+    if (
+      largest === undefined ||
+      candidate.memberCount > largest.memberCount ||
+      (candidate.memberCount === largest.memberCount && candidate.communityId < largest.communityId)
+    ) {
+      largest = candidate;
+    }
+  }
+  return {
+    center:
+      largest === undefined
+        ? layoutCenter
+        : { x: largest.x + largest.width / 2, y: largest.y + largest.height / 2 },
+    zoom: ROUTE_MIN_READABLE_ZOOM,
+    fitted: false,
+    ...(largest === undefined ? {} : { openedOn: { label: largest.label, memberCount: largest.memberCount } }),
+  };
 }
 
 /**
@@ -7178,6 +7228,9 @@ export function CodeMap({
     setExpandedCommunities(NO_EXPANDED_COMMUNITIES);
   }, [currentRevealKey]);
 
+  /** Set when the Grouped/All Nodes toggle asks for All Nodes; consumed once the new layout exists. */
+  const pendingAllNodesOpenRef = useRef(false);
+
   const collapsedCommunities = useMemo(
     () =>
       fullStructure === null
@@ -7271,6 +7324,10 @@ export function CodeMap({
       if (partition === null) {
         return;
       }
+      // The opening view is placed by the effect below, not here: this tick's
+      // `fullGrid` still describes the collapsed layout, so the All Nodes
+      // coordinates do not exist yet.
+      pendingAllNodesOpenRef.current = next === 'all';
       setExpandedCommunities(expandedForMode(partition, next));
       announceReveal(
         next === 'all'
@@ -7640,9 +7697,9 @@ export function CodeMap({
    * inside the bounds rather than on them. Reads `lodInputNodes` because that
    * is already "every card that is drawn", collapsed community cards included.
    */
-  const layoutExtent = useMemo<Size>(() => {
+  const layoutBounds = useMemo<Rect>(() => {
     if (lodInputNodes.length === 0) {
-      return { width: 0, height: 0 };
+      return { x: 0, y: 0, width: 0, height: 0 };
     }
     let minX = Number.POSITIVE_INFINITY;
     let maxX = Number.NEGATIVE_INFINITY;
@@ -7655,10 +7712,43 @@ export function CodeMap({
       maxY = Math.max(maxY, position.y);
     }
     return {
+      x: minX,
+      y: minY,
       width: maxX - minX + NODE_CARD_FALLBACK_WIDTH,
       height: maxY - minY + NODE_CARD_FALLBACK_HEIGHT,
     };
   }, [lodInputNodes]);
+
+  /**
+   * Places the view when All Nodes opens. Runs here rather than in
+   * `changeCommunityMode` because the All Nodes coordinates do not exist until
+   * `fullGrid` has been rebuilt for the expanded partition — in
+   * `changeCommunityMode`'s own tick, `fullGrid` still describes the collapsed
+   * layout. Fires once per switch (the ref is cleared as it applies), so it
+   * never fights the user's own panning afterwards.
+   */
+  useEffect(() => {
+    if (!pendingAllNodesOpenRef.current) {
+      return;
+    }
+    const instance = reactFlowInstanceRef.current;
+    if (instance === null || fullGrid === null || layoutBounds.width <= 0 || containerSize.width <= 0) {
+      return;
+    }
+    pendingAllNodesOpenRef.current = false;
+    const opening = allNodesOpeningView(layoutBounds, fullGrid.blocks, containerSize);
+    instance.setCenter(opening.center.x, opening.center.y, { zoom: opening.zoom, duration: 300 });
+    if (opening.openedOn !== undefined) {
+      // Never leave the earlier "Showing all N Nodes" standing alone when the
+      // view in fact opens on one community: that is the map asserting more
+      // than the screen shows.
+      announceReveal(
+        `Showing all ${communityCardNodesText(partitionNodeCount(fullGrid.structure.partition))} — the view opens on ${
+          opening.openedOn.label
+        }, ${communityCardNodesText(opening.openedOn.memberCount)}`,
+      );
+    }
+  }, [fullGrid, layoutBounds, containerSize, announceReveal]);
 
   /**
    * What `computeLOD` may cluster: the Node and folded cards alone. A
@@ -9566,7 +9656,7 @@ export function CodeMap({
             // at any map size — found via live CDP verification. Only fixture
             // sessions get the very low floor; real usage keeps a much higher
             // one (`MIN_ZOOM_REAL`'s comment above — review finding).
-            minZoom={mapMinZoom(layoutExtent, containerSize, isDevFixtureMode ? MIN_ZOOM_FIXTURE : MIN_ZOOM_REAL)}
+            minZoom={mapMinZoom(layoutBounds, containerSize, isDevFixtureMode ? MIN_ZOOM_FIXTURE : MIN_ZOOM_REAL)}
             // AD-2's viewport-culling half — confirmed present on the
             // installed `@xyflow/react` (12.11.6); this phase's own code only
             // needed to build the clustering half (`computeLOD`) alongside it.
