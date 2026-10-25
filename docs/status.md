@@ -33,7 +33,7 @@ usefulness, and neither does a state in this table.
 | Capability | State | Evidence |
 | --- | --- | --- |
 | **Open a Project and Explore Its Code Map** (FR1–FR6, FR10, FR16, FR17) | Shipped | Epic 1; P0-3; P1-2/3; P2-1. Assessment 2026-10-13 confirms folder/recent-project entry, indexing progress, explicit degraded states, retry and close-project recovery. |
-| **See Where the Risk Is** (FR7–FR9) | Shipped | Epic 2; P0-5; P1-1; P4-3f. Deterministic complexity/hotspot/blast-radius signals, LCOV gaps, separate AI judgments, opt-in bot findings. |
+| **See Where the Risk Is** (FR7–FR9) | Shipped | Epic 2; P0-5; P1-1; P4-3f. Deterministic complexity/hotspot/blast-radius signals, LCOV gaps, separate AI judgments, opt-in bot findings. Pairwise co-change added 2026-10-22 (`6f44910`, `52b6802`): `FILE_CHANGES_WITH` as a sixth deterministic signal, with the co-changing files named in Node detail. |
 | **Audit a PR Before Merging** (FR11, FR12) | Shipped | Epic 3; P4-3. Local-git diff scope, changed/affected rows, contract dependents, sortable metrics table. Checkout-move detection added 2026-10-15 (P5-a, `1e1af7e`). |
 | **Audit an Entire Codebase** (FR13) | Shipped | Epic 4; P0-2a/b/c. Directory-grouped risk-ranked cards on their own surface. |
 | **Let Agents Query What Humans See** (FR14, FR15) | Shipped | Epic 5; P0-4; P4-6; P4-4f; P4-7c/h. Six MCP tools, not FR14's five — entry candidates is the sixth, with relations capped at 50 plus a total (disclosed, not parity drift). AD-24 MCP-listener liveness monitoring is in. |
@@ -41,15 +41,23 @@ usefulness, and neither does a state in this table.
 | **Section-switch latency** | Shipped, live unverified | P5-b (`9406588`, 2026-10-18) serves a same-generation request from the raw cache; bench reports ~11 ms at 2k Nodes and ~59 ms at 10k. The ~5 s switch the 2026-10-13 assessment recorded on driller/app has not been re-measured live since. |
 | **Revealed view / progressive exploration** | Shipped | P4-7a–P4-7h; FIX-5/6/7. Heuristic entry candidates, layered drill-down, history, persistent pins, shared-reach relations. Harness/fixture files excluded as roots (P5-e, `102eaa8`). |
 | **Full map laid out by the call graph** | Shipped | `ba062d8` (2026-10-20). `communities.ts` partitions Nodes by who calls whom; `communityLayout.ts` draws each community as its own block by hop depth. Renderer-local layout only — a community id never reaches a Graph Service call (AD-2). Below 40 connected Nodes the map is not partitioned. |
-| **Collapsed community cards** | Shipped | `72f72af` (2026-10-21). Full opens on one card per community (count, cohesion as two real counts, "↗ N out"), with a Grouped / All Nodes toggle, pooled islands, and generated community names. Known limit, by design: a link edge draws only between two *collapsed* cards. |
+| **Collapsed community cards** | Shipped | `72f72af` (2026-10-21). Full opens on one card per community (count, cohesion as two real counts, "↗ N out"; the pooled-islands card says "each group calls only itself" instead, `e8a9eb6`), with a Grouped / All Nodes toggle, pooled islands, and generated community names. Known limit, by design: a link edge draws only between two *collapsed* cards. |
 | **Local model download gating** | Shipped | P5-c (`f3a9c69`, 2026-10-18). Cloud never downloads the local model; e2e asserts no Hugging Face host is contacted. |
 | **Cloud backend path** | Shipped, live unverified | Key handling (AD-4, P2-10) and switch-failure messaging (P5-g) are in and tested. No recorded real paid cloud call or backend-switch run — assessment 2026-10-13 asks for one before treating this path as verified. |
 | **PR-bot ingestion (CodeRabbit, Qodo)** | Shipped, live unverified | FR9 path exists; no recorded installed-bot run. Carries an open read-only violation, below. |
 | **Node 24 LTS / engines** | Shipped | P5-h (`17836f3`, 2026-10-18). `.nvmrc` 24; `engines.node` `^22.22.2 \|\| ^24.15.0 \|\| >=26.0.0`; CI gates on 22.x and the `.nvmrc` 24 leg. |
-| **Verification suite** | Shipped | 2,559 unit and DOM tests, clean typecheck and lint, and 11 Electron e2e journeys passing against the real app as of `72f72af` (2026-10-21). e2e journeys hardened and run three times in a row on Node 24 at `25cfaaa` (2026-10-19). |
+| **Verification suite** | Shipped | 2,599 unit and DOM tests across 626 suites, clean typecheck and lint, and all 11 Electron e2e journeys passing against the real app in 253 s with real userData untouched, as of `f3f383a` (2026-10-25). e2e journeys hardened and run three times in a row on Node 24 at `25cfaaa` (2026-10-19). Reproducing the e2e leg means no ambient `codebase-memory-mcp` at all — see below. |
 
 ## Open and unverified
 
+- **An e2e run cannot coexist with an ambient backend, including the editor's.**
+  `decidePreflight` refuses while *any* `codebase-memory-mcp` process is alive,
+  because the run starts its own daemon and stops only that one. Each Claude Code
+  session with the backend configured as a user-level MCP server holds a child of
+  its own, so stopping the backend by hand does not stick — those processes have to
+  go too (`2026-10-25`: four of them, across three idle sessions). Worth a narrower
+  check — the port plus a daemon, rather than every process — but loosening a safety
+  check to make a run go green is the wrong way round, so it stands as is.
 - **Snapshot ownership across cached arrays.** Raw maps have an index-generation
   guard; other cached arrays can still adopt an older fetch. Adoption should be
   atomic and generation-checked across every operation and outgoing UI result,
