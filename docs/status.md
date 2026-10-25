@@ -78,6 +78,15 @@ usefulness, and neither does a state in this table.
   of nodes and edges and is not generation-checked, so the original item's
   "every outgoing UI result, renderer included" is only half met. (Assessment
   2026-10-13, Winston.)
+- **A test that assumes a layout will fail when the layout improves.**
+  `[2026-10-25]` `CodeMap.sections.dom.test.tsx` picked `web.nodes.at(-1)` as a
+  Node it assumed the first fit would cull. That tied it to one seating: it
+  failed under partition-only seating, under no seating, and under identity
+  seating, while passing under the measured seating it happened to be written
+  against — and it cost three wrong diagnoses before that was spotted, because
+  it times out rather than failing an assertion. It now picks a Node the first
+  fit actually culled. Worth checking for the same shape elsewhere: a premise
+  the test *assumes* about the map, rather than one it *establishes*.
 - **A CI-only failure is not evidence about the code until the code is ruled
   out.** `[2026-10-25]` "a cluster expanded in Full is a cluster again after
   Revealed and back" failed on ubuntu-latest and passed on macOS. It was
@@ -200,10 +209,15 @@ usefulness, and neither does a state in this table.
   crossings (−84%)**, total link length −49%, mean link length 1,468 → 753.
   Reverted in `d8ce609` on a wrong diagnosis and re-landed in `e5f93d1`: CI
   failed identically with the revert on `origin/main`, which ruled this out —
-  the cause was a `waitFor` budget CI never scaled (`4a1c48b`). **Open design
-  debt:** it still decides seating from the packed slot positions, which are
-  measured geometry, against the rule below. To be paid deliberately, from the
-  partition and the card count alone.
+  the cause was a `waitFor` budget CI never scaled (`4a1c48b`). **Debt paid in
+  `a87e057`,** at a stated price. Seating was decided by hill-climbing over the
+  packed slot positions, so a re-measure could reshuffle the map; it is now
+  decided over a nominal grid from the partition and its links alone. Measured
+  live: **measured seating 69 crossings, partition-only seating 222, no seating
+  425** — about half the win kept, and all of the stability. The nominal grid
+  is a crude stand-in for shelves it cannot see; **sizing its cells by member
+  count** (partition data, not measurement) is the obvious way to close the
+  gap and has not been tried.
 
   **Carries a known latent instability:** it reads the packed slot positions,
   so the seating is a function of measured card sizes, bounded only by never
