@@ -771,7 +771,7 @@ export const NODE_CARD_FALLBACK_HEIGHT = 80;
 // `MIN_ZOOM_FIXTURE`, low enough that a much-larger-than-10,000-Node map
 // still has real headroom below `LOD_ZOOM_THRESHOLD`.
 const MIN_ZOOM_FIXTURE = 0.02;
-const MIN_ZOOM_REAL = 0.1;
+export const MIN_ZOOM_REAL = 0.1;
 
 // Zoom (as `@xyflow/react` reports it — 1 = 100%) at/above which an
 // in-viewport Node renders full-size, unclustered, matching Phase 1 exactly
@@ -1042,6 +1042,36 @@ const isFiniteNumber = (value: number) => Number.isFinite(value);
  */
 export function boundsFitZoom(bounds: Size, viewport: Size, maxZoom: number): number {
   return Math.min(maxZoom, viewport.width / bounds.width, viewport.height / bounds.height);
+}
+
+const isUsableSize = (size: Size) =>
+  isFiniteNumber(size.width) && isFiniteNumber(size.height) && size.width > 0 && size.height > 0;
+
+/**
+ * The map's zoom floor: `ceiling` (`MIN_ZOOM_REAL`, or `MIN_ZOOM_FIXTURE` in a
+ * dev-fixture session) unless THIS map needs to go further out to be seen
+ * whole, in which case the zoom that fits it.
+ *
+ * `[2026-10-25]` The flat floor was calibrated against a ~155-Node map, which
+ * fits at zoom ≈0.29 — comfortably above it — and the review finding it exists
+ * for is about small maps, where cards become unclickable if you zoom out too
+ * far. On a map that needs LESS than the floor the flat value is not a guard
+ * but a wall: `fitView` clamps to it, the viewport holds a sliver of the
+ * layout, `onlyRenderVisibleElements` culls the rest, and the map looks empty
+ * while the panel still counts every Node. Measured on driller's own repo, All
+ * Nodes lays 1,279 cards over 13,260 x 34,082 units into a 1,100 x 497
+ * viewport: it needs ≈0.0146 and was being held at 0.1.
+ *
+ * Taking the smaller of the two keeps the small-map guard exactly as it was
+ * (a map that fits above the floor is unaffected) while letting a large one be
+ * framed. There is no second absolute floor: you can never usefully zoom out
+ * past "the whole map fits", so that bound is its own limit.
+ */
+export function mapMinZoom(extent: Size, viewport: Size, ceiling: number): number {
+  if (!isUsableSize(extent) || !isUsableSize(viewport)) {
+    return ceiling;
+  }
+  return boundsFitZoom(extent, viewport, ceiling);
 }
 
 /**
@@ -7605,6 +7635,32 @@ export function CodeMap({
   );
 
   /**
+   * The laid-out map's own footprint, for `mapMinZoom`'s floor. Positions are
+   * card top-left corners, so one card's size is added to put the far edge
+   * inside the bounds rather than on them. Reads `lodInputNodes` because that
+   * is already "every card that is drawn", collapsed community cards included.
+   */
+  const layoutExtent = useMemo<Size>(() => {
+    if (lodInputNodes.length === 0) {
+      return { width: 0, height: 0 };
+    }
+    let minX = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const { position } of lodInputNodes) {
+      minX = Math.min(minX, position.x);
+      maxX = Math.max(maxX, position.x);
+      minY = Math.min(minY, position.y);
+      maxY = Math.max(maxY, position.y);
+    }
+    return {
+      width: maxX - minX + NODE_CARD_FALLBACK_WIDTH,
+      height: maxY - minY + NODE_CARD_FALLBACK_HEIGHT,
+    };
+  }, [lodInputNodes]);
+
+  /**
    * What `computeLOD` may cluster: the Node and folded cards alone. A
    * collapsed community card is already an aggregate of the call graph's own
    * making, so bucketing it with its neighbours by on-screen proximity would
@@ -9510,7 +9566,7 @@ export function CodeMap({
             // at any map size — found via live CDP verification. Only fixture
             // sessions get the very low floor; real usage keeps a much higher
             // one (`MIN_ZOOM_REAL`'s comment above — review finding).
-            minZoom={isDevFixtureMode ? MIN_ZOOM_FIXTURE : MIN_ZOOM_REAL}
+            minZoom={mapMinZoom(layoutExtent, containerSize, isDevFixtureMode ? MIN_ZOOM_FIXTURE : MIN_ZOOM_REAL)}
             // AD-2's viewport-culling half — confirmed present on the
             // installed `@xyflow/react` (12.11.6); this phase's own code only
             // needed to build the clustering half (`computeLOD`) alongside it.

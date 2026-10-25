@@ -27,6 +27,8 @@ import {
   routeExtendsBeyondText,
   routeFitRequest,
   routeViewport,
+  mapMinZoom,
+  MIN_ZOOM_REAL,
 } from './CodeMap';
 import { renderTree, textOf, type RenderedElement } from './testRender';
 
@@ -563,5 +565,63 @@ describe('NeighborTraceSteps extends-beyond line', () => {
     const unclamped = render(ids, false).filter((element) => element.props.className === TRUNCATED);
     assert.equal(unclamped.length, 1);
     assert.match(textOf(unclamped[0]), /^Showing the first /);
+  });
+});
+
+/**
+ * The zoom floor exists so an ordinary small map cannot be zoomed out until
+ * its cards are unclickable (the review finding behind `MIN_ZOOM_REAL`). It
+ * was calibrated against a ~155-Node map, which fits at zoom ≈0.29 — far
+ * above the floor. A map that needs LESS zoom than the floor to fit cannot be
+ * framed at all: `fitView` clamps at the floor, the viewport holds a sliver,
+ * and `onlyRenderVisibleElements` culls everything else — which is what made
+ * All Nodes draw one cluster bubble on driller's own repo while the panel
+ * said "Showing all 1279 Nodes".
+ */
+describe("the map's zoom floor", () => {
+  // Measured live on driller/app, 2026-10-25: 1,279 cards laid out over
+  // 13,260 x 34,082 world units in a 1,100 x 497 viewport.
+  const DRILLER_ALL_NODES = { width: 13_260, height: 34_082 };
+  const DRILLER_VIEWPORT = { width: 1_100, height: 497.1875 };
+
+  it('lets driller’s own 1,279-Node map zoom out far enough to be seen', () => {
+    const needed = Math.min(
+      DRILLER_VIEWPORT.width / DRILLER_ALL_NODES.width,
+      DRILLER_VIEWPORT.height / DRILLER_ALL_NODES.height,
+    );
+    assert.ok(needed < MIN_ZOOM_REAL, 'precondition: this map cannot be fitted at the standing floor');
+    assert.ok(
+      mapMinZoom(DRILLER_ALL_NODES, DRILLER_VIEWPORT, MIN_ZOOM_REAL) <= needed,
+      'the floor must not stop the whole map being framed',
+    );
+  });
+
+  it('keeps the clickable floor for a map that already fits above it', () => {
+    // A ~155-Node map: fits at ≈0.29, so nothing should change for it.
+    const small = { width: 3_000, height: 1_600 };
+    assert.equal(mapMinZoom(small, DRILLER_VIEWPORT, MIN_ZOOM_REAL), MIN_ZOOM_REAL);
+  });
+
+  it('never reports a floor above the ceiling it is given', () => {
+    for (const extent of [{ width: 10, height: 10 }, { width: 50_000, height: 90_000 }]) {
+      assert.ok(mapMinZoom(extent, DRILLER_VIEWPORT, MIN_ZOOM_REAL) <= MIN_ZOOM_REAL, JSON.stringify(extent));
+    }
+  });
+
+  it('falls back to the ceiling when the layout or the viewport cannot be measured', () => {
+    const unusable = [
+      [{ width: 0, height: 0 }, DRILLER_VIEWPORT],
+      [DRILLER_ALL_NODES, { width: 0, height: 0 }],
+      [{ width: Number.NaN, height: 10 }, DRILLER_VIEWPORT],
+      [DRILLER_ALL_NODES, { width: Number.POSITIVE_INFINITY, height: 10 }],
+    ] as const;
+    for (const [extent, viewport] of unusable) {
+      assert.equal(mapMinZoom(extent, viewport, MIN_ZOOM_REAL), MIN_ZOOM_REAL, JSON.stringify({ extent, viewport }));
+    }
+  });
+
+  it('is always a usable zoom, never zero or negative', () => {
+    const floor = mapMinZoom(DRILLER_ALL_NODES, DRILLER_VIEWPORT, MIN_ZOOM_REAL);
+    assert.ok(floor > 0 && Number.isFinite(floor), String(floor));
   });
 });
