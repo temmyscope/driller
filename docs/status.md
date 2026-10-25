@@ -87,10 +87,13 @@ usefulness, and neither does a state in this table.
   inside a test, which stayed flat at 1.5s while `BUDGET` beside it doubled for
   CI — so on CI each inner wait had half the allowance, relative to machine
   speed, of the test around it. Reproduced by shrinking `FIND` locally. Fixed
-  in `4a1c48b` for that file; **the same flat `FIND` beside a scaled `BUDGET`
-  is in every other DOM test file here**, so the next CI-only timeout is
-  probably this again. Rule of thumb earned: before blaming a change, push the
-  revert and see whether CI notices.
+  in `4a1c48b` for that file, then in `e5baf13` for the sixteen others that had
+  the same shape — thirteen pairing a scaled `BUDGET` with a flat `FIND`, three
+  (`App.smoke`, `CodeMap.smoke`, `CodeMap.retryForce`) scaling nothing at all,
+  plus `CodeMap.revealed`'s `DRILL_WAIT`. Nothing changed locally, where the
+  multiplier is 1; CI simply gets the headroom it was always meant to have.
+  Rule of thumb earned: before blaming a change, push the revert and see
+  whether CI notices.
 - **A measured card size must never decide the shape of the layout.**
   `[2026-10-25]` Learned the hard way: `wrapToSquare` derived its wrap point
   from the *measured* card pitches, and `fullGrid` is memoized on
