@@ -98,14 +98,24 @@ usefulness, and neither does a state in this table.
   speech output, focus under clustering/culling, and zoom have not been checked
   live; live-region text and fixture assertions do not establish that the spoken
   experience is understandable.
-- **Plain-edge faintness: judged live, verdict negative.** `[2026-10-25]` P5-f
-  (`42943e7`) paints plain edges at DESIGN.md's `border-strong`. Judged on
-  driller/app's own map (34 community cards, 59 drawn edges): the edges are
-  barely perceptible against the near-black canvas, and where they cross — which
-  is most of the canvas — a single edge cannot be followed by eye. Since the
-  grouped layout's relational information lives entirely in those edges, this is
-  not a cosmetic row: it is why the map reads as a lattice of cards. Needs a
-  contrast decision, not a re-measurement.
+- **Plain-edge faintness: judged live, then fixed.** `[2026-10-25]` P5-f
+  (`42943e7`) painted plain edges with `--border-strong` and deferred the
+  visual judgement; DESIGN.md recorded the alternative to take if it came back
+  badly. Judged on driller/app's own map (34 cards, 59 edges): the strokes
+  could not be followed by eye and crossings were indistinguishable.
+  `--border-strong` is 1.72:1 against `--bg` — measured against React Flow's
+  own `#3e3e3e` default at 1.81:1, P5-f had made them slightly *dimmer* than
+  the library's. Fixed in `028b4fa` by taking DESIGN.md's own named
+  alternative, `--border-control` at 3.16:1: the grouped Full map carries every
+  relation it shows in these edges and nothing else, so they are meaningful
+  graphical objects under WCAG 1.4.11 rather than decoration.
+  `contrast.test.ts` now reads the stroke off the `.code-map__edge` rule and
+  enforces 3:1 against every `--bg`, instead of recording the ratio, so a later
+  restyle cannot quietly return to a decorative token. **Separate and still
+  open:** following one specific edge through the dense middle of the map
+  remains hard. That is crossings — 33 cards in a near-lattice with edges
+  routed straight through it — not contrast, and it wants edge routing or
+  layout work, not another colour.
 - **`All Nodes` on a large map: both halves now closed.** `[2026-10-25, found
   by dogfooding on driller/app]` Originally: Grouped drew 34 nodes and 59
   edges, All Nodes drew **one** cluster bubble standing for 28 Nodes and no
