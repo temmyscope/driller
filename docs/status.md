@@ -58,11 +58,26 @@ usefulness, and neither does a state in this table.
   go too (`2026-10-25`: four of them, across three idle sessions). Worth a narrower
   check — the port plus a daemon, rather than every process — but loosening a safety
   check to make a run go green is the wrong way round, so it stands as is.
-- **Snapshot ownership across cached arrays.** Raw maps have an index-generation
-  guard; other cached arrays can still adopt an older fetch. Adoption should be
-  atomic and generation-checked across every operation and outgoing UI result,
-  renderer included, not only live MCP queries. (Assessment 2026-10-13,
-  Winston.)
+- **Snapshot ownership across cached arrays — service side closed, renderer
+  open.** `[2026-10-25]` A Code Map fetch still in flight when an index starts
+  lands in `activeCodeMapNodes`/`activeCodeMapEdges` but never in the raw
+  cache, so `getActiveRawCodeMap()` reports no current stamp. Entry candidates
+  asked for that stamp since P4-7c; the others did not. Measured by driving the
+  real sequence — map open, refetch starts, re-index of the same project begins
+  before it lands — a whole-scope diff scope returned a *fully resolved* result
+  over the previous generation's Nodes (changed contracts, dependent ids and
+  all, nothing marking it stale), Blast Radius expansion returned confident hop
+  distances, and `lookup_node` described a Node at the previous index's line
+  range. With a `section` all three already refused, via
+  `resolveCachedSectionFilter`; only the whole-scope path was exposed.
+  Fixed in `584d7fa` and `41faa8c`: diff scope, Blast Radius expansion and the
+  `startMcpServer` Nodes getter now ask the same stamp, so every service-side
+  reader of the cached arrays refuses a generation-old map
+  (`MAP_REFRESHING_RESULT`, or `lookup_node`'s existing "No project has
+  finished indexing yet."). **Still open:** the renderer holds its own copies
+  of nodes and edges and is not generation-checked, so the original item's
+  "every outgoing UI result, renderer included" is only half met. (Assessment
+  2026-10-13, Winston.)
 - **Qodo ingestion writes into the user's repo.** PR-Agent writes `review.md`
   into the repo root and driller deletes it afterwards — a live exception to the
   never-write-to-the-user's-repo invariant. See [arc42.md §11](arc42.md#11-risks-and-technical-debt)
