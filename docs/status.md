@@ -101,8 +101,11 @@ usefulness, and neither does a state in this table.
   (`App.smoke`, `CodeMap.smoke`, `CodeMap.retryForce`) scaling nothing at all,
   plus `CodeMap.revealed`'s `DRILL_WAIT`. Nothing changed locally, where the
   multiplier is 1; CI simply gets the headroom it was always meant to have.
-  Rule of thumb earned: before blaming a change, push the revert and see
-  whether CI notices.
+  **Confirmed green on `1148e5c`, 2026-10-26** — the first CI pass since the
+  failure, with both reverted improvements back in place, which is what closes
+  the loop: the budget was the cause and the layout work never was. Rule of
+  thumb earned: before blaming a change, push the revert and see whether CI
+  notices.
 - **A measured card size must never decide the shape of the layout.**
   `[2026-10-25]` Learned the hard way: `wrapToSquare` derived its wrap point
   from the *measured* card pitches, and `fullGrid` is memoized on
